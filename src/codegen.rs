@@ -4942,7 +4942,7 @@ impl<'ctx> Codegen<'ctx> {
                     .into_int_value();
                 Ok(found.into())
             }
-            _ => Ok(i64_t.const_int(0, false).into()),
+            _ => Err(format!("codegen: Map.{method} not yet implemented")),
         }
     }
 
