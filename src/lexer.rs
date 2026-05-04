@@ -647,9 +647,8 @@ impl<'a> Lexer<'a> {
                     }
                     _ => {
                         let c = self.consume_codepoint();
-                        return self.make_spanned(Token::Error(format!(
-                            "Unknown escape sequence: \\{c}"
-                        )));
+                        return self
+                            .make_spanned(Token::Error(format!("Unknown escape sequence: \\{c}")));
                     }
                 }
             } else {
@@ -835,9 +834,8 @@ impl<'a> Lexer<'a> {
                     }
                     _ => {
                         let c = self.consume_codepoint();
-                        return self.make_spanned(Token::Error(format!(
-                            "Unknown escape sequence: \\{c}"
-                        )));
+                        return self
+                            .make_spanned(Token::Error(format!("Unknown escape sequence: \\{c}")));
                     }
                 }
             } else {

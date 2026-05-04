@@ -1187,7 +1187,10 @@ fn test_non_ascii_identifier_start_emits_one_error() {
         panic!("expected Token::Error, got {:?}", tokens[0]);
     };
     assert!(msg.contains("non-ASCII"), "msg = {msg}");
-    assert!(msg.contains('α'), "diagnostic should name the actual codepoint, got {msg}");
+    assert!(
+        msg.contains('α'),
+        "diagnostic should name the actual codepoint, got {msg}"
+    );
     assert!(msg.contains("deferred") || msg.contains("ASCII"));
     assert!(matches!(tokens[1], Token::EOF));
 }
@@ -1202,7 +1205,10 @@ fn test_non_ascii_identifier_mid_word_emits_one_error() {
         panic!("expected Token::Error, got {:?}", tokens[0]);
     };
     assert!(msg.contains("non-ASCII"), "msg = {msg}");
-    assert!(msg.contains('ā'), "diagnostic should name the actual codepoint, got {msg}");
+    assert!(
+        msg.contains('ā'),
+        "diagnostic should name the actual codepoint, got {msg}"
+    );
 }
 
 #[test]
@@ -1229,7 +1235,10 @@ fn test_non_ascii_non_letter_emits_clean_unexpected_character() {
         panic!("expected Token::Error, got {:?}", tokens[0]);
     };
     assert!(msg.contains("Unexpected character"), "msg = {msg}");
-    assert!(msg.contains('🚀'), "diagnostic should name the actual codepoint, got {msg}");
+    assert!(
+        msg.contains('🚀'),
+        "diagnostic should name the actual codepoint, got {msg}"
+    );
 }
 
 #[test]
