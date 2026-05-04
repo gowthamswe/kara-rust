@@ -92,11 +92,23 @@ mod memory_sanitizer_tests {
             return None;
         }
 
+        // LeakSanitizer (the leak-detection arm of ASAN) ships only with
+        // upstream LLVM's ASAN runtime on Linux — Apple clang's macOS ASAN
+        // does not include it. Setting `detect_leaks=1` on Darwin makes the
+        // ASAN runtime print "detect_leaks is not supported on this platform"
+        // and exit with the configured `exitcode=23`, which the harness
+        // would interpret as a memory error. Drop the flag on macOS — keep
+        // ASAN's UAF / double-free / heap-buffer-overflow coverage there.
+        // Leak-style bugs are caught separately on Linux + by the runtime
+        // alloc/free counter assertion described in phase-7-codegen.md
+        // (`scope_cleanup_actions` testing note).
+        let asan_options = if cfg!(target_os = "macos") {
+            "abort_on_error=0:exitcode=23"
+        } else {
+            "detect_leaks=1:abort_on_error=0:exitcode=23"
+        };
         let output = Command::new(&exe_path)
-            .env(
-                "ASAN_OPTIONS",
-                "detect_leaks=1:abort_on_error=0:exitcode=23",
-            )
+            .env("ASAN_OPTIONS", asan_options)
             .output();
 
         let _ = std::fs::remove_file(&obj_path);
