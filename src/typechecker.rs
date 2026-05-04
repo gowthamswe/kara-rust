@@ -1560,6 +1560,7 @@ impl<'a> TypeChecker<'a> {
             TypeKind::FnType {
                 params,
                 return_type,
+                is_once,
                 ..
             } => {
                 let param_types: Vec<Type> = params
@@ -1570,9 +1571,16 @@ impl<'a> TypeChecker<'a> {
                     .as_ref()
                     .map(|t| self.lower_type_expr(t, generic_scope))
                     .unwrap_or(Type::Unit);
-                Type::Function {
-                    params: param_types,
-                    return_type: Box::new(ret),
+                if *is_once {
+                    Type::OnceFunction {
+                        params: param_types,
+                        return_type: Box::new(ret),
+                    }
+                } else {
+                    Type::Function {
+                        params: param_types,
+                        return_type: Box::new(ret),
+                    }
                 }
             }
             TypeKind::Ref(inner) => Type::Ref(Box::new(self.lower_type_expr(inner, generic_scope))),
@@ -7763,6 +7771,36 @@ impl<'a> TypeChecker<'a> {
             return self.infer_slice_method(element, *mutable, method, args, span);
         }
 
+        // `Vec[T].push(item: T)` slot check (round 12.46 / Step 4). Vec is a
+        // built-in prelude type with no impl block, so without this dispatch
+        // `push` falls through to the silent `Type::Error` arm below and the
+        // argument never gets checked against the element type. Routing the
+        // single argument through `check_assignable(element, arg_ty, span)`
+        // means a once-callable closure value flowing into a `Vec[Fn(...)]`
+        // element slot triggers `OnceFnIntoFnSlot` via the same path Step 3
+        // wired for parameter slots. Other Vec methods continue through the
+        // historical fall-through to preserve existing test behavior — Step 5
+        // can promote them when needed.
+        if method == "push" && args.len() == 1 {
+            let element_ty = match &obj_ty {
+                Type::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                    Some(args[0].clone())
+                }
+                Type::Ref(inner) | Type::MutRef(inner) => match inner.as_ref() {
+                    Type::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                        Some(args[0].clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(elem) = element_ty {
+                let arg_ty = self.infer_expr(&args[0].value);
+                self.check_assignable(&elem, &arg_ty, args[0].value.span.clone());
+                return Type::Unit;
+            }
+        }
+
         // `String` method dispatch. `Type::Str` is not `Type::Named` so it
         // also falls through the generic branch; handle it here.
         if obj_ty == Type::Str {
@@ -9948,5 +9986,226 @@ mod once_fn_slot_rejection_tests {
                 tm
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod once_fn_container_slot_tests {
+    //! Round 12.46 (Step 4) — once-callability rejection at container element
+    //! slots, plus surface `OnceFn(...)` annotation acceptance and for-loop
+    //! iteration parity over `Vec[Fn]` and `Vec[OnceFn]`. The active rejection
+    //! is at the *insert* (`.push`); iteration falls out for free because
+    //! `for f in vec` types `f` as the element type, and Step 1's `Call`
+    //! dispatch already accepts both `Function` and `OnceFunction` callees.
+    use super::*;
+
+    fn typecheck_src(src: &str) -> TypeCheckResult {
+        let parsed = crate::parse(src);
+        let resolved = crate::resolve(&parsed.program);
+        crate::typecheck(&parsed.program, &resolved)
+    }
+
+    fn errors_of_kind(result: &TypeCheckResult, kind: &TypeErrorKind) -> Vec<TypeError> {
+        result
+            .errors
+            .iter()
+            .filter(|e| std::mem::discriminant(&e.kind) == std::mem::discriminant(kind))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn vec_fn_push_rejects_oncefn_closure_literal() {
+        // `Vec[Fn()]` element slot — pushing a once-callable closure must
+        // reject at the call site of `.push` because the slot promises
+        // repeatable invocation. Routes through the new Vec.push slot
+        // dispatch into `check_assignable`, which fires `OnceFnIntoFnSlot`
+        // (E0235) via Step 3's logic.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       let mut v: Vec[Fn()] = Vec.new();\n\
+                       v.push(|| apply(cfg));\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one OnceFnIntoFnSlot error at Vec[Fn].push site; \
+             all errors: {:?}",
+            result.errors
+        );
+        assert!(
+            hits[0].message.contains("once-callable"),
+            "expected 'once-callable' in message; got '{}'",
+            hits[0].message
+        );
+        assert!(
+            hits[0].message.contains("'cfg'") || hits[0].message.contains("captured binding"),
+            "expected consumed-capture name 'cfg' in message; got '{}'",
+            hits[0].message
+        );
+    }
+
+    #[test]
+    fn vec_fn_push_accepts_repeatable_closure() {
+        // Capture-free closure → `Type::Function` → fits `Vec[Fn()]` element.
+        let src = "fn main() {\n\
+                       let mut v: Vec[Fn()] = Vec.new();\n\
+                       v.push(|| { });\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert!(
+            hits.is_empty(),
+            "expected no OnceFnIntoFnSlot for repeatable closure push; got: {:?}",
+            hits
+        );
+        // Also confirm no TypeMismatch crept in for the push arg.
+        let mismatch = errors_of_kind(&result, &TypeErrorKind::TypeMismatch);
+        assert!(
+            mismatch.is_empty(),
+            "expected no TypeMismatch errors; got: {:?}",
+            mismatch
+        );
+    }
+
+    #[test]
+    fn vec_oncefn_push_accepts_once_callable_closure() {
+        // Surface `OnceFn(...)` annotation (round 12.46 Step 4) lets the
+        // user opt into a Vec whose element slot accepts once-callable
+        // closures. Pushing a closure that consumes a captured non-Copy
+        // binding now fits the slot — `OnceFunction` ⇄ `OnceFunction`.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       let mut v: Vec[OnceFn()] = Vec.new();\n\
+                       v.push(|| apply(cfg));\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert!(
+            hits.is_empty(),
+            "expected no OnceFnIntoFnSlot for OnceFn-into-OnceFn slot; got: {:?}",
+            hits
+        );
+        let mismatch = errors_of_kind(&result, &TypeErrorKind::TypeMismatch);
+        assert!(
+            mismatch.is_empty(),
+            "expected no TypeMismatch for OnceFn-into-OnceFn slot; got: {:?}",
+            mismatch
+        );
+    }
+
+    #[test]
+    fn vec_oncefn_annotation_lowers_to_once_function_type() {
+        // Round-trip the parser/lowering: `Vec[OnceFn() -> i64]` annotation
+        // on a let binding lowers to the OnceFunction carrier. Confirm by
+        // pushing a Function-typed closure (capture-free, no consume) — the
+        // slot expects OnceFunction, the closure synthesizes Function, and
+        // since types_compatible rejects the cross-pair (Step 1 baseline),
+        // a TypeMismatch fires. This pins that the annotation is *not*
+        // silently lowered to Function.
+        let src = "fn main() {\n\
+                       let mut v: Vec[OnceFn() -> i64] = Vec.new();\n\
+                       v.push(|| 7);\n\
+                   }";
+        let result = typecheck_src(src);
+        // The closure synthesizes as Function() -> i64. Slot wants
+        // OnceFunction() -> i64. types_compatible returns false on the
+        // cross-pair → TypeMismatch fires (NOT OnceFnIntoFnSlot, which only
+        // triggers in the OnceFn → Fn direction).
+        let mismatch = errors_of_kind(&result, &TypeErrorKind::TypeMismatch);
+        assert!(
+            !mismatch.is_empty(),
+            "expected TypeMismatch when pushing Function into Vec[OnceFn] slot; \
+             all errors: {:?}",
+            result.errors
+        );
+        let once_hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert!(
+            once_hits.is_empty(),
+            "OnceFnIntoFnSlot must not fire for Function → OnceFn (only the \
+             reverse direction is the round-12.45 case); got: {:?}",
+            once_hits
+        );
+    }
+
+    #[test]
+    fn for_loop_over_vec_fn_invokes_repeatedly() {
+        // Iteration over `Vec[Fn()]` yields `f: Fn()` per iteration. The
+        // body's `f()` call dispatches against `Type::Function`, which
+        // Step 1 made first-class for callee dispatch. No OnceFn ever
+        // appears in this path because the slot at insert time was Fn.
+        let src = "fn main() {\n\
+                       let mut v: Vec[Fn()] = Vec.new();\n\
+                       v.push(|| { });\n\
+                       v.push(|| { });\n\
+                       for f in v {\n\
+                           f();\n\
+                       }\n\
+                   }";
+        let result = typecheck_src(src);
+        assert!(
+            result.errors.is_empty(),
+            "expected clean typecheck; got errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn for_loop_over_vec_oncefn_invokes_each_element() {
+        // Iteration over `Vec[OnceFn()]` yields `f: OnceFn()` per
+        // iteration. The typechecker's Call dispatch matches
+        // `Function | OnceFunction`, so the body's `f()` succeeds. Each
+        // iteration owns its element (move semantics) so calling once is
+        // fine; the body invokes f exactly once.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn main() {\n\
+                       let cfg1 = Cfg { name: 1 };\n\
+                       let cfg2 = Cfg { name: 2 };\n\
+                       let mut v: Vec[OnceFn()] = Vec.new();\n\
+                       v.push(|| apply(cfg1));\n\
+                       v.push(|| apply(cfg2));\n\
+                       for f in v {\n\
+                           f();\n\
+                       }\n\
+                   }";
+        let result = typecheck_src(src);
+        assert!(
+            result.errors.is_empty(),
+            "expected clean typecheck for Vec[OnceFn] iter+invoke; got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn vec_fn_push_oncefn_through_intermediate_binding_still_rejects() {
+        // The closure is bound to a let first, then pushed. The let's
+        // binding type infers to OnceFunction (Step 2) and the push slot
+        // check sees OnceFunction → Function and fires E0235. This pins
+        // that the Vec.push slot check does not depend on the argument
+        // being a closure literal — any once-callable value flowing into
+        // the slot rejects.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       let h = || apply(cfg);\n\
+                       let mut v: Vec[Fn()] = Vec.new();\n\
+                       v.push(h);\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert!(
+            !hits.is_empty(),
+            "expected OnceFnIntoFnSlot when pushing a let-bound once-callable \
+             closure into Vec[Fn]; all errors: {:?}",
+            result.errors
+        );
     }
 }

@@ -2454,6 +2454,7 @@ impl<'a> Resolver<'a> {
                 params,
                 return_type,
                 effect_spec,
+                is_once: _,
             } => {
                 for p in params {
                     self.resolve_type_expr(p);

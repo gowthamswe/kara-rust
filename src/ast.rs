@@ -660,6 +660,11 @@ pub enum TypeKind {
         params: Vec<TypeExpr>,
         return_type: Option<Box<TypeExpr>>,
         effect_spec: Option<EffectSpec>,
+        /// Round 12.46 (Step 4): set when the surface annotation is
+        /// `OnceFn(...)` rather than `Fn(...)`. The two share AST shape and
+        /// effect-spec structure; only the lowering target differs
+        /// (`Type::OnceFunction` vs `Type::Function`).
+        is_once: bool,
     },
     Ref(Box<TypeExpr>),
     MutRef(Box<TypeExpr>),

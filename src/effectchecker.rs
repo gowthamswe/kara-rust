@@ -3486,6 +3486,7 @@ fn collect_effect_var_names_in_type(ty: &TypeExpr, out: &mut Vec<String>) {
             params,
             return_type,
             effect_spec,
+            is_once: _,
         } => {
             if let Some(EffectSpec::Specific(list)) = effect_spec {
                 for item in &list.items {
@@ -3631,8 +3632,9 @@ fn format_type_expr_with_subs(
             params,
             return_type,
             effect_spec,
+            is_once,
         } => {
-            out.push_str("Fn(");
+            out.push_str(if *is_once { "OnceFn(" } else { "Fn(" });
             for (i, p) in params.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");

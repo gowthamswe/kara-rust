@@ -2126,8 +2126,12 @@ impl Parser {
                     Some(first)
                 }
             }
-            // Fn(T) -> U with _
-            Token::Identifier(ref s) if s == "Fn" => {
+            // Fn(T) -> U with _ — and the once-callable variant `OnceFn(...)`
+            // (round 12.46, Step 4). Both share the same AST shape; the
+            // `is_once` flag distinguishes them so `lower_type_expr` can emit
+            // `Type::OnceFunction` for the OnceFn form.
+            Token::Identifier(ref s) if s == "Fn" || s == "OnceFn" => {
+                let is_once = s == "OnceFn";
                 self.advance();
                 self.expect(&Token::LeftParen)?;
                 let mut params = Vec::new();
@@ -2181,6 +2185,7 @@ impl Parser {
                         params,
                         return_type,
                         effect_spec,
+                        is_once,
                     },
                     span: self.span_from(&start),
                 })
