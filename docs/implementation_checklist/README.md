@@ -13,7 +13,7 @@ Sourced from open gaps identified during design review that don't require design
 *Scoping context (audit 2026-05-04): `compile_map_method` (`src/codegen.rs:4667`) handles 6 of 11 typechecker-blessed methods (`len`/`is_empty`/`insert`/`get`/`remove`/`contains_key`) and falls through to a silent-`0` catch-all at line 4945 for the other 5 (`get_or` / `keys` / `values` / `entries` / `merge`). `compile_index` (line 5009) handles only Array/Vec/Slice — `m[k]` is wrong on compiled binaries today. No `karac_set_*` runtime exists; `Set[T]` is interpreter-only. Existing `runtime/src/map.rs` already supports `val_size = 0` correctly (line 71's `(key_size + val_size).max(1)`), so Set lowers to `Map[T, ()]` with no new C code. 12 Map E2E codegen tests; 0 Set E2E codegen tests.*
 
 - [~] **Map codegen gap closure.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Map codegen gap closure`)_
-  - [ ] **1. Catch-all hardening** — `_ => Err(...)` at `src/codegen.rs:4945`
+  - [x] **1. Catch-all hardening** — `_ => Err(...)` at `src/codegen.rs:4945` (commit `4a3bc3e`)
   - [ ] **2. `m[k]` index op (read)** — `compile_index` Map dispatch + `panics` on missing key
   - [ ] **3. `m[k] = v` index op (write)** — `compile_index_store` Map dispatch
   - [ ] **4. `Map.clear()`** — `karac_map_clear` runtime fn + interp + codegen
