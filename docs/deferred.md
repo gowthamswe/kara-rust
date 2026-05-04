@@ -2341,6 +2341,30 @@ This is correct but requires wrapping each iteration as a closure, which is verb
 
 ---
 
+### `OrderedMap[K, V]` / `OrderedSet[T]` — Insertion-Ordered Collections
+
+**Decision:** Add `OrderedMap[K, V]` (and its set counterpart `OrderedSet[T]`) as separate stdlib types alongside `Map[K, V]` / `Set[T]`. Iteration yields entries in the order they were first inserted; re-inserting an existing key updates the value but does *not* move the key in the order. Deferred to post-v1.
+
+**Why deferred:** v1 ships with `Map[K, V]` / `Set[T]` (unordered, hash-table-backed) and `TreeMap[K, V]` (sorted by key). A third collection axis — insertion-order — is genuinely useful (deterministic iteration for Display / golden tests, removes the "linked-list-of-(key, value)-pairs" boilerplate users otherwise write), but the use cases are narrow enough that v1 doesn't need to ship three hash-table flavors. Once `Map` / `Set` are stable, lifting the implementation to `OrderedMap` / `OrderedSet` is mechanical.
+
+**Why non-breaking:** Purely additive. New collection types; `Map[K, V]` semantics — including the unspecified-iteration-order guarantee in `design.md` — are unchanged. Code written against `Map` continues to compile and behave identically.
+
+**Why a separate type, not "promote `Map` to insertion-ordered":** Keeping `Map[K, V]` order-unspecified preserves runtime freedom — the implementation can swap hash strategies (Robin Hood, Swiss-table variants, sharded concurrent maps) and rehash on growth without breaking semantics. Pinning insertion-order into `Map` would be a one-way door: every future strategy must preserve it, and concurrent `Map` variants become significantly harder. Users who want stable iteration opt into `OrderedMap` and accept its costs (extra memory for the order spine, branch + pointer writes per insert/remove, harder concurrent variants). This is the Rust ecosystem's split (`HashMap` + `indexmap`); we follow it.
+
+**Design shape:**
+
+- API mirrors `Map[K, V]` / `Set[T]` exactly — `insert`, `remove`, `get`, `contains`, `entry`, `len`, `is_empty`, iteration, etc. The only observable difference is iteration order.
+- Two viable implementation strategies:
+  - **Linked-list spine.** Hash table entries also carry `prev` / `next` pointers; iteration walks the linked list. Java's `LinkedHashMap` shape. Adds 16 bytes/entry (two pointers).
+  - **Compact-dict.** A dense `Vec[(K, V)]` in insertion order plus a sparse hash table storing indices into the dense array. Python 3.6+'s shape. Adds ~1 index/entry to the hash table; deletion tombstones the dense slot and triggers periodic compaction. Better cache locality on iteration.
+- Choice between the two is an implementation detail; `OrderedMap[K, V]` semantics don't depend on which is used. Lean toward compact-dict for memory + iteration speed; spine is simpler if compaction proves fiddly.
+- Removal semantics: `remove(k)` removes the entry; later iteration skips the removed key. No order shift on remove (the surviving keys keep their original positions). `entry(k).or_insert_with(...)` on a missing key inserts at the end; on a present key, value is updated but order is unchanged.
+- Effect parity with `Map[K, V]`: `allocates(Heap)` on growth, `panics` on `unwrap`-style accessors. No new effect surface.
+
+**Cross-reference:** `design.md` Map/Set sections (unordered semantics anchored there); implementation_checklist `phase-7-codegen.md` Display work (which highlighted that deterministic Display output is a real ergonomic gap `OrderedMap` would close).
+
+---
+
 ## P3 — Post-v1 Build Targets (library / ecosystem)
 
 Items that are **not language features** and will not be added to `design.md` — they are libraries or frameworks built on top of the language. They live here because, post-v1, the project author may choose to build them directly rather than wait for community ownership. Each entry describes the scope, what it rests on in the language, and what would need to be in place before building it.

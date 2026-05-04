@@ -5201,9 +5201,20 @@ impl<'ctx> Codegen<'ctx> {
                     });
                 self.emit_vec_display_body(display_fn, val_ptr, &elem_name, elem_ty);
             }
+            other if other.starts_with("Map_") => {
+                // Map types have two type parameters and so cannot recover
+                // (key_ty, val_ty) by string-splitting the cache key. Callers
+                // that already know K and V should go through the typed entry
+                // point `emit_map_display_fn` instead — that path constructs
+                // the same canonical name and shares the cache.
+                panic!(
+                    "emit_display_fn_for_type: '{other}' must be emitted via \
+                     emit_map_display_fn(key_name, key_ty, val_name, val_ty)"
+                );
+            }
             other => {
-                // Map_*, Set_*, Tuple_*, user structs not yet supported.
-                // Subtasks 4-6 of the Display canonical bullet
+                // Set_*, Tuple_*, user structs not yet supported.
+                // Subtasks 5-6 of the Display canonical bullet
                 // (phase-7-codegen.md § Phase 7.2) extend this match.
                 panic!("emit_display_fn_for_type: type_name '{other}' not yet supported");
             }
@@ -5224,8 +5235,9 @@ impl<'ctx> Codegen<'ctx> {
     /// call needs both the canonical `type_name` AND the LLVM type to pass.
     ///
     /// Covers the same primitives the primitive arms of
-    /// `emit_display_fn_for_type` handle, plus `Vec_*` (always 24-byte struct).
-    /// `Map_*` / `Set_*` / `Tuple_*` cases land alongside subtasks 4-6.
+    /// `emit_display_fn_for_type` handle, plus `Vec_*` (always 24-byte struct)
+    /// and `Map_*` (always opaque-handle slot, i.e. a `ptr` to a `ptr`).
+    /// `Set_*` / `Tuple_*` cases land alongside subtasks 5-6.
     #[allow(dead_code)]
     fn resolve_ty_for_display_name(&self, name: &str) -> Option<BasicTypeEnum<'ctx>> {
         match name {
@@ -5238,6 +5250,11 @@ impl<'ctx> Codegen<'ctx> {
             "bool" => Some(self.context.bool_type().into()),
             "String" | "str" => Some(self.vec_struct_type().into()),
             n if n.starts_with("Vec_") => Some(self.vec_struct_type().into()),
+            n if n.starts_with("Map_") => Some(
+                self.context
+                    .ptr_type(AddressSpace::default())
+                    .into(),
+            ),
             _ => None,
         }
     }
@@ -5370,6 +5387,222 @@ impl<'ctx> Codegen<'ctx> {
         // exit: print "]".
         self.builder.position_at_end(exit_bb);
         let rb = self.builder.build_global_string_ptr("]", "vd.rb").unwrap();
+        self.builder
+            .build_call(self.printf_fn, &[rb.as_pointer_value().into()], "p")
+            .unwrap();
+    }
+
+    /// Emit (or reuse) a Display function for `Map[K, V]`. Typed entry point —
+    /// distinct from `emit_display_fn_for_type` because Map's two type
+    /// parameters can't be recovered from a single mangled name string.
+    ///
+    /// The emitted function is named `karac_display_Map_<key_name>_<val_name>`
+    /// and is shared with the generic Display cache under the same key, so a
+    /// later `emit_display_fn_for_type("Map_K_V", ...)` cache hit returns the
+    /// same function (the catch-all `Map_*` arm panics on cache miss to steer
+    /// callers here).
+    ///
+    /// Calling convention: `void karac_display_Map_K_V(ptr slot)` where `slot`
+    /// is the address of a slot holding the opaque map handle (matches the
+    /// shape produced by `compile_map_new_stmt` — see `src/codegen.rs:5395`).
+    /// Body loads the handle, drives `karac_map_iter_*` (mirroring
+    /// `compile_for_map_var` at `src/codegen.rs:8038`), per-iteration recurses
+    /// into `emit_display_fn_for_type` for K and V, and frees the iterator
+    /// before returning. Iteration order is unspecified per `design.md` line
+    /// 1588 — tests must not assert order.
+    ///
+    /// `dead_code` retained until subtask 7 wires `compile_print` to dispatch.
+    #[allow(dead_code)]
+    fn emit_map_display_fn(
+        &mut self,
+        key_name: &str,
+        key_ty: BasicTypeEnum<'ctx>,
+        val_name: &str,
+        val_ty: BasicTypeEnum<'ctx>,
+    ) -> FunctionValue<'ctx> {
+        let type_name = format!("Map_{key_name}_{val_name}");
+        if let Some(&f) = self.display_fn_cache.get(&type_name) {
+            return f;
+        }
+        let fn_name = format!("karac_display_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            self.display_fn_cache.insert(type_name, f);
+            return f;
+        }
+
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+
+        let saved_bb = self.builder.get_insert_block();
+
+        let display_fn_ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let display_fn =
+            self.module
+                .add_function(&fn_name, display_fn_ty, Some(Linkage::Internal));
+        self.display_fn_cache.insert(type_name, display_fn);
+
+        let entry_bb = self.context.append_basic_block(display_fn, "entry");
+        self.builder.position_at_end(entry_bb);
+        let slot_ptr = display_fn.get_nth_param(0).unwrap().into_pointer_value();
+
+        self.emit_map_display_body(display_fn, slot_ptr, key_name, key_ty, val_name, val_ty);
+
+        self.builder.build_return(None).unwrap();
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        display_fn
+    }
+
+    /// Emit the body of a `Map[K, V]` Display function. Loads the map handle
+    /// from `slot_ptr`, prints `"{"`, drives `karac_map_iter_new` /
+    /// `karac_map_iter_next` to walk pairs, per-iteration recurses into
+    /// `emit_display_fn_for_type(K)` and `emit_display_fn_for_type(V)` with
+    /// `": "` between key/value and `", "` between pairs, frees the iterator
+    /// in the exit block, and prints `"}"`.
+    ///
+    /// `is_first` flag is tracked via an i1 alloca because the iterator-driven
+    /// loop has no scalar counter (unlike Vec where `i == 0` works).
+    ///
+    /// Caller positions the builder at `display_fn`'s entry block and is
+    /// responsible for emitting the trailing `ret void`.
+    #[allow(dead_code)]
+    fn emit_map_display_body(
+        &mut self,
+        display_fn: FunctionValue<'ctx>,
+        slot_ptr: PointerValue<'ctx>,
+        key_name: &str,
+        key_ty: BasicTypeEnum<'ctx>,
+        val_name: &str,
+        val_ty: BasicTypeEnum<'ctx>,
+    ) {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let bool_t = self.context.bool_type();
+
+        // Print "{".
+        let lb = self.builder.build_global_string_ptr("{", "md.lb").unwrap();
+        self.builder
+            .build_call(self.printf_fn, &[lb.as_pointer_value().into()], "p")
+            .unwrap();
+
+        // Load the opaque map handle from slot_ptr.
+        let map_handle = self
+            .builder
+            .build_load(ptr_ty, slot_ptr, "md.handle")
+            .unwrap()
+            .into_pointer_value();
+
+        // Allocas for the loop's iterator handle, the is_first flag, and the
+        // out_key / out_val staging slots. Place them in the entry block via
+        // `create_entry_alloca` so they dominate the loop.
+        let iter_slot = self.create_entry_alloca(display_fn, "md.iter.slot", ptr_ty.into());
+        let first_slot = self.create_entry_alloca(display_fn, "md.first", bool_t.into());
+        let out_key = self.create_entry_alloca(display_fn, "md.out_key", key_ty);
+        let out_val = self.create_entry_alloca(display_fn, "md.out_val", val_ty);
+
+        // Initialize iter, is_first.
+        let iter_ptr = self
+            .builder
+            .build_call(self.karac_map_iter_new_fn, &[map_handle.into()], "md.iter")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_pointer_value();
+        self.builder.build_store(iter_slot, iter_ptr).unwrap();
+        self.builder
+            .build_store(first_slot, bool_t.const_int(1, false))
+            .unwrap();
+
+        // Materialize (or fetch) the per-key and per-value Display fns.
+        let key_disp = self.emit_display_fn_for_type(key_name, key_ty);
+        let val_disp = self.emit_display_fn_for_type(val_name, val_ty);
+
+        let hdr_bb = self.context.append_basic_block(display_fn, "map.hdr");
+        let bdy_bb = self.context.append_basic_block(display_fn, "map.bdy");
+        let sep_bb = self.context.append_basic_block(display_fn, "map.sep");
+        let pair_bb = self.context.append_basic_block(display_fn, "map.pair");
+        let exit_bb = self.context.append_basic_block(display_fn, "map.exit");
+
+        self.builder.build_unconditional_branch(hdr_bb).unwrap();
+
+        // hdr: advance iterator; loop while it returns true.
+        self.builder.position_at_end(hdr_bb);
+        let iter_cur = self
+            .builder
+            .build_load(ptr_ty, iter_slot, "md.iter.cur")
+            .unwrap()
+            .into_pointer_value();
+        let has_next = self
+            .builder
+            .build_call(
+                self.karac_map_iter_next_fn,
+                &[iter_cur.into(), out_key.into(), out_val.into()],
+                "md.next",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(has_next, bdy_bb, exit_bb)
+            .unwrap();
+
+        // bdy: branch on is_first — first iteration skips the ", " separator
+        // and clears the flag; subsequent iterations print ", " first.
+        self.builder.position_at_end(bdy_bb);
+        let f = self
+            .builder
+            .build_load(bool_t, first_slot, "md.f")
+            .unwrap()
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(f, pair_bb, sep_bb)
+            .unwrap();
+
+        // sep: print ", " then fall through to pair.
+        self.builder.position_at_end(sep_bb);
+        let sep = self
+            .builder
+            .build_global_string_ptr(", ", "md.sep")
+            .unwrap();
+        self.builder
+            .build_call(self.printf_fn, &[sep.as_pointer_value().into()], "p")
+            .unwrap();
+        self.builder.build_unconditional_branch(pair_bb).unwrap();
+
+        // pair: clear is_first (idempotent on second+ iters), print key, ": ",
+        // value, then loop back to hdr.
+        self.builder.position_at_end(pair_bb);
+        self.builder
+            .build_store(first_slot, bool_t.const_int(0, false))
+            .unwrap();
+        self.builder
+            .build_call(key_disp, &[out_key.into()], "md.kd")
+            .unwrap();
+        let colon = self
+            .builder
+            .build_global_string_ptr(": ", "md.col")
+            .unwrap();
+        self.builder
+            .build_call(self.printf_fn, &[colon.as_pointer_value().into()], "p")
+            .unwrap();
+        self.builder
+            .build_call(val_disp, &[out_val.into()], "md.vd")
+            .unwrap();
+        self.builder.build_unconditional_branch(hdr_bb).unwrap();
+
+        // exit: free iterator, print "}".
+        self.builder.position_at_end(exit_bb);
+        let iter_final = self
+            .builder
+            .build_load(ptr_ty, iter_slot, "md.iter.final")
+            .unwrap()
+            .into_pointer_value();
+        self.builder
+            .build_call(self.karac_map_iter_free_fn, &[iter_final.into()], "")
+            .unwrap();
+        let rb = self.builder.build_global_string_ptr("}", "md.rb").unwrap();
         self.builder
             .build_call(self.printf_fn, &[rb.as_pointer_value().into()], "p")
             .unwrap();

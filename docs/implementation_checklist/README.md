@@ -18,7 +18,7 @@ Sourced from open gaps identified during design review that don't require design
   - [x] **1. Per-type Display function emission machinery** — `emit_display_fn_for_type` cached by type, parallel to `emit_hash_fn_for_type` (commit `8123a8e`)
   - [x] **2. Primitive Display fns** — i8…i64 / u8…u64 / f32/f64 / bool / char / String (commit `8123a8e`)
   - [x] **3. `Vec[T]` Display fn** — `[` + loop with recursive elem call + `]`
-  - [ ] **4. `Map[K, V]` Display fn** — `{` + iterator loop with recursive K, V calls + `}`
+  - [x] **4. `Map[K, V]` Display fn** — `{` + iterator loop with recursive K, V calls + `}` (typed entry `emit_map_display_fn` since two type params don't recover from a flat name)
   - [ ] **5. `Set[T]` Display fn** — depends on Set codegen landing; format aligned with interpreter
   - [ ] **6. Tuple Display fn** — `(` + recursive per-field calls + `)`
   - [ ] **7. `compile_print` integration** — recognize Vec/Map/Set/Tuple types, dispatch to emitted Display fn
@@ -42,15 +42,27 @@ Sourced from open gaps identified during design review that don't require design
 
 These bullets touch files / functions that don't conflict with the active List-1 work. Any agent can pick them up in parallel; merge-conflict risk is minimal.
 
-- [x] ~~**Effect-checker wiring for `Map[K, V]` and `Set[T]` methods.**~~ ✓ DONE (2026-05-04) — `src/effectchecker.rs` seed list and `STDLIB_METHOD_MAP` extended with the full Map/Set allocator surface (`with_capacity`, `try_insert`, `entry`, `clone`, `from_iter`, `extend`, `merge`, `keys`, `values`, `entries` for Map; `with_capacity`, `clone`, `from_iter`, `union`, `intersection`, `difference` for Set; missing `Set.insert` dispatch entry also fixed). `Heap` and `panics` already wired through preludes. 11 new tests in `tests/effectchecker.rs`; 208/208 effectchecker tests pass. Index-op `panics` already covered by the existing `__builtin_index` path. _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Effect-checker wiring`)_
-
-- [ ] **Hash codegen for compound key types.** _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `Hash codegen for compound key types`)_
+- [~] **Hash codegen for compound key types.** _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `Hash codegen for compound key types`)_ — in flight, parallel agent.
 
   **Files:** `src/codegen.rs` — extends `emit_hash_fn_for_type` (`src/codegen.rs:4282`) and `emit_eq_fn_for_type`. Distinct functions from Display's `emit_display_fn_for_type` and from List-1's `compile_print` integration; no textual collision.
   **Estimate:** ~3–4 commits (tuples → enums → user `#[derive(Hash)]`).
   **Scope:** 5 subtasks already scoped in canonical.
+  **Conflict-avoidance:** keep a separate `resolve_ty_for_hash_name` helper — do NOT refactor `resolve_ty_for_display_name` into a shared helper while List-1 Display work is in flight. Append tests at end of `tests/codegen.rs`.
 
-- [x] ~~**For-loop bindings don't propagate Vec/String/Slice element type for method dispatch.**~~ ✓ DONE (2026-05-04) — `src/codegen.rs` gains `var_elem_type_exprs` / `map_key_type_exprs` side-tables (carrying the element/value `TypeExpr` per collection variable), populated at param + let-stmt sites for `Vec[T]` / `Slice[T]` / `Map[K, V]`. New `register_var_from_type_expr` helper drives the side-tables off a `TypeExpr`, and `register_for_loop_bindings` is called from `compile_for_vec_var` / `compile_for_slice_var` / `compile_for_map_var` after `bind_pattern` so each per-iteration binding inherits the right Vec/String/Slice/Map registrations. 4 new codegen E2E tests (`for s in v: Vec[String]`, `for inner in v: Vec[Vec[i64]]`, `for (k, _v) in m: Map[String, i64]`, `for elem in s: Slice[String]`) + 1 interpreter parity test. _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `For-loop bindings don't propagate`)_
+- [ ] **Lexer: reserve `expr_<NNNN>` fragment-specifier identifier namespace.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Lexer: reserve` `expr_<NNNN>`)_
+
+  **Files:** `src/lexer.rs` + `tests/lexer.rs`. No `src/codegen.rs` touch. Zero conflict with List-1 Display work or with the in-flight Hash codegen agent.
+  **Estimate:** 1 commit.
+  **Scope:** 7 slices in canonical (lexer regex check, raw-identifier exemption via `was_raw_escaped`, narrow `expr_` scope at v1, year range `2020..=2099`, diagnostic shape with both fix-its, no connection to literal year value, positive + negative test coverage).
+  **Repo conventions:** no Co-Authored-By trailer; prefer `--amend` for tight follow-ups.
+
+- [ ] **Iterator trait — full adaptor surface.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Iterator trait — full adaptor surface`)_
+
+  **Files:** stdlib/prelude registration (`src/prelude.rs`), typechecker method registration (`src/typechecker.rs`), interpreter dispatch (`src/interpreter.rs`), tests (`tests/typechecker.rs` + `tests/interpreter.rs`). Codegen is a follow-up — most adaptors lower to existing `for`-loop / collection ops at the interpreter layer first, keeping the parallel agent off `src/codegen.rs` entirely.
+  **Estimate:** ~5–10 commits, one or a small group of adaptors per commit.
+  **Scope:** 16 adaptors named in canonical (`chain`, `zip`, `enumerate`, `take(n)`, `skip(n)`, `take_while(pred)`, `skip_while(pred)`, `flat_map(f)`, `peekable`, `chunk_by(key_fn)`, `step_by(n)`, `cycle`, `inspect(f)`, `scan(state, f)`, `windows(n)`, `chunks(n)`). Each is 5–20 lines once `Iterator` is in place. `chunk_by` and `windows` may declare `allocates(Heap)`; the rest are effect-free.
+  **Conflict-avoidance:** stay out of `src/codegen.rs` and `tests/codegen.rs`. If you encounter a typechecker or interpreter touchpoint that overlaps an active List-1 round, defer that adaptor to a later commit and pick up the next.
+  **Repo conventions:** no Co-Authored-By trailer; prefer `--amend` for tight follow-ups; mark this checkbox `[x]` only when ALL 16 adaptors are landed (or update inline with a `(N/16 done)` annotation).
 
 ---
 
