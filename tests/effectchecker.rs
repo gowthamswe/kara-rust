@@ -3646,6 +3646,195 @@ fn test_allocates_heap_propagates_through_call_chain() {
     );
 }
 
+// ── Per-method effect surface for Map / Set (List 2, item 1) ────
+
+fn has_alloc_heap(set: &EffectSet) -> bool {
+    set.effects
+        .iter()
+        .any(|e| e.effect.verb == EffectVerbKind::Allocates && e.effect.resource == "Heap")
+}
+
+fn has_panics(set: &EffectSet) -> bool {
+    set.effects
+        .iter()
+        .any(|e| e.effect.verb == EffectVerbKind::Panics)
+}
+
+#[test]
+fn test_map_insert_infers_allocates_heap() {
+    let result = effectcheck_ok(
+        "fn fill(m: Map[String, i64]) {
+             m.insert(\"k\", 1);
+         }",
+    );
+    assert!(
+        has_alloc_heap(result.inferred_effects.get("fill").unwrap()),
+        "Map.insert should infer allocates(Heap)"
+    );
+}
+
+#[test]
+fn test_map_merge_infers_allocates_heap() {
+    let result = effectcheck_ok(
+        "fn do_merge(m1: Map[String, i64], m2: Map[String, i64]) {
+             m1.merge(m2);
+         }",
+    );
+    assert!(
+        has_alloc_heap(result.inferred_effects.get("do_merge").unwrap()),
+        "Map.merge should infer allocates(Heap)"
+    );
+}
+
+#[test]
+fn test_map_keys_values_entries_infer_allocates_heap() {
+    for method in ["keys", "values", "entries"] {
+        let src = format!(
+            "fn dump(m: Map[String, i64]) {{
+                 let _v = m.{}();
+             }}",
+            method
+        );
+        let result = effectcheck_ok(&src);
+        assert!(
+            has_alloc_heap(result.inferred_effects.get("dump").unwrap()),
+            "Map.{} should infer allocates(Heap)",
+            method
+        );
+    }
+}
+
+#[test]
+fn test_map_pure_reads_infer_no_alloc() {
+    // get / contains_key / len / is_empty are pure reads.
+    let result = effectcheck_ok(
+        "fn pure_query(m: Map[i64, i64], k: i64) -> bool {
+             let n: i64 = m.len();
+             let e: bool = m.is_empty();
+             let c: bool = m.contains_key(k);
+             let g: Option[i64] = m.get(k);
+             c
+         }",
+    );
+    let inferred = result.inferred_effects.get("pure_query").unwrap();
+    assert!(
+        !has_alloc_heap(inferred),
+        "pure Map reads should not infer allocates(Heap), got: {:?}",
+        inferred.effects
+    );
+}
+
+#[test]
+fn test_map_remove_clear_no_alloc() {
+    // remove / clear mutate without growing — no allocates(Heap).
+    let result = effectcheck_ok(
+        "fn shrink(m: Map[i64, i64], k: i64) {
+             let _ = m.remove(k);
+             m.clear();
+         }",
+    );
+    let inferred = result.inferred_effects.get("shrink").unwrap();
+    assert!(
+        !has_alloc_heap(inferred),
+        "remove/clear should not infer allocates(Heap), got: {:?}",
+        inferred.effects
+    );
+}
+
+#[test]
+fn test_map_index_infers_panics() {
+    // Map's `[]` operator can panic on missing key.
+    let result = effectcheck_ok(
+        "fn lookup(m: Map[i64, i64], k: i64) -> i64 {
+             m[k]
+         }",
+    );
+    assert!(
+        has_panics(result.inferred_effects.get("lookup").unwrap()),
+        "Map[k] should infer panics"
+    );
+}
+
+#[test]
+fn test_pub_fn_returning_map_must_declare_allocates_heap() {
+    // Building and returning a Map demands the declared effect on a pub fn.
+    let errors = effectcheck_errors(
+        "pub fn build_map() -> Map[String, i64] {
+             let m: Map[String, i64] = Map.new();
+             m
+         }",
+    );
+    assert!(
+        errors.iter().any(|e| e.message.contains("allocates")),
+        "Expected undeclared-allocates error for pub fn returning a Map, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_pub_fn_indexing_map_must_declare_panics() {
+    // `pub fn lookup(...) -> i64 { m[k] }` without `panics` is rejected.
+    let errors = effectcheck_errors("pub fn lookup(m: Map[i64, i64], k: i64) -> i64 { m[k] }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.to_lowercase().contains("panic")),
+        "Expected undeclared-panics error for pub fn indexing a Map, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_set_insert_infers_allocates_heap() {
+    let result = effectcheck_ok(
+        "fn fill(s: Set[i64]) {
+             s.insert(1);
+         }",
+    );
+    assert!(
+        has_alloc_heap(result.inferred_effects.get("fill").unwrap()),
+        "Set.insert should infer allocates(Heap)"
+    );
+}
+
+#[test]
+fn test_set_union_intersection_difference_infer_allocates_heap() {
+    for method in ["union", "intersection", "difference"] {
+        let src = format!(
+            "fn combine(a: Set[i64], b: Set[i64]) -> Set[i64] {{
+                 a.{}(b)
+             }}",
+            method
+        );
+        let result = effectcheck_ok(&src);
+        assert!(
+            has_alloc_heap(result.inferred_effects.get("combine").unwrap()),
+            "Set.{} should infer allocates(Heap)",
+            method
+        );
+    }
+}
+
+#[test]
+fn test_set_pure_reads_infer_no_alloc() {
+    // contains / len / is_empty are pure reads; remove does not grow.
+    let result = effectcheck_ok(
+        "fn pure_query(s: Set[i64], x: i64) -> bool {
+             let n: i64 = s.len();
+             let e: bool = s.is_empty();
+             let c: bool = s.contains(x);
+             let r: bool = s.remove(x);
+             c
+         }",
+    );
+    let inferred = result.inferred_effects.get("pure_query").unwrap();
+    assert!(
+        !has_alloc_heap(inferred),
+        "pure Set reads should not infer allocates(Heap), got: {:?}",
+        inferred.effects
+    );
+}
+
 // ── Trait associated function ceilings (List 1, item 4) ─────────
 
 #[test]

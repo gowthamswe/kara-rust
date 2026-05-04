@@ -42,11 +42,7 @@ Sourced from open gaps identified during design review that don't require design
 
 These bullets touch files / functions that don't conflict with the active List-1 work. Any agent can pick them up in parallel; merge-conflict risk is minimal.
 
-- [ ] **Effect-checker wiring for `Map[K, V]` and `Set[T]` methods.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Effect-checker wiring`)_
-
-  **Files:** `src/effectchecker.rs` only. Fully isolated from codegen and List 1.
-  **Estimate:** ~1 commit.
-  **Scope:** new `infer_map_method_effects` + `infer_set_method_effects` paralleling `infer_vec_method_effects`. Effects: `allocates(Heap)` for growth methods, `panics` for index op, none for pure reads. 6 subtasks already scoped in canonical.
+- [x] ~~**Effect-checker wiring for `Map[K, V]` and `Set[T]` methods.**~~ ✓ DONE (2026-05-04) — `src/effectchecker.rs` seed list and `STDLIB_METHOD_MAP` extended with the full Map/Set allocator surface (`with_capacity`, `try_insert`, `entry`, `clone`, `from_iter`, `extend`, `merge`, `keys`, `values`, `entries` for Map; `with_capacity`, `clone`, `from_iter`, `union`, `intersection`, `difference` for Set; missing `Set.insert` dispatch entry also fixed). `Heap` and `panics` already wired through preludes. 11 new tests in `tests/effectchecker.rs`; 208/208 effectchecker tests pass. Index-op `panics` already covered by the existing `__builtin_index` path. _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Effect-checker wiring`)_
 
 - [ ] **Hash codegen for compound key types.** _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `Hash codegen for compound key types`)_
 
