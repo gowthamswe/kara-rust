@@ -14,7 +14,7 @@ Sourced from open gaps identified during design review that don't require design
 
 - [~] **Map codegen gap closure.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Map codegen gap closure`)_
   - [x] **1. Catch-all hardening** — `_ => Err(...)` at `src/codegen.rs:4945` (commit `4a3bc3e`)
-  - [ ] **2. `m[k]` index op (read)** — `compile_index` Map dispatch + `panics` on missing key
+  - [x] **2. `m[k]` index op (read)** — `compile_index` Map dispatch + `panics` on missing key (commit `ca94b9f`)
   - [ ] **3. `m[k] = v` index op (write)** — `compile_index_store` Map dispatch
   - [ ] **4. `Map.clear()`** — `karac_map_clear` runtime fn + interp + codegen
   - [ ] **5. `keys()` / `values()` / `entries()` codegen** — materialize Vec via `karac_map_iter_*`
