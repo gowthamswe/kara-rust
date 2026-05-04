@@ -9,8 +9,8 @@
   - [x] **Integer indexing and for-loop iteration on `Vec[T]`** now return the correct element type.
   - [ ] Empty prefix-literal diagnostic (deferred).
   - [x] **Repeat form `[v; n]` / `Array[0; 256]`.** New `ExprKind::RepeatLiteral { type_name: Option<String>, value, count }` variant. Parser recognizes `[v; n]` (bare) and `Vec[v; n]` / `Array[v; n]` (prefix) forms. Typechecker: bare `[v; n]` defaults to `Vec[T]` in synthesis and coerces to `Array[T, N]` against an array-typed annotation; `Array[v; n]` requires `n` to be a non-negative integer literal; count must be integer-typed; `Set[v; n]` / `Map[v; n]` rejected with a clear diagnostic. Interpreter evaluates value once and produces `Value::Array(vec![v; n])`. Walker arms added across all 11 visitor sites (resolver, typechecker, effectchecker, ownership, interpreter, formatter, lowering, concurrency, provider_escape, ffi_lint, unsafe_lint). 3 parser tests + 8 typechecker tests + 4 interpreter tests. Codegen support for the variant is still deferred — codegen's wildcard fallthroughs absorb the new node without crashing but emit a 0 constant; non-issue for the tree-walk pipeline.
-  - [ ] `Set[...]` element type inference (deferred — Set runtime not wired).
-  - [ ] `Map[...]` literal syntax element type inference (Map runtime is wired; literal K/V type inference from `Map[k1: v1, k2: v2]` syntax deferred).
+  - [ ] `Set[...]` element type inference. → tracked under [phase-8-stdlib-floor.md § `Set[T]` LLVM codegen](phase-8-stdlib-floor.md) subtask 8; flip this checkbox in lockstep with the canonical subtask.
+  - [ ] `Map[...]` literal syntax element type inference (the bare `["k": v]` form already works; this is the explicit-prefix `Map[k1: v1, k2: v2]` form). → tracked under [phase-8-stdlib-floor.md § Map codegen gap closure](phase-8-stdlib-floor.md) subtask 7; flip this checkbox in lockstep with the canonical subtask.
 
   See design.md § Collection Literals for the full specification.
 
