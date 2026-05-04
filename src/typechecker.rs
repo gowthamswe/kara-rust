@@ -1490,12 +1490,22 @@ impl<'a> TypeChecker<'a> {
                 type_display(expected),
                 type_display(found),
             );
-            if let Some(reason) = self.closure_once_reasons.get(&SpanKey::from_span(&span)) {
+            let consumed = self
+                .closure_once_reasons
+                .get(&SpanKey::from_span(&span))
+                .map(|r| r.consumed_binding.clone());
+            if let Some(name) = &consumed {
                 msg.push_str(&format!(
                     " (closure becomes once-callable because it consumes captured binding '{}')",
-                    reason.consumed_binding
+                    name
                 ));
             }
+            msg.push_str(
+                "; help: clone the captured value before the closure body consumes it \
+                 so the closure becomes repeatable, restructure the code to invoke the \
+                 closure locally instead of routing it through this slot, or change the \
+                 slot type to `OnceFn(...)` if you control its declaration",
+            );
             self.type_error(msg, span, TypeErrorKind::OnceFnIntoFnSlot);
             return false;
         }
@@ -9986,6 +9996,42 @@ mod once_fn_slot_rejection_tests {
                 tm
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_includes_three_concrete_fix_hints() {
+        // Round 12.47 (Step 5a) — diagnostic polish. The OnceFnIntoFnSlot
+        // message must offer the three concrete fixes documented in the
+        // implementation checklist: clone the consumed capture, restructure
+        // to keep the closure local, or change the slot type to `OnceFn`.
+        // Pin each phrase so future edits to the message body don't silently
+        // drop a fix hint.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn take(f: Fn()) { f() }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       take(|| apply(cfg));\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert_eq!(hits.len(), 1, "all errors: {:?}", result.errors);
+        let msg = &hits[0].message;
+        assert!(
+            msg.contains("clone the captured value"),
+            "missing clone hint; got '{}'",
+            msg
+        );
+        assert!(
+            msg.contains("invoke the closure locally") || msg.contains("restructure"),
+            "missing restructure-locally hint; got '{}'",
+            msg
+        );
+        assert!(
+            msg.contains("`OnceFn(...)`") || msg.contains("OnceFn(...)"),
+            "missing OnceFn-slot-change hint; got '{}'",
+            msg
+        );
     }
 }
 
