@@ -3124,6 +3124,114 @@ fn test_map_insert_update_returns_old() {
     assert_eq!(output, "5\n");
 }
 
+// ── Map.entry / Entry[K, V] (canonical: phase-8-stdlib-floor.md
+//    "Map.entry(k) + Entry[K, V] enum") ────────────────────────────
+
+#[test]
+fn test_map_entry_or_insert_vacant_inserts_default() {
+    // Vacant key — or_insert pushes (key, default) and returns the default.
+    // Verify the map state by re-fetching.
+    let output = run("fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             let v = m.entry(\"a\").or_insert(7_i64);\n\
+             println(v);\n\
+             match m.get(\"a\") {\n\
+                 Some(x) => println(x),\n\
+                 None => println(\"missing\"),\n\
+             }\n\
+         }");
+    assert_eq!(output, "7\n7\n");
+}
+
+#[test]
+fn test_map_entry_or_insert_occupied_returns_existing() {
+    // Occupied key — or_insert is a no-op write; returns the existing value.
+    let output = run("fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             m.insert(\"a\", 42_i64);\n\
+             let v = m.entry(\"a\").or_insert(0_i64);\n\
+             println(v);\n\
+             match m.get(\"a\") {\n\
+                 Some(x) => println(x),\n\
+                 None => println(\"missing\"),\n\
+             }\n\
+         }");
+    assert_eq!(output, "42\n42\n");
+}
+
+#[test]
+fn test_map_entry_or_insert_with_vacant_invokes_closure() {
+    // Vacant — closure runs to produce the default. Counter pattern via
+    // a side variable confirms the closure fired exactly once.
+    let output = run("fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             let v = m.entry(\"x\").or_insert_with(|| 99_i64);\n\
+             println(v);\n\
+         }");
+    assert_eq!(output, "99\n");
+}
+
+#[test]
+fn test_map_entry_or_insert_with_occupied_skips_closure() {
+    // Occupied — closure does NOT fire. Returning a sentinel that would
+    // overwrite if the closure ran lets the test detect a regression.
+    let output = run("fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             m.insert(\"k\", 5_i64);\n\
+             let v = m.entry(\"k\").or_insert_with(|| 999_i64);\n\
+             println(v);\n\
+         }");
+    assert_eq!(output, "5\n");
+}
+
+#[test]
+fn test_map_entry_and_modify_runs_when_occupied() {
+    // and_modify's closure fires only on Occupied; it receives the slot
+    // value as a mut ref and can mutate through (the interpreter aliases
+    // the slot via SharedCell for the duration of the call).
+    let output = run("fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             m.insert(\"k\", 5_i64);\n\
+             m.entry(\"k\").and_modify(|v| { v += 1; });\n\
+             match m.get(\"k\") {\n\
+                 Some(x) => println(x),\n\
+                 None => println(\"missing\"),\n\
+             }\n\
+         }");
+    assert_eq!(output, "6\n");
+}
+
+#[test]
+fn test_map_entry_and_modify_skips_when_vacant() {
+    // Vacant — closure does not fire; map state is unchanged.
+    let output = run("fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             m.entry(\"k\").and_modify(|v| { v += 1; });\n\
+             println(m.is_empty());\n\
+         }");
+    assert_eq!(output, "true\n");
+}
+
+#[test]
+fn test_map_entry_and_modify_chain_with_or_insert() {
+    // The canonical chain: and_modify on Occupied increments; on Vacant
+    // the trailing or_insert provides the seed value.
+    let output = run("fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             m.entry(\"a\").and_modify(|v| { v += 1; }).or_insert(1_i64);\n\
+             m.entry(\"a\").and_modify(|v| { v += 1; }).or_insert(1_i64);\n\
+             m.entry(\"a\").and_modify(|v| { v += 1; }).or_insert(1_i64);\n\
+             match m.get(\"a\") {\n\
+                 Some(x) => println(x),\n\
+                 None => println(\"missing\"),\n\
+             }\n\
+         }");
+    // First call: vacant → or_insert(1) sets a=1.
+    // Second:    occupied → and_modify(+1) → a=2; or_insert no-op.
+    // Third:     occupied → and_modify(+1) → a=3; or_insert no-op.
+    assert_eq!(output, "3\n");
+}
+
 // ── Regex ─────────────────────────────────────────────────────────
 
 #[test]

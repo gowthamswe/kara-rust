@@ -125,6 +125,25 @@ pub enum Value {
     /// boundaries (single-threaded mutation in practice — `par` branches
     /// run in independent envs).
     SharedCell(Arc<Mutex<Value>>),
+    /// `Entry[K, V]` view returned by `Map.entry(k)` for in-place insert-or-
+    /// modify. Spec at design.md § Entry[K, V].
+    ///
+    /// `map_var` names the original Map binding so `or_insert`,
+    /// `or_insert_with`, and `and_modify` can write the mutation back via
+    /// `env.set` — the interpreter's idiomatic mut-ref-self path. `None`
+    /// when the entry was produced from a non-identifier receiver (rare;
+    /// the chain still evaluates but mutations are dropped).
+    ///
+    /// `slot_idx` is the index of the `(key, value)` pair in the map's Vec
+    /// when `Some` (Occupied); `None` means Vacant. The interpreter never
+    /// hands a stale slot_idx to chain consumers — each method that mutates
+    /// the map (or_insert / or_insert_with) refreshes the index before
+    /// returning a fresh `Entry`.
+    Entry {
+        map_var: Option<String>,
+        key: Box<Value>,
+        slot_idx: Option<usize>,
+    },
 }
 
 /// Newtype wrapping [`Value`] that implements [`Ord`] via [`value_compare`]
@@ -205,6 +224,9 @@ impl PartialEq for Value {
             // Iterators have no meaningful equality — like closures, two
             // iterator values aren't compared structurally.
             (Value::Iterator { .. }, Value::Iterator { .. }) => false,
+            // Entry values aren't compared structurally either — they're
+            // chain-locals returned only from Map.entry(k).
+            (Value::Entry { .. }, Value::Entry { .. }) => false,
             _ => false,
         }
     }
@@ -332,6 +354,19 @@ impl std::fmt::Display for Value {
                 write!(f, "<iter {}/{}>", cursor, items.len())
             }
             Value::SharedCell(cell) => write!(f, "{}", cell.lock().unwrap()),
+            Value::Entry {
+                map_var,
+                key,
+                slot_idx,
+            } => {
+                let occ = if slot_idx.is_some() {
+                    "Occupied"
+                } else {
+                    "Vacant"
+                };
+                let mv = map_var.as_deref().unwrap_or("?");
+                write!(f, "<{} entry for {} in {}>", occ, key, mv)
+            }
         }
     }
 }
@@ -3155,6 +3190,38 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Shared body for `Entry.or_insert(default)` and the vacant arm of
+    /// `Entry.or_insert_with(f)`. On Vacant, push the new (key, default)
+    /// pair onto the live Map (re-fetched by `map_var`) and write back.
+    /// On Occupied, return the existing slot value cloned. Either way,
+    /// returns the inserted-or-existing value as a Value (NOT a true
+    /// `mut ref V`); chained mutation through the return is only fully
+    /// supported by the codegen path. Returns `Value::Unit` if the entry
+    /// has no `map_var` (chain rooted at a non-identifier receiver) or
+    /// the binding doesn't resolve to a Map.
+    fn entry_or_insert_value(
+        &mut self,
+        map_var: Option<String>,
+        key: Value,
+        slot_idx: Option<usize>,
+        default: Value,
+    ) -> Value {
+        let Some(name) = map_var else {
+            return Value::Unit;
+        };
+        let Some(Value::Map(mut m)) = self.env.get(&name) else {
+            return Value::Unit;
+        };
+        if let Some(idx) = slot_idx {
+            if let Some((_, v)) = m.get(idx) {
+                return v.clone();
+            }
+        }
+        m.push((key, default.clone()));
+        self.env.set(&name, Value::Map(m));
+        default
+    }
+
     /// Invoke a `Value::Function` (closure or named function) with
     /// pre-evaluated argument values. Used by iterator adaptors that
     /// receive a closure as an already-evaluated value rather than via the
@@ -4127,6 +4194,128 @@ impl<'a> Interpreter<'a> {
                         self.env.set(name, Value::Set(set));
                     }
                     return Value::Bool(was_present);
+                }
+            }
+            // ── Map.entry(k) and the Entry[K, V] method surface ────────────
+            //
+            // `entry(k)` returns a `Value::Entry` carrying the original Map's
+            // binding name (so write-back can target the right slot via
+            // `env.set`), the key, and the slot index when the key is
+            // already present. The chain methods (`or_insert`,
+            // `or_insert_with`, `and_modify`) dispatch on `Value::Entry` and
+            // re-fetch the Map from the env each call so any mutation that
+            // happened earlier in the chain (or in user code between calls)
+            // is visible.
+            //
+            // The interpreter's `mut ref V` semantics on `or_insert*`'s
+            // return are partial: `or_insert` returns the cloned slot value,
+            // not a true alias into the map. The fully-aliased form
+            // (`m.entry(k).or_insert_with(Vec.new).push(row)` mutating the
+            // slot in place) is gated on Subtask 6 (codegen) where mut-ref-V
+            // is realised as a raw slot pointer; the typechecker accepts the
+            // chain shape regardless. Tests at the interpreter layer verify
+            // map state after the chain runs, not the returned-slot ergonomics.
+            "entry" => {
+                if let Value::Map(ref m) = obj {
+                    let key = args
+                        .first()
+                        .map(|a| self.eval_expr_inner(&a.value))
+                        .unwrap_or(Value::Unit);
+                    let slot_idx = m.iter().position(|(k, _)| *k == key);
+                    let map_var = if let ExprKind::Identifier(name) = &object.kind {
+                        Some(name.clone())
+                    } else {
+                        None
+                    };
+                    return Value::Entry {
+                        map_var,
+                        key: Box::new(key),
+                        slot_idx,
+                    };
+                }
+            }
+            "or_insert" => {
+                if let Value::Entry {
+                    map_var,
+                    key,
+                    slot_idx,
+                } = obj
+                {
+                    let default = args
+                        .first()
+                        .map(|a| self.eval_expr_inner(&a.value))
+                        .unwrap_or(Value::Unit);
+                    return self.entry_or_insert_value(map_var, *key, slot_idx, default);
+                }
+            }
+            "or_insert_with" => {
+                if let Value::Entry {
+                    map_var,
+                    key,
+                    slot_idx,
+                } = obj
+                {
+                    if slot_idx.is_some() {
+                        // Occupied — closure not invoked. Pull the existing
+                        // slot value out of the live Map (it may have been
+                        // mutated by an earlier chain step).
+                        if let Some(name) = map_var.as_deref() {
+                            if let Some(Value::Map(m)) = self.env.get(name) {
+                                if let Some(idx) = slot_idx {
+                                    if let Some((_, v)) = m.get(idx) {
+                                        return v.clone();
+                                    }
+                                }
+                            }
+                        }
+                        return Value::Unit;
+                    }
+                    // Vacant — invoke the no-arg closure to produce the
+                    // default value, then insert.
+                    let f = args
+                        .first()
+                        .map(|a| self.eval_expr_inner(&a.value))
+                        .unwrap_or(Value::Unit);
+                    let default = self.invoke_function_value(f, vec![]);
+                    return self.entry_or_insert_value(map_var, *key, slot_idx, default);
+                }
+            }
+            "and_modify" => {
+                if let Value::Entry {
+                    map_var,
+                    key,
+                    slot_idx,
+                } = obj
+                {
+                    if let (Some(name), Some(idx)) = (map_var.as_deref(), slot_idx) {
+                        // Occupied — invoke closure with a SharedCell aliased
+                        // to the slot value so `|v| { v += 1 }` mutates
+                        // through. Read the cell back and write the result
+                        // into the Map slot.
+                        let f = args
+                            .first()
+                            .map(|a| self.eval_expr_inner(&a.value))
+                            .unwrap_or(Value::Unit);
+                        if let Some(Value::Map(mut m)) = self.env.get(name) {
+                            if let Some((_, slot_v)) = m.get(idx) {
+                                let cell = Arc::new(Mutex::new(slot_v.clone()));
+                                let _ = self.invoke_function_value(
+                                    f,
+                                    vec![Value::SharedCell(cell.clone())],
+                                );
+                                let new_v = cell.lock().unwrap().clone();
+                                m[idx].1 = new_v;
+                                self.env.set(name, Value::Map(m));
+                            }
+                        }
+                    }
+                    // Return self for chaining — vacant case is a no-op pass-
+                    // through. slot_idx and key are unchanged in either case.
+                    return Value::Entry {
+                        map_var,
+                        key,
+                        slot_idx,
+                    };
                 }
             }
             "clear" => {
