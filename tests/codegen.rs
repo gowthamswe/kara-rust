@@ -3526,6 +3526,48 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_map_index_set_fresh_and_overwrite() {
+        // m[k] = v on a missing key inserts; on an existing key overwrites.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m[1_i64] = 10_i64;
+    m[2_i64] = 20_i64;
+    println(m[1_i64]);
+    println(m[2_i64]);
+    m[1_i64] = 99_i64;
+    println(m[1_i64]);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["10", "20", "99"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_index_set_string_key() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[String, i64] = Map.new();
+    m["alice"] = 1_i64;
+    m["bob"] = 2_i64;
+    m["alice"] = 100_i64;
+    println(m["alice"]);
+    println(m["bob"]);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["100", "2"]);
+        }
+    }
+
+    #[test]
     fn test_e2e_map_index_panics_on_missing() {
         // Indexing a Map with a missing key panics at runtime.
         let captured = run_program_capturing(

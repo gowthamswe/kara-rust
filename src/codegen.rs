@@ -4663,6 +4663,65 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
+    /// Compile `m[k] = v` index-store on a `Map[K, V]` variable. Lowers to
+    /// `karac_map_insert_old` and discards the previous-value out-slot. The
+    /// write path is uniform regardless of whether the key already exists —
+    /// `karac_map_insert_old` overwrites or fresh-inserts as appropriate.
+    fn compile_map_index_store(
+        &mut self,
+        name: &str,
+        index: &Expr,
+        val: BasicValueEnum<'ctx>,
+    ) -> Result<(), String> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+
+        let slot = self
+            .variables
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("unknown map variable '{name}' in index-store"))?;
+        let map_handle = self
+            .builder
+            .build_load(ptr_ty, slot.ptr, "map.idxst.handle")
+            .unwrap()
+            .into_pointer_value();
+
+        let key_ty = self
+            .map_key_types
+            .get(name)
+            .copied()
+            .unwrap_or(i64_t.into());
+        let val_ty = self
+            .map_val_types
+            .get(name)
+            .copied()
+            .unwrap_or(i64_t.into());
+
+        let key_val = self.compile_expr(index)?;
+        let fn_val = self.current_fn.unwrap();
+        let key_slot = self.create_entry_alloca(fn_val, "map.idxst.key", key_ty);
+        let val_slot = self.create_entry_alloca(fn_val, "map.idxst.val", val_ty);
+        let old_slot = self.create_entry_alloca(fn_val, "map.idxst.old", val_ty);
+        self.builder.build_store(key_slot, key_val).unwrap();
+        self.builder.build_store(val_slot, val).unwrap();
+
+        self.builder
+            .build_call(
+                self.karac_map_insert_old_fn,
+                &[
+                    map_handle.into(),
+                    key_slot.into(),
+                    val_slot.into(),
+                    old_slot.into(),
+                ],
+                "map.idxst.existed",
+            )
+            .unwrap();
+
+        Ok(())
+    }
+
     /// Compile `m[k]` indexing on a `Map[K, V]` variable. Panics at runtime if
     /// the key is missing — matches the spec's `fn index(ref self, key: ref K)
     /// -> ref V` semantics. The returned value is a bit-copy of the bucket's V,
@@ -5357,6 +5416,15 @@ impl<'ctx> Codegen<'ctx> {
         if let ExprKind::Identifier(name) = &object.kind {
             if self.slice_elem_types.contains_key(name.as_str()) {
                 return self.compile_slice_index_store(name, index, val);
+            }
+        }
+
+        // Map[K, V] element store: `m[k] = v` lowers to karac_map_insert_old
+        // discarding the previous-value out-slot. Fresh-insert and overwrite
+        // are both handled by the same runtime call.
+        if let ExprKind::Identifier(name) = &object.kind {
+            if self.map_key_types.contains_key(name.as_str()) {
+                return self.compile_map_index_store(name, index, val);
             }
         }
 
