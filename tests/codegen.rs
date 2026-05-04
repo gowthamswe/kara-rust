@@ -4337,6 +4337,161 @@ fn main() {
         }
     }
 
+    // ── Map.entry / Entry[K, V] codegen (canonical: phase-8-stdlib-floor.md
+    //    "Map.entry(k) + Entry[K, V] enum") ──────────────────────────────────
+
+    #[test]
+    fn test_e2e_map_entry_or_insert_vacant() {
+        // Vacant key → or_insert pushes (key, default), map state changes.
+        // The chain return is mut ref V — discarded here; the post-chain
+        // get() call reads the inserted value.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.entry(7_i64).or_insert(42_i64);
+    let v = m.get(7_i64);
+    match v {
+        Some(x) => println(x),
+        None => println(0_i64),
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "42");
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_entry_or_insert_occupied_passthrough() {
+        // Occupied key → or_insert is a no-op write; map keeps existing value.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.insert(3_i64, 99_i64);
+    m.entry(3_i64).or_insert(0_i64);
+    let v = m.get(3_i64);
+    match v {
+        Some(x) => println(x),
+        None => println(-1_i64),
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "99");
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_entry_or_insert_with_vacant_invokes_closure() {
+        // Vacant key → or_insert_with fires the closure to produce default.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.entry(1_i64).or_insert_with(|| 17_i64);
+    let v = m.get(1_i64);
+    match v {
+        Some(x) => println(x),
+        None => println(0_i64),
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "17");
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_entry_or_insert_with_occupied_skips_closure() {
+        // Occupied key → closure does NOT run; map unchanged.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.insert(2_i64, 5_i64);
+    m.entry(2_i64).or_insert_with(|| 999_i64);
+    let v = m.get(2_i64);
+    match v {
+        Some(x) => println(x),
+        None => println(0_i64),
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "5");
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_entry_and_modify_runs_when_occupied() {
+        // Occupied → and_modify's closure fires with mut ref V; the body's
+        // mutation propagates back through the slot pointer.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.insert(4_i64, 10_i64);
+    m.entry(4_i64).and_modify(|v| { v += 1; });
+    let v = m.get(4_i64);
+    match v {
+        Some(x) => println(x),
+        None => println(0_i64),
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "11");
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_entry_and_modify_skips_when_vacant() {
+        // Vacant → closure does not fire; map stays empty.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.entry(8_i64).and_modify(|v| { v += 1; });
+    println(m.is_empty());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "true");
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_entry_and_modify_chain_or_insert() {
+        // Canonical chain: vacant → or_insert seeds 1; subsequent calls
+        // → and_modify increments. Three calls produce a final value of 3.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.entry(5_i64).and_modify(|v| { v += 1; }).or_insert(1_i64);
+    m.entry(5_i64).and_modify(|v| { v += 1; }).or_insert(1_i64);
+    m.entry(5_i64).and_modify(|v| { v += 1; }).or_insert(1_i64);
+    let v = m.get(5_i64);
+    match v {
+        Some(x) => println(x),
+        None => println(0_i64),
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "3");
+        }
+    }
+
     // ── Half-open range indexing ──────────────────────────────────────────────
 
     #[test]

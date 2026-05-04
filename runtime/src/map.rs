@@ -344,23 +344,19 @@ pub unsafe extern "C" fn karac_map_contains(map: *const c_void, key: *const c_vo
     (*(map as *const KaracMap)).lookup(key).is_some()
 }
 
-/// Probe-and-maybe-insert variant used to lower `Map.entry(k)`. Returns the
-/// `occupied` bit and writes the value-half pointer of the bucket to
-/// `out_slot_ptr`.
+/// Probe-and-insert-on-vacant. Used by `Map.entry(k)` chains whose
+/// terminal step is `or_insert` / `or_insert_with` — the codegen knows it
+/// will write a default through the returned slot pointer when the key was
+/// missing, so the runtime claims the bucket up front.
 ///
 /// On Vacant: writes the key bytes, marks the bucket OCCUPIED, and leaves
-/// the value half uninitialised — the caller (typically `or_insert` /
-/// `or_insert_with` codegen) writes the default value through the returned
-/// pointer. Returns `false` so the caller knows to overwrite.
+/// the value half uninitialised. Returns `false` so the caller overwrites.
+/// On Occupied: leaves the bucket alone, returns `true`.
 ///
-/// On Occupied: leaves the bucket alone. Returns `true`. The caller can
-/// read or mutate through the slot pointer.
-///
-/// Resizes first if a fresh insertion would push the load past 3/4. The
-/// returned pointer is valid until the next mutating call on the same map
-/// — matching the Rust `HashMap::entry` lifetime contract. Subsequent
-/// `karac_map_insert` / `karac_map_remove` / another `karac_map_entry` may
-/// trigger a resize that moves storage and invalidates the pointer.
+/// Resizes before probing so the slot index — and therefore the slot
+/// pointer — is stable for the rest of the call. The returned pointer is
+/// valid until the next mutating call on the same map (matches the Rust
+/// `HashMap::entry` lifetime contract).
 #[no_mangle]
 pub unsafe extern "C" fn karac_map_entry(
     map: *mut c_void,
@@ -368,10 +364,6 @@ pub unsafe extern "C" fn karac_map_entry(
     out_slot_ptr: *mut *mut c_void,
 ) -> bool {
     let m = &mut *(map as *mut KaracMap);
-    // Resize before probing — afterwards, find_insert_slot's slot index is
-    // stable for the rest of the call, and the val_ptr we hand out won't
-    // be invalidated by the next insert in the chain (the chain itself is
-    // a single mutation: at most one Vacant → fresh insert).
     if (m.len + m.tombstones + 1) * 4 > m.capacity * 3 {
         m.resize();
     }
@@ -388,6 +380,30 @@ pub unsafe extern "C" fn karac_map_entry(
     }
     *out_slot_ptr = m.val_ptr(slot) as *mut c_void;
     exists
+}
+
+/// Read-only lookup variant used to lower `Map.entry(k)` chains whose
+/// terminal step is `and_modify` — the codegen runs the closure only when
+/// the key is present, and never inserts. Distinct C ABI from
+/// `karac_map_entry` so the runtime can keep the pure / mutating contracts
+/// separate.
+///
+/// On Occupied: writes the value-half pointer to `out_slot_ptr`, returns
+/// `true`. On Vacant: leaves `out_slot_ptr` untouched, returns `false`.
+/// Pointer lifetime matches `karac_map_entry`'s contract.
+#[no_mangle]
+pub unsafe extern "C" fn karac_map_lookup_slot(
+    map: *mut c_void,
+    key: *const c_void,
+    out_slot_ptr: *mut *mut c_void,
+) -> bool {
+    let m = &*(map as *const KaracMap);
+    if let Some(slot) = m.lookup(key) {
+        *out_slot_ptr = m.val_ptr(slot) as *mut c_void;
+        true
+    } else {
+        false
+    }
 }
 
 #[no_mangle]
