@@ -176,9 +176,27 @@ reviewable in isolation.
   and with each other (`skip_while.take_while` while-window), and
   arity / non-bool errors.
 
-- [ ] **9. `flat_map(f)`.** Closure returns an iterator; flatten the result.
-  Each `next()` advances through the inner iterator until exhausted, then pulls
-  the next outer element and re-enters.
+- [x] **9. `flat_map(f)`.** Closure returns an iterator; flatten the result.
+  New `IteratorSource::FlatMap { outer, f, current_inner }` variant —
+  source-layer not step-layer, same shape as `Chain` / `Zip`. The
+  outer is itself a `Value::Iterator` (so its own adaptor chain
+  fires); `f` is the boxed closure (`Value::Function`); `current_inner`
+  is the in-flight inner iterator across `next()` pulls. `pull_source`
+  drains the in-flight inner first; on exhaust, advances the outer
+  via recursive `iterator_step`, applies `f` to the outer item, and
+  retries. `f` is `Box<Value>` because `Value::Iterator` embeds
+  `IteratorSource` inline — without indirection the size of `Value`
+  recurses through the closure. Typechecker pushes
+  `Fn(T) -> TypeParam("__iter_flatmap_U")` so the closure's actual
+  return type flows back; the resulting type is unwrapped from
+  `Iterator[U]` for the new Item, with explicit TypeMismatch on
+  non-iterator returns. 5 typechecker tests + 10 interpreter tests
+  cover concatenation order, empty outer, empty-inner-skipping, state
+  persistence across separate `next()` pulls, inner-with-adaptors,
+  composition with downstream filter / map / take / count and
+  upstream filter, and the take-short-circuit case (verified via
+  side-effect prefixes that outer N+1 is never visited when take(N)
+  is satisfied earlier).
 
 - [ ] **10. `step_by(n)` + `cycle()`.** `step_by` yields every n-th element
   (n ≥ 1). `cycle` requires the source to be cloneable — when exhausted,

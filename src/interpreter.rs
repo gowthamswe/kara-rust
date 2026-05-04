@@ -3464,9 +3464,7 @@ impl<'a> Interpreter<'a> {
                     } else {
                         return None;
                     };
-                    let Some(item) = outer_yield else {
-                        return None;
-                    };
+                    let item = outer_yield?;
                     let f_clone = if let Value::Iterator {
                         source: IteratorSource::FlatMap { f, .. },
                         ..
