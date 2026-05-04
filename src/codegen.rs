@@ -289,6 +289,17 @@ enum CleanupAction<'ctx> {
     },
 }
 
+/// Per-element predicate driving `emit_set_op_iter` (`Set.union` /
+/// `intersection` / `difference` codegen). `Always` means insert every
+/// element; the other two consult `karac_map_contains` against the named
+/// other-set handle and either insert on hit or on miss.
+#[derive(Clone, Copy)]
+enum SetOpFilter<'ctx> {
+    Always,
+    ContainsIn(PointerValue<'ctx>),
+    NotContainsIn(PointerValue<'ctx>),
+}
+
 // ── Loop frame: break / continue targets ───────────────────────
 
 #[derive(Clone, Copy)]
@@ -2822,6 +2833,30 @@ impl<'ctx> Codegen<'ctx> {
                     if self.vec_elem_types.contains_key(var_name.as_str()) {
                         if let Some(slot) = self.variables.get(var_name.as_str()) {
                             self.track_vec_var(slot.ptr);
+                        }
+                    }
+                }
+                // Track Map/Set variables when the RHS is a fresh-handle-producing
+                // method call (`clone`, `union`, `intersection`, `difference`).
+                // `Map.new()` / `Set.new()` / map-literal RHS shapes already track
+                // via their early-return paths above; `let n = m;` (move) bypasses
+                // this since it's an Identifier RHS, not a MethodCall, so the
+                // source's existing track stays the unique cleanup owner.
+                if let PatternKind::Binding(var_name) = &pattern.kind {
+                    let fresh_handle = matches!(
+                        &value.kind,
+                        ExprKind::MethodCall { method, .. }
+                            if matches!(
+                                method.as_str(),
+                                "clone" | "union" | "intersection" | "difference"
+                            )
+                    );
+                    if fresh_handle
+                        && (self.map_key_types.contains_key(var_name.as_str())
+                            || self.set_elem_types.contains_key(var_name.as_str()))
+                    {
+                        if let Some(slot) = self.variables.get(var_name.as_str()) {
+                            self.track_map_var(slot.ptr);
                         }
                     }
                 }
@@ -7685,27 +7720,6 @@ impl<'ctx> Codegen<'ctx> {
         clone_fn
     }
 
-    /// Recognise the `Map.entry(k)` chain pattern and lower it as a single
-    /// sequence. Returns `Some(value)` only when `<object>.<method>(<args>)`
-    /// matches:
-    ///
-    /// ```text
-    /// m.entry(k){.and_modify(f)}*.{or_insert(d)|or_insert_with(f)|and_modify(f)}
-    /// ```
-    ///
-    /// where `m` is an Identifier-bound Map variable. The single `karac_map_entry`
-    /// call at the chain root is followed by branch blocks for each
-    /// `and_modify` (innermost first) and the terminal method, keeping the
-    /// slot pointer valid for the whole sequence — exactly one hash per chain.
-    ///
-    /// The terminal method's return shape:
-    /// * `or_insert(default)` / `or_insert_with(closure)` — returns the slot
-    ///   pointer (`*mut V`), the LLVM realisation of `mut ref V`. Subsequent
-    ///   `.push(row)` etc. on the result is the per-type Clone codegen story.
-    /// * `and_modify(closure)` — returns the Entry struct value
-    ///   `{slot_ptr, occupied}` so further chaining (`.or_insert(d)`) sees
-    ///   the same Entry. v1 only nests further `and_modify`s on top; chained
-    ///   terminal methods are recognised by recursing through this fn.
     /// Lower `<receiver>.clone()` for an identifier-bound collection
     /// receiver (Vec[T], String, Map[K, V], Set[T]). Returns `Some(value)`
     /// when the receiver is recognised; `None` otherwise (caller falls
@@ -7813,6 +7827,28 @@ impl<'ctx> Codegen<'ctx> {
         Ok(Some(dst_val))
     }
 
+    /// Recognise the `Map.entry(k)` chain pattern and lower it as a single
+    /// sequence. Returns `Some(value)` only when `<object>.<method>(<args>)`
+    /// matches:
+    ///
+    /// ```text
+    /// m.entry(k){.and_modify(f)}*.{or_insert(d)|or_insert_with(f)|and_modify(f)}
+    /// ```
+    ///
+    /// where `m` is an Identifier-bound Map variable. The single `karac_map_entry`
+    /// call at the chain root is followed by branch blocks for each
+    /// `and_modify` (innermost first) and the terminal method, keeping the
+    /// slot pointer valid for the whole sequence — exactly one hash per chain.
+    ///
+    /// The terminal method's return shape:
+    ///
+    /// - `or_insert(default)` / `or_insert_with(closure)` — returns the slot
+    ///   pointer (`*mut V`), the LLVM realisation of `mut ref V`. Subsequent
+    ///   `.push(row)` etc. on the result is the per-type Clone codegen story.
+    /// - `and_modify(closure)` — returns the Entry struct value
+    ///   `{slot_ptr, occupied}` so further chaining (`.or_insert(d)`) sees
+    ///   the same Entry. v1 only nests further `and_modify`s on top; chained
+    ///   terminal methods are recognised by recursing through this fn.
     fn try_compile_entry_chain(
         &mut self,
         object: &Expr,
@@ -8299,8 +8335,200 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap();
                 Ok(i64_t.const_int(0, false).into())
             }
+            "union" | "intersection" | "difference" => {
+                if args.is_empty() {
+                    return Err(format!("Set.{method} requires another set as argument"));
+                }
+                let other_handle = self
+                    .compile_expr(&args[0].value)?
+                    .into_pointer_value();
+                // Element TypeExpr drives clone/hash/eq fn synthesis. Without
+                // it we can't deep-clone non-Copy elements (String, …) safely.
+                let elem_te = self
+                    .set_elem_type_exprs
+                    .get(var_name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "codegen: Set.{method} missing elem TypeExpr for '{var_name}'"
+                        )
+                    })?;
+
+                let elem_size = elem_ty
+                    .size_of()
+                    .unwrap_or_else(|| i64_t.const_int(8, false));
+                let val_size = i64_t.const_int(0, false);
+                let hash_fn = self.emit_hash_fn_for_type_expr(&elem_te);
+                let eq_fn = self.emit_eq_fn_for_type_expr(&elem_te);
+
+                let new_handle = self
+                    .builder
+                    .build_call(
+                        self.karac_map_new_fn,
+                        &[
+                            elem_size.into(),
+                            val_size.into(),
+                            hash_fn.as_global_value().as_pointer_value().into(),
+                            eq_fn.as_global_value().as_pointer_value().into(),
+                        ],
+                        "set.op.new",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_pointer_value();
+
+                match method {
+                    "union" => {
+                        // Clone all of self → dst (dst empty, no duplicates),
+                        // then iterate other and insert clones for elements
+                        // not already in self. The "skip if in self" check
+                        // (rather than "skip if in dst") avoids a probe into
+                        // the partially-built dst.
+                        self.emit_set_op_iter(
+                            set_handle,
+                            new_handle,
+                            SetOpFilter::Always,
+                            &elem_te,
+                        );
+                        self.emit_set_op_iter(
+                            other_handle,
+                            new_handle,
+                            SetOpFilter::NotContainsIn(set_handle),
+                            &elem_te,
+                        );
+                    }
+                    "intersection" => {
+                        self.emit_set_op_iter(
+                            set_handle,
+                            new_handle,
+                            SetOpFilter::ContainsIn(other_handle),
+                            &elem_te,
+                        );
+                    }
+                    "difference" => {
+                        self.emit_set_op_iter(
+                            set_handle,
+                            new_handle,
+                            SetOpFilter::NotContainsIn(other_handle),
+                            &elem_te,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(new_handle.into())
+            }
             _ => Err(format!("codegen: Set.{method} not yet implemented")),
         }
+    }
+
+    /// Iterate `src_handle`, optionally filter elements through `mode`,
+    /// per-element-clone the survivors and insert them into `dst_handle`.
+    /// Used by `Set.union` / `intersection` / `difference` codegen — each
+    /// op materialises a fresh empty `dst_handle` and calls this once
+    /// (intersection / difference) or twice (union: once unfiltered from
+    /// `self`, once filtered against `self` from `other`).
+    ///
+    /// The "skip" branch jumps back to the iterator header, preserving the
+    /// invariant that `karac_map_iter_free` runs exactly once per call —
+    /// at the exit block, only after `karac_map_iter_next` returned false.
+    /// Element clones for skipped survivors never happen, so there is no
+    /// leak even when the per-element clone allocates (e.g. `String`).
+    fn emit_set_op_iter(
+        &mut self,
+        src_handle: PointerValue<'ctx>,
+        dst_handle: PointerValue<'ctx>,
+        mode: SetOpFilter<'ctx>,
+        elem_te: &TypeExpr,
+    ) {
+        let i8_t = self.context.i8_type();
+        let elem_ty = self.llvm_type_for_type_expr(elem_te);
+        let clone_fn = self.emit_clone_fn_for_type_expr(elem_te);
+        let fn_val = self.current_fn.unwrap();
+
+        let elem_out = self.create_entry_alloca(fn_val, "setop.k.out", elem_ty);
+        let clone_slot = self.create_entry_alloca(fn_val, "setop.k.clone", elem_ty);
+        let dummy = self.create_entry_alloca(fn_val, "setop.dummy", i8_t.into());
+
+        let iter_handle = self
+            .builder
+            .build_call(self.karac_map_iter_new_fn, &[src_handle.into()], "setop.iter")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_pointer_value();
+
+        let hdr_bb = self.context.append_basic_block(fn_val, "setop.iter.hdr");
+        let bdy_bb = self.context.append_basic_block(fn_val, "setop.iter.bdy");
+        let exit_bb = self.context.append_basic_block(fn_val, "setop.iter.exit");
+        self.builder.build_unconditional_branch(hdr_bb).unwrap();
+
+        self.builder.position_at_end(hdr_bb);
+        let has = self
+            .builder
+            .build_call(
+                self.karac_map_iter_next_fn,
+                &[iter_handle.into(), elem_out.into(), dummy.into()],
+                "setop.iter.has",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(has, bdy_bb, exit_bb)
+            .unwrap();
+
+        self.builder.position_at_end(bdy_bb);
+        match mode {
+            SetOpFilter::Always => {}
+            SetOpFilter::ContainsIn(other) | SetOpFilter::NotContainsIn(other) => {
+                let pass_bb = self.context.append_basic_block(fn_val, "setop.iter.pass");
+                let found = self
+                    .builder
+                    .build_call(
+                        self.karac_map_contains_fn,
+                        &[other.into(), elem_out.into()],
+                        "setop.contains",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_int_value();
+                let cond = match mode {
+                    SetOpFilter::ContainsIn(_) => found,
+                    SetOpFilter::NotContainsIn(_) => self
+                        .builder
+                        .build_xor(
+                            found,
+                            self.context.bool_type().const_int(1, false),
+                            "setop.neg",
+                        )
+                        .unwrap(),
+                    SetOpFilter::Always => unreachable!(),
+                };
+                self.builder
+                    .build_conditional_branch(cond, pass_bb, hdr_bb)
+                    .unwrap();
+                self.builder.position_at_end(pass_bb);
+            }
+        }
+        self.builder
+            .build_call(clone_fn, &[elem_out.into(), clone_slot.into()], "")
+            .unwrap();
+        self.builder
+            .build_call(
+                self.karac_map_insert_fn(),
+                &[dst_handle.into(), clone_slot.into(), dummy.into()],
+                "",
+            )
+            .unwrap();
+        self.builder.build_unconditional_branch(hdr_bb).unwrap();
+
+        self.builder.position_at_end(exit_bb);
+        self.builder
+            .build_call(self.karac_map_iter_free_fn, &[iter_handle.into()], "")
+            .unwrap();
     }
 
     fn compile_array_literal(&mut self, elems: &[Expr]) -> Result<BasicValueEnum<'ctx>, String> {

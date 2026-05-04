@@ -5205,6 +5205,154 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_set_union_i64() {
+        // Membership-based assertions (rather than printing the result set)
+        // — runtime iteration order is unspecified for Map-backed sets.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut a: Set[i64] = Set.new();
+    a.insert(1_i64);
+    a.insert(2_i64);
+    a.insert(3_i64);
+    let mut b: Set[i64] = Set.new();
+    b.insert(3_i64);
+    b.insert(4_i64);
+    b.insert(5_i64);
+    let u: Set[i64] = a.union(b);
+    println(u.len());
+    println(u.contains(1_i64));
+    println(u.contains(2_i64));
+    println(u.contains(3_i64));
+    println(u.contains(4_i64));
+    println(u.contains(5_i64));
+    println(u.contains(99_i64));
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(
+                lines,
+                vec!["5", "true", "true", "true", "true", "true", "false"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_set_intersection_i64() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut a: Set[i64] = Set.new();
+    a.insert(1_i64);
+    a.insert(2_i64);
+    a.insert(3_i64);
+    let mut b: Set[i64] = Set.new();
+    b.insert(2_i64);
+    b.insert(3_i64);
+    b.insert(4_i64);
+    let i: Set[i64] = a.intersection(b);
+    println(i.len());
+    println(i.contains(1_i64));
+    println(i.contains(2_i64));
+    println(i.contains(3_i64));
+    println(i.contains(4_i64));
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["2", "false", "true", "true", "false"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_set_difference_i64() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut a: Set[i64] = Set.new();
+    a.insert(1_i64);
+    a.insert(2_i64);
+    a.insert(3_i64);
+    let mut b: Set[i64] = Set.new();
+    b.insert(2_i64);
+    b.insert(3_i64);
+    b.insert(4_i64);
+    let d: Set[i64] = a.difference(b);
+    println(d.len());
+    println(d.contains(1_i64));
+    println(d.contains(2_i64));
+    println(d.contains(3_i64));
+    println(d.contains(4_i64));
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["1", "true", "false", "false", "false"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_set_union_string() {
+        // String elements exercise the per-element clone path — the result
+        // owns independently-allocated buffers, not aliases of the source.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut a: Set[String] = Set.new();
+    a.insert("alpha");
+    a.insert("beta");
+    let mut b: Set[String] = Set.new();
+    b.insert("beta");
+    b.insert("gamma");
+    let u: Set[String] = a.union(b);
+    println(u.len());
+    println(u.contains("alpha"));
+    println(u.contains("beta"));
+    println(u.contains("gamma"));
+    println(u.contains("delta"));
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["3", "true", "true", "true", "false"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_set_difference_independent_after_source_mutation() {
+        // The result set owns its keys — mutating `a` after the difference
+        // doesn't reach back into `d`. Membership snapshot is preserved.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut a: Set[i64] = Set.new();
+    a.insert(1_i64);
+    a.insert(2_i64);
+    a.insert(3_i64);
+    let mut b: Set[i64] = Set.new();
+    b.insert(2_i64);
+    let d: Set[i64] = a.difference(b);
+    a.insert(99_i64);
+    a.remove(1_i64);
+    println(d.len());
+    println(d.contains(1_i64));
+    println(d.contains(3_i64));
+    println(d.contains(99_i64));
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["2", "true", "true", "false"]);
+        }
+    }
+
+    #[test]
     fn test_e2e_display_map_with_vec_value_singleton() {
         // Map[String, Vec[i64]] — the Map body recurses into Vec Display
         // for the value side. Single-entry map keeps output deterministic.

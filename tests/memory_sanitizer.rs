@@ -536,6 +536,32 @@ fn main() {
     }
 
     #[test]
+    fn asan_set_union_string_independent_handles() {
+        // Set[String].union — every surviving element is per-element-cloned
+        // into a freshly-allocated bucket array. ASAN catches both the new
+        // bucket-array leak (if `u` is not scope-tracked) and any UAF if
+        // the per-element String clone aliases the source's heap buffer.
+        assert_clean_asan_run(
+            r#"
+fn main() {
+    let mut a: Set[String] = Set.new();
+    a.insert("alpha");
+    a.insert("beta");
+    let mut b: Set[String] = Set.new();
+    b.insert("beta");
+    b.insert("gamma");
+    let u: Set[String] = a.union(b);
+    println(u.contains("alpha"));
+    println(u.contains("beta"));
+    println(u.contains("gamma"));
+}
+"#,
+            &["true", "true", "true"],
+            "set_union_string_independent_handles",
+        );
+    }
+
+    #[test]
     fn asan_vec_clone_repeat_stresses_scope_cleanup() {
         // Clone in a fresh scope across multiple loop iterations —
         // verifies the scope-exit free fires for each loop-local clone
