@@ -1146,6 +1146,130 @@ fn test_repeatable_closure_in_vec_dispatched_via_index_call() {
     );
 }
 
+// ── `mut ref |...|` capture-mutation propagation (round 12.48) ──
+//
+// Mutations made by a `mut ref` closure to a captured outer binding
+// must persist across invocations and be observable via the outer
+// binding after the calls return. Implemented by promoting each
+// captured slot to `Value::SharedCell` at closure construction so
+// reads/writes on either side route through the same Mutex<Value>.
+// Bare and `ref ||` closures do NOT alias — those captures keep the
+// snapshot-at-construction behavior the existing tests above pin.
+
+#[test]
+fn test_mut_ref_closure_assignment_propagates() {
+    assert_eq!(
+        run("fn main() {\n\
+                 let mut counter = 0_i64;\n\
+                 let bump = mut ref || { counter = counter + 1; };\n\
+                 bump();\n\
+                 bump();\n\
+                 bump();\n\
+                 println(counter);\n\
+             }"),
+        "3\n"
+    );
+}
+
+#[test]
+fn test_mut_ref_closure_compound_assign_propagates() {
+    assert_eq!(
+        run("fn main() {\n\
+                 let mut counter = 10_i64;\n\
+                 let bump = mut ref || { counter += 5; };\n\
+                 bump();\n\
+                 bump();\n\
+                 println(counter);\n\
+             }"),
+        "20\n"
+    );
+}
+
+#[test]
+fn test_mut_ref_closure_vec_push_propagates() {
+    assert_eq!(
+        run("fn main() {\n\
+                 let mut v = Vec[1_i64, 2, 3];\n\
+                 let push5 = mut ref || { v.push(5); };\n\
+                 push5();\n\
+                 push5();\n\
+                 println(v.len());\n\
+             }"),
+        "5\n"
+    );
+}
+
+#[test]
+fn test_mut_ref_closure_field_mutation_propagates() {
+    // Field-level mutation through a captured struct binding routes
+    // through `set_field` → `Env::set` → SharedCell write-through.
+    assert_eq!(
+        run("struct Counter { n: i64 }\n\
+             fn main() {\n\
+                 let mut c = Counter { n: 0 };\n\
+                 let bump = mut ref || { c.n = c.n + 1; };\n\
+                 bump();\n\
+                 bump();\n\
+                 bump();\n\
+                 println(c.n);\n\
+             }"),
+        "3\n"
+    );
+}
+
+#[test]
+fn test_mut_ref_closure_observes_outer_change_between_calls() {
+    // Aliasing is bidirectional — between calls the outer binding can
+    // be mutated and the next invocation sees the updated value.
+    assert_eq!(
+        run("fn main() {\n\
+                 let mut x = 1_i64;\n\
+                 let print_x = mut ref || { println(x); x = x + 10; };\n\
+                 print_x();\n\
+                 x = 100_i64;\n\
+                 print_x();\n\
+                 println(x);\n\
+             }"),
+        "1\n100\n110\n"
+    );
+}
+
+#[test]
+fn test_mut_ref_closure_forwarded_to_higher_order_fn() {
+    // The Value::Function clones when passed across function boundaries,
+    // but the SharedCell aliases inside `closure_env` are Arc-based so
+    // every clone shares the same backing cell — mutations made by the
+    // higher-order function's invocations are still visible at main's
+    // outer binding.
+    assert_eq!(
+        run("fn run_thrice(f: ref Fn()) { f(); f(); f(); }\n\
+             fn main() {\n\
+                 let mut counter = 0_i64;\n\
+                 let bump = mut ref || { counter = counter + 1; };\n\
+                 run_thrice(bump);\n\
+                 println(counter);\n\
+             }"),
+        "3\n"
+    );
+}
+
+#[test]
+fn test_bare_closure_does_not_propagate_mutation() {
+    // Pinning the negative case: a bare `|...|` closure (default — captures
+    // by ownership) snapshots the captured value, so mutations stay local
+    // to the body and the outer binding is untouched.
+    assert_eq!(
+        run("fn main() {\n\
+                 let mut x = 0_i64;\n\
+                 let f = || { let _y = x + 1; };\n\
+                 f();\n\
+                 f();\n\
+                 println(x);\n\
+             }"),
+        "0\n"
+    );
+}
+
 // ── Edge Cases: Method + Enum Interaction ──────────────────────
 
 #[test]

@@ -103,6 +103,17 @@ pub enum Value {
     /// single-threaded tree-walk interpreter the test pattern is always
     /// send-before-recv, so the queue already has items when recv fires.
     Receiver(Arc<Mutex<VecDeque<Value>>>),
+    /// Aliasing slot used to back a `mut ref |...|` closure capture.
+    /// Lives only inside an `Env` scope or a closure's captured-env map;
+    /// never reaches user expressions because every path that reads a
+    /// value goes through `Env::get`, which auto-derefs. Writes via
+    /// `Env::set` propagate through the cell so mutations made inside one
+    /// closure invocation are visible to the outer binding and to
+    /// subsequent invocations. `Arc<Mutex<...>>` rather than
+    /// `Rc<RefCell<...>>` so `par {}` can clone branch envs across thread
+    /// boundaries (single-threaded mutation in practice — `par` branches
+    /// run in independent envs).
+    SharedCell(Arc<Mutex<Value>>),
 }
 
 /// Newtype wrapping [`Value`] that implements [`Ord`] via [`value_compare`]
@@ -290,6 +301,7 @@ impl std::fmt::Display for Value {
             }
             Value::Sender(_) => write!(f, "<Sender>"),
             Value::Receiver(_) => write!(f, "<Receiver>"),
+            Value::SharedCell(cell) => write!(f, "{}", cell.lock().unwrap()),
         }
     }
 }
@@ -406,10 +418,17 @@ impl Env {
     }
 
     fn set(&mut self, name: &str, val: Value) {
-        // Update in the nearest scope that has this name
+        // Update in the nearest scope that has this name. If the existing
+        // slot is a `SharedCell` (a `mut ref` closure capture aliased back
+        // to the outer binding) the assignment writes through the cell so
+        // the outer binding observes the mutation.
         for scope in self.scopes.iter_mut().rev() {
-            if scope.contains_key(name) {
-                scope.insert(name.to_string(), val);
+            if let Some(slot) = scope.get_mut(name) {
+                if let Value::SharedCell(cell) = slot {
+                    *cell.lock().unwrap() = val;
+                } else {
+                    *slot = val;
+                }
                 return;
             }
         }
@@ -417,16 +436,23 @@ impl Env {
         self.define(name.to_string(), val);
     }
 
-    fn get(&self, name: &str) -> Option<&Value> {
+    /// Read a binding by name. Auto-derefs `SharedCell` so callers always
+    /// see the underlying value rather than the aliasing slot.
+    fn get(&self, name: &str) -> Option<Value> {
         for scope in self.scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
-                return Some(v);
+                return Some(match v {
+                    Value::SharedCell(cell) => cell.lock().unwrap().clone(),
+                    other => other.clone(),
+                });
             }
         }
         None
     }
 
-    /// Snapshot current env for closure capture.
+    /// Snapshot current env for closure capture. Preserves `SharedCell`
+    /// slots verbatim so a captured `mut ref` alias keeps pointing at the
+    /// shared cell when the closure dispatches.
     fn snapshot(&self) -> HashMap<String, Value> {
         let mut all = HashMap::new();
         for scope in &self.scopes {
@@ -435,6 +461,305 @@ impl Env {
             }
         }
         all
+    }
+
+    /// Promote a binding's slot to `SharedCell`, if it isn't one already,
+    /// and return a clone of the resulting cell value (also a `SharedCell`)
+    /// so callers can install the same alias into a closure's captured-env
+    /// map. Used at construction of a `mut ref |...|` closure to convert
+    /// each captured outer binding into an aliased cell so mutations made
+    /// inside the closure body propagate back.
+    fn wrap_capture(&mut self, name: &str) -> Option<Value> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(slot) = scope.get_mut(name) {
+                if !matches!(slot, Value::SharedCell(_)) {
+                    let inner = std::mem::replace(slot, Value::Unit);
+                    *slot = Value::SharedCell(Arc::new(Mutex::new(inner)));
+                }
+                return Some(slot.clone());
+            }
+        }
+        None
+    }
+}
+
+// ── Free-variable analysis for `mut ref |...|` closures ────────
+//
+// Walks a closure body collecting every identifier that resolves outside
+// the closure (i.e. is not introduced by a closure param, body-local
+// `let`, pattern binding, or nested closure param). The interpreter uses
+// this set to decide which outer-scope bindings to promote to
+// `Value::SharedCell` so mutations propagate back. Conservative against
+// shadowing: a name that appears in the body before a `let` of the same
+// name is captured; a name that appears only after the `let` is treated
+// as the inner shadow and not captured.
+fn add_pattern_bindings(pat: &Pattern, out: &mut HashSet<String>) {
+    for n in pat.binding_names() {
+        out.insert(n);
+    }
+}
+
+fn collect_free_idents_block(block: &Block, bound: &mut HashSet<String>, out: &mut Vec<String>) {
+    let snapshot = bound.clone();
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            StmtKind::Let { pattern, value, .. } => {
+                collect_free_idents_expr(value, bound, out);
+                add_pattern_bindings(pattern, bound);
+            }
+            StmtKind::LetUninit { name, .. } => {
+                bound.insert(name.clone());
+            }
+            StmtKind::LetElse {
+                pattern,
+                value,
+                else_block,
+                ..
+            } => {
+                collect_free_idents_expr(value, bound, out);
+                let snap = bound.clone();
+                collect_free_idents_block(else_block, bound, out);
+                *bound = snap;
+                add_pattern_bindings(pattern, bound);
+            }
+            StmtKind::Defer { body } => collect_free_idents_block(body, bound, out),
+            StmtKind::ErrDefer { body, binding } => {
+                let snap = bound.clone();
+                if let Some(n) = binding {
+                    bound.insert(n.clone());
+                }
+                collect_free_idents_block(body, bound, out);
+                *bound = snap;
+            }
+            StmtKind::Assign { target, value } => {
+                collect_free_idents_expr(target, bound, out);
+                collect_free_idents_expr(value, bound, out);
+            }
+            StmtKind::CompoundAssign { target, value, .. } => {
+                collect_free_idents_expr(target, bound, out);
+                collect_free_idents_expr(value, bound, out);
+            }
+            StmtKind::Expr(e) => collect_free_idents_expr(e, bound, out),
+        }
+    }
+    if let Some(final_expr) = &block.final_expr {
+        collect_free_idents_expr(final_expr, bound, out);
+    }
+    *bound = snapshot;
+}
+
+fn collect_free_idents_expr(expr: &Expr, bound: &mut HashSet<String>, out: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Identifier(name) => {
+            if !bound.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        ExprKind::Path(_)
+        | ExprKind::Integer(_, _)
+        | ExprKind::Float(_, _)
+        | ExprKind::Bool(_)
+        | ExprKind::CharLit(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::MultiStringLit(_)
+        | ExprKind::SelfValue
+        | ExprKind::SelfType
+        | ExprKind::PipePlaceholder
+        | ExprKind::Continue { .. }
+        | ExprKind::Error => {}
+        ExprKind::InterpolatedStringLit(parts) => {
+            for part in parts {
+                if let crate::ast::ParsedInterpolationPart::Expr(e) = part {
+                    collect_free_idents_expr(e, bound, out);
+                }
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_free_idents_expr(left, bound, out);
+            collect_free_idents_expr(right, bound, out);
+        }
+        ExprKind::Unary { operand, .. } => {
+            collect_free_idents_expr(operand, bound, out);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_free_idents_expr(callee, bound, out);
+            for arg in args {
+                collect_free_idents_expr(&arg.value, bound, out);
+            }
+        }
+        ExprKind::MethodCall { object, args, .. } => {
+            collect_free_idents_expr(object, bound, out);
+            for arg in args {
+                collect_free_idents_expr(&arg.value, bound, out);
+            }
+        }
+        ExprKind::FieldAccess { object, .. } | ExprKind::TupleIndex { object, .. } => {
+            collect_free_idents_expr(object, bound, out);
+        }
+        ExprKind::OptionalChain { object, args, .. } => {
+            collect_free_idents_expr(object, bound, out);
+            if let Some(args) = args {
+                for arg in args {
+                    collect_free_idents_expr(&arg.value, bound, out);
+                }
+            }
+        }
+        ExprKind::NilCoalesce { left, right } => {
+            collect_free_idents_expr(left, bound, out);
+            collect_free_idents_expr(right, bound, out);
+        }
+        ExprKind::Index { object, index } => {
+            collect_free_idents_expr(object, bound, out);
+            collect_free_idents_expr(index, bound, out);
+        }
+        ExprKind::Block(b) => collect_free_idents_block(b, bound, out),
+        ExprKind::If {
+            condition,
+            then_block,
+            else_branch,
+        } => {
+            collect_free_idents_expr(condition, bound, out);
+            collect_free_idents_block(then_block, bound, out);
+            if let Some(eb) = else_branch {
+                collect_free_idents_expr(eb, bound, out);
+            }
+        }
+        ExprKind::IfLet {
+            pattern,
+            value,
+            then_block,
+            else_branch,
+        } => {
+            collect_free_idents_expr(value, bound, out);
+            let snapshot = bound.clone();
+            add_pattern_bindings(pattern, bound);
+            collect_free_idents_block(then_block, bound, out);
+            *bound = snapshot;
+            if let Some(eb) = else_branch {
+                collect_free_idents_expr(eb, bound, out);
+            }
+        }
+        ExprKind::While {
+            condition, body, ..
+        } => {
+            collect_free_idents_expr(condition, bound, out);
+            collect_free_idents_block(body, bound, out);
+        }
+        ExprKind::WhileLet {
+            pattern,
+            value,
+            body,
+            ..
+        } => {
+            collect_free_idents_expr(value, bound, out);
+            let snapshot = bound.clone();
+            add_pattern_bindings(pattern, bound);
+            collect_free_idents_block(body, bound, out);
+            *bound = snapshot;
+        }
+        ExprKind::Loop { body, .. } => collect_free_idents_block(body, bound, out),
+        ExprKind::For {
+            pattern,
+            iterable,
+            body,
+            ..
+        } => {
+            collect_free_idents_expr(iterable, bound, out);
+            let snapshot = bound.clone();
+            add_pattern_bindings(pattern, bound);
+            collect_free_idents_block(body, bound, out);
+            *bound = snapshot;
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_free_idents_expr(scrutinee, bound, out);
+            for arm in arms {
+                let snapshot = bound.clone();
+                add_pattern_bindings(&arm.pattern, bound);
+                if let Some(g) = &arm.guard {
+                    collect_free_idents_expr(g, bound, out);
+                }
+                collect_free_idents_expr(&arm.body, bound, out);
+                *bound = snapshot;
+            }
+        }
+        ExprKind::Closure { params, body, .. } => {
+            let snapshot = bound.clone();
+            for p in params {
+                add_pattern_bindings(&p.pattern, bound);
+            }
+            collect_free_idents_expr(body, bound, out);
+            *bound = snapshot;
+        }
+        ExprKind::Tuple(items) | ExprKind::ArrayLiteral(items) => {
+            for it in items {
+                collect_free_idents_expr(it, bound, out);
+            }
+        }
+        ExprKind::PrefixCollectionLiteral { items, .. } => {
+            for it in items {
+                collect_free_idents_expr(it, bound, out);
+            }
+        }
+        ExprKind::RepeatLiteral { value, count, .. } => {
+            collect_free_idents_expr(value, bound, out);
+            collect_free_idents_expr(count, bound, out);
+        }
+        ExprKind::MapLiteral(entries) => {
+            for (k, v) in entries {
+                collect_free_idents_expr(k, bound, out);
+                collect_free_idents_expr(v, bound, out);
+            }
+        }
+        ExprKind::StructLiteral { fields, spread, .. } => {
+            for f in fields {
+                collect_free_idents_expr(&f.value, bound, out);
+            }
+            if let Some(s) = spread {
+                collect_free_idents_expr(s, bound, out);
+            }
+        }
+        ExprKind::Return(opt) => {
+            if let Some(e) = opt {
+                collect_free_idents_expr(e, bound, out);
+            }
+        }
+        ExprKind::Break { value: opt, .. } => {
+            if let Some(e) = opt {
+                collect_free_idents_expr(e, bound, out);
+            }
+        }
+        ExprKind::Question(inner) | ExprKind::Cast { expr: inner, .. } => {
+            collect_free_idents_expr(inner, bound, out);
+        }
+        ExprKind::Range { start, end, .. } => {
+            if let Some(s) = start {
+                collect_free_idents_expr(s, bound, out);
+            }
+            if let Some(e) = end {
+                collect_free_idents_expr(e, bound, out);
+            }
+        }
+        ExprKind::Pipe { left, right } => {
+            collect_free_idents_expr(left, bound, out);
+            collect_free_idents_expr(right, bound, out);
+        }
+        ExprKind::Par(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) => {
+            collect_free_idents_block(b, bound, out);
+        }
+        ExprKind::Lock { body, alias, .. } => {
+            let snap = bound.clone();
+            if let Some(a) = alias {
+                bound.insert(a.clone());
+            }
+            collect_free_idents_block(body, bound, out);
+            *bound = snap;
+        }
+        ExprKind::Providers { bindings, body } => {
+            for b in bindings {
+                collect_free_idents_expr(&b.value, bound, out);
+            }
+            collect_free_idents_block(body, bound, out);
+        }
     }
 }
 
@@ -917,7 +1242,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn call_function(&mut self, name: &str, args: &[Value]) -> Value {
-        let func = self.env.get(name).cloned();
+        let func = self.env.get(name);
         match func {
             Some(Value::Function {
                 param_patterns,
@@ -1006,7 +1331,7 @@ impl<'a> Interpreter<'a> {
                 self.eval_unary(op, val, &expr.span)
             }
 
-            ExprKind::Identifier(name) => self.env.get(name).cloned().unwrap_or_else(|| {
+            ExprKind::Identifier(name) => self.env.get(name).unwrap_or_else(|| {
                 unreachable!(
                     "variable '{}' not found at {}:{}; should be caught by resolver",
                     name, expr.span.line, expr.span.column
@@ -1015,7 +1340,7 @@ impl<'a> Interpreter<'a> {
 
             ExprKind::Path(segments) => {
                 let full = segments.join(".");
-                if let Some(v) = self.env.get(&full).cloned() {
+                if let Some(v) = self.env.get(&full) {
                     return v;
                 }
                 // Type-parameter dispatch: `T.method` where `T` is bound to a
@@ -1024,14 +1349,14 @@ impl<'a> Interpreter<'a> {
                 if segments.len() == 2 {
                     if let Some(concrete) = self.resolve_type_param(&segments[0]) {
                         let key = format!("{}.{}", concrete, segments[1]);
-                        if let Some(v) = self.env.get(&key).cloned() {
+                        if let Some(v) = self.env.get(&key) {
                             return v;
                         }
                     }
                 }
                 // Try just the last segment (enum variant, etc.)
                 let last = segments.last().cloned().unwrap_or_default();
-                self.env.get(&last).cloned().unwrap_or_else(|| {
+                self.env.get(&last).unwrap_or_else(|| {
                     unreachable!(
                         "path '{}' not found at {}:{}; should be caught by resolver",
                         full, expr.span.line, expr.span.column
@@ -1039,7 +1364,7 @@ impl<'a> Interpreter<'a> {
                 })
             }
 
-            ExprKind::SelfValue => self.env.get("self").cloned().unwrap_or_else(|| {
+            ExprKind::SelfValue => self.env.get("self").unwrap_or_else(|| {
                 unreachable!(
                     "'self' not found at {}:{}; should be caught by resolver",
                     expr.span.line, expr.span.column
@@ -1458,10 +1783,36 @@ impl<'a> Interpreter<'a> {
             // Closure
             ExprKind::Closure {
                 params,
-                capture_mode: _,
+                capture_mode,
                 prefix_span: _,
                 body,
             } => {
+                // For `mut ref |...|` closures, promote each captured outer
+                // binding's slot to a `Value::SharedCell` so mutations made
+                // inside the body propagate back to the outer binding and
+                // are visible to subsequent invocations of the closure.
+                if matches!(capture_mode, Some(CaptureMode::MutRef)) {
+                    let mut bound: HashSet<String> = HashSet::new();
+                    for p in params {
+                        add_pattern_bindings(&p.pattern, &mut bound);
+                    }
+                    let mut idents: Vec<String> = Vec::new();
+                    collect_free_idents_expr(body, &mut bound, &mut idents);
+                    for name in idents {
+                        // Skip globals (functions, enum variants, type ctors,
+                        // etc.) — they live in scope[0] and never need to
+                        // alias back through a cell.
+                        if self
+                            .env
+                            .scopes
+                            .first()
+                            .is_some_and(|s| s.contains_key(&name))
+                        {
+                            continue;
+                        }
+                        let _ = self.env.wrap_capture(&name);
+                    }
+                }
                 let captured = self.env.snapshot();
                 let closure_body = Block {
                     stmts: Vec::new(),
@@ -2530,7 +2881,7 @@ impl<'a> Interpreter<'a> {
                     };
                     if let Some(pat) = param_patterns.get(i) {
                         if let crate::ast::PatternKind::Binding(param_name) = &pat.kind {
-                            if let Some(val) = self.env.get(param_name).cloned() {
+                            if let Some(val) = self.env.get(param_name) {
                                 writebacks.push((caller_var, val));
                             }
                         }
@@ -3817,7 +4168,7 @@ impl<'a> Interpreter<'a> {
         let type_name = self.value_type_name(&obj);
         let method_key = format!("{}.{}", type_name, method);
 
-        if let Some(func) = self.env.get(&method_key).cloned() {
+        if let Some(func) = self.env.get(&method_key) {
             let mut arg_vals: Vec<Value> = vec![obj];
             arg_vals.extend(args.iter().map(|a| self.eval_expr_inner(&a.value)));
 
@@ -3905,7 +4256,7 @@ impl<'a> Interpreter<'a> {
 
         let method_key = format!("{}.{}", type_name, method);
 
-        let Some(func) = self.env.get(&method_key).cloned() else {
+        let Some(func) = self.env.get(&method_key) else {
             return self.record_runtime_error(
                 format!(
                     "provider type '{}' bound to resource '{}' has no method '{}'",
@@ -4165,7 +4516,7 @@ impl<'a> Interpreter<'a> {
                 }) = self.env.get(name)
                 {
                     if let Value::EnumVariant { variant: v2, .. } = value {
-                        return variant == v2;
+                        return variant == *v2;
                     }
                     return false;
                 }
@@ -4480,7 +4831,7 @@ impl<'a> Interpreter<'a> {
 
     fn set_field(&mut self, object: &Expr, field: &str, val: Value) {
         if let ExprKind::Identifier(name) = &object.kind {
-            if let Some(Value::Struct { name: sn, fields }) = self.env.get(name).cloned() {
+            if let Some(Value::Struct { name: sn, fields }) = self.env.get(name) {
                 let mut fields = fields;
                 fields.insert(field.to_string(), val);
                 self.env.set(name, Value::Struct { name: sn, fields });
@@ -4491,7 +4842,7 @@ impl<'a> Interpreter<'a> {
     fn set_index(&mut self, object: &Expr, index: &Expr, val: Value) {
         if let ExprKind::Identifier(name) = &object.kind {
             let idx = self.eval_expr_inner(index);
-            if let (Some(Value::Array(arr)), Value::Int(i)) = (self.env.get(name).cloned(), idx) {
+            if let (Some(Value::Array(arr)), Value::Int(i)) = (self.env.get(name), idx) {
                 let mut arr = arr;
                 arr[i as usize] = val;
                 self.env.set(name, Value::Array(arr));
