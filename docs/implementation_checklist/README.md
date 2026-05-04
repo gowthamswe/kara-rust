@@ -8,20 +8,23 @@ Sourced from open gaps identified during design review that don't require design
 
 ## Work in Progress (updated 2026-05-04)
 
-**Theme: HashMap/HashSet completion.** Finish `Map[K, V]` and `Set[T]` codegen so real test programs and benchmarks run on compiled binaries. Five canonical bullets — four in [Phase 8](phase-8-stdlib-floor.md), one in [Phase 7.2](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen). Active rounds: gap-closure and Set codegen first; the rest queue behind.
+**Theme: HashMap/HashSet completion.** Finish `Map[K, V]` and `Set[T]` codegen so real test programs and benchmarks run on compiled binaries. Work splits into a serial **List 1** (active session, one agent) and a parallel-safe **List 2** (any agent can pick up without coordination — file/function boundaries don't conflict with List 1).
 
-*Scoping context (audit 2026-05-04): `compile_map_method` (`src/codegen.rs:4667`) handles 6 of 11 typechecker-blessed methods (`len`/`is_empty`/`insert`/`get`/`remove`/`contains_key`) and falls through to a silent-`0` catch-all at line 4945 for the other 5 (`get_or` / `keys` / `values` / `entries` / `merge`). `compile_index` (line 5009) handles only Array/Vec/Slice — `m[k]` is wrong on compiled binaries today. No `karac_set_*` runtime exists; `Set[T]` is interpreter-only. Existing `runtime/src/map.rs` already supports `val_size = 0` correctly (line 71's `(key_size + val_size).max(1)`), so Set lowers to `Map[T, ()]` with no new C code. 12 Map E2E codegen tests; 0 Set E2E codegen tests.*
+*Scoping context (audit 2026-05-04): `compile_map_method` (`src/codegen.rs:4667`) originally handled 6 of 11 typechecker-blessed methods and fell through to a silent-`0` catch-all for the rest. `compile_index` (line 5009) handled only Array/Vec/Slice. No `karac_set_*` runtime; `Set[T]` interpreter-only. Existing `runtime/src/map.rs` supports `val_size = 0` correctly (line 71's `(key_size + val_size).max(1)`), so Set lowers to `Map[T, ()]` with no new C code. Map gap closure (subtasks 1–7) closed by 2026-05-04 across commits `4a3bc3e`, `ca94b9f`, `3f08a39`, `8806883`, `b150d8c`, `1678d0a`; subtask 6 (Display) split into its own canonical bullet because recursive Display codegen is its own scope. Map E2E codegen tests grew 12 → 27.*
 
-- [~] **Map codegen gap closure.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Map codegen gap closure`)_
-  - [x] **1. Catch-all hardening** — `_ => Err(...)` at `src/codegen.rs:4945` (commit `4a3bc3e`)
-  - [x] **2. `m[k]` index op (read)** — `compile_index` Map dispatch + `panics` on missing key (commit `ca94b9f`)
-  - [x] **3. `m[k] = v` index op (write)** — `compile_index_store` Map dispatch (commit `3f08a39`)
-  - [x] **4. `Map.clear()`** — `karac_map_clear` runtime fn + interp + codegen (commit `8806883`)
-  - [x] **5. `keys()` / `values()` / `entries()` codegen** — materialize Vec via `karac_map_iter_*` (commit `b150d8c`)
-  - [ ] **6. `Display` for collections** — `Vec` / `Map` / `Set` / `VecDeque` / `SortedSet` / `TreeMap`; supersedes the stub at `phase-8-stdlib-floor.md:207` (delete that line)
-  - [x] **7. `Map[k: v, ...]` prefix-literal K/V inference** — turned out to need parser + codegen too; closes `phase-4-interpreter.md` line 13 (commit `1678d0a`)
+### List 1 — Active (serial, this session)
 
-- [~] **`Set[T]` LLVM codegen.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Set[T] LLVM codegen`)_
+- [~] **Display for collections (recursive codegen).** _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `Display for collections (recursive codegen)`)_
+  - [ ] **1. Per-type Display function emission machinery** — `emit_display_fn_for_type` cached by type, parallel to `emit_hash_fn_for_type`
+  - [ ] **2. Primitive Display fns** — i8…i64 / u8…u64 / f32/f64 / bool / char / String
+  - [ ] **3. `Vec[T]` Display fn** — `[` + loop with recursive elem call + `]`
+  - [ ] **4. `Map[K, V]` Display fn** — `{` + iterator loop with recursive K, V calls + `}`
+  - [ ] **5. `Set[T]` Display fn** — depends on Set codegen landing; format aligned with interpreter
+  - [ ] **6. Tuple Display fn** — `(` + recursive per-field calls + `)`
+  - [ ] **7. `compile_print` integration** — recognize Vec/Map/Set/Tuple types, dispatch to emitted Display fn
+  - [ ] **8. Test coverage** — E2E covering primitives + nested collections + interpreter-codegen parity
+
+- [ ] **`Set[T]` LLVM codegen.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Set[T] LLVM codegen`)_
   - [ ] **1. Codegen state** — `set_elem_types` side-table + `extract_set_elem_type` helper
   - [ ] **2. `Set.new()` path-call dispatch** — `karac_map_new(elem_size, 0, ...)` (val_size=0)
   - [ ] **3. `compile_set_method`** — `len` / `is_empty` / `insert` / `contains` / `remove` / `clear`
@@ -33,19 +36,29 @@ Sourced from open gaps identified during design review that don't require design
 
 - [ ] **`Map.entry(k)` + `Entry[K, V]` enum — in-place insert-or-modify.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Map.entry(k)`)_
 
-  Queued — start after gap-closure and Set codegen land. Touches parser/AST verification, prelude registration of `Entry[K, V]`, three Entry methods (`or_insert` / `or_insert_with` / `and_modify`), interpreter `Value::Entry`, new `karac_map_entry` runtime fn, and codegen lowering. Round-scoped subtasks will be added when the round opens.
+  Queued — touches parser/AST/typechecker/interp/codegen/runtime. Round-scoped subtasks added when round opens.
+
+### List 2 — Parallel-safe (pick up without coordination)
+
+These bullets touch files / functions that don't conflict with the active List-1 work. Any agent can pick them up in parallel; merge-conflict risk is minimal.
 
 - [ ] **Effect-checker wiring for `Map[K, V]` and `Set[T]` methods.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Effect-checker wiring`)_
 
-  Queued — independent of the other rounds; can run in parallel. Adds `infer_map_method_effects` + `infer_set_method_effects` paralleling `infer_vec_method_effects`. Effects: `allocates(Heap)` for growth methods, `panics` for index op, none for pure reads. Round-scoped subtasks will be added when the round opens.
+  **Files:** `src/effectchecker.rs` only. Fully isolated from codegen and List 1.
+  **Estimate:** ~1 commit.
+  **Scope:** new `infer_map_method_effects` + `infer_set_method_effects` paralleling `infer_vec_method_effects`. Effects: `allocates(Heap)` for growth methods, `panics` for index op, none for pure reads. 6 subtasks already scoped in canonical.
 
 - [ ] **Hash codegen for compound key types.** _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `Hash codegen for compound key types`)_
 
-  Queued — tuples first, then enums, then user `#[derive(Hash)]`. Extends `emit_hash_fn_for_type` at `src/codegen.rs:4282` past primitives + `String`. Round-scoped subtasks will be added when the round opens.
+  **Files:** `src/codegen.rs` — extends `emit_hash_fn_for_type` (`src/codegen.rs:4282`) and `emit_eq_fn_for_type`. Distinct functions from Display's `emit_display_fn_for_type` and from List-1's `compile_print` integration; no textual collision.
+  **Estimate:** ~3–4 commits (tuples → enums → user `#[derive(Hash)]`).
+  **Scope:** 5 subtasks already scoped in canonical.
 
 - [ ] **For-loop bindings don't propagate Vec/String/Slice element type for method dispatch.** _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `For-loop bindings don't propagate`)_
 
-  Queued — surfaced 2026-05-04 during the keys/values/entries work. `for s in vec_of_strings { s.len() }` returns 0 because `bind_pattern` doesn't register loop-bound names in `vec_elem_types` / `slice_elem_types` / `map_key_types`. Affects every Vec[String], Slice[String], Map[String, _] iteration that calls a method on the bound name. Round-scoped subtasks will be added when the round opens.
+  **Files:** `src/codegen.rs` — modifies `bind_pattern` (`src/codegen.rs:2579`) and the four `compile_for_*_var` family. Distinct functions from Display work and Hash codegen; no overlap.
+  **Estimate:** ~1–2 commits.
+  **Scope:** surfaced 2026-05-04 during `Map.keys()` work. `for s in vec_of_strings { s.len() }` returns 0 because `bind_pattern` doesn't register loop-bound names in side-tables. 5 subtasks already scoped in canonical.
 
 ---
 
