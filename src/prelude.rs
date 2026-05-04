@@ -72,6 +72,7 @@ pub const PRELUDE_TYPES: &[&str] = &[
     "Slice",
     "Map",
     "Set",
+    "Entry",
     "Never",
     "StringSlice",
     "F32",
@@ -130,6 +131,8 @@ pub const PRELUDE_TRAITS: &[&str] = &[
 pub const PRELUDE_VARIANTS: &[&str] = &[
     "Some", "None", "Ok", "Err", // Ordering
     "Relaxed", "Acquire", "Release", "AcqRel", "SeqCst",
+    // Entry[K, V] — Map.entry(k) returns one of these
+    "Occupied", "Vacant",
 ];
 
 /// Ambient program-rooted effect resources — resources whose provider is
@@ -245,7 +248,7 @@ fn stub_generics(name: &str, span: &Span) -> Option<GenericParams> {
         "Option" | "Vec" | "Slice" | "Array" | "Set" | "Atomic" | "SortedSet" | "Channel"
         | "Sender" | "Receiver" => &["T"],
         "Result" => &["T", "E"],
-        "Map" => &["K", "V"],
+        "Map" | "Entry" => &["K", "V"],
         _ => return None,
     };
     Some(GenericParams {

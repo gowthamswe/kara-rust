@@ -577,6 +577,16 @@ fn test_method_call() {
 }
 
 #[test]
+fn test_map_entry_chain_parses() {
+    // m.entry(k) is just a method call; the .or_insert / .and_modify chain
+    // composes through standard method-call grammar. No new syntax.
+    parse_ok("fn main() { let m = Map.new(); m.entry(k).or_insert(0); }");
+    parse_ok("fn main() { let m = Map.new(); m.entry(k).or_insert_with(|| 0); }");
+    parse_ok("fn main() { let m = Map.new(); m.entry(k).and_modify(|v| v + 1).or_insert(0); }");
+    parse_ok("fn main() { let m = Map.new(); m.entry(k).or_insert_with(Vec.new).push(row); }");
+}
+
+#[test]
 fn test_field_access() {
     parse_ok("fn main() { let x = point.x; let y = self.count; }");
 }
