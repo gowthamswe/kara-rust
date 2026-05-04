@@ -2146,6 +2146,106 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_slice_len_after_array_coercion() {
+        // Regression: `Slice.len()` had no codegen handler — fell through to
+        // the dispatcher's silent-`0` catch-all (line ~4163 pre-fix). Manifested
+        // as `Slice.len() == 0` on any slice constructed by Array → Slice
+        // coercion at a call site. See docs/known_bugs.md § B1.
+        let out = run_program(
+            r#"
+fn dump(xs: Slice[i64]) {
+    println(xs.len());
+    println(xs[0]);
+    println(xs[3]);
+}
+fn main() {
+    let a: Array[i64, 4] = [2, 7, 11, 15];
+    dump(a);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "4\n2\n15");
+        }
+    }
+
+    #[test]
+    fn test_e2e_slice_len_through_nested_call() {
+        // Companion regression: `Slice.len()` correct after Slice → Slice
+        // forwarding (matches the LeetCode #1 `report` → `two_sum` shape that
+        // exposed the bug originally).
+        let out = run_program(
+            r#"
+fn inner(xs: Slice[i64]) -> i64 { xs[0] + xs[1] }
+fn outer(xs: Slice[i64]) {
+    println(inner(xs));
+    println(xs.len());
+}
+fn main() {
+    let a: Array[i64, 4] = [2, 7, 11, 15];
+    outer(a);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "9\n4");
+        }
+    }
+
+    #[test]
+    fn test_e2e_slice_is_empty() {
+        // `Slice.is_empty()` shares the dispatcher path with `len`. Pre-fix
+        // it fell through to the silent-`0` catch-all so both empty and
+        // non-empty slices reported "empty" (i1 zero). Use the bool directly
+        // as a return value to avoid hitting the unrelated empty-array-literal
+        // gap and the if-as-statement Unit-coercion path.
+        let out = run_program(
+            r#"
+fn empty_flag(xs: Slice[i64]) -> bool { xs.is_empty() }
+fn main() {
+    let a: Array[i64, 3] = [1, 2, 3];
+    let r = empty_flag(a);
+    if r { println(1); } else { println(0); }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "0");
+        }
+    }
+
+    #[test]
+    fn test_e2e_slice_brute_force_two_sum() {
+        // End-to-end: the LeetCode #1 brute-force shape that exposed B1.
+        // Pre-fix: returned [-1, -1] regardless of input because `nums.len()`
+        // returned 0 → for-loop never executed.
+        let out = run_program(
+            r#"
+fn two_sum(nums: Slice[i64], target: i64) -> Array[i64, 2] {
+    let n = nums.len();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if nums[i] + nums[j] == target {
+                return [i, j];
+            }
+        }
+    }
+    [-1, -1]
+}
+fn main() {
+    let nums: Array[i64, 4] = [2, 7, 11, 15];
+    let r = two_sum(nums, 9);
+    println(r[0]);
+    println(r[1]);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "0\n1");
+        }
+    }
+
+    #[test]
     fn test_e2e_mut_slice_indexing_writes_back() {
         // `mut Slice[T]` indexing writes through the slice's data pointer.
         // When the slice aliases an Array on the caller's stack, the write

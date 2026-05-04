@@ -4122,6 +4122,49 @@ impl<'ctx> Codegen<'ctx> {
                     let data_ptr = self.get_data_ptr(name).unwrap();
                     return self.compile_vec_method(name, data_ptr, method, args);
                 }
+                // Slice[T] / mut Slice[T] read-only methods. The slice's
+                // stack alloca holds the 2-field `{ptr, i64}` struct (see
+                // `slice_struct_type`); GEP field 1 is the length.
+                if self.slice_elem_types.contains_key(name.as_str()) {
+                    let i64_t = self.context.i64_type();
+                    let slice_ty = self.slice_struct_type();
+                    match method {
+                        "len" => {
+                            let len_ptr = self
+                                .builder
+                                .build_struct_gep(slice_ty, slot.ptr, 1, "slice.len.ptr")
+                                .unwrap();
+                            let len = self
+                                .builder
+                                .build_load(i64_t, len_ptr, "slice.len")
+                                .unwrap();
+                            return Ok(len);
+                        }
+                        "is_empty" => {
+                            let len_ptr = self
+                                .builder
+                                .build_struct_gep(slice_ty, slot.ptr, 1, "slice.len.ptr")
+                                .unwrap();
+                            let len = self
+                                .builder
+                                .build_load(i64_t, len_ptr, "slice.len")
+                                .unwrap()
+                                .into_int_value();
+                            let zero = i64_t.const_zero();
+                            let is_empty = self
+                                .builder
+                                .build_int_compare(
+                                    IntPredicate::EQ,
+                                    len,
+                                    zero,
+                                    "slice.is_empty",
+                                )
+                                .unwrap();
+                            return Ok(is_empty.into());
+                        }
+                        _ => {}
+                    }
+                }
                 // Map methods
                 if self.map_key_types.contains_key(name.as_str()) {
                     let name = name.clone();
