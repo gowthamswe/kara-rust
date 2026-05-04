@@ -459,6 +459,20 @@ struct Codegen<'ctx> {
     karac_map_iter_new_fn: FunctionValue<'ctx>,
     karac_map_iter_next_fn: FunctionValue<'ctx>,
     karac_map_iter_free_fn: FunctionValue<'ctx>,
+    /// Per-type Display function cache. Keyed by the canonical type name
+    /// (e.g. `"i64"`, `"String"`, `"Vec_i64"`, `"Map_String_i64"`). Each
+    /// emitted fn has signature `void karac_display_<typename>(ptr)` and
+    /// writes characters to stdout via `printf` with no trailing newline.
+    /// The pointer-by-reference convention is uniform across every type so
+    /// callers don't need per-type calling conventions; primitives load the
+    /// value, structs extract fields, opaque ptrs load the handle.
+    ///
+    /// `dead_code` is allowed because subtasks 1+2 of the Display canonical
+    /// bullet ship the machinery + primitive Display fns ahead of subtasks
+    /// 3-7 which add the callers (Vec/Map/Set/Tuple Display fns + the
+    /// `compile_print` integration). Remove the allow when subtask 7 lands.
+    #[allow(dead_code)]
+    display_fn_cache: HashMap<String, FunctionValue<'ctx>>,
     // ── Error return trace runtime ────────────────────────────────
     /// `void karac_error_trace_push(ptr file, i64 file_len, i32 line, i32 col)`.
     /// Called by `compile_question` at each `?` failure block before
@@ -702,6 +716,7 @@ impl<'ctx> Codegen<'ctx> {
             karac_map_iter_new_fn,
             karac_map_iter_next_fn,
             karac_map_iter_free_fn,
+            display_fn_cache: HashMap::new(),
             karac_error_trace_push_fn,
             karac_error_trace_clear_fn,
         }
@@ -4612,6 +4627,242 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.position_at_end(bb);
         }
         eq_fn
+    }
+
+    /// Emit (or reuse) a module-level Display function for the given type.
+    ///
+    /// Signature: `void karac_display_<type_name>(*const T)`. The function
+    /// reads `*ptr` (or extracts struct fields, depending on the type) and
+    /// writes a textual representation to stdout via `printf`. No trailing
+    /// newline — callers append `\n` themselves for `println`.
+    ///
+    /// Subtask 1+2 scope: primitives (`i8`..`i64` / `u8`..`u64` / `f32`/`f64`
+    /// / `bool` / `char` / `String`/`str`). Compound types (Vec/Map/Set/Tuple)
+    /// land in subtasks 3-6, each as a new arm in this function that recurses
+    /// into `emit_display_fn_for_type` for element/field types.
+    ///
+    /// Cache is keyed by the canonical `type_name` string — same convention
+    /// used by `emit_hash_fn_for_type`. Caller is responsible for ensuring
+    /// `type_name` uniquely identifies the type (for primitives this is
+    /// trivial; for compound types the caller composes a mangled name).
+    ///
+    /// `dead_code` is allowed because subtasks 1+2 of the Display canonical
+    /// bullet ship the machinery + primitive Display fns ahead of subtasks
+    /// 3-7 which add the callers. Remove the allow when subtask 7 lands.
+    #[allow(dead_code)]
+    fn emit_display_fn_for_type(
+        &mut self,
+        type_name: &str,
+        ty: BasicTypeEnum<'ctx>,
+    ) -> FunctionValue<'ctx> {
+        if let Some(&f) = self.display_fn_cache.get(type_name) {
+            return f;
+        }
+        let fn_name = format!("karac_display_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            self.display_fn_cache.insert(type_name.to_string(), f);
+            return f;
+        }
+
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let f64_t = self.context.f64_type();
+
+        let saved_bb = self.builder.get_insert_block();
+
+        let display_fn_ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let display_fn = self
+            .module
+            .add_function(&fn_name, display_fn_ty, Some(Linkage::Internal));
+        self.display_fn_cache
+            .insert(type_name.to_string(), display_fn);
+
+        let entry_bb = self.context.append_basic_block(display_fn, "entry");
+        self.builder.position_at_end(entry_bb);
+        let val_ptr = display_fn.get_nth_param(0).unwrap().into_pointer_value();
+
+        match type_name {
+            "i8" | "i16" | "i32" | "i64" | "isize" => {
+                // Sign-extend to i64, printf "%lld".
+                let v = self
+                    .builder
+                    .build_load(ty, val_ptr, "v")
+                    .unwrap()
+                    .into_int_value();
+                let v64 = self.builder.build_int_s_extend(v, i64_t, "v64").unwrap();
+                let fmt = self
+                    .builder
+                    .build_global_string_ptr("%lld", "fi")
+                    .unwrap();
+                self.builder
+                    .build_call(
+                        self.printf_fn,
+                        &[fmt.as_pointer_value().into(), v64.into()],
+                        "p",
+                    )
+                    .unwrap();
+            }
+            "u8" | "u16" | "u32" | "u64" | "usize" => {
+                // Zero-extend to i64, printf "%llu".
+                let v = self
+                    .builder
+                    .build_load(ty, val_ptr, "v")
+                    .unwrap()
+                    .into_int_value();
+                let v64 = self.builder.build_int_z_extend(v, i64_t, "v64").unwrap();
+                let fmt = self
+                    .builder
+                    .build_global_string_ptr("%llu", "fu")
+                    .unwrap();
+                self.builder
+                    .build_call(
+                        self.printf_fn,
+                        &[fmt.as_pointer_value().into(), v64.into()],
+                        "p",
+                    )
+                    .unwrap();
+            }
+            "f32" => {
+                // Widen to f64, printf "%g".
+                let v = self
+                    .builder
+                    .build_load(ty, val_ptr, "v")
+                    .unwrap()
+                    .into_float_value();
+                let v64 = self.builder.build_float_ext(v, f64_t, "v64").unwrap();
+                let fmt = self.builder.build_global_string_ptr("%g", "ff").unwrap();
+                self.builder
+                    .build_call(
+                        self.printf_fn,
+                        &[fmt.as_pointer_value().into(), v64.into()],
+                        "p",
+                    )
+                    .unwrap();
+            }
+            "f64" => {
+                let v = self
+                    .builder
+                    .build_load(ty, val_ptr, "v")
+                    .unwrap()
+                    .into_float_value();
+                let fmt = self.builder.build_global_string_ptr("%g", "ff").unwrap();
+                self.builder
+                    .build_call(
+                        self.printf_fn,
+                        &[fmt.as_pointer_value().into(), v.into()],
+                        "p",
+                    )
+                    .unwrap();
+            }
+            "bool" => {
+                // Select between "true" / "false" static strings.
+                let v = self
+                    .builder
+                    .build_load(ty, val_ptr, "v")
+                    .unwrap()
+                    .into_int_value();
+                let true_s = self
+                    .builder
+                    .build_global_string_ptr("true", "ts")
+                    .unwrap();
+                let false_s = self
+                    .builder
+                    .build_global_string_ptr("false", "fs")
+                    .unwrap();
+                let sel = self
+                    .builder
+                    .build_select(
+                        v,
+                        true_s.as_pointer_value(),
+                        false_s.as_pointer_value(),
+                        "bsel",
+                    )
+                    .unwrap();
+                let fmt = self.builder.build_global_string_ptr("%s", "fs").unwrap();
+                self.builder
+                    .build_call(
+                        self.printf_fn,
+                        &[fmt.as_pointer_value().into(), sel.into()],
+                        "p",
+                    )
+                    .unwrap();
+            }
+            "char" => {
+                // Char is a Unicode scalar (i32). For ASCII (the common case)
+                // %c prints correctly. Non-ASCII codepoints get truncated to
+                // i32 by printf — UTF-8 encoding refinement is a follow-up.
+                let v = self
+                    .builder
+                    .build_load(ty, val_ptr, "v")
+                    .unwrap()
+                    .into_int_value();
+                let fmt = self.builder.build_global_string_ptr("%c", "fc").unwrap();
+                self.builder
+                    .build_call(
+                        self.printf_fn,
+                        &[fmt.as_pointer_value().into(), v.into()],
+                        "p",
+                    )
+                    .unwrap();
+            }
+            "String" | "str" => {
+                // 24-byte struct {data, len, cap}. Use %.*s to bound by len —
+                // String values are NOT NUL-terminated.
+                let str_ty = self.vec_struct_type();
+                let data_pp = self
+                    .builder
+                    .build_struct_gep(str_ty, val_ptr, 0, "s.data.pp")
+                    .unwrap();
+                let len_p = self
+                    .builder
+                    .build_struct_gep(str_ty, val_ptr, 1, "s.len.p")
+                    .unwrap();
+                let data = self
+                    .builder
+                    .build_load(ptr_ty, data_pp, "s.data")
+                    .unwrap()
+                    .into_pointer_value();
+                let len = self
+                    .builder
+                    .build_load(i64_t, len_p, "s.len")
+                    .unwrap()
+                    .into_int_value();
+                let len32 = self
+                    .builder
+                    .build_int_truncate(len, i32_t, "len32")
+                    .unwrap();
+                let fmt = self
+                    .builder
+                    .build_global_string_ptr("%.*s", "fs")
+                    .unwrap();
+                self.builder
+                    .build_call(
+                        self.printf_fn,
+                        &[
+                            fmt.as_pointer_value().into(),
+                            len32.into(),
+                            data.into(),
+                        ],
+                        "p",
+                    )
+                    .unwrap();
+            }
+            other => {
+                // Compound types (Vec_*, Map_*, Set_*, Tuple_*, user structs)
+                // not yet supported. Subtasks 3-6 of the Display canonical
+                // bullet (phase-7-codegen.md § Phase 7.2) extend this match.
+                panic!("emit_display_fn_for_type: type_name '{other}' not yet supported");
+            }
+        }
+
+        self.builder.build_return(None).unwrap();
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        display_fn
     }
 
     /// Emit `karac_map_new`, alloca a ptr slot to hold the opaque handle, and
