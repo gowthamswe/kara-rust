@@ -3232,6 +3232,102 @@ fn test_map_entry_and_modify_chain_with_or_insert() {
     assert_eq!(output, "3\n");
 }
 
+// ── Clone trait surface (canonical: phase-8-stdlib-floor.md
+//    "Clone trait surface for collections") ────────────────────────
+
+#[test]
+fn test_vec_clone_preserves_contents() {
+    // Cloning a Vec produces an equal Vec; both contain the same elements
+    // in the same order.
+    let output = run("fn main() {\n\
+             let v: Vec[i64] = [1_i64, 2_i64, 3_i64];\n\
+             let w: Vec[i64] = v.clone();\n\
+             println(w[0]);\n\
+             println(w[1]);\n\
+             println(w[2]);\n\
+         }");
+    assert_eq!(output, "1\n2\n3\n");
+}
+
+#[test]
+fn test_vec_clone_independent_after_push() {
+    // Mutating the source after cloning does not affect the clone — they
+    // own independent buffers.
+    let output = run("fn main() {\n\
+             let v: Vec[i64] = [1_i64, 2_i64];\n\
+             let w: Vec[i64] = v.clone();\n\
+             v.push(99_i64);\n\
+             println(v.len());\n\
+             println(w.len());\n\
+         }");
+    assert_eq!(output, "3\n2\n");
+}
+
+#[test]
+fn test_string_clone_preserves_value() {
+    let output = run("fn main() {\n\
+             let s = \"hello\";\n\
+             let t = s.clone();\n\
+             println(t);\n\
+         }");
+    assert_eq!(output, "hello\n");
+}
+
+#[test]
+fn test_map_clone_preserves_entries() {
+    let output = run("fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             m.insert(\"k\", 7_i64);\n\
+             let n: Map[String, i64] = m.clone();\n\
+             match n.get(\"k\") {\n\
+                 Some(v) => println(v),\n\
+                 None => println(\"missing\"),\n\
+             }\n\
+         }");
+    assert_eq!(output, "7\n");
+}
+
+#[test]
+fn test_map_clone_independent_after_source_insert() {
+    // Inserting into the source after cloning leaves the clone unchanged.
+    let output = run("fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             m.insert(\"k\", 1_i64);\n\
+             let n: Map[String, i64] = m.clone();\n\
+             m.insert(\"k\", 99_i64);\n\
+             match n.get(\"k\") {\n\
+                 Some(v) => println(v),\n\
+                 None => println(\"missing\"),\n\
+             }\n\
+         }");
+    assert_eq!(output, "1\n");
+}
+
+#[test]
+fn test_set_clone_preserves_membership() {
+    let output = run("fn main() {\n\
+             let s: Set[i64] = Set.new();\n\
+             s.insert(5_i64);\n\
+             let t: Set[i64] = s.clone();\n\
+             println(t.contains(5_i64));\n\
+             println(t.contains(99_i64));\n\
+         }");
+    assert_eq!(output, "true\nfalse\n");
+}
+
+#[test]
+fn test_set_clone_independent_after_source_insert() {
+    let output = run("fn main() {\n\
+             let s: Set[i64] = Set.new();\n\
+             s.insert(1_i64);\n\
+             let t: Set[i64] = s.clone();\n\
+             s.insert(2_i64);\n\
+             println(t.len());\n\
+             println(s.len());\n\
+         }");
+    assert_eq!(output, "1\n2\n");
+}
+
 // ── Regex ─────────────────────────────────────────────────────────
 
 #[test]

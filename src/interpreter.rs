@@ -283,6 +283,17 @@ pub enum IteratorStep {
     /// is the number of items still to skip; while > 0, the step
     /// rejects the item and decrements.
     Skip(usize),
+    /// `.take_while(pred)` — yield items while `pred(item)` returns
+    /// true; on the first false, signal stop (drain the source) and
+    /// remain stopped on every subsequent pull. The `bool` flag tracks
+    /// whether we've already seen the trip element so future pulls go
+    /// straight to "stop" without re-firing the predicate.
+    TakeWhile { pred: Value, done: bool },
+    /// `.skip_while(pred)` — drop items while `pred(item)` returns
+    /// true; on the first false, yield that element AND every
+    /// subsequent element unconditionally. The `bool` flag flips once
+    /// the predicate fails so future pulls bypass it entirely.
+    SkipWhile { pred: Value, done: bool },
 }
 
 impl std::fmt::Display for Value {
@@ -3237,6 +3248,37 @@ impl<'a> Interpreter<'a> {
                             break;
                         }
                     }
+                    IteratorStep::TakeWhile { pred, done } => {
+                        if *done {
+                            // Sticky-stop: predicate already tripped on
+                            // an earlier element, so every subsequent
+                            // pull short-circuits without firing pred.
+                            stop = true;
+                            keep = false;
+                            break;
+                        }
+                        let result = self.invoke_function_value(pred.clone(), vec![item.clone()]);
+                        if !matches!(result, Value::Bool(true)) {
+                            *done = true;
+                            stop = true;
+                            keep = false;
+                            break;
+                        }
+                    }
+                    IteratorStep::SkipWhile { pred, done } => {
+                        if *done {
+                            // Sticky-pass: predicate failed on an
+                            // earlier element, so every subsequent
+                            // item goes through unconditionally.
+                            continue;
+                        }
+                        let result = self.invoke_function_value(pred.clone(), vec![item.clone()]);
+                        if matches!(result, Value::Bool(true)) {
+                            keep = false;
+                            break;
+                        }
+                        *done = true;
+                    }
                 }
             }
             if stop {
@@ -3732,6 +3774,42 @@ impl<'a> Interpreter<'a> {
                     steps.push(match method {
                         "take" => IteratorStep::Take(n),
                         "skip" => IteratorStep::Skip(n),
+                        _ => unreachable!(),
+                    });
+                    return Value::Iterator { source, steps };
+                }
+            }
+            "take_while" | "skip_while" => {
+                // Lazy predicate-bounded adaptors. `take_while` stops
+                // on the first false; `skip_while` drops items while
+                // pred holds, then yields the rest unconditionally.
+                // Both share the closure-validation path of map/filter.
+                if matches!(obj, Value::Iterator { .. }) {
+                    let Some(arg) = args.first() else {
+                        return self.record_runtime_error(
+                            format!("Iterator.{}() requires a closure argument", method),
+                            span,
+                        );
+                    };
+                    let closure = self.eval_expr_inner(&arg.value);
+                    if !matches!(closure, Value::Function { .. }) {
+                        return self.record_runtime_error(
+                            format!("Iterator.{}() expects a closure; got {}", method, closure),
+                            span,
+                        );
+                    }
+                    let Value::Iterator { source, mut steps } = obj else {
+                        unreachable!()
+                    };
+                    steps.push(match method {
+                        "take_while" => IteratorStep::TakeWhile {
+                            pred: closure,
+                            done: false,
+                        },
+                        "skip_while" => IteratorStep::SkipWhile {
+                            pred: closure,
+                            done: false,
+                        },
                         _ => unreachable!(),
                     });
                     return Value::Iterator { source, steps };
@@ -4315,12 +4393,25 @@ impl<'a> Interpreter<'a> {
                     };
                 }
             }
-            // clone() on Sender creates an additional producer sharing the
-            // same queue Arc. Conflicts with Array.clone / general clone —
-            // gate on Value::Sender explicitly so other types fall through.
+            // clone() — Sender creates an additional producer sharing the
+            // same queue Arc. For collection types (Array/String/Map/Set/
+            // SortedSet) the canonical Clone impl is a structural deep
+            // copy: each `Value` variant is itself `Clone` so
+            // `obj.clone()` does the right thing without per-type
+            // unrolling. Non-Clone payloads (closures, iterators, refs,
+            // entries, shared cells) fall through; the typechecker
+            // rejects `clone()` on those receivers via `clone_self_type_for`.
             "clone" => {
                 if let Value::Sender(ref queue) = obj {
                     return Value::Sender(Arc::clone(queue));
+                }
+                match &obj {
+                    Value::Array(a) => return Value::Array(a.clone()),
+                    Value::String(s) => return Value::String(s.clone()),
+                    Value::Map(m) => return Value::Map(m.clone()),
+                    Value::Set(s) => return Value::Set(s.clone()),
+                    Value::SortedSet(s) => return Value::SortedSet(s.clone()),
+                    _ => {}
                 }
             }
 

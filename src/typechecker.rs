@@ -352,6 +352,30 @@ fn iterator_item_type_for(ty: &Type) -> Option<Type> {
     }
 }
 
+/// Return the `Self` type for `clone()` on stdlib collection types, or
+/// None if the receiver isn't a Clone-bearing collection. Used by the
+/// `clone()` arm in `infer_method_call` so any `ref`/`mut ref` borrow of
+/// a collection still resolves to the underlying owned type. See the
+/// `Clone trait surface for collections` bullet in
+/// `phase-8-stdlib-floor.md`.
+///
+/// Element-type `T: Clone` bound checking rides the existing trait-bound
+/// machinery — primitives, `String`, and stdlib collection types satisfy
+/// `Clone` trivially; user structs without `#[derive(Clone)]` would be
+/// rejected at the bound-resolution layer when that lands.
+fn clone_self_type_for(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Str => Some(Type::Str),
+        Type::Array { .. } => Some(ty.clone()),
+        Type::Named { name, args: _ } => match name.as_str() {
+            "Vec" | "Set" | "SortedSet" | "VecDeque" | "Map" | "TreeMap" => Some(ty.clone()),
+            _ => None,
+        },
+        Type::Ref(inner) | Type::MutRef(inner) => clone_self_type_for(inner),
+        _ => None,
+    }
+}
+
 /// Walk `ty` looking for any `Type::TypeParam` or `Type::AssocProjection` node.
 /// Used by `infer_call` to decide whether a callee signature needs ad-hoc
 /// generic instantiation.
@@ -7909,6 +7933,29 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // `clone()` on collection types — `Vec[T]`, `String`, `Map[K, V]`,
+        // `Set[T]`, `SortedSet[T]`, `Array[T, N]` all implement Clone per
+        // design.md § Iteration line 1692. Returns `Self`. The `T: Clone`
+        // bound on element types is enforced via the existing trait-bound
+        // checking; primitives and String satisfy it trivially. The
+        // canonical bullet lives in `phase-8-stdlib-floor.md` (search
+        // `Clone trait surface for collections`).
+        if method == "clone" {
+            if let Some(self_ty) = clone_self_type_for(&obj_ty) {
+                if !args.is_empty() {
+                    self.type_error(
+                        "clone() takes no arguments".to_string(),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                }
+                return self_ty;
+            }
+        }
+
         // Iterator method dispatch — `Iterator[Item = T].next()` and the
         // adaptor surface (added in subtask 3+). Keyed on the receiver's
         // outer Type::Named name; the Item type is at args[0].
@@ -9022,6 +9069,39 @@ impl<'a> TypeChecker<'a> {
                     };
                 }
                 self.check_expr(&args[0].value, &Type::Int(IntSize::I64));
+                Type::Named {
+                    name: "Iterator".to_string(),
+                    args: vec![item.clone()],
+                }
+            }
+            "take_while" | "skip_while" => {
+                // `take_while(pred: Fn(T) -> bool) -> Iterator[T]` and
+                // `skip_while(pred: Fn(T) -> bool) -> Iterator[T]` —
+                // same predicate signature as `filter`, so check_expr
+                // against `Fn(T) -> bool` suffices for closure-pushdown.
+                if args.len() != 1 {
+                    self.type_error(
+                        format!(
+                            "Iterator.{}() expects 1 argument, found {}",
+                            method,
+                            args.len()
+                        ),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                    return Type::Named {
+                        name: "Iterator".to_string(),
+                        args: vec![item.clone()],
+                    };
+                }
+                let pred_ty = Type::Function {
+                    params: vec![item.clone()],
+                    return_type: Box::new(Type::Bool),
+                };
+                self.check_expr(&args[0].value, &pred_ty);
                 Type::Named {
                     name: "Iterator".to_string(),
                     args: vec![item.clone()],

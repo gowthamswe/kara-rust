@@ -651,6 +651,86 @@ fn test_map_entry_arity_error() {
     );
 }
 
+// ── Clone trait surface (canonical: phase-8-stdlib-floor.md
+//    "Clone trait surface for collections") ─────────────────────────
+
+#[test]
+fn test_vec_clone_returns_self_type() {
+    typecheck_ok(
+        "fn main() {\n\
+             let v: Vec[i64] = Vec.new();\n\
+             let w: Vec[i64] = v.clone();\n\
+         }",
+    );
+}
+
+#[test]
+fn test_string_clone_returns_string() {
+    typecheck_ok(
+        "fn main() {\n\
+             let s: String = \"hello\";\n\
+             let t: String = s.clone();\n\
+         }",
+    );
+}
+
+#[test]
+fn test_map_clone_returns_self_type() {
+    typecheck_ok(
+        "fn main() {\n\
+             let m: Map[i64, String] = Map.new();\n\
+             let n: Map[i64, String] = m.clone();\n\
+         }",
+    );
+}
+
+#[test]
+fn test_set_clone_returns_self_type() {
+    typecheck_ok(
+        "fn main() {\n\
+             let s: Set[i64] = Set.new();\n\
+             let t: Set[i64] = s.clone();\n\
+         }",
+    );
+}
+
+#[test]
+fn test_sorted_set_clone_returns_self_type() {
+    typecheck_ok(
+        "fn main() {\n\
+             let s: SortedSet[i64] = SortedSet.new();\n\
+             let t: SortedSet[i64] = s.clone();\n\
+         }",
+    );
+}
+
+#[test]
+fn test_clone_arity_error() {
+    // `clone()` takes no arguments — passing one is rejected.
+    let errors = typecheck_errors(
+        "fn main() {\n\
+             let v: Vec[i64] = Vec.new();\n\
+             let _ = v.clone(42);\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs),
+        "expected WrongNumberOfArgs on v.clone(42), got {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_vec_clone_through_borrow_returns_owned() {
+    // `clone()` on a `ref Vec[T]` borrow returns the owned `Vec[T]`.
+    typecheck_ok(
+        "fn dup(v: ref Vec[i64]) -> Vec[i64] { v.clone() }\n\
+         fn main() {}",
+    );
+}
+
 // ── Category 8: Pattern Exhaustiveness ──────────────────────────
 
 #[test]
@@ -6420,6 +6500,106 @@ fn test_iter_zip_wrong_arg_count_rejected() {
             .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
                 && e.message.contains("Iterator.zip()")),
         "expected WrongNumberOfArgs for zip() with no args, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_take_while_returns_same_item_type() {
+    // take_while(pred) is bound-by-predicate but doesn't change item type.
+    typecheck_ok(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().take_while(|x| x < 10);
+             let _x: i64 = it.next().unwrap();
+         }",
+    );
+}
+
+#[test]
+fn test_iter_skip_while_returns_same_item_type() {
+    typecheck_ok(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().skip_while(|x| x < 5);
+             let _x: i64 = it.next().unwrap();
+         }",
+    );
+}
+
+#[test]
+fn test_iter_take_while_after_map_predicate_sees_mapped_type() {
+    // map then take_while — predicate's parameter is the post-map type.
+    typecheck_ok(
+        r#"fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().map(|x| if x > 0 { "pos" } else { "neg" }).take_while(|s| s == "pos");
+             let _s: String = it.next().unwrap();
+         }"#,
+    );
+}
+
+#[test]
+fn test_iter_take_while_predicate_must_return_bool() {
+    // Predicate must return bool — i64 return is rejected.
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().take_while(|x| x + 1);
+         }",
+    );
+    assert!(
+        errs.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch on non-bool take_while predicate, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_skip_while_predicate_must_return_bool() {
+    let errs = typecheck_errors(
+        r#"fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().skip_while(|x| "nope");
+         }"#,
+    );
+    assert!(
+        errs.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch on non-bool skip_while predicate, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_take_while_wrong_arg_count_rejected() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().take_while();
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
+                && e.message.contains("Iterator.take_while()")),
+        "expected WrongNumberOfArgs for take_while() with no args, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_skip_while_wrong_arg_count_rejected() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().skip_while();
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
+                && e.message.contains("Iterator.skip_while()")),
+        "expected WrongNumberOfArgs for skip_while() with no args, got: {:?}",
         errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
     );
 }
