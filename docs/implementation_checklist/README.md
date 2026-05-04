@@ -43,6 +43,10 @@ Sourced from open gaps identified during design review that don't require design
 
   Queued — tuples first, then enums, then user `#[derive(Hash)]`. Extends `emit_hash_fn_for_type` at `src/codegen.rs:4282` past primitives + `String`. Round-scoped subtasks will be added when the round opens.
 
+- [ ] **For-loop bindings don't propagate Vec/String/Slice element type for method dispatch.** _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `For-loop bindings don't propagate`)_
+
+  Queued — surfaced 2026-05-04 during the keys/values/entries work. `for s in vec_of_strings { s.len() }` returns 0 because `bind_pattern` doesn't register loop-bound names in `vec_elem_types` / `slice_elem_types` / `map_key_types`. Affects every Vec[String], Slice[String], Map[String, _] iteration that calls a method on the bound name. Round-scoped subtasks will be added when the round opens.
+
 ---
 
 ## Contents
