@@ -525,6 +525,132 @@ fn test_entry_kv_pattern_match_occupied() {
     );
 }
 
+#[test]
+fn test_map_entry_returns_entry_kv() {
+    // `m.entry(k)` returns `Entry[K, V]`. Type ascription confirms the
+    // return-type plumbing.
+    typecheck_ok(
+        "fn main() {\n\
+             let m: Map[i64, String] = Map.new();\n\
+             let e: Entry[i64, String] = m.entry(1);\n\
+         }",
+    );
+}
+
+#[test]
+fn test_map_entry_wrong_key_type_rejected() {
+    // `entry(k: K)` checks the key against K — string into a Map[i64, ...]
+    // is a TypeMismatch at the argument site.
+    let errors = typecheck_errors(
+        "fn main() {\n\
+             let m: Map[i64, String] = Map.new();\n\
+             let _e = m.entry(\"not an i64\");\n\
+         }",
+    );
+    assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch for string-into-i64-key Map.entry, got {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_entry_or_insert_returns_mut_ref_v() {
+    // `or_insert(default: V) -> mut ref V`. Argument must match V.
+    typecheck_ok(
+        "fn main() {\n\
+             let m: Map[i64, String] = Map.new();\n\
+             let _slot: mut ref String = m.entry(1).or_insert(\"default\");\n\
+         }",
+    );
+}
+
+#[test]
+fn test_entry_or_insert_wrong_default_type_rejected() {
+    let errors = typecheck_errors(
+        "fn main() {\n\
+             let m: Map[i64, String] = Map.new();\n\
+             let _ = m.entry(1).or_insert(42);\n\
+         }",
+    );
+    assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch when or_insert default doesn't match V, got {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_entry_or_insert_with_closure_returning_v() {
+    // `or_insert_with(f: Fn() -> V) -> mut ref V`. Closure-pushdown solves
+    // the closure's return type from the expected V.
+    typecheck_ok(
+        "fn main() {\n\
+             let m: Map[i64, Vec[i64]] = Map.new();\n\
+             let _slot: mut ref Vec[i64] = m.entry(1).or_insert_with(|| Vec.new());\n\
+         }",
+    );
+}
+
+#[test]
+fn test_entry_and_modify_returns_entry_for_chaining() {
+    // `and_modify(f: Fn(mut ref V)) -> Entry[K, V]`. The bare and_modify
+    // (without further chaining) returns Entry[K, V] so subsequent
+    // methods can chain on it.
+    typecheck_ok(
+        "fn main() {\n\
+             let m: Map[i64, i64] = Map.new();\n\
+             let _e: Entry[i64, i64] = m.entry(1).and_modify(|_v| {});\n\
+         }",
+    );
+}
+
+#[test]
+fn test_entry_and_modify_chain_with_or_insert() {
+    // The canonical pattern: and_modify chained into or_insert returns
+    // `mut ref V` from the final or_insert.
+    typecheck_ok(
+        "fn main() {\n\
+             let m: Map[i64, i64] = Map.new();\n\
+             let _slot: mut ref i64 = m.entry(1).and_modify(|_v| {}).or_insert(0);\n\
+         }",
+    );
+}
+
+#[test]
+fn test_entry_or_insert_arity_error() {
+    let errors = typecheck_errors(
+        "fn main() {\n\
+             let m: Map[i64, i64] = Map.new();\n\
+             let _ = m.entry(1).or_insert();\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs),
+        "expected WrongNumberOfArgs on bare or_insert(), got {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_map_entry_arity_error() {
+    let errors = typecheck_errors(
+        "fn main() {\n\
+             let m: Map[i64, i64] = Map.new();\n\
+             let _ = m.entry();\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs),
+        "expected WrongNumberOfArgs on bare m.entry(), got {:?}",
+        errors
+    );
+}
+
 // ── Category 8: Pattern Exhaustiveness ──────────────────────────
 
 #[test]
@@ -5975,6 +6101,101 @@ fn test_iter_fold_wrong_arg_count_rejected() {
             .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
                 && e.message.contains("Iterator.fold()")),
         "expected WrongNumberOfArgs for fold(init) only, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_any_returns_bool() {
+    typecheck_ok(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _b: bool = v.iter().any(|x| x > 0);
+         }",
+    );
+}
+
+#[test]
+fn test_iter_all_returns_bool() {
+    typecheck_ok(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _b: bool = v.iter().all(|x| x > 0);
+         }",
+    );
+}
+
+#[test]
+fn test_iter_any_after_map_uses_mapped_item_type_for_predicate() {
+    // Composes with map — predicate sees the mapped type.
+    typecheck_ok(
+        r#"fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _b: bool = v.iter().map(|x| if x > 0 { "pos" } else { "neg" }).any(|s| s == "pos");
+         }"#,
+    );
+}
+
+#[test]
+fn test_iter_any_predicate_must_return_bool() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _b = v.iter().any(|x| x + 1);
+         }",
+    );
+    assert!(
+        errs.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch on non-bool any predicate, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_all_predicate_must_return_bool() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _b = v.iter().all(|x| x + 1);
+         }",
+    );
+    assert!(
+        errs.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch on non-bool all predicate, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_any_wrong_arg_count_rejected() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _b = v.iter().any();
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
+                && e.message.contains("Iterator.any()")),
+        "expected WrongNumberOfArgs for any() with no args, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_all_wrong_arg_count_rejected() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _b = v.iter().all();
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
+                && e.message.contains("Iterator.all()")),
+        "expected WrongNumberOfArgs for all() with no args, got: {:?}",
         errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
     );
 }

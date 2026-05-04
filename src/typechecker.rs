@@ -7972,6 +7972,20 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // `Entry[K, V]` method dispatch — `or_insert`, `or_insert_with`,
+        // `and_modify`. Produced by `Map.entry(k)`.
+        if let Type::Named {
+            name,
+            args: type_args,
+        } = &obj_ty
+        {
+            if name == "Entry" {
+                let key = type_args.first().cloned().unwrap_or(Type::Error);
+                let val = type_args.get(1).cloned().unwrap_or(Type::Error);
+                return self.infer_entry_method(&key, &val, method, args, span);
+            }
+        }
+
         // `SortedSet[T]` method dispatch. Named type but with dedicated
         // per-method typing (generic T threads through return types).
         if let Type::Named {
@@ -8473,6 +8487,129 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Unit
             }
+            "entry" => {
+                // `entry(key: K) -> Entry[K, V]` — view returned for the given
+                // key, occupied or vacant. Drives the in-place insert-or-modify
+                // chain (or_insert / or_insert_with / and_modify) via
+                // `infer_entry_method`. See design.md § Entry[K, V].
+                if args.len() != 1 {
+                    self.type_error(
+                        format!("Map.entry() expects 1 argument, found {}", args.len()),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                } else {
+                    let kt = self.infer_expr(&args[0].value);
+                    self.check_assignable(&k, &kt, args[0].value.span.clone());
+                }
+                Type::Named {
+                    name: "Entry".to_string(),
+                    args: vec![k.clone(), v.clone()],
+                }
+            }
+            _ => {
+                for arg in args {
+                    self.infer_expr(&arg.value);
+                }
+                Type::Error
+            }
+        }
+    }
+
+    /// Infer the return type of a method call on `Entry[K, V]`.
+    /// Drives the chain produced by `Map.entry(k)` — `or_insert`,
+    /// `or_insert_with`, `and_modify`. Effect polymorphism on the closure-
+    /// taking forms is handled by the existing closure-effect-propagation
+    /// pass in the effect checker; this layer just types the shape.
+    fn infer_entry_method(
+        &mut self,
+        key: &Type,
+        val: &Type,
+        method: &str,
+        args: &[CallArg],
+        span: &Span,
+    ) -> Type {
+        let v = val.clone();
+        let mut_ref_v = Type::MutRef(Box::new(v.clone()));
+        let entry_kv = Type::Named {
+            name: "Entry".to_string(),
+            args: vec![key.clone(), v.clone()],
+        };
+        match method {
+            "or_insert" => {
+                // `or_insert(default: V) -> mut ref V`. Returns a borrow into
+                // the map's slot — fresh on Vacant (after writing default),
+                // existing on Occupied.
+                if args.len() != 1 {
+                    self.type_error(
+                        format!("Entry.or_insert() expects 1 argument, found {}", args.len()),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                } else {
+                    let dt = self.infer_expr(&args[0].value);
+                    self.check_assignable(&v, &dt, args[0].value.span.clone());
+                }
+                mut_ref_v
+            }
+            "or_insert_with" => {
+                // `or_insert_with[with E](f: Fn() -> V with E) -> mut ref V
+                // with E`. Closure invoked only on the Vacant arm; effect
+                // propagation through `with E` is handled by the effect
+                // checker reading the closure's effect set.
+                if args.len() != 1 {
+                    self.type_error(
+                        format!(
+                            "Entry.or_insert_with() expects 1 argument, found {}",
+                            args.len()
+                        ),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                } else {
+                    let f_ty = Type::Function {
+                        params: vec![],
+                        return_type: Box::new(v.clone()),
+                    };
+                    self.check_expr(&args[0].value, &f_ty);
+                }
+                mut_ref_v
+            }
+            "and_modify" => {
+                // `and_modify[with E](f: Fn(mut ref V) with E) -> Entry[K, V]
+                // with E`. Closure invoked only on Occupied; receives a
+                // `mut ref V` to the existing slot. Returns self for
+                // chaining (e.g. `.and_modify(...).or_insert(default)`).
+                if args.len() != 1 {
+                    self.type_error(
+                        format!(
+                            "Entry.and_modify() expects 1 argument, found {}",
+                            args.len()
+                        ),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                } else {
+                    let f_ty = Type::Function {
+                        params: vec![mut_ref_v.clone()],
+                        return_type: Box::new(Type::Unit),
+                    };
+                    self.check_expr(&args[0].value, &f_ty);
+                }
+                entry_kv
+            }
             _ => {
                 for arg in args {
                     self.infer_expr(&arg.value);
@@ -8816,6 +8953,33 @@ impl<'a> TypeChecker<'a> {
                 };
                 self.check_expr(&args[1].value, &f_ty);
                 acc_ty
+            }
+            "any" | "all" => {
+                // Short-circuit terminals — `any(pred) -> bool` /
+                // `all(pred) -> bool`. Same predicate signature as
+                // `filter`, so check_expr against `Fn(T) -> bool`
+                // suffices for closure-pushdown.
+                if args.len() != 1 {
+                    self.type_error(
+                        format!(
+                            "Iterator.{}() expects 1 argument, found {}",
+                            method,
+                            args.len()
+                        ),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                    return Type::Bool;
+                }
+                let pred_ty = Type::Function {
+                    params: vec![item.clone()],
+                    return_type: Box::new(Type::Bool),
+                };
+                self.check_expr(&args[0].value, &pred_ty);
+                Type::Bool
             }
             _ => {
                 for arg in args {
