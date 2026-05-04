@@ -3898,6 +3898,47 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_map_unit_enum_key() {
+        // Unit-variant enum used as a Map key. Layout is `{ i64 tag }` — the
+        // existing primitive hash/eq path (byte-by-byte over sizeof(K))
+        // already does the right thing once the typechecker permits the
+        // `K: Hash + Eq` bound.
+        let out = run_program(
+            r#"
+#[derive(Hash, Eq)]
+enum Color { Red, Green, Blue }
+
+fn main() {
+    let mut m: Map[Color, i64] = Map.new();
+    m.insert(Color.Red,   100_i64);
+    m.insert(Color.Green, 200_i64);
+    m.insert(Color.Blue,  300_i64);
+    println(m.len());
+    let v1 = m.get(Color.Red);
+    match v1 {
+        Some(x) => { println(x); }
+        None => { println(0_i64 - 1_i64); }
+    }
+    let v2 = m.get(Color.Green);
+    match v2 {
+        Some(x) => { println(x); }
+        None => { println(0_i64 - 1_i64); }
+    }
+    let v3 = m.get(Color.Blue);
+    match v3 {
+        Some(x) => { println(x); }
+        None => { println(0_i64 - 1_i64); }
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["3", "100", "200", "300"]);
+        }
+    }
+
+    #[test]
     fn test_e2e_map_keys_empty() {
         // Empty map → empty Vec; len=0, no iteration body runs.
         let out = run_program(
