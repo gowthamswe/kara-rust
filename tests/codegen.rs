@@ -3568,6 +3568,128 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_map_keys_returns_vec() {
+        // m.keys() materializes Vec[K] containing every key. Iteration order
+        // is unspecified, so sum the keys and verify total.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.insert(10_i64, 1_i64);
+    m.insert(20_i64, 2_i64);
+    m.insert(30_i64, 3_i64);
+    let ks: Vec[i64] = m.keys();
+    println(ks.len());
+    let mut sum: i64 = 0;
+    for k in ks {
+        sum = sum + k;
+    }
+    println(sum);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["3", "60"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_values_returns_vec() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.insert(1_i64, 100_i64);
+    m.insert(2_i64, 200_i64);
+    m.insert(3_i64, 300_i64);
+    let vs: Vec[i64] = m.values();
+    println(vs.len());
+    let mut sum: i64 = 0;
+    for v in vs {
+        sum = sum + v;
+    }
+    println(sum);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["3", "600"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_entries_returns_vec_of_tuples() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.insert(1_i64, 10_i64);
+    m.insert(2_i64, 20_i64);
+    let es: Vec[(i64, i64)] = m.entries();
+    println(es.len());
+    let mut k_sum: i64 = 0;
+    let mut v_sum: i64 = 0;
+    for (k, v) in es {
+        k_sum = k_sum + k;
+        v_sum = v_sum + v;
+    }
+    println(k_sum);
+    println(v_sum);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["2", "3", "30"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_keys_string_keys_len() {
+        // Keys are heap-bearing String values. Verify the resulting Vec[String]
+        // reports the correct length. Iterating the Vec[String] and dereferencing
+        // each String's heap data is a separate, pre-existing limitation —
+        // for-loop bindings don't currently propagate String type to method
+        // dispatch, so `for s in vs { s.len() }` reads zeroes regardless of
+        // whether the Vec came from m.keys() or Vec.push. Tracked separately.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[String, i64] = Map.new();
+    m.insert("alice", 1_i64);
+    m.insert("bob", 2_i64);
+    let ks: Vec[String] = m.keys();
+    println(ks.len());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "2");
+        }
+    }
+
+    #[test]
+    fn test_e2e_map_keys_empty() {
+        // Empty map → empty Vec; len=0, no iteration body runs.
+        let out = run_program(
+            r#"
+fn main() {
+    let m: Map[i64, i64] = Map.new();
+    let ks: Vec[i64] = m.keys();
+    println(ks.len());
+    println(ks.is_empty());
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["0", "true"]);
+        }
+    }
+
+    #[test]
     fn test_e2e_map_clear() {
         // clear() empties the map; subsequent insert/lookup work normally.
         let out = run_program(

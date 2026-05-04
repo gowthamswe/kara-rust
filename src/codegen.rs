@@ -4802,6 +4802,205 @@ impl<'ctx> Codegen<'ctx> {
         Ok(elem_val)
     }
 
+    /// Compile `Map.keys()`, `Map.values()`, or `Map.entries()` — each
+    /// materializes a fresh Vec by iterating the map. Pre-allocates the result
+    /// buffer at `karac_map_len` capacity (matches Rust's reserve-then-fill
+    /// pattern for known-size collections), then writes elements at index `i`
+    /// via the iterator. Returns the resulting Vec struct value `{data, len,
+    /// cap}` directly; the receiving binding's let-statement registers it for
+    /// scope cleanup via the existing `vec_elem_types` machinery (the type
+    /// annotation `let v: Vec[K] = m.keys()` drives that path).
+    ///
+    /// Iteration order is unspecified — matches the spec at design.md
+    /// "Iteration order is unspecified" (line 1588).
+    fn compile_map_keys_values_entries(
+        &mut self,
+        var_name: &str,
+        method: &str,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let i64_t = self.context.i64_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let vec_ty = self.vec_struct_type();
+        let fn_val = self.current_fn.unwrap();
+
+        let slot = self
+            .variables
+            .get(var_name)
+            .copied()
+            .ok_or_else(|| format!("unknown map variable '{var_name}'"))?;
+        let map_handle = self
+            .builder
+            .build_load(ptr_ty, slot.ptr, "kvg.map.handle")
+            .unwrap()
+            .into_pointer_value();
+
+        let key_ty = self
+            .map_key_types
+            .get(var_name)
+            .copied()
+            .unwrap_or(i64_t.into());
+        let val_ty = self
+            .map_val_types
+            .get(var_name)
+            .copied()
+            .unwrap_or(i64_t.into());
+
+        // Resulting Vec's element type depends on which method we're emitting.
+        // For `entries`, the element is the {K, V} tuple struct — same shape
+        // as `extract_vec_elem_type` produces for `Vec[(K, V)]`.
+        let elem_ty: BasicTypeEnum<'ctx> = match method {
+            "keys" => key_ty,
+            "values" => val_ty,
+            "entries" => self.context.struct_type(&[key_ty, val_ty], false).into(),
+            _ => return Err(format!("compile_map_keys_values_entries: unexpected method '{method}'")),
+        };
+
+        let elem_size = elem_ty.size_of().unwrap();
+
+        // len = karac_map_len(map)
+        let len = self
+            .builder
+            .build_call(self.karac_map_len_fn, &[map_handle.into()], "kvg.len")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+
+        // Allocate buffer: malloc(len * elem_size). On len == 0 this calls
+        // malloc(0) — implementation-defined; the resulting Vec carries cap=0
+        // so scope cleanup never frees it (the bytes leak only on empty maps,
+        // a pre-existing pattern shared with empty Vec literals).
+        let alloc_bytes = self
+            .builder
+            .build_int_mul(len, elem_size, "kvg.alloc.bytes")
+            .unwrap();
+        let buf = self
+            .builder
+            .build_call(self.malloc_fn, &[alloc_bytes.into()], "kvg.buf")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_pointer_value();
+
+        // Map iterator + per-iteration out-slots.
+        let iter_ptr = self
+            .builder
+            .build_call(self.karac_map_iter_new_fn, &[map_handle.into()], "kvg.iter")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_pointer_value();
+        let out_key = self.create_entry_alloca(fn_val, "kvg.out.k", key_ty);
+        let out_val = self.create_entry_alloca(fn_val, "kvg.out.v", val_ty);
+        let i_slot = self.create_entry_alloca(fn_val, "kvg.i", i64_t.into());
+        self.builder
+            .build_store(i_slot, i64_t.const_int(0, false))
+            .unwrap();
+
+        let loop_bb = self.context.append_basic_block(fn_val, "kvg.loop");
+        let body_bb = self.context.append_basic_block(fn_val, "kvg.body");
+        let exit_bb = self.context.append_basic_block(fn_val, "kvg.exit");
+
+        self.builder.build_unconditional_branch(loop_bb).unwrap();
+
+        // loop_bb: advance iterator; branch on result.
+        self.builder.position_at_end(loop_bb);
+        let has_next = self
+            .builder
+            .build_call(
+                self.karac_map_iter_next_fn,
+                &[iter_ptr.into(), out_key.into(), out_val.into()],
+                "kvg.next",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        self.builder
+            .build_conditional_branch(has_next, body_bb, exit_bb)
+            .unwrap();
+
+        // body_bb: load key/val from slots, build the element value, write
+        // into buf[i], increment i.
+        self.builder.position_at_end(body_bb);
+        let i_val = self
+            .builder
+            .build_load(i64_t, i_slot, "kvg.i.cur")
+            .unwrap()
+            .into_int_value();
+        let elem_ptr = unsafe {
+            self.builder
+                .build_gep(elem_ty, buf, &[i_val], "kvg.elem.ptr")
+                .unwrap()
+        };
+        let written: BasicValueEnum<'ctx> = match method {
+            "keys" => self
+                .builder
+                .build_load(key_ty, out_key, "kvg.k.load")
+                .unwrap(),
+            "values" => self
+                .builder
+                .build_load(val_ty, out_val, "kvg.v.load")
+                .unwrap(),
+            "entries" => {
+                let kv_struct_ty = self.context.struct_type(&[key_ty, val_ty], false);
+                let key_val = self
+                    .builder
+                    .build_load(key_ty, out_key, "kvg.k.load")
+                    .unwrap();
+                let val_val = self
+                    .builder
+                    .build_load(val_ty, out_val, "kvg.v.load")
+                    .unwrap();
+                let mut kv = kv_struct_ty.get_undef();
+                kv = self
+                    .builder
+                    .build_insert_value(kv, key_val, 0, "kv.k")
+                    .unwrap()
+                    .into_struct_value();
+                kv = self
+                    .builder
+                    .build_insert_value(kv, val_val, 1, "kv.v")
+                    .unwrap()
+                    .into_struct_value();
+                kv.into()
+            }
+            _ => unreachable!(),
+        };
+        self.builder.build_store(elem_ptr, written).unwrap();
+        let i_next = self
+            .builder
+            .build_int_add(i_val, i64_t.const_int(1, false), "kvg.i.next")
+            .unwrap();
+        self.builder.build_store(i_slot, i_next).unwrap();
+        self.builder.build_unconditional_branch(loop_bb).unwrap();
+
+        // exit_bb: free iterator, build Vec struct {data, len, cap=len}.
+        self.builder.position_at_end(exit_bb);
+        self.builder
+            .build_call(self.karac_map_iter_free_fn, &[iter_ptr.into()], "")
+            .unwrap();
+
+        let mut vec_val = vec_ty.get_undef();
+        vec_val = self
+            .builder
+            .build_insert_value(vec_val, buf, 0, "vec.data")
+            .unwrap()
+            .into_struct_value();
+        vec_val = self
+            .builder
+            .build_insert_value(vec_val, len, 1, "vec.len")
+            .unwrap()
+            .into_struct_value();
+        vec_val = self
+            .builder
+            .build_insert_value(vec_val, len, 2, "vec.cap")
+            .unwrap()
+            .into_struct_value();
+
+        Ok(vec_val.into())
+    }
+
     /// Compile a method call on a `Map[K,V]` variable.
     fn compile_map_method(
         &mut self,
@@ -5087,6 +5286,9 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap();
                 // Map.clear returns Unit — codegen represents Unit as i64 0.
                 Ok(i64_t.const_int(0, false).into())
+            }
+            "keys" | "values" | "entries" => {
+                self.compile_map_keys_values_entries(var_name, method)
             }
             _ => Err(format!("codegen: Map.{method} not yet implemented")),
         }
