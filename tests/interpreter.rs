@@ -4554,3 +4554,149 @@ fn main() {
     );
     assert_eq!(output, "12\n");
 }
+
+#[test]
+fn test_iter_any_returns_true_on_first_match() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    let b: bool = v.iter().any(|x| x > 3);
+    println(b);
+}
+"#,
+    );
+    assert_eq!(output, "true\n");
+}
+
+#[test]
+fn test_iter_any_returns_false_when_no_match() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3];
+    let b: bool = v.iter().any(|x| x > 100);
+    println(b);
+}
+"#,
+    );
+    assert_eq!(output, "false\n");
+}
+
+#[test]
+fn test_iter_any_on_empty_returns_false() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v: Vec[i64] = Vec[];
+    let b: bool = v.iter().any(|x| x > 0);
+    println(b);
+}
+"#,
+    );
+    assert_eq!(output, "false\n");
+}
+
+#[test]
+fn test_iter_any_short_circuits_on_first_match() {
+    // any() should stop iterating the moment the predicate returns true.
+    // The closure prints each element it sees; with input 1..5 and
+    // pred `x > 2`, only the first three elements should print before
+    // any() returns. Tree-walk closures snapshot captures so we can't
+    // count via mutated outer bindings — the println side-effect
+    // ordering is the visible signal.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    let b: bool = v.iter().any(|x| {
+        println(x);
+        x > 2
+    });
+    println(b);
+}
+"#,
+    );
+    assert_eq!(output, "1\n2\n3\ntrue\n");
+}
+
+#[test]
+fn test_iter_all_returns_true_when_every_element_matches() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [2, 4, 6];
+    let b: bool = v.iter().all(|x| x > 0);
+    println(b);
+}
+"#,
+    );
+    assert_eq!(output, "true\n");
+}
+
+#[test]
+fn test_iter_all_returns_false_on_first_mismatch() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [2, 4, -1, 6];
+    let b: bool = v.iter().all(|x| x > 0);
+    println(b);
+}
+"#,
+    );
+    assert_eq!(output, "false\n");
+}
+
+#[test]
+fn test_iter_all_on_empty_returns_true() {
+    // Vacuously true — no element violates the predicate.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v: Vec[i64] = Vec[];
+    let b: bool = v.iter().all(|x| x > 100);
+    println(b);
+}
+"#,
+    );
+    assert_eq!(output, "true\n");
+}
+
+#[test]
+fn test_iter_all_short_circuits_on_first_mismatch() {
+    // all() should stop the moment the predicate returns false. With
+    // input 1..5 and pred `x < 3`, the predicate sees 1, 2, 3 — and
+    // bails on 3 (the first failing element). Element 3 is still
+    // printed because the closure body runs to completion before its
+    // boolean is consulted.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    let b: bool = v.iter().all(|x| {
+        println(x);
+        x < 3
+    });
+    println(b);
+}
+"#,
+    );
+    assert_eq!(output, "1\n2\n3\nfalse\n");
+}
+
+#[test]
+fn test_iter_any_after_map_predicate_sees_mapped_values() {
+    // Composes with map — the predicate sees mapped i64 (x * 10), so
+    // it returns true once the running x*10 exceeds 25 (i.e. on x=3).
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4];
+    let b: bool = v.iter().map(|x| x * 10).any(|y| y > 25);
+    println(b);
+}
+"#,
+    );
+    assert_eq!(output, "true\n");
+}

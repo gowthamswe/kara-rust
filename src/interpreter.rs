@@ -3497,6 +3497,45 @@ impl<'a> Interpreter<'a> {
                     return acc;
                 }
             }
+            "any" | "all" => {
+                // Short-circuit terminals. `any(pred)` returns true the
+                // first time `pred` returns true; `all(pred)` returns
+                // false the first time `pred` returns false. Both walk
+                // the iterator via iterator_step — the loop bails the
+                // moment the answer is decided, so upstream adaptor
+                // closures only fire for as many elements as it takes.
+                if matches!(obj, Value::Iterator { .. }) {
+                    let Some(arg) = args.first() else {
+                        return self.record_runtime_error(
+                            format!("Iterator.{}() requires a closure argument", method),
+                            span,
+                        );
+                    };
+                    let pred = self.eval_expr_inner(&arg.value);
+                    if !matches!(pred, Value::Function { .. }) {
+                        return self.record_runtime_error(
+                            format!("Iterator.{}() expects a closure; got {}", method, pred),
+                            span,
+                        );
+                    }
+                    let want_any = method == "any";
+                    let mut iter_val = obj;
+                    while let Some(item) = self.iterator_step(&mut iter_val) {
+                        let result = self.invoke_function_value(pred.clone(), vec![item]);
+                        let truthy = matches!(result, Value::Bool(true));
+                        if want_any && truthy {
+                            return Value::Bool(true);
+                        }
+                        if !want_any && !truthy {
+                            return Value::Bool(false);
+                        }
+                    }
+                    // Source exhausted with no decisive answer — any
+                    // returns false (no element matched), all returns
+                    // true (every element matched / source was empty).
+                    return Value::Bool(!want_any);
+                }
+            }
             "as_slice" | "as_slice_mut" => {
                 // The tree-walk interpreter is type-erased; Slice[T] uses
                 // the same Value::Array representation as Vec/Array. Clone

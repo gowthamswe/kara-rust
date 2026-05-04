@@ -109,8 +109,17 @@ reviewable in isolation.
   walks, empty-source cases, composition with filter / map adaptors,
   String accumulator, type-mismatch on closure return, and arity errors.
 
-- [ ] **5. `any(pred)` + `all(pred)`.** Two short-circuit terminal predicates.
-  Stop iteration on first `true` / first `false` respectively.
+- [x] **5. `any(pred)` + `all(pred)`.** Short-circuit terminal predicates,
+  routed through `iterator_step` so adaptor closures fire only for the
+  prefix the predicate has to inspect. `any` returns true on the first
+  `true`; `all` returns false on the first `false`. Both share the same
+  `Fn(T) -> bool` signature so closure-pushdown via `check_expr`
+  suffices (no fresh type variable). Empty-source semantics are the
+  identity element of each: `any` → `false`, `all` → `true`. 7
+  typechecker tests + 9 interpreter tests cover positive / negative /
+  empty-source cases, short-circuit (predicate println side effects
+  observed for the prefix only), composition with map for the
+  predicate's element type, and arity / non-bool errors.
 
 ## Long-tail adaptors (the 16 named in the L2 entry)
 
