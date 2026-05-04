@@ -4949,10 +4949,21 @@ impl<'ctx> Codegen<'ctx> {
                     )
                     .unwrap();
             }
+            other if other.starts_with("Vec_") => {
+                let elem_name = other[4..].to_string();
+                let elem_ty = self
+                    .resolve_ty_for_display_name(&elem_name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "emit_display_fn_for_type: Vec elem type '{elem_name}' not supported"
+                        )
+                    });
+                self.emit_vec_display_body(display_fn, val_ptr, &elem_name, elem_ty);
+            }
             other => {
-                // Compound types (Vec_*, Map_*, Set_*, Tuple_*, user structs)
-                // not yet supported. Subtasks 3-6 of the Display canonical
-                // bullet (phase-7-codegen.md § Phase 7.2) extend this match.
+                // Map_*, Set_*, Tuple_*, user structs not yet supported.
+                // Subtasks 4-6 of the Display canonical bullet
+                // (phase-7-codegen.md § Phase 7.2) extend this match.
                 panic!("emit_display_fn_for_type: type_name '{other}' not yet supported");
             }
         }
@@ -4964,6 +4975,163 @@ impl<'ctx> Codegen<'ctx> {
         }
 
         display_fn
+    }
+
+    /// Resolve a Display `type_name` string back to its `BasicTypeEnum`. Used
+    /// when recursing from a compound Display fn (Vec/Map/Set/Tuple) into the
+    /// element/key/value/field type — the recursive `emit_display_fn_for_type`
+    /// call needs both the canonical `type_name` AND the LLVM type to pass.
+    ///
+    /// Covers the same primitives the primitive arms of
+    /// `emit_display_fn_for_type` handle, plus `Vec_*` (always 24-byte struct).
+    /// `Map_*` / `Set_*` / `Tuple_*` cases land alongside subtasks 4-6.
+    #[allow(dead_code)]
+    fn resolve_ty_for_display_name(&self, name: &str) -> Option<BasicTypeEnum<'ctx>> {
+        match name {
+            "i8" | "u8" => Some(self.context.i8_type().into()),
+            "i16" | "u16" => Some(self.context.i16_type().into()),
+            "i32" | "u32" | "char" => Some(self.context.i32_type().into()),
+            "i64" | "u64" | "isize" | "usize" => Some(self.context.i64_type().into()),
+            "f32" => Some(self.context.f32_type().into()),
+            "f64" => Some(self.context.f64_type().into()),
+            "bool" => Some(self.context.bool_type().into()),
+            "String" | "str" => Some(self.vec_struct_type().into()),
+            n if n.starts_with("Vec_") => Some(self.vec_struct_type().into()),
+            _ => None,
+        }
+    }
+
+    /// Emit the body of a `Vec[T]` Display function. Reads `data`/`len` from
+    /// the 24-byte Vec struct at `val_ptr`, prints `[`, walks elements with
+    /// `, ` separators recursing into the element Display fn, prints `]`.
+    ///
+    /// `elem_name` / `elem_ty` describe the element type and let us recurse
+    /// into `emit_display_fn_for_type(elem_name, elem_ty)` — this is what
+    /// makes nested cases work (`Vec[Vec[i64]]` → outer dispatches to inner).
+    ///
+    /// Caller is expected to have positioned the builder at the entry block
+    /// of `display_fn` and to emit the trailing `ret void` after this returns.
+    #[allow(dead_code)]
+    fn emit_vec_display_body(
+        &mut self,
+        display_fn: FunctionValue<'ctx>,
+        val_ptr: PointerValue<'ctx>,
+        elem_name: &str,
+        elem_ty: BasicTypeEnum<'ctx>,
+    ) {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i8_t = self.context.i8_type();
+        let i64_t = self.context.i64_type();
+        let vec_ty = self.vec_struct_type();
+
+        // Print "[".
+        let lb = self.builder.build_global_string_ptr("[", "vd.lb").unwrap();
+        self.builder
+            .build_call(self.printf_fn, &[lb.as_pointer_value().into()], "p")
+            .unwrap();
+
+        // Load data (i8*) and len (i64) from the Vec struct.
+        let data_pp = self
+            .builder
+            .build_struct_gep(vec_ty, val_ptr, 0, "v.data.pp")
+            .unwrap();
+        let len_p = self
+            .builder
+            .build_struct_gep(vec_ty, val_ptr, 1, "v.len.p")
+            .unwrap();
+        let data = self
+            .builder
+            .build_load(ptr_ty, data_pp, "v.data")
+            .unwrap()
+            .into_pointer_value();
+        let len = self
+            .builder
+            .build_load(i64_t, len_p, "v.len")
+            .unwrap()
+            .into_int_value();
+
+        // Element size in bytes — drives the GEP stride.
+        let raw_size = elem_ty
+            .size_of()
+            .unwrap_or_else(|| i64_t.const_int(8, false));
+        let elem_size = if raw_size.get_type().get_bit_width() == 64 {
+            raw_size
+        } else {
+            self.builder
+                .build_int_z_extend(raw_size, i64_t, "esz64")
+                .unwrap()
+        };
+
+        // Materialize (or fetch) the element Display fn — recursive call.
+        let elem_disp = self.emit_display_fn_for_type(elem_name, elem_ty);
+
+        // Loop: i in 0..len, with ", " separator before every elem after first.
+        let pre_bb = self.builder.get_insert_block().unwrap();
+        let hdr_bb = self.context.append_basic_block(display_fn, "vec.hdr");
+        let bdy_bb = self.context.append_basic_block(display_fn, "vec.bdy");
+        let sep_bb = self.context.append_basic_block(display_fn, "vec.sep");
+        let elem_bb = self.context.append_basic_block(display_fn, "vec.elem");
+        let exit_bb = self.context.append_basic_block(display_fn, "vec.exit");
+
+        self.builder.build_unconditional_branch(hdr_bb).unwrap();
+
+        self.builder.position_at_end(hdr_bb);
+        let i_phi = self.builder.build_phi(i64_t, "vec.i").unwrap();
+        i_phi.add_incoming(&[(&i64_t.const_zero(), pre_bb)]);
+        let i_val = i_phi.as_basic_value().into_int_value();
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, i_val, len, "vec.cond")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(cond, bdy_bb, exit_bb)
+            .unwrap();
+
+        // bdy: branch to sep if i > 0, else straight to elem.
+        self.builder.position_at_end(bdy_bb);
+        let is_first = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, i_val, i64_t.const_zero(), "is.first")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(is_first, elem_bb, sep_bb)
+            .unwrap();
+
+        // sep: print ", ", then fall to elem.
+        self.builder.position_at_end(sep_bb);
+        let sep = self
+            .builder
+            .build_global_string_ptr(", ", "vd.sep")
+            .unwrap();
+        self.builder
+            .build_call(self.printf_fn, &[sep.as_pointer_value().into()], "p")
+            .unwrap();
+        self.builder.build_unconditional_branch(elem_bb).unwrap();
+
+        // elem: GEP to data + i * elem_size, call element Display fn.
+        self.builder.position_at_end(elem_bb);
+        let offset = self.builder.build_int_mul(i_val, elem_size, "off").unwrap();
+        let elem_ptr = unsafe {
+            self.builder
+                .build_gep(i8_t, data, &[offset], "elem.p")
+                .unwrap()
+        };
+        self.builder
+            .build_call(elem_disp, &[elem_ptr.into()], "ed")
+            .unwrap();
+        let i_next = self
+            .builder
+            .build_int_add(i_val, i64_t.const_int(1, false), "vec.i1")
+            .unwrap();
+        i_phi.add_incoming(&[(&i_next, elem_bb)]);
+        self.builder.build_unconditional_branch(hdr_bb).unwrap();
+
+        // exit: print "]".
+        self.builder.position_at_end(exit_bb);
+        let rb = self.builder.build_global_string_ptr("]", "vd.rb").unwrap();
+        self.builder
+            .build_call(self.printf_fn, &[rb.as_pointer_value().into()], "p")
+            .unwrap();
     }
 
     /// Emit `karac_map_new`, alloca a ptr slot to hold the opaque handle, and
