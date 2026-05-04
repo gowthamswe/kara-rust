@@ -4808,3 +4808,188 @@ fn main() {
     );
     assert_eq!(output, "true\n");
 }
+
+#[test]
+fn test_iter_enumerate_yields_index_and_item_pairs() {
+    // enumerate() yields (idx, item) tuples; idx starts at 0.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = ["a", "b", "c"];
+    for (i, s) in v.iter().enumerate() {
+        println(f"{i}:{s}");
+    }
+}
+"#,
+    );
+    assert_eq!(output, "0:a\n1:b\n2:c\n");
+}
+
+#[test]
+fn test_iter_enumerate_persists_index_across_next_calls() {
+    // Verifies state writeback — the Enumerate(idx) counter has to
+    // survive between separate next() calls on the same iterator.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [10, 20, 30];
+    let mut it = v.iter().enumerate();
+    let (a, ax) = it.next().unwrap();
+    let (b, bx) = it.next().unwrap();
+    println(f"{a}:{ax}");
+    println(f"{b}:{bx}");
+}
+"#,
+    );
+    assert_eq!(output, "0:10\n1:20\n");
+}
+
+#[test]
+fn test_iter_take_yields_only_first_n_elements() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    for x in v.iter().take(3) {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "1\n2\n3\n");
+}
+
+#[test]
+fn test_iter_take_zero_yields_nothing() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3];
+    let mut it = v.iter().take(0);
+    match it.next() {
+        Some(_) => println("had value"),
+        None => println("empty"),
+    }
+}
+"#,
+    );
+    assert_eq!(output, "empty\n");
+}
+
+#[test]
+fn test_iter_take_more_than_length_yields_all_elements() {
+    // take(n) where n > len yields all elements without error.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2];
+    let n: i64 = v.iter().take(100).count();
+    println(n);
+}
+"#,
+    );
+    assert_eq!(output, "2\n");
+}
+
+#[test]
+fn test_iter_skip_drops_first_n_elements() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [10, 20, 30, 40, 50];
+    for x in v.iter().skip(2) {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "30\n40\n50\n");
+}
+
+#[test]
+fn test_iter_skip_more_than_length_yields_nothing() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3];
+    let mut it = v.iter().skip(100);
+    match it.next() {
+        Some(_) => println("had value"),
+        None => println("empty"),
+    }
+}
+"#,
+    );
+    assert_eq!(output, "empty\n");
+}
+
+#[test]
+fn test_iter_skip_then_take_window() {
+    // skip + take composed forms a slice — drop 1, take next 2 → [2, 3].
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    for x in v.iter().skip(1).take(2) {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "2\n3\n");
+}
+
+#[test]
+fn test_iter_take_with_filter_yields_first_n_passing() {
+    // filter then take(2) — only the first two elements that pass the
+    // predicate are yielded; the source still walks past rejected items.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5, 6];
+    for x in v.iter().filter(|x| x > 2).take(2) {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "3\n4\n");
+}
+
+#[test]
+fn test_iter_take_state_persists_across_next_calls() {
+    // The Take(remaining) counter has to survive between next() calls
+    // for the bound to actually limit total yields.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [10, 20, 30, 40];
+    let mut it = v.iter().take(2);
+    println(it.next().unwrap());
+    println(it.next().unwrap());
+    match it.next() {
+        Some(_) => println("more"),
+        None => println("done"),
+    }
+}
+"#,
+    );
+    assert_eq!(output, "10\n20\ndone\n");
+}
+
+#[test]
+fn test_iter_enumerate_after_map_indexes_mapped_values() {
+    // Map first, then enumerate — index counts mapped output positions
+    // (same as source positions here, but enumerate sees the mapped item).
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3];
+    for (i, y) in v.iter().map(|x| x * 100).enumerate() {
+        println(f"{i}={y}");
+    }
+}
+"#,
+    );
+    assert_eq!(output, "0=100\n1=200\n2=300\n");
+}

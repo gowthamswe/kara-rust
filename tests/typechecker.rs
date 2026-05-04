@@ -6199,3 +6199,120 @@ fn test_iter_all_wrong_arg_count_rejected() {
         errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
     );
 }
+
+#[test]
+fn test_iter_enumerate_yields_indexed_tuples() {
+    // enumerate() returns Iterator[(i64, T)] — indexable via tuple
+    // destructuring on next().
+    typecheck_ok(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().enumerate();
+             let (i, x): (i64, i64) = it.next().unwrap();
+             let _ = i + x;
+         }",
+    );
+}
+
+#[test]
+fn test_iter_enumerate_after_map_uses_mapped_type_in_tuple() {
+    // Map first, then enumerate — the second slot of the tuple is the
+    // mapped type (String here), not the source's i64.
+    typecheck_ok(
+        r#"fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().map(|x| if x > 0 { "pos" } else { "neg" }).enumerate();
+             let (_i, _s): (i64, String) = it.next().unwrap();
+         }"#,
+    );
+}
+
+#[test]
+fn test_iter_enumerate_with_arg_rejected() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().enumerate(0);
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
+                && e.message.contains("Iterator.enumerate()")),
+        "expected WrongNumberOfArgs for enumerate(arg), got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_take_returns_same_item_type() {
+    // take(n) bounds the iterator but doesn't change the item type.
+    typecheck_ok(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().take(3);
+             let _x: i64 = it.next().unwrap();
+         }",
+    );
+}
+
+#[test]
+fn test_iter_skip_returns_same_item_type() {
+    typecheck_ok(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().skip(2);
+             let _x: i64 = it.next().unwrap();
+         }",
+    );
+}
+
+#[test]
+fn test_iter_take_argument_must_be_integer() {
+    // The bound must be i64 — passing a String is a TypeMismatch.
+    let errs = typecheck_errors(
+        r#"fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().take("nope");
+         }"#,
+    );
+    assert!(
+        errs.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch on take(non-int), got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_take_wrong_arg_count_rejected() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().take();
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
+                && e.message.contains("Iterator.take()")),
+        "expected WrongNumberOfArgs for take() with no args, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_skip_wrong_arg_count_rejected() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().skip();
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
+                && e.message.contains("Iterator.skip()")),
+        "expected WrongNumberOfArgs for skip() with no args, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}

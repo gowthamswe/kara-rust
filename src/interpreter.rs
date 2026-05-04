@@ -240,8 +240,10 @@ pub enum EnumData {
 }
 
 /// One step in a `Value::Iterator`'s lazy adaptor chain. Each step is a
-/// closure-bearing transform applied per `next()` pull. New variants land
-/// as the adaptor surface grows in `wip-list2.md` subtasks 6+.
+/// transform applied per `next()` pull. Some steps carry mutable state
+/// (positional counters for `enumerate` / `take` / `skip`); the per-call
+/// state is mutated on the cloned chain inside `iterator_step` and the
+/// updated chain is written back to the iterator value before return.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IteratorStep {
     /// `.map(f)` — apply `f` to each item before yielding.
@@ -250,6 +252,17 @@ pub enum IteratorStep {
     /// `.filter(pred)` — yield only items where `pred(item)` is `true`.
     /// The Value is a `Value::Function` (closure returning `bool`).
     Filter(Value),
+    /// `.enumerate()` — wrap each item into `(idx, item)`. The `usize`
+    /// is the index of the *next* yielded item (incremented after wrap).
+    Enumerate(usize),
+    /// `.take(n)` — yield at most `n` items. The `usize` is the number
+    /// of items remaining to yield; once it hits 0, the step signals
+    /// "stop" and the iterator's cursor is advanced past end.
+    Take(usize),
+    /// `.skip(n)` — drop the first `n` items the step sees. The `usize`
+    /// is the number of items still to skip; while > 0, the step
+    /// rejects the item and decrements.
+    Skip(usize),
 }
 
 impl std::fmt::Display for Value {
@@ -3152,17 +3165,21 @@ impl<'a> Interpreter<'a> {
     fn iterator_step(&mut self, iter: &mut Value) -> Option<Value> {
         // Snapshot the step chain once so the per-element loop doesn't
         // hold a borrow on `*iter` across `invoke_function_value` calls.
-        let steps = match iter {
+        // Stateful steps (Enumerate / Take / Skip) mutate this clone in
+        // place; whatever state changes survive — closure rejection,
+        // `take` exhaustion, multiple pulls in one call — get written
+        // back to the iterator's stored chain just before return.
+        let mut steps = match iter {
             Value::Iterator { steps, .. } => steps.clone(),
             _ => return None,
         };
-        loop {
+        let yielded = 'pull: loop {
             let raw_item = {
                 let Value::Iterator { items, cursor, .. } = iter else {
-                    return None;
+                    break 'pull None;
                 };
                 if *cursor >= items.len() {
-                    return None;
+                    break 'pull None;
                 }
                 let it = items[*cursor].clone();
                 *cursor += 1;
@@ -3170,7 +3187,8 @@ impl<'a> Interpreter<'a> {
             };
             let mut item = raw_item;
             let mut keep = true;
-            for step in &steps {
+            let mut stop = false;
+            for step in steps.iter_mut() {
                 match step {
                     IteratorStep::Map(f) => {
                         item = self.invoke_function_value(f.clone(), vec![item]);
@@ -3182,12 +3200,50 @@ impl<'a> Interpreter<'a> {
                             break;
                         }
                     }
+                    IteratorStep::Enumerate(idx) => {
+                        item = Value::Tuple(vec![Value::Int(*idx as i64), item]);
+                        *idx += 1;
+                    }
+                    IteratorStep::Take(remaining) => {
+                        if *remaining == 0 {
+                            stop = true;
+                            keep = false;
+                            break;
+                        }
+                        *remaining -= 1;
+                    }
+                    IteratorStep::Skip(remaining) => {
+                        if *remaining > 0 {
+                            *remaining -= 1;
+                            keep = false;
+                            break;
+                        }
+                    }
                 }
             }
-            if keep {
-                return Some(item);
+            if stop {
+                // `take` exhaustion — drain the source so subsequent
+                // calls also return None without touching downstream
+                // adaptor state.
+                if let Value::Iterator { items, cursor, .. } = iter {
+                    *cursor = items.len();
+                }
+                break 'pull None;
             }
+            if keep {
+                break 'pull Some(item);
+            }
+        };
+        // Write the (possibly mutated) step chain back so per-call
+        // counter state persists across `next()` pulls.
+        if let Value::Iterator {
+            steps: stored_steps,
+            ..
+        } = iter
+        {
+            *stored_steps = steps;
         }
+        yielded
     }
 
     /// Shared body for `Entry.or_insert(default)` and the vacant arm of
@@ -3504,6 +3560,68 @@ impl<'a> Interpreter<'a> {
                     steps.push(match method {
                         "map" => IteratorStep::Map(closure),
                         "filter" => IteratorStep::Filter(closure),
+                        _ => unreachable!(),
+                    });
+                    return Value::Iterator {
+                        items,
+                        cursor,
+                        steps,
+                    };
+                }
+            }
+            "enumerate" => {
+                // Lazy positional adaptor — append `Enumerate(0)` to the
+                // chain. iterator_step wraps each yielded item into
+                // `(idx, item)` and bumps the counter.
+                if matches!(obj, Value::Iterator { .. }) {
+                    let Value::Iterator {
+                        items,
+                        cursor,
+                        mut steps,
+                    } = obj
+                    else {
+                        unreachable!()
+                    };
+                    steps.push(IteratorStep::Enumerate(0));
+                    return Value::Iterator {
+                        items,
+                        cursor,
+                        steps,
+                    };
+                }
+            }
+            "take" | "skip" => {
+                // Lazy count-bounded adaptors. Negative `n` clamps to
+                // zero — `take(-1)` yields nothing; `skip(-1)` skips
+                // nothing. The typechecker accepts any i64 so this
+                // matters at runtime.
+                if matches!(obj, Value::Iterator { .. }) {
+                    let Some(arg) = args.first() else {
+                        return self.record_runtime_error(
+                            format!("Iterator.{}() requires an integer argument", method),
+                            span,
+                        );
+                    };
+                    let n = match self.eval_expr_inner(&arg.value) {
+                        Value::Int(n) => n.max(0) as usize,
+                        v => {
+                            return self.record_runtime_error(
+                                format!("Iterator.{}() expects an integer; got {}", method, v),
+                                span,
+                            );
+                        }
+                    };
+                    let Value::Iterator {
+                        items,
+                        cursor,
+                        mut steps,
+                    } = obj
+                    else {
+                        unreachable!()
+                    };
+                    steps.push(match method {
+                        "take" => IteratorStep::Take(n),
+                        "skip" => IteratorStep::Skip(n),
                         _ => unreachable!(),
                     });
                     return Value::Iterator {

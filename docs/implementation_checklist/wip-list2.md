@@ -123,9 +123,21 @@ reviewable in isolation.
 
 ## Long-tail adaptors (the 16 named in the L2 entry)
 
-- [ ] **6. `enumerate()` + `take(n)` + `skip(n)`.** Three positional / count
-  adaptors with no closure args. `enumerate` yields `(i64, T)` tuples; `take` /
-  `skip` are bounded counters.
+- [x] **6. `enumerate()` + `take(n)` + `skip(n)`.** Three positional /
+  count adaptors. Required extending `IteratorStep` with stateful
+  variants (`Enumerate(idx)` / `Take(remaining)` / `Skip(remaining)`)
+  and refactoring `iterator_step` to mutate the cloned step chain
+  in-place and write it back into the iterator's `steps` field before
+  return — earlier closure-only steps were stateless. `take`
+  exhaustion drains the source cursor so subsequent pulls return
+  `None` without re-evaluating downstream adaptors. Negative `n` clamps
+  to zero at the runtime layer (typechecker accepts any i64). 8
+  typechecker tests + 11 interpreter tests cover index plumbing,
+  bound semantics for `take(0)` / `take(n>len)` / `skip(n>len)`,
+  state persistence across separate `next()` pulls, composition
+  (`skip.take` window, `filter.take` first-n-passing,
+  `map.enumerate` mapped tuple), tuple type threading, and arity /
+  non-int errors.
 
 - [ ] **7. `chain(other)` + `zip(other)`.** Two-source combinators. `chain`
   exhausts self then exhausts other; `zip` pairs until the shorter source ends.

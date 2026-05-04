@@ -8981,6 +8981,52 @@ impl<'a> TypeChecker<'a> {
                 self.check_expr(&args[0].value, &pred_ty);
                 Type::Bool
             }
+            "enumerate" => {
+                // `enumerate() -> Iterator[(i64, T)]` — wraps each item
+                // into a tuple of (index, item).
+                if !args.is_empty() {
+                    self.type_error(
+                        "Iterator.enumerate() takes no arguments".to_string(),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                }
+                Type::Named {
+                    name: "Iterator".to_string(),
+                    args: vec![Type::Tuple(vec![Type::Int(IntSize::I64), item.clone()])],
+                }
+            }
+            "take" | "skip" => {
+                // `take(n: i64) -> Iterator[T]` and `skip(n: i64) ->
+                // Iterator[T]`. Argument is checked against i64; the
+                // element type passes through unchanged.
+                if args.len() != 1 {
+                    self.type_error(
+                        format!(
+                            "Iterator.{}() expects 1 argument, found {}",
+                            method,
+                            args.len()
+                        ),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                    return Type::Named {
+                        name: "Iterator".to_string(),
+                        args: vec![item.clone()],
+                    };
+                }
+                self.check_expr(&args[0].value, &Type::Int(IntSize::I64));
+                Type::Named {
+                    name: "Iterator".to_string(),
+                    args: vec![item.clone()],
+                }
+            }
             _ => {
                 for arg in args {
                     self.infer_expr(&arg.value);
