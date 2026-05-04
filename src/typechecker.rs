@@ -942,6 +942,13 @@ pub enum TypeErrorKind {
     /// functions. The typechecker cannot infer the target type — programmer
     /// must add a type annotation or use type-prefixed `T.method(...)`.
     CannotInferAssocFn,
+    /// A once-callable closure (`OnceFn(...)` value, or a closure literal
+    /// whose body consumes a captured owned non-Copy binding) is being
+    /// assigned to a slot whose type is `Fn(...)` or `ref Fn(...)`. The slot
+    /// promises repeatable invocation; the closure can only be called once.
+    /// Round 12.45 (Step 3) — caller-side rejection of `OnceFn` at `Fn` /
+    /// `ref Fn` parameter slots and any other Fn-shaped assignment boundary.
+    OnceFnIntoFnSlot,
 }
 
 impl std::fmt::Display for TypeError {
@@ -1113,6 +1120,27 @@ pub struct TypeChecker<'a> {
     /// path. Used to resolve bare `method(args)` calls at expected-type
     /// positions when the expected type is a generic param.
     enclosing_bounds: HashMap<String, Vec<crate::ast::TraitBound>>,
+    /// Closure expression span → reason that closure became once-callable.
+    /// Populated by `closure_type_with_capture_inference` when the body walk
+    /// finds a captured-non-Copy consume; consumed by `check_assignable` so
+    /// `E_ONCE_FN_INTO_FN_SLOT` can name the consumed binding when a closure
+    /// literal is rejected at a `Fn` slot. Round 12.45 (Step 3).
+    closure_once_reasons: HashMap<SpanKey, OnceReason>,
+}
+
+/// Why a closure is `OnceFunction`-typed: which captured outer binding the
+/// body consumed, and where in the body the consume happened. Populated by
+/// the once-callability walker when it flips its first identifier-leaf in
+/// `Consuming` mode that resolves to an outer non-Copy binding.
+#[derive(Debug, Clone)]
+struct OnceReason {
+    /// The outer binding name (or `"self"`) that the closure body consumed.
+    consumed_binding: String,
+    /// The body span where the consume occurred (the identifier-leaf, not
+    /// the enclosing call). Used for diagnostics; not currently surfaced in
+    /// the rejection message but kept for future polish in Step 5.
+    #[allow(dead_code)]
+    consumed_span: Span,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -1138,6 +1166,7 @@ impl<'a> TypeChecker<'a> {
             bare_assoc_fn_targets: HashMap::new(),
             call_type_subs: HashMap::new(),
             enclosing_bounds: HashMap::new(),
+            closure_once_reasons: HashMap::new(),
         }
     }
 
@@ -1454,6 +1483,22 @@ impl<'a> TypeChecker<'a> {
         if types_compatible(expected, found) {
             return true;
         }
+        if Self::is_once_into_fn_shape(expected, found) {
+            let mut msg = format!(
+                "cannot pass once-callable closure where '{}' is expected; \
+                 the slot promises repeatable invocation but the closure has type '{}'",
+                type_display(expected),
+                type_display(found),
+            );
+            if let Some(reason) = self.closure_once_reasons.get(&SpanKey::from_span(&span)) {
+                msg.push_str(&format!(
+                    " (closure becomes once-callable because it consumes captured binding '{}')",
+                    reason.consumed_binding
+                ));
+            }
+            self.type_error(msg, span, TypeErrorKind::OnceFnIntoFnSlot);
+            return false;
+        }
         self.type_error(
             format!(
                 "expected '{}', found '{}'",
@@ -1464,6 +1509,27 @@ impl<'a> TypeChecker<'a> {
             TypeErrorKind::TypeMismatch,
         );
         false
+    }
+
+    /// Returns `true` iff the assignment is a once-callable closure flowing
+    /// into a `Fn`-shaped slot. Both `Fn(...)` and `ref Fn(...)` slots
+    /// reject `OnceFn` arguments — the callee in either case may invoke
+    /// the parameter many times, which violates the once-callable contract.
+    /// Refs on either side are stripped before comparison so cross-wrapping
+    /// (e.g., bare `OnceFn` arg into `ref Fn` slot) is also recognized as
+    /// the once-callability violation rather than a generic ref-mismatch.
+    /// Step 3 / round 12.45.
+    fn is_once_into_fn_shape(expected: &Type, found: &Type) -> bool {
+        fn unwrap(t: &Type) -> &Type {
+            match t {
+                Type::Ref(inner) | Type::MutRef(inner) => unwrap(inner),
+                _ => t,
+            }
+        }
+        matches!(
+            (unwrap(expected), unwrap(found)),
+            (Type::Function { .. }, Type::OnceFunction { .. })
+        )
     }
 
     fn record_expr_type(&mut self, span: &Span, ty: &Type) {
@@ -4296,8 +4362,14 @@ impl<'a> TypeChecker<'a> {
     /// the user's promise that captures are borrowed, never moved
     /// (matches round 12.6's repeatable-closure rule). `None` /
     /// `Some(CaptureMode::Own)` (capture-by-ownership) walk the body.
+    ///
+    /// Round 12.45 (Step 3): when the walk produces a reason, the reason
+    /// is recorded in `closure_once_reasons` keyed by the closure-expr
+    /// span so the slot-rejection diagnostic can name the consumed binding.
+    #[allow(clippy::too_many_arguments)]
     fn closure_type_with_capture_inference(
-        &self,
+        &mut self,
+        closure_span: &Span,
         capture_mode: Option<CaptureMode>,
         closure_param_names: &[String],
         body: &Expr,
@@ -4310,18 +4382,24 @@ impl<'a> TypeChecker<'a> {
             capture_mode,
             Some(CaptureMode::Ref) | Some(CaptureMode::MutRef)
         );
-        if !force_repeatable
-            && self.closure_consumes_captured_non_copy(body, closure_param_names, outer_bindings)
-        {
-            Type::OnceFunction {
-                params: param_types,
-                return_type,
-            }
+        let reason = if force_repeatable {
+            None
         } else {
-            Type::Function {
+            self.closure_consumes_captured_non_copy(body, closure_param_names, outer_bindings)
+        };
+        match reason {
+            Some(r) => {
+                self.closure_once_reasons
+                    .insert(SpanKey::from_span(closure_span), r);
+                Type::OnceFunction {
+                    params: param_types,
+                    return_type,
+                }
+            }
+            None => Type::Function {
                 params: param_types,
                 return_type,
-            }
+            },
         }
     }
 
@@ -4357,22 +4435,22 @@ impl<'a> TypeChecker<'a> {
         body: &Expr,
         closure_param_names: &[String],
         outer_bindings: &HashMap<String, Type>,
-    ) -> bool {
+    ) -> Option<OnceReason> {
         let mut shadow_stack: Vec<HashSet<String>> = Vec::new();
         let mut params_set: HashSet<String> = HashSet::new();
         for n in closure_param_names {
             params_set.insert(n.clone());
         }
         shadow_stack.push(params_set);
-        let mut found = false;
+        let mut reason: Option<OnceReason> = None;
         self.walk_capture_consume(
             body,
             CaptureWalkMode::Reading,
             outer_bindings,
             &mut shadow_stack,
-            &mut found,
+            &mut reason,
         );
-        found
+        reason
     }
 
     fn name_is_shadowed(name: &str, shadow_stack: &[HashSet<String>]) -> bool {
@@ -4385,14 +4463,14 @@ impl<'a> TypeChecker<'a> {
         terminal_mode: CaptureWalkMode,
         outer: &HashMap<String, Type>,
         shadows: &mut Vec<HashSet<String>>,
-        found: &mut bool,
+        reason: &mut Option<OnceReason>,
     ) {
-        if *found {
+        if reason.is_some() {
             return;
         }
         shadows.push(HashSet::new());
         for stmt in &block.stmts {
-            if *found {
+            if reason.is_some() {
                 break;
             }
             match &stmt.kind {
@@ -4402,7 +4480,7 @@ impl<'a> TypeChecker<'a> {
                         CaptureWalkMode::Consuming,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                     let names = pattern.binding_names();
                     if let Some(top) = shadows.last_mut() {
@@ -4427,14 +4505,14 @@ impl<'a> TypeChecker<'a> {
                         CaptureWalkMode::Consuming,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                     self.walk_capture_consume_block(
                         else_block,
                         CaptureWalkMode::Reading,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                     let names = pattern.binding_names();
                     if let Some(top) = shadows.last_mut() {
@@ -4449,7 +4527,7 @@ impl<'a> TypeChecker<'a> {
                         CaptureWalkMode::Reading,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                 }
                 StmtKind::Assign { target, value } => {
@@ -4458,14 +4536,14 @@ impl<'a> TypeChecker<'a> {
                         CaptureWalkMode::Consuming,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                     self.walk_capture_consume(
                         target,
                         CaptureWalkMode::Reading,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                 }
                 StmtKind::CompoundAssign { target, value, .. } => {
@@ -4474,24 +4552,24 @@ impl<'a> TypeChecker<'a> {
                         CaptureWalkMode::Reading,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                     self.walk_capture_consume(
                         target,
                         CaptureWalkMode::Reading,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                 }
                 StmtKind::Expr(e) => {
-                    self.walk_capture_consume(e, CaptureWalkMode::Reading, outer, shadows, found);
+                    self.walk_capture_consume(e, CaptureWalkMode::Reading, outer, shadows, reason);
                 }
             }
         }
-        if !*found {
+        if reason.is_none() {
             if let Some(tail) = &block.final_expr {
-                self.walk_capture_consume(tail, terminal_mode, outer, shadows, found);
+                self.walk_capture_consume(tail, terminal_mode, outer, shadows, reason);
             }
         }
         shadows.pop();
@@ -4503,9 +4581,9 @@ impl<'a> TypeChecker<'a> {
         mode: CaptureWalkMode,
         outer: &HashMap<String, Type>,
         shadows: &mut Vec<HashSet<String>>,
-        found: &mut bool,
+        reason: &mut Option<OnceReason>,
     ) {
-        if *found {
+        if reason.is_some() {
             return;
         }
         match &expr.kind {
@@ -4513,7 +4591,10 @@ impl<'a> TypeChecker<'a> {
                 if mode == CaptureWalkMode::Consuming && !Self::name_is_shadowed(name, shadows) {
                     if let Some(ty) = outer.get(name) {
                         if !self.is_copy_type_during_check(ty) {
-                            *found = true;
+                            *reason = Some(OnceReason {
+                                consumed_binding: name.clone(),
+                                consumed_span: expr.span.clone(),
+                            });
                         }
                     }
                 }
@@ -4522,7 +4603,10 @@ impl<'a> TypeChecker<'a> {
                 if mode == CaptureWalkMode::Consuming && !Self::name_is_shadowed("self", shadows) {
                     if let Some(ty) = outer.get("self") {
                         if !self.is_copy_type_during_check(ty) {
-                            *found = true;
+                            *reason = Some(OnceReason {
+                                consumed_binding: "self".to_string(),
+                                consumed_span: expr.span.clone(),
+                            });
                         }
                     }
                 }
@@ -4543,15 +4627,21 @@ impl<'a> TypeChecker<'a> {
             ExprKind::Binary { left, right, .. }
             | ExprKind::Pipe { left, right }
             | ExprKind::NilCoalesce { left, right } => {
-                self.walk_capture_consume(left, CaptureWalkMode::Reading, outer, shadows, found);
-                self.walk_capture_consume(right, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(left, CaptureWalkMode::Reading, outer, shadows, reason);
+                self.walk_capture_consume(right, CaptureWalkMode::Reading, outer, shadows, reason);
             }
             ExprKind::Unary { operand, .. } => {
-                self.walk_capture_consume(operand, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(
+                    operand,
+                    CaptureWalkMode::Reading,
+                    outer,
+                    shadows,
+                    reason,
+                );
             }
 
             ExprKind::Call { callee, args } => {
-                self.walk_capture_consume(callee, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(callee, CaptureWalkMode::Reading, outer, shadows, reason);
                 let borrow_modes = self.callee_borrow_positions(callee);
                 for (i, arg) in args.iter().enumerate() {
                     let is_borrow = arg.mut_marker
@@ -4565,30 +4655,30 @@ impl<'a> TypeChecker<'a> {
                     } else {
                         CaptureWalkMode::Consuming
                     };
-                    self.walk_capture_consume(&arg.value, arg_mode, outer, shadows, found);
+                    self.walk_capture_consume(&arg.value, arg_mode, outer, shadows, reason);
                 }
             }
             ExprKind::MethodCall { object, args, .. } => {
-                self.walk_capture_consume(object, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(object, CaptureWalkMode::Reading, outer, shadows, reason);
                 for arg in args {
                     let arg_mode = if arg.mut_marker {
                         CaptureWalkMode::Reading
                     } else {
                         CaptureWalkMode::Consuming
                     };
-                    self.walk_capture_consume(&arg.value, arg_mode, outer, shadows, found);
+                    self.walk_capture_consume(&arg.value, arg_mode, outer, shadows, reason);
                 }
             }
             ExprKind::FieldAccess { object, .. } | ExprKind::TupleIndex { object, .. } => {
-                self.walk_capture_consume(object, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(object, CaptureWalkMode::Reading, outer, shadows, reason);
             }
             ExprKind::Index { object, index } => {
-                self.walk_capture_consume(object, CaptureWalkMode::Reading, outer, shadows, found);
-                self.walk_capture_consume(index, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(object, CaptureWalkMode::Reading, outer, shadows, reason);
+                self.walk_capture_consume(index, CaptureWalkMode::Reading, outer, shadows, reason);
             }
 
             ExprKind::Block(block) => {
-                self.walk_capture_consume_block(block, mode, outer, shadows, found);
+                self.walk_capture_consume_block(block, mode, outer, shadows, reason);
             }
             ExprKind::If {
                 condition,
@@ -4600,11 +4690,11 @@ impl<'a> TypeChecker<'a> {
                     CaptureWalkMode::Reading,
                     outer,
                     shadows,
-                    found,
+                    reason,
                 );
-                self.walk_capture_consume_block(then_block, mode, outer, shadows, found);
+                self.walk_capture_consume_block(then_block, mode, outer, shadows, reason);
                 if let Some(eb) = else_branch {
-                    self.walk_capture_consume(eb, mode, outer, shadows, found);
+                    self.walk_capture_consume(eb, mode, outer, shadows, reason);
                 }
             }
             ExprKind::IfLet {
@@ -4613,16 +4703,16 @@ impl<'a> TypeChecker<'a> {
                 then_block,
                 else_branch,
             } => {
-                self.walk_capture_consume(value, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(value, CaptureWalkMode::Reading, outer, shadows, reason);
                 let mut arm_scope: HashSet<String> = HashSet::new();
                 for n in pattern.binding_names() {
                     arm_scope.insert(n);
                 }
                 shadows.push(arm_scope);
-                self.walk_capture_consume_block(then_block, mode, outer, shadows, found);
+                self.walk_capture_consume_block(then_block, mode, outer, shadows, reason);
                 shadows.pop();
                 if let Some(eb) = else_branch {
-                    self.walk_capture_consume(eb, mode, outer, shadows, found);
+                    self.walk_capture_consume(eb, mode, outer, shadows, reason);
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
@@ -4631,7 +4721,7 @@ impl<'a> TypeChecker<'a> {
                     CaptureWalkMode::Consuming,
                     outer,
                     shadows,
-                    found,
+                    reason,
                 );
                 for arm in arms {
                     let mut arm_scope: HashSet<String> = HashSet::new();
@@ -4645,10 +4735,10 @@ impl<'a> TypeChecker<'a> {
                             CaptureWalkMode::Reading,
                             outer,
                             shadows,
-                            found,
+                            reason,
                         );
                     }
-                    self.walk_capture_consume(&arm.body, mode, outer, shadows, found);
+                    self.walk_capture_consume(&arm.body, mode, outer, shadows, reason);
                     shadows.pop();
                 }
             }
@@ -4661,14 +4751,14 @@ impl<'a> TypeChecker<'a> {
                     CaptureWalkMode::Reading,
                     outer,
                     shadows,
-                    found,
+                    reason,
                 );
                 self.walk_capture_consume_block(
                     body,
                     CaptureWalkMode::Reading,
                     outer,
                     shadows,
-                    found,
+                    reason,
                 );
             }
             ExprKind::WhileLet {
@@ -4677,7 +4767,7 @@ impl<'a> TypeChecker<'a> {
                 body,
                 ..
             } => {
-                self.walk_capture_consume(value, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(value, CaptureWalkMode::Reading, outer, shadows, reason);
                 let mut arm_scope: HashSet<String> = HashSet::new();
                 for n in pattern.binding_names() {
                     arm_scope.insert(n);
@@ -4688,7 +4778,7 @@ impl<'a> TypeChecker<'a> {
                     CaptureWalkMode::Reading,
                     outer,
                     shadows,
-                    found,
+                    reason,
                 );
                 shadows.pop();
             }
@@ -4703,7 +4793,7 @@ impl<'a> TypeChecker<'a> {
                     CaptureWalkMode::Consuming,
                     outer,
                     shadows,
-                    found,
+                    reason,
                 );
                 let mut arm_scope: HashSet<String> = HashSet::new();
                 for n in pattern.binding_names() {
@@ -4715,7 +4805,7 @@ impl<'a> TypeChecker<'a> {
                     CaptureWalkMode::Reading,
                     outer,
                     shadows,
-                    found,
+                    reason,
                 );
                 shadows.pop();
             }
@@ -4725,22 +4815,28 @@ impl<'a> TypeChecker<'a> {
                     CaptureWalkMode::Reading,
                     outer,
                     shadows,
-                    found,
+                    reason,
                 );
             }
 
             ExprKind::Break { value: Some(v), .. } | ExprKind::Return(Some(v)) => {
-                self.walk_capture_consume(v, CaptureWalkMode::Consuming, outer, shadows, found);
+                self.walk_capture_consume(v, CaptureWalkMode::Consuming, outer, shadows, reason);
             }
             ExprKind::Break { value: None, .. }
             | ExprKind::Continue { .. }
             | ExprKind::Return(None) => {}
 
             ExprKind::Question(inner) => {
-                self.walk_capture_consume(inner, CaptureWalkMode::Consuming, outer, shadows, found);
+                self.walk_capture_consume(
+                    inner,
+                    CaptureWalkMode::Consuming,
+                    outer,
+                    shadows,
+                    reason,
+                );
             }
             ExprKind::OptionalChain { object, args, .. } => {
-                self.walk_capture_consume(object, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(object, CaptureWalkMode::Reading, outer, shadows, reason);
                 if let Some(arg_list) = args {
                     for arg in arg_list {
                         let arg_mode = if arg.mut_marker {
@@ -4748,7 +4844,7 @@ impl<'a> TypeChecker<'a> {
                         } else {
                             CaptureWalkMode::Consuming
                         };
-                        self.walk_capture_consume(&arg.value, arg_mode, outer, shadows, found);
+                        self.walk_capture_consume(&arg.value, arg_mode, outer, shadows, reason);
                     }
                 }
             }
@@ -4770,41 +4866,41 @@ impl<'a> TypeChecker<'a> {
                     CaptureWalkMode::Reading,
                     outer,
                     shadows,
-                    found,
+                    reason,
                 );
                 shadows.pop();
             }
 
             ExprKind::Cast { expr: inner, .. } => {
-                self.walk_capture_consume(inner, mode, outer, shadows, found);
+                self.walk_capture_consume(inner, mode, outer, shadows, reason);
             }
             ExprKind::Range { start, end, .. } => {
                 if let Some(s) = start {
-                    self.walk_capture_consume(s, CaptureWalkMode::Reading, outer, shadows, found);
+                    self.walk_capture_consume(s, CaptureWalkMode::Reading, outer, shadows, reason);
                 }
                 if let Some(e) = end {
-                    self.walk_capture_consume(e, CaptureWalkMode::Reading, outer, shadows, found);
+                    self.walk_capture_consume(e, CaptureWalkMode::Reading, outer, shadows, reason);
                 }
             }
 
             ExprKind::Tuple(es) | ExprKind::ArrayLiteral(es) => {
                 for e in es {
-                    self.walk_capture_consume(e, mode, outer, shadows, found);
+                    self.walk_capture_consume(e, mode, outer, shadows, reason);
                 }
             }
             ExprKind::PrefixCollectionLiteral { items, .. } => {
                 for e in items {
-                    self.walk_capture_consume(e, mode, outer, shadows, found);
+                    self.walk_capture_consume(e, mode, outer, shadows, reason);
                 }
             }
             ExprKind::RepeatLiteral { value, count, .. } => {
-                self.walk_capture_consume(value, mode, outer, shadows, found);
-                self.walk_capture_consume(count, CaptureWalkMode::Reading, outer, shadows, found);
+                self.walk_capture_consume(value, mode, outer, shadows, reason);
+                self.walk_capture_consume(count, CaptureWalkMode::Reading, outer, shadows, reason);
             }
             ExprKind::MapLiteral(entries) => {
                 for (k, v) in entries {
-                    self.walk_capture_consume(k, mode, outer, shadows, found);
-                    self.walk_capture_consume(v, mode, outer, shadows, found);
+                    self.walk_capture_consume(k, mode, outer, shadows, reason);
+                    self.walk_capture_consume(v, mode, outer, shadows, reason);
                 }
             }
             ExprKind::StructLiteral { fields, spread, .. } => {
@@ -4814,19 +4910,25 @@ impl<'a> TypeChecker<'a> {
                         CaptureWalkMode::Consuming,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                 }
                 if let Some(s) = spread {
-                    self.walk_capture_consume(s, CaptureWalkMode::Consuming, outer, shadows, found);
+                    self.walk_capture_consume(
+                        s,
+                        CaptureWalkMode::Consuming,
+                        outer,
+                        shadows,
+                        reason,
+                    );
                 }
             }
 
             ExprKind::Par(body) | ExprKind::Seq(body) | ExprKind::Unsafe(body) => {
-                self.walk_capture_consume_block(body, mode, outer, shadows, found);
+                self.walk_capture_consume_block(body, mode, outer, shadows, reason);
             }
             ExprKind::Lock { body, .. } => {
-                self.walk_capture_consume_block(body, mode, outer, shadows, found);
+                self.walk_capture_consume_block(body, mode, outer, shadows, reason);
             }
             ExprKind::Providers { bindings, body } => {
                 for binding in bindings {
@@ -4835,10 +4937,10 @@ impl<'a> TypeChecker<'a> {
                         CaptureWalkMode::Consuming,
                         outer,
                         shadows,
-                        found,
+                        reason,
                     );
                 }
-                self.walk_capture_consume_block(body, mode, outer, shadows, found);
+                self.walk_capture_consume_block(body, mode, outer, shadows, reason);
             }
         }
     }
@@ -5317,6 +5419,7 @@ impl<'a> TypeChecker<'a> {
                 let body_ty = self.check_expr(body, expected_ret);
                 self.local_scope.pop();
                 let actual = self.closure_type_with_capture_inference(
+                    &expr.span,
                     *capture_mode,
                     &closure_param_names,
                     body,
@@ -6071,6 +6174,7 @@ impl<'a> TypeChecker<'a> {
                 let body_ty = self.infer_expr(body);
                 self.local_scope.pop();
                 self.closure_type_with_capture_inference(
+                    &expr.span,
                     *capture_mode,
                     &closure_param_names,
                     body,
@@ -9641,5 +9745,208 @@ mod closure_once_callability_inference_tests {
             "expected Function (body let shadows capture); got {}",
             type_display(&ty)
         );
+    }
+}
+
+#[cfg(test)]
+mod once_fn_slot_rejection_tests {
+    //! Round 12.45 (Step 3) — caller-side rejection of `OnceFn` arguments at
+    //! `Fn(...)` and `ref Fn(...)` parameter slots. The slot promises
+    //! repeatable invocation; an `OnceFn` value violates that promise. The
+    //! diagnostic kind is `OnceFnIntoFnSlot` (E0235); when the argument is
+    //! a closure literal that the typechecker has already classified as
+    //! once-callable (Step 2), the message also names the consumed capture.
+    use super::*;
+
+    fn typecheck_src(src: &str) -> TypeCheckResult {
+        let parsed = crate::parse(src);
+        let resolved = crate::resolve(&parsed.program);
+        crate::typecheck(&parsed.program, &resolved)
+    }
+
+    fn errors_of_kind(result: &TypeCheckResult, kind: &TypeErrorKind) -> Vec<TypeError> {
+        result
+            .errors
+            .iter()
+            .filter(|e| std::mem::discriminant(&e.kind) == std::mem::discriminant(kind))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn own_fn_slot_rejects_oncefn_closure_literal() {
+        // `take(f: Fn())`: owned `Fn()` slot — promises the callee can call
+        // `f` any number of times. The closure `|| apply(cfg)` is once-
+        // callable (consumes captured non-Copy `cfg`). Step 3 must reject.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn take(f: Fn()) { f() }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       take(|| apply(cfg));\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one OnceFnIntoFnSlot error; all errors: {:?}",
+            result.errors
+        );
+        assert!(
+            hits[0].message.contains("once-callable"),
+            "expected message to mention 'once-callable'; got '{}'",
+            hits[0].message
+        );
+        assert!(
+            hits[0].message.contains("'cfg'") || hits[0].message.contains("captured binding"),
+            "expected message to name the consumed capture 'cfg'; got '{}'",
+            hits[0].message
+        );
+    }
+
+    #[test]
+    fn own_fn_slot_accepts_repeatable_closure() {
+        // Capture-free closure → `Type::Function` → fits an own `Fn()` slot.
+        let src = "fn take(f: Fn()) { f() }\n\
+                   fn main() {\n\
+                       take(|| { });\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert!(
+            hits.is_empty(),
+            "expected no OnceFnIntoFnSlot error for repeatable closure; got: {:?}",
+            hits
+        );
+    }
+
+    #[test]
+    fn own_fn_slot_accepts_explicit_ref_prefix_closure_via_binding() {
+        // `ref ||` forces repeatable per round 12.6 even when the body
+        // would otherwise look consume-y. `ref` is not legal at call
+        // sites (parser rejects), so the closure must be let-bound first;
+        // the binding gets `Type::Function`, which the own-Fn slot accepts.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn take(f: Fn()) { f() }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       let h = ref || apply(cfg);\n\
+                       take(h);\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert!(
+            hits.is_empty(),
+            "expected no OnceFnIntoFnSlot error for ref-prefix-bound closure; got: {:?}",
+            hits
+        );
+    }
+
+    #[test]
+    fn ref_fn_slot_rejects_oncefn_closure_literal() {
+        // `ref Fn()` slot — same once-callability constraint; the callee
+        // can dispatch through the ref repeatedly, so a once-callable
+        // closure value must be rejected. The closure literal types as
+        // bare `OnceFn()`, the slot is `ref Fn()`; the unwrapped shape
+        // (Fn vs OnceFn) flags the once-callability violation rather than
+        // the ref-vs-bare regular mismatch.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn take(f: ref Fn()) { }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       take(|| apply(cfg));\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert!(
+            !hits.is_empty(),
+            "expected OnceFnIntoFnSlot error for ref-Fn slot rejection; all errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn cross_call_oncefn_through_fn_slot_rejects_at_inner_site() {
+        // Inner `inner(cb: Fn())` — a Fn slot. Outer `forward(cb: Fn())`
+        // forwards `cb` to inner. Caller passes a once-callable closure to
+        // forward — already a Step-3 violation at the OUTER call site. The
+        // test pins that the diagnostic kind fires at the user-visible
+        // call site (forward(...)), regardless of how many forwarding
+        // hops the typechecker would chase.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn inner(cb: Fn()) { cb() }\n\
+                   fn forward(cb: Fn()) { inner(cb) }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       forward(|| apply(cfg));\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert!(
+            !hits.is_empty(),
+            "expected at least one OnceFnIntoFnSlot error in cross-call forwarding; \
+             all errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn method_call_fn_slot_rejects_oncefn_closure_literal() {
+        // Method-call slot rejection — the same `Fn()` rule applies to
+        // method parameter slots, since the dispatch site routes through
+        // `check_call_args_with_substitution` and ultimately
+        // `check_assignable`.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   struct Runner { }\n\
+                   impl Runner {\n\
+                       fn drive(self, f: Fn()) { f() }\n\
+                   }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       let r = Runner { };\n\
+                       r.drive(|| apply(cfg));\n\
+                   }";
+        let result = typecheck_src(src);
+        let hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        assert!(
+            !hits.is_empty(),
+            "expected OnceFnIntoFnSlot error for method-call Fn-slot rejection; \
+             all errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn no_typemismatch_double_report_when_oncefn_slot_violation_fires() {
+        // The OnceFnIntoFnSlot kind replaces the generic TypeMismatch for
+        // this specific shape — emitting both would double-report. The
+        // single-error invariant is what makes the new diagnostic useful;
+        // this test pins it.
+        let src = "struct Cfg { name: i64 }\n\
+                   fn apply(c: Cfg) { }\n\
+                   fn take(f: Fn()) { f() }\n\
+                   fn main() {\n\
+                       let cfg = Cfg { name: 7 };\n\
+                       take(|| apply(cfg));\n\
+                   }";
+        let result = typecheck_src(src);
+        let once_hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
+        let mismatch_hits = errors_of_kind(&result, &TypeErrorKind::TypeMismatch);
+        assert_eq!(once_hits.len(), 1);
+        // The TypeMismatch kind may still appear for unrelated reasons,
+        // but not for the same span as the OnceFn slot violation.
+        let once_span = once_hits[0].span.clone();
+        for tm in &mismatch_hits {
+            assert!(
+                tm.span != once_span,
+                "TypeMismatch double-reported at OnceFn slot violation span: {:?}",
+                tm
+            );
+        }
     }
 }
