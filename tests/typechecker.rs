@@ -5680,3 +5680,49 @@ fn test_next_with_extra_argument_rejected() {
         errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
     );
 }
+
+// ── for-loop on iterator values (wip-list2 subtask 2) ────────────
+
+#[test]
+fn test_for_loop_on_vec_iter_binds_element_type() {
+    // `for x in v.iter()` binds `x` to the Iterator's Item type. The iter()
+    // call returns Iterator[T]; element_type_of resolves Item through the
+    // impl_assoc_types entry registered for Iterator at subtask 2.
+    typecheck_ok(
+        "fn add_one(n: i64) -> i64 { n + 1 }
+         fn main() {
+             let v: Vec[i64] = Vec.new();
+             for x in v.iter() {
+                 let _ = add_one(x);
+             }
+         }",
+    );
+}
+
+#[test]
+fn test_for_loop_on_map_iter_destructures_kv_tuple() {
+    // Map.iter() yields (K, V); for-loop tuple pattern destructures through
+    // the Iterator's Item type.
+    typecheck_ok(
+        "fn main() {
+             let m: Map[String, i64] = Map.new();
+             for (k, v) in m.iter() {
+                 let _key: String = k;
+                 let _val: i64 = v;
+             }
+         }",
+    );
+}
+
+#[test]
+fn test_for_loop_on_set_iter_binds_element() {
+    typecheck_ok(
+        "fn double(n: i64) -> i64 { n * 2 }
+         fn main() {
+             let s: Set[i64] = Set.new();
+             for x in s.iter() {
+                 let _ = double(x);
+             }
+         }",
+    );
+}

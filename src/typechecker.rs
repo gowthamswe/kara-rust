@@ -2121,8 +2121,12 @@ impl<'a> TypeChecker<'a> {
         let k = || Type::TypeParam("K".to_string());
         let v = || Type::TypeParam("V".to_string());
 
-        for name in &["Vec", "Array", "SortedSet", "Set"] {
+        for name in &["Vec", "Array", "SortedSet", "Set", "Iterator"] {
             // Register in env.structs so element_type_of can find generic_params.
+            // `Iterator` is a trait per design.md but is treated as a parametric
+            // pseudo-type at this layer so `for x in v.iter()` resolves the
+            // bound element via the same impl_assoc_types path as collections.
+            // See `wip-list2.md` § Iterator trait — full adaptor surface.
             self.env
                 .structs
                 .entry(name.to_string())

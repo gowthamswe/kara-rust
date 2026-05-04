@@ -59,12 +59,20 @@ reviewable in isolation.
   interpreter today; tests on empty Vecs use the `Vec[]` prefix-literal form.
   Subtask 2 (for-loop integration) is the next foundation step.
 
-- [ ] **2. `for` loop consumes `Value::Iterator` via `next()`.** Existing
-  for-loop driver in `src/interpreter.rs:1674-1730` adds an iterator-value arm
-  that calls `next()` repeatedly. Raw-collection arms preserved for backwards
-  compat (today's `for x in vec` keeps working without an explicit `.iter()`).
-  Unblocks chained-adaptor for-loops (`for x in v.iter().filter(p) { ... }`)
-  once adaptors land.
+- [x] **2. `for` loop consumes `Value::Iterator`.** New arm in the for-loop
+  driver (`src/interpreter.rs`) drains the iterator via `items.into_iter().
+  skip(cursor)` — observably identical to a `next()`-call loop today because
+  subtask 1's iterator is eager (no closure-bearing adaptors yet). When
+  closures land in subtask 3+, this arm migrates to a true `next()` pull so
+  adaptor closures fire per step. Raw-collection arms (Array/Tuple/Set/
+  SortedSet/Map) preserved for backwards compat. Typechecker side: `Iterator`
+  registered in `env.structs` + `impl_assoc_types` alongside Vec/Array/Set/
+  SortedSet so `element_type_of` resolves the bound element via the same
+  generic-substitution path as collections; `for x in v.iter()` and
+  `for (k, v) in m.iter()` typecheck and bind correctly. 3 typechecker tests
+  + 5 interpreter tests cover Vec/Map/Set, cursor resumption (manually
+  advance with next() then drop into for-loop), and break/continue inside
+  iterator-driven loops.
 
 ## Baseline adaptors (the 6 the canonical L2 entry assumes already exist)
 

@@ -4173,3 +4173,101 @@ fn main() {
     );
     assert_eq!(output, "empty\n");
 }
+
+// ── for-loop on iterator values (wip-list2 subtask 2) ────────────
+
+#[test]
+fn test_for_loop_on_vec_iter_walks_elements() {
+    // Direct iteration over an iterator value — `for x in v.iter() { ... }`
+    // walks the source elements in order.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [10, 20, 30];
+    for x in v.iter() {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "10\n20\n30\n");
+}
+
+#[test]
+fn test_for_loop_on_iter_resumes_from_cursor() {
+    // The iterator is bound, advanced manually with next(), then dropped
+    // into a for-loop — the loop must resume from the cursor's current
+    // position rather than restarting from the beginning.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4];
+    let mut it = v.iter();
+    let _ = it.next();
+    let _ = it.next();
+    for x in it {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "3\n4\n");
+}
+
+#[test]
+fn test_for_loop_on_map_iter_destructures_kv() {
+    // Map.iter() yields (K, V) tuples; for-loop binds via tuple pattern.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let mut m: Map[String, i64] = Map.new();
+    m.insert("x", 1);
+    m.insert("y", 2);
+    for (k, v) in m.iter() {
+        println(k);
+        println(v);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "x\n1\ny\n2\n");
+}
+
+#[test]
+fn test_for_loop_break_inside_iterator_loop() {
+    // break exits the for-loop early; downstream code still executes.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    for x in v.iter() {
+        if x > 2 {
+            break;
+        }
+        println(x);
+    }
+    println(99);
+}
+"#,
+    );
+    assert_eq!(output, "1\n2\n99\n");
+}
+
+#[test]
+fn test_for_loop_continue_inside_iterator_loop() {
+    // continue skips to the next iteration without exiting the loop.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4];
+    for x in v.iter() {
+        if x == 2 {
+            continue;
+        }
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "1\n3\n4\n");
+}

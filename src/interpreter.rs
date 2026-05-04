@@ -1705,6 +1705,13 @@ impl<'a> Interpreter<'a> {
                         .into_iter()
                         .map(|(k, v)| Value::Tuple(vec![k, v]))
                         .collect(),
+                    // Iterator: drain remaining items from cursor onward.
+                    // Subtask 1's iterator is eager (items snapshotted at
+                    // iter() time); a snapshot-drain is observably identical
+                    // to a `next()` loop today. When closure-bearing adaptors
+                    // land in subtask 3+ this arm becomes a `next()`-driven
+                    // pull so adaptor closures fire per step. See `wip-list2.md`.
+                    Value::Iterator { items, cursor } => items.into_iter().skip(cursor).collect(),
                     _ => vec![iter_val],
                 };
                 for item in items {
