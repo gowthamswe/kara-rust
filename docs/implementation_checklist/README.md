@@ -42,13 +42,6 @@ Sourced from open gaps identified during design review that don't require design
 
 These bullets touch files / functions that don't conflict with the active List-1 work. Any agent can pick them up in parallel; merge-conflict risk is minimal.
 
-- [ ] **Lexer: reserve `expr_<NNNN>` fragment-specifier identifier namespace.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Lexer: reserve` `expr_<NNNN>`)_
-
-  **Files:** `src/lexer.rs` + `tests/lexer.rs`. No `src/codegen.rs` touch. Zero conflict with List-1 Display work.
-  **Estimate:** 1 commit.
-  **Scope:** 7 slices in canonical (lexer regex check, raw-identifier exemption via `was_raw_escaped`, narrow `expr_` scope at v1, year range `2020..=2099`, diagnostic shape with both fix-its, no connection to literal year value, positive + negative test coverage).
-  **Repo conventions:** no Co-Authored-By trailer; prefer `--amend` for tight follow-ups.
-
 - [ ] **Iterator trait — full adaptor surface.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Iterator trait — full adaptor surface`)_
 
   **Files:** stdlib/prelude registration (`src/prelude.rs`), typechecker method registration (`src/typechecker.rs`), interpreter dispatch (`src/interpreter.rs`), tests (`tests/typechecker.rs` + `tests/interpreter.rs`). Codegen is a follow-up — most adaptors lower to existing `for`-loop / collection ops at the interpreter layer first, keeping the parallel agent off `src/codegen.rs` entirely.
