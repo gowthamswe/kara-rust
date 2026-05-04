@@ -4586,6 +4586,26 @@ fn test_map_struct_with_derive_hash_eq_ok() {
     );
 }
 
+#[test]
+fn test_map_tuple_with_float_field_rejects() {
+    // `Map[(String, f64), V]` — tuple Hash recurses per-field, and f64 fails
+    // Hash. Locks in the recursive bound check so the codegen tuple path
+    // never sees an unhashable element.
+    let errors = typecheck_errors(
+        "fn f() {
+             let m: Map[(String, f64), i64] = Map.new();
+             m.insert((\"k\", 1.0), 42);
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::TraitBoundNotSatisfied),
+        "Expected TraitBoundNotSatisfied for Map[(String, f64), _], got: {:?}",
+        errors
+    );
+}
+
 // ── Regex ─────────────────────────────────────────────────────────
 
 #[test]

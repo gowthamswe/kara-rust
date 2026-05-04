@@ -4125,6 +4125,74 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_map_tuple_string_string_key() {
+        // Two heap-bearing fields in the tuple — exercises the per-field
+        // recursion path on both sides. A byte-loop FNV over raw struct bytes
+        // would hash the two String headers (data ptr / len / cap pairs), which
+        // diverge across allocations when the contents are equal — so this
+        // test would fail under the pre-recursion hash.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m: Map[(String, String), i64] = Map.new();
+    m.insert(("alice", "red"),  1_i64);
+    m.insert(("alice", "blue"), 2_i64);
+    m.insert(("bob",   "red"),  3_i64);
+    println(m.len());
+    let v = m.get(("alice", "blue"));
+    match v {
+        Some(x) => println(x),
+        None => println(0_i64 - 1_i64),
+    }
+    let v2 = m.get(("alice", "green"));
+    match v2 {
+        Some(x) => println(x),
+        None => println(0_i64 - 1_i64),
+    }
+}
+"#,
+        );
+        let out = out.expect("(String,String)-key codegen should not bail");
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, vec!["3", "2", "-1"]);
+    }
+
+    #[test]
+    fn test_e2e_map_compound_key_cache_reuse() {
+        // Two distinct Map variables in one program share the same compound
+        // key shape `(String, i64)`. Cache reuse means `karac_hash_tuple_*`
+        // and `karac_eq_tuple_*` are emitted exactly once and called by both
+        // map-new sites — duplicate emission would surface as a `module
+        // already has a function named ...` panic during codegen, so this
+        // test failing to compile is the cache regression signal.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut m1: Map[(String, i64), i64] = Map.new();
+    let mut m2: Map[(String, i64), i64] = Map.new();
+    m1.insert(("a", 1_i64), 10_i64);
+    m2.insert(("a", 1_i64), 99_i64);
+    println(m1.len());
+    println(m2.len());
+    let v1 = m1.get(("a", 1_i64));
+    match v1 {
+        Some(x) => println(x),
+        None => println(0_i64 - 1_i64),
+    }
+    let v2 = m2.get(("a", 1_i64));
+    match v2 {
+        Some(x) => println(x),
+        None => println(0_i64 - 1_i64),
+    }
+}
+"#,
+        );
+        let out = out.expect("compound-key cache reuse codegen should not bail");
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, vec!["1", "1", "10", "99"]);
+    }
+
+    #[test]
     fn test_e2e_map_keys_empty() {
         // Empty map → empty Vec; len=0, no iteration body runs.
         let out = run_program(

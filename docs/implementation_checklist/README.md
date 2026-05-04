@@ -42,12 +42,7 @@ Sourced from open gaps identified during design review that don't require design
 
 These bullets touch files / functions that don't conflict with the active List-1 work. Any agent can pick them up in parallel; merge-conflict risk is minimal.
 
-- [~] **Hash codegen for compound key types.** _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `Hash codegen for compound key types`)_ — in flight, parallel agent.
-
-  **Files:** `src/codegen.rs` — extends `emit_hash_fn_for_type` (`src/codegen.rs:4282`) and `emit_eq_fn_for_type`. Distinct functions from Display's `emit_display_fn_for_type` and from List-1's `compile_print` integration; no textual collision.
-  **Estimate:** ~3–4 commits (tuples → enums → user `#[derive(Hash)]`).
-  **Scope:** 5 subtasks already scoped in canonical.
-  **Conflict-avoidance:** keep a separate `resolve_ty_for_hash_name` helper — do NOT refactor `resolve_ty_for_display_name` into a shared helper while List-1 Display work is in flight. Append tests at end of `tests/codegen.rs`.
+- [x] **Hash codegen for compound key types.** _(canonical: [phase-7-codegen.md](phase-7-codegen.md#phase-72-compiled-stdlib-types--layout-codegen), search `Hash codegen for compound key types`)_ — landed 2026-05-04. Tuple, unit-enum, and `#[derive(Hash, Eq)]` struct keys work end-to-end on the codegen path; cache is the module-level function table, with defensive checks in `emit_hash_fn_for_tuple` / `emit_eq_fn_for_tuple`. 9 E2E tests in `tests/codegen.rs` + 4 typechecker tests in `tests/typechecker.rs`. Set-side coverage (`Set[(i32, i32)]`, `Set[(String, (i32, i32))]`) deferred to when List-1 Set codegen lands — the underlying Hash machinery is shared.
 
 - [ ] **Lexer: reserve `expr_<NNNN>` fragment-specifier identifier namespace.** _(canonical: [phase-8-stdlib-floor.md](phase-8-stdlib-floor.md), search `Lexer: reserve` `expr_<NNNN>`)_
 

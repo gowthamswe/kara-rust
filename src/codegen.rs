@@ -4912,6 +4912,10 @@ impl<'ctx> Codegen<'ctx> {
         type_name: &str,
         elems: &[TypeExpr],
     ) -> FunctionValue<'ctx> {
+        let fn_name = format!("karac_hash_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            return f;
+        }
         let elems_owned: Vec<TypeExpr> = elems.to_vec();
         let child_fns: Vec<FunctionValue<'ctx>> = elems_owned
             .iter()
@@ -4925,7 +4929,6 @@ impl<'ctx> Codegen<'ctx> {
 
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_t = self.context.i64_type();
-        let fn_name = format!("karac_hash_{type_name}");
 
         let saved_bb = self.builder.get_insert_block();
         let hash_fn_ty = i64_t.fn_type(&[ptr_ty.into()], false);
@@ -4973,6 +4976,10 @@ impl<'ctx> Codegen<'ctx> {
     /// compared via the recursively-emitted per-field eq fn; the function
     /// short-circuits to `false` on the first mismatch.
     fn emit_eq_fn_for_tuple(&mut self, type_name: &str, elems: &[TypeExpr]) -> FunctionValue<'ctx> {
+        let fn_name = format!("karac_eq_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            return f;
+        }
         let elems_owned: Vec<TypeExpr> = elems.to_vec();
         let child_fns: Vec<FunctionValue<'ctx>> = elems_owned
             .iter()
@@ -4986,7 +4993,6 @@ impl<'ctx> Codegen<'ctx> {
 
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let bool_t = self.context.bool_type();
-        let fn_name = format!("karac_eq_{type_name}");
 
         let saved_bb = self.builder.get_insert_block();
         let eq_fn_ty = bool_t.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
