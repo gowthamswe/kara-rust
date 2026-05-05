@@ -802,6 +802,52 @@ impl TypeEnv {
         self.find_impl(trait_name, target_type).is_some()
     }
 
+    /// Look up a method by name on `target_type` from `impls`, preferring
+    /// inherent methods over trait methods per design.md § Method Resolution
+    /// Step 3. Returns the first inherent impl's method if any matches;
+    /// otherwise the first trait impl's method. First-match within each tier
+    /// — multi-inherent and multi-trait ambiguity detection is deferred to
+    /// the step-4 work tracked in phase-4-interpreter.md.
+    pub fn find_method(&self, target_type: &str, method: &str) -> Option<&FunctionSig> {
+        let mut inherent: Option<&FunctionSig> = None;
+        let mut trait_method: Option<&FunctionSig> = None;
+        for imp in &self.impls {
+            if imp.target_type != target_type {
+                continue;
+            }
+            let Some(sig) = imp.methods.get(method) else {
+                continue;
+            };
+            if imp.trait_name.is_none() {
+                if inherent.is_none() {
+                    inherent = Some(sig);
+                }
+            } else if trait_method.is_none() {
+                trait_method = Some(sig);
+            }
+        }
+        inherent.or(trait_method)
+    }
+
+    /// Collect every method name registered on `target_type` across both
+    /// inherent and trait impls. Used for `did you mean` typo suggestions
+    /// when method resolution falls through (design.md § Method Resolution
+    /// Step 7).
+    pub fn collect_method_names(&self, target_type: &str) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for imp in &self.impls {
+            if imp.target_type != target_type {
+                continue;
+            }
+            for name in imp.methods.keys() {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
+    }
+
     /// Find a `From` impl mapping `source` → `target`. Disambiguates
     /// multiple `impl From[X] for T` impls for the same target by matching
     /// the `from` method's first parameter type against `source`.
@@ -992,6 +1038,12 @@ pub enum TypeErrorKind {
     /// Round 12.45 (Step 3) — caller-side rejection of `OnceFn` at `Fn` /
     /// `ref Fn` parameter slots and any other Fn-shaped assignment boundary.
     OnceFnIntoFnSlot,
+    /// `e.m(args)` where no candidate at any receiver level resolves to a
+    /// method named `m`. Carries an optional `did you mean 'm2'?` tail when
+    /// an edit-distance-≤2 candidate exists on the receiver type's impls.
+    /// Method-resolution Step 7 — see phase-4-interpreter.md § TypeChecker:
+    /// implement full method resolution algorithm.
+    NoMethodFound,
 }
 
 impl std::fmt::Display for TypeError {
@@ -1279,6 +1331,58 @@ impl<'a> TypeChecker<'a> {
             span,
             kind,
         });
+    }
+
+    /// Emit `NoMethodFound` for an unknown stdlib method only when a close
+    /// candidate exists in `known_methods` (edit distance ≤ 2 via
+    /// `edit_distance::suggest_similar`). Used by per-type `infer_*_method`
+    /// arms to surface typos without breaking the silent fallback for
+    /// runtime-only methods that the typechecker has not yet enumerated.
+    /// Each arm's `KNOWN_METHODS` constant is the typechecker's current
+    /// enumeration of that type's surface — it grows as stdlib enumeration
+    /// catches up to the interpreter, at which point the arm's `_` case
+    /// can flip from "typo-only" to "always-error". See
+    /// phase-4-interpreter.md § Method Resolution Step 7.
+    fn maybe_emit_method_typo(
+        &mut self,
+        type_name: &str,
+        method: &str,
+        known_methods: &[&str],
+        span: &Span,
+    ) {
+        if let Some(suggestion) =
+            crate::edit_distance::suggest_similar(method, known_methods)
+        {
+            self.type_error(
+                format!(
+                    "no method '{}' on type '{}', did you mean '{}'?",
+                    method, type_name, suggestion
+                ),
+                span.clone(),
+                TypeErrorKind::NoMethodFound,
+            );
+        }
+    }
+
+    /// Default `_` arm body for per-type `infer_*_method` dispatch: emit a
+    /// typo-suggestion diagnostic when the typed name is close to a known
+    /// method, type-check the arguments, and return `Type::Error`. The
+    /// silent fallback for far-from-anything names preserves the historical
+    /// permissive behavior for runtime-only methods that the typechecker
+    /// has not yet enumerated.
+    fn handle_unknown_method(
+        &mut self,
+        type_name: &str,
+        method: &str,
+        known_methods: &[&str],
+        args: &[CallArg],
+        span: &Span,
+    ) -> Type {
+        self.maybe_emit_method_typo(type_name, method, known_methods, span);
+        for arg in args {
+            self.infer_expr(&arg.value);
+        }
+        Type::Error
     }
 
     /// Map a lexer-provided integer suffix to the concrete `Type` it denotes.
@@ -7813,18 +7917,11 @@ impl<'a> TypeChecker<'a> {
                     );
                     return Type::Error;
                 }
-                // General associated call: scan impls for the target type
-                // and find a method with this name. Picks the first match
-                // (multi-impl name collisions for non-From traits aren't
-                // common in v1 stdlib).
-                if let Some(sig) = self
-                    .env
-                    .impls
-                    .iter()
-                    .filter(|imp| imp.target_type == *type_name)
-                    .find_map(|imp| imp.methods.get(method))
-                    .cloned()
-                {
+                // General associated call: look up the method on the target
+                // type with inherent-beats-trait priority per design.md
+                // § Method Resolution Step 3. Multi-inherent / multi-trait
+                // ambiguity detection (Step 4) is deferred.
+                if let Some(sig) = self.env.find_method(type_name, method).cloned() {
                     if args.len() != sig.params.len() {
                         self.type_error(
                             format!(
@@ -8084,7 +8181,18 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        let type_name = match &obj_ty {
+        // Strip outer `ref` / `mut ref` to get the named receiver per
+        // design.md § Method Resolution Step 1 (autoref candidates `T`,
+        // `ref T`, `mut ref T` collapse to the same name lookup; the
+        // receiver/self-mode compatibility check happens at the
+        // param-binding layer). The `shared struct` / `Rc[S]` / `Arc[S]`
+        // and refinement-base candidates are deferred — those types have
+        // no Type-level representation in v1.
+        let receiver_for_lookup = match &obj_ty {
+            Type::Ref(inner) | Type::MutRef(inner) => inner.as_ref(),
+            other => other,
+        };
+        let type_name = match receiver_for_lookup {
             Type::Named { name, .. } => name.clone(),
             _ => {
                 // For non-named types, just type-check args and return Error
@@ -8095,14 +8203,10 @@ impl<'a> TypeChecker<'a> {
             }
         };
 
-        // Look up method in impls
-        let method_sig = self
-            .env
-            .impls
-            .iter()
-            .filter(|imp| imp.target_type == type_name)
-            .find_map(|imp| imp.methods.get(method))
-            .cloned();
+        // Look up method on the receiver type with inherent-beats-trait
+        // priority per design.md § Method Resolution Step 3. Multi-inherent
+        // / multi-trait ambiguity detection (Step 4) is deferred.
+        let method_sig = self.env.find_method(&type_name, method).cloned();
 
         match method_sig {
             Some(sig) => {
@@ -8153,11 +8257,16 @@ impl<'a> TypeChecker<'a> {
                     || self.env.enums.contains_key(&type_name))
                     && !crate::prelude::PRELUDE_TYPES.contains(&type_name.as_str());
                 if is_user_defined {
-                    self.type_error(
-                        format!("no method '{}' on type '{}'", method, type_name),
-                        span.clone(),
-                        TypeErrorKind::TypeMismatch,
-                    );
+                    let candidates = self.env.collect_method_names(&type_name);
+                    let candidate_refs: Vec<&str> =
+                        candidates.iter().map(String::as_str).collect();
+                    let mut msg = format!("no method '{}' on type '{}'", method, type_name);
+                    if let Some(suggestion) =
+                        crate::edit_distance::suggest_similar(method, &candidate_refs)
+                    {
+                        msg.push_str(&format!(", did you mean '{}'?", suggestion));
+                    }
+                    self.type_error(msg, span.clone(), TypeErrorKind::NoMethodFound);
                 }
                 Type::Error
             }
@@ -8191,16 +8300,19 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Str
             }
-            _ => {
-                // Unknown string method — fall through silently so calls to
-                // runtime-only methods (len, contains, is_empty, …) don't
-                // emit spurious diagnostics before those methods are fully
-                // wired into the typechecker.
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            // Unknown string method — typo-suggestion diagnostic if close to
+            // a known name, silent otherwise (`len`, `contains`, `is_empty`,
+            // … are runtime-only and not yet wired through the typechecker).
+            // Flip to always-error once enumeration catches up to the
+            // interpreter's String surface — design.md § Method Resolution
+            // Step 7.
+            _ => self.handle_unknown_method(
+                "String",
+                method,
+                &["sorted", "sorted_by"],
+                args,
+                span,
+            ),
         }
     }
 
@@ -8363,12 +8475,17 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Unit
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "Slice",
+                method,
+                &[
+                    "binary_search", "chunks", "contains", "fill", "first",
+                    "get", "is_empty", "last", "len", "reverse", "sort",
+                    "sort_by", "split_at", "swap", "windows",
+                ],
+                args,
+                span,
+            ),
         }
     }
 
@@ -8561,12 +8678,17 @@ impl<'a> TypeChecker<'a> {
                     args: vec![k.clone(), v.clone()],
                 }
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "Map",
+                method,
+                &[
+                    "clear", "contains_key", "entries", "entry", "get",
+                    "get_or", "insert", "is_empty", "keys", "len", "merge",
+                    "remove", "values",
+                ],
+                args,
+                span,
+            ),
         }
     }
 
@@ -8661,12 +8783,13 @@ impl<'a> TypeChecker<'a> {
                 }
                 entry_kv
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "Entry",
+                method,
+                &["and_modify", "or_insert", "or_insert_with"],
+                args,
+                span,
+            ),
         }
     }
 
@@ -8763,12 +8886,16 @@ impl<'a> TypeChecker<'a> {
                 }
                 sorted_set_elem
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "SortedSet",
+                method,
+                &[
+                    "contains", "difference", "insert", "intersection",
+                    "is_empty", "len", "max", "min", "remove", "union",
+                ],
+                args,
+                span,
+            ),
         }
     }
 
@@ -8850,12 +8977,16 @@ impl<'a> TypeChecker<'a> {
                 }
                 set_elem
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "Set",
+                method,
+                &[
+                    "contains", "difference", "insert", "intersection",
+                    "is_empty", "len", "remove", "union",
+                ],
+                args,
+                span,
+            ),
         }
     }
 
@@ -9532,12 +9663,19 @@ impl<'a> TypeChecker<'a> {
                     args: vec![item.clone()],
                 }
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "Iterator",
+                method,
+                &[
+                    "all", "any", "chain", "chunk_by", "chunks", "collect",
+                    "count", "cycle", "enumerate", "filter", "flat_map",
+                    "fold", "inspect", "map", "next", "peek", "peekable",
+                    "scan", "skip", "skip_while", "step_by", "take",
+                    "take_while", "windows", "zip",
+                ],
+                args,
+                span,
+            ),
         }
     }
 
@@ -9607,12 +9745,13 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Str
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "Regex",
+                method,
+                &["find", "find_all", "is_match", "replace_all"],
+                args,
+                span,
+            ),
         }
     }
 
@@ -9656,12 +9795,13 @@ impl<'a> TypeChecker<'a> {
                 }
                 result_response
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "Client",
+                method,
+                &["get", "post"],
+                args,
+                span,
+            ),
         }
     }
 
@@ -9703,12 +9843,13 @@ impl<'a> TypeChecker<'a> {
                     args: vec![Type::Str],
                 }
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "Response",
+                method,
+                &["body", "header", "status"],
+                args,
+                span,
+            ),
         }
     }
 
@@ -9724,12 +9865,13 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Str
             }
-            _ => {
-                for arg in args {
-                    self.infer_expr(&arg.value);
-                }
-                Type::Error
-            }
+            _ => self.handle_unknown_method(
+                "HttpError",
+                method,
+                &["message"],
+                args,
+                span,
+            ),
         }
     }
 
@@ -9772,12 +9914,13 @@ impl<'a> TypeChecker<'a> {
                     }
                     sender_elem
                 }
-                _ => {
-                    for arg in args {
-                        self.infer_expr(&arg.value);
-                    }
-                    Type::Error
-                }
+                _ => self.handle_unknown_method(
+                    "Sender",
+                    method,
+                    &["clone", "send"],
+                    args,
+                    span,
+                ),
             }
         } else {
             // Receiver
@@ -9802,12 +9945,13 @@ impl<'a> TypeChecker<'a> {
                     }
                     option_elem
                 }
-                _ => {
-                    for arg in args {
-                        self.infer_expr(&arg.value);
-                    }
-                    Type::Error
-                }
+                _ => self.handle_unknown_method(
+                    "Receiver",
+                    method,
+                    &["recv", "try_recv"],
+                    args,
+                    span,
+                ),
             }
         }
     }

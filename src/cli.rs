@@ -1337,6 +1337,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 crate::typechecker::TypeErrorKind::AmbiguousAssocFn => "E0233",
                 crate::typechecker::TypeErrorKind::CannotInferAssocFn => "E0234",
                 crate::typechecker::TypeErrorKind::OnceFnIntoFnSlot => "E0235",
+                crate::typechecker::TypeErrorKind::NoMethodFound => "E0236",
             };
             diags.add(DiagEntry {
                 id: &format!("d{id_counter}"),

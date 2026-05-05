@@ -7,6 +7,7 @@ pub mod concurrency;
 pub mod cost_summary;
 pub mod doc;
 pub mod dominator;
+pub mod edit_distance;
 pub mod effectchecker;
 pub mod ffi_lint;
 pub mod formatter;

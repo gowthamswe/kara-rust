@@ -3679,6 +3679,277 @@ fn test_trait_with_generic_and_self_default_body() {
     );
 }
 
+// ── Method resolution: inherent-beats-trait priority ────────────
+//
+// Per design.md § Method Resolution Step 3, inherent methods have
+// priority over trait methods on the same receiver candidate.
+
+#[test]
+fn test_method_resolution_inherent_wins_over_trait() {
+    // Both impls declare `m`; the call must resolve to the inherent one
+    // (return type `i64`), not the trait one (return type `bool`). If the
+    // trait method were chosen, `let r: i64 = s.m()` would fail to typecheck.
+    typecheck_ok(
+        "struct S { x: i64 }\n\
+         trait Foo { fn m(self) -> bool; }\n\
+         impl S { fn m(self) -> i64 { 1 } }\n\
+         impl Foo for S { fn m(self) -> bool { true } }\n\
+         fn main() { let s = S { x: 0 }; let r: i64 = s.m(); }",
+    );
+}
+
+#[test]
+fn test_method_resolution_trait_method_when_no_inherent() {
+    // Regression: when only a trait impl declares `m`, the call resolves
+    // through the trait method (preserving pre-priority behavior).
+    typecheck_ok(
+        "struct S { x: i64 }\n\
+         trait Foo { fn m(self) -> i64; }\n\
+         impl Foo for S { fn m(self) -> i64 { 42 } }\n\
+         fn main() { let s = S { x: 0 }; let r: i64 = s.m(); }",
+    );
+}
+
+#[test]
+fn test_method_resolution_type_prefixed_inherent_wins_over_trait() {
+    // Type-prefixed `T.method(args)` form (parsed as MethodCall with
+    // object = Identifier("T")) should also respect inherent priority.
+    // `S.make()` resolves to the inherent constructor (returning S),
+    // not the trait associated function (returning bool).
+    typecheck_ok(
+        "struct S { x: i64 }\n\
+         trait Make { fn make() -> bool; }\n\
+         impl S { fn make() -> S { S { x: 0 } } }\n\
+         impl Make for S { fn make() -> bool { true } }\n\
+         fn main() { let r: S = S.make(); }",
+    );
+}
+
+// ── Method resolution: autoref through ref / mut ref ────────────
+//
+// Per design.md § Method Resolution Step 1, the receiver candidate list
+// is `[T, ref T, mut ref T, ...]` — autoref candidates collapse to the
+// same name lookup, so `r.method()` on a `ref T` receiver resolves to
+// methods declared on `T`.
+
+#[test]
+fn test_method_resolution_through_ref_returns_real_type() {
+    // Without autoref, `r.get()` returned `Type::Error` silently and the
+    // type mismatch on `want_string(...)` would be missed. With autoref,
+    // it returns `i64`, which fails to match the `String` parameter type.
+    // `r` enters with type `ref S` because `read` declares it that way.
+    let errors = typecheck_errors(
+        "struct S { x: i64 }\n\
+         impl S { fn get(ref self) -> i64 { self.x } }\n\
+         fn want_string(s: String) {}\n\
+         fn read(r: ref S) { want_string(r.get()); }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::TypeMismatch
+                && e.message.contains("expected 'String'")
+                && e.message.contains("found 'i64'")),
+        "expected TypeMismatch for String/i64 from r.get() through ref, got: {:?}",
+        errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_method_resolution_through_mut_ref_returns_real_type() {
+    let errors = typecheck_errors(
+        "struct S { x: i64 }\n\
+         impl S { fn get(ref self) -> i64 { self.x } }\n\
+         fn want_string(s: String) {}\n\
+         fn read(r: mut ref S) { want_string(r.get()); }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::TypeMismatch
+                && e.message.contains("expected 'String'")
+                && e.message.contains("found 'i64'")),
+        "expected TypeMismatch for String/i64 from r.get() through mut ref, got: {:?}",
+        errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_method_resolution_no_method_diagnostic_fires_through_ref() {
+    // The `no method named` diagnostic now reaches through `ref T`.
+    let errors = typecheck_errors(
+        "struct S { x: i64 }\n\
+         impl S { fn length(ref self) -> i64 { 0 } }\n\
+         fn read(r: ref S) { r.lenght(); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound through ref");
+    assert!(
+        msg.contains("did you mean 'length'?"),
+        "expected typo suggestion through ref, got: {msg}"
+    );
+}
+
+// ── Method resolution: `no method named` diagnostic ─────────────
+//
+// Per design.md § Method Resolution Step 7, a method-call that fails to
+// resolve at any receiver level emits a focused `no method named ... on
+// type ...` diagnostic with an optional `did you mean ...?` tail when an
+// edit-distance-≤2 candidate exists on the type's impls.
+
+#[test]
+fn test_method_resolution_no_method_diagnostic_uses_dedicated_kind() {
+    // The diagnostic now uses `TypeErrorKind::NoMethodFound` (not the
+    // historical `TypeMismatch`).
+    let errors = typecheck_errors(
+        "struct S { x: i64 }\n\
+         impl S { fn len(self) -> i64 { 0 } }\n\
+         fn main() { let s = S { x: 0 }; s.bogus(); }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::NoMethodFound),
+        "expected NoMethodFound, got: {:?}",
+        errors.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_method_resolution_typo_suggestion_appears() {
+    // `s.lenght()` is one character off from `length` — diagnostic should
+    // include the suggestion.
+    let errors = typecheck_errors(
+        "struct S { x: i64 }\n\
+         impl S { fn length(self) -> i64 { 0 } }\n\
+         fn main() { let s = S { x: 0 }; s.lenght(); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound diagnostic");
+    assert!(
+        msg.contains("did you mean 'length'?"),
+        "expected typo suggestion in: {msg}"
+    );
+}
+
+#[test]
+fn test_method_resolution_typo_suggestion_considers_trait_methods() {
+    // The candidate list for typo suggestion includes both inherent and
+    // trait-impl method names. Here only the trait declares `flush`; a
+    // typo `flus()` should still find it.
+    let errors = typecheck_errors(
+        "struct S { x: i64 }\n\
+         trait Output { fn flush(ref self); }\n\
+         impl Output for S { fn flush(ref self) { } }\n\
+         fn main() { let s = S { x: 0 }; s.flus(); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound diagnostic");
+    assert!(
+        msg.contains("did you mean 'flush'?"),
+        "expected typo suggestion in: {msg}"
+    );
+}
+
+#[test]
+fn test_method_resolution_no_suggestion_when_nothing_close() {
+    // Nothing within edit distance 2 — diagnostic fires but carries no
+    // `did you mean` tail.
+    let errors = typecheck_errors(
+        "struct S { x: i64 }\n\
+         impl S { fn length(self) -> i64 { 0 } }\n\
+         fn main() { let s = S { x: 0 }; s.completely_unrelated(); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound diagnostic");
+    assert!(
+        !msg.contains("did you mean"),
+        "did not expect a typo suggestion in: {msg}"
+    );
+}
+
+// ── Method resolution: stdlib typo suggestions ──────────────────
+//
+// Each per-type `infer_*_method` arm in the typechecker now emits a
+// typo-suggestion diagnostic when the typed name is close to a known
+// method. Far-from-anything names stay silent (preserves the historical
+// permissive behavior for runtime-only methods that the typechecker
+// hasn't enumerated yet).
+
+#[test]
+fn test_method_resolution_iterator_typo_suggestion() {
+    // `iter.colect()` → suggests `collect`
+    let errors = typecheck_errors(
+        "fn main() { let v = [1, 2, 3]; v.iter().colect(); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Iterator");
+    assert!(
+        msg.contains("'Iterator'") && msg.contains("did you mean 'collect'?"),
+        "expected Iterator typo suggestion, got: {msg}"
+    );
+}
+
+#[test]
+fn test_method_resolution_map_typo_suggestion() {
+    // `m.contians_key(...)` → suggests `contains_key`
+    let errors = typecheck_errors(
+        "fn main() { let m: Map[String, i64] = Map.new(); m.contians_key(\"x\"); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Map");
+    assert!(
+        msg.contains("'Map'") && msg.contains("did you mean 'contains_key'?"),
+        "expected Map typo suggestion, got: {msg}"
+    );
+}
+
+#[test]
+fn test_method_resolution_slice_typo_suggestion() {
+    // `s.firts()` → suggests `first`
+    let errors = typecheck_errors(
+        "fn main() { let v = [1, 2, 3]; v.as_slice().firts(); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Slice");
+    assert!(
+        msg.contains("'Slice'") && msg.contains("did you mean 'first'?"),
+        "expected Slice typo suggestion, got: {msg}"
+    );
+}
+
+#[test]
+fn test_method_resolution_stdlib_silent_for_runtime_only() {
+    // `s.completely_unrelated()` on a String stays silent (no edit-distance
+    // match to `sorted` / `sorted_by`). Preserves the permissive fall-through
+    // for runtime-only methods like `len` that aren't yet typechecker-known.
+    // `typecheck_ok` asserts there are no errors at all.
+    typecheck_ok(
+        "fn main() { let s = \"hi\"; s.completely_unrelated(); }",
+    );
+}
+
 // ── Public-signature visibility (CR-18) ─────────────────────────
 //
 // A `pub fn` / pub method / pub struct field / pub enum variant payload /

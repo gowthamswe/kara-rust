@@ -7,6 +7,7 @@
 //! names, duplicates, and visibility violations.
 
 use crate::ast::*;
+use crate::edit_distance::suggest_similar;
 use crate::module::{self, ModuleId, ProgramTree};
 use crate::token::Span;
 use std::collections::{HashMap, HashSet};
@@ -465,52 +466,6 @@ pub struct ResolveResult {
     pub resolutions: HashMap<SpanKey, SymbolId>,
     pub symbol_table: SymbolTable,
     pub errors: Vec<ResolveError>,
-}
-
-// ── Levenshtein Distance ────────────────────────────────────────
-
-fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let (m, n) = (a.len(), b.len());
-    let mut matrix = vec![vec![0usize; n + 1]; m + 1];
-    for (i, row) in matrix.iter_mut().enumerate().take(m + 1) {
-        row[0] = i;
-    }
-    #[allow(clippy::needless_range_loop)]
-    for j in 0..=n {
-        matrix[0][j] = j;
-    }
-    for i in 1..=m {
-        for j in 1..=n {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            matrix[i][j] = (matrix[i - 1][j] + 1)
-                .min(matrix[i][j - 1] + 1)
-                .min(matrix[i - 1][j - 1] + cost);
-        }
-    }
-    matrix[m][n]
-}
-
-fn suggest_similar(name: &str, visible: &[&str]) -> Option<String> {
-    if name.len() < 3 {
-        return None;
-    }
-    let mut best: Option<(&str, usize)> = None;
-    for &candidate in visible {
-        if candidate == name {
-            continue;
-        }
-        let dist = levenshtein_distance(name, candidate);
-        if dist <= 2 {
-            match best {
-                None => best = Some((candidate, dist)),
-                Some((_, best_dist)) if dist < best_dist => best = Some((candidate, dist)),
-                _ => {}
-            }
-        }
-    }
-    best.map(|(s, _)| s.to_string())
 }
 
 // ── Cross-module lookup helpers (CR-24 slice 5) ─────────────────
