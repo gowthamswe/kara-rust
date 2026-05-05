@@ -9162,6 +9162,55 @@ impl<'a> TypeChecker<'a> {
                     args: vec![new_item],
                 }
             }
+            "step_by" => {
+                // `step_by(n: i64) -> Iterator[T]` — element type
+                // passes through. Argument is checked against i64;
+                // negative or zero `n` is a runtime concern (clamped
+                // to 1 by the interpreter), so the typechecker
+                // accepts any i64.
+                if args.len() != 1 {
+                    self.type_error(
+                        format!(
+                            "Iterator.step_by() expects 1 argument, found {}",
+                            args.len()
+                        ),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                    return Type::Named {
+                        name: "Iterator".to_string(),
+                        args: vec![item.clone()],
+                    };
+                }
+                self.check_expr(&args[0].value, &Type::Int(IntSize::I64));
+                Type::Named {
+                    name: "Iterator".to_string(),
+                    args: vec![item.clone()],
+                }
+            }
+            "cycle" => {
+                // `cycle() -> Iterator[T]` — element type passes
+                // through. The "cloneable source" requirement noted
+                // in design.md is implicit here: every Value derives
+                // Clone, so any iterator can cycle.
+                if !args.is_empty() {
+                    self.type_error(
+                        "Iterator.cycle() takes no arguments".to_string(),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                }
+                Type::Named {
+                    name: "Iterator".to_string(),
+                    args: vec![item.clone()],
+                }
+            }
             "chain" => {
                 // `chain(other: Iterator[T]) -> Iterator[T]` — the
                 // element type must agree on both sides. Push down

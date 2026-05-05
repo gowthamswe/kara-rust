@@ -5765,3 +5765,245 @@ fn main() {
     // 3 outer × 3 inner each = 9.
     assert_eq!(output, "9\n");
 }
+
+#[test]
+fn test_iter_step_by_yields_every_nth_element() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5, 6, 7];
+    for x in v.iter().step_by(2) {
+        println(x);
+    }
+}
+"#,
+    );
+    // Yields indices 0, 2, 4, 6 → 1, 3, 5, 7.
+    assert_eq!(output, "1\n3\n5\n7\n");
+}
+
+#[test]
+fn test_iter_step_by_one_is_observable_noop() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3];
+    for x in v.iter().step_by(1) {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "1\n2\n3\n");
+}
+
+#[test]
+fn test_iter_step_by_zero_clamps_to_one() {
+    // n=0 would underflow on the post-yield reset; runtime clamps
+    // to 1, behaving like step_by(1).
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3];
+    for x in v.iter().step_by(0) {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "1\n2\n3\n");
+}
+
+#[test]
+fn test_iter_step_by_larger_than_length_yields_only_first() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3];
+    for x in v.iter().step_by(100) {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "1\n");
+}
+
+#[test]
+fn test_iter_step_by_on_empty_yields_nothing() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v: Vec[i64] = Vec[];
+    let mut it = v.iter().step_by(2);
+    match it.next() {
+        Some(_) => println("had value"),
+        None => println("empty"),
+    }
+}
+"#,
+    );
+    assert_eq!(output, "empty\n");
+}
+
+#[test]
+fn test_iter_step_by_state_persists_across_next_calls() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [10, 20, 30, 40, 50];
+    let mut it = v.iter().step_by(2);
+    println(it.next().unwrap());
+    println(it.next().unwrap());
+    println(it.next().unwrap());
+    match it.next() {
+        Some(_) => println("more"),
+        None => println("done"),
+    }
+}
+"#,
+    );
+    // Yields 10, 30, 50.
+    assert_eq!(output, "10\n30\n50\ndone\n");
+}
+
+#[test]
+fn test_iter_step_by_composes_with_filter() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5, 6, 7, 8];
+    let xs: Vec[i64] = v.iter().filter(|x| x > 2).step_by(2).collect();
+    for x in xs {
+        println(x);
+    }
+}
+"#,
+    );
+    // Filter yields 3, 4, 5, 6, 7, 8. step_by(2) → 3, 5, 7.
+    assert_eq!(output, "3\n5\n7\n");
+}
+
+#[test]
+fn test_iter_cycle_with_take_yields_repeated_elements() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2];
+    for x in v.iter().cycle().take(5) {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "1\n2\n1\n2\n1\n");
+}
+
+#[test]
+fn test_iter_cycle_preserves_pre_adaptors() {
+    // Adaptors applied BEFORE cycle live in the template's own
+    // step chain — they re-run on each restart. Here the filter
+    // re-rejects 1 each cycle.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3];
+    for x in v.iter().filter(|x| x > 1).cycle().take(5) {
+        println(x);
+    }
+}
+"#,
+    );
+    // Each cycle yields 2, 3. take(5) → 2, 3, 2, 3, 2.
+    assert_eq!(output, "2\n3\n2\n3\n2\n");
+}
+
+#[test]
+fn test_iter_cycle_on_empty_yields_nothing() {
+    // Sticky-stop on empty template — must NOT infinite-loop.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v: Vec[i64] = Vec[];
+    let mut it = v.iter().cycle().take(10);
+    match it.next() {
+        Some(_) => println("had value"),
+        None => println("empty"),
+    }
+}
+"#,
+    );
+    assert_eq!(output, "empty\n");
+}
+
+#[test]
+fn test_iter_cycle_composes_with_post_map() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2];
+    for x in v.iter().cycle().take(4).map(|x| x * 10) {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "10\n20\n10\n20\n");
+}
+
+#[test]
+fn test_iter_cycle_state_persists_across_next_calls() {
+    // next() pulls one item at a time, crossing cycle boundaries
+    // transparently.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [7, 8];
+    let mut it = v.iter().cycle();
+    println(it.next().unwrap());
+    println(it.next().unwrap());
+    println(it.next().unwrap());
+    println(it.next().unwrap());
+    println(it.next().unwrap());
+}
+"#,
+    );
+    assert_eq!(output, "7\n8\n7\n8\n7\n");
+}
+
+#[test]
+fn test_iter_cycle_resets_stateful_adaptors_each_cycle() {
+    // enumerate inside the template restarts at index 0 each cycle
+    // because cycle clones the template (with its initial counters).
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [10, 20];
+    for (i, x) in v.iter().enumerate().cycle().take(4) {
+        println(f"{i}:{x}");
+    }
+}
+"#,
+    );
+    // First cycle: (0,10), (1,20). Second cycle re-runs enumerate
+    // from 0 → (0,10), (1,20). take(4) total.
+    assert_eq!(output, "0:10\n1:20\n0:10\n1:20\n");
+}
+
+#[test]
+fn test_iter_step_by_then_cycle() {
+    // step_by trims the template; cycle replays the trimmed
+    // sequence forever.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = [1, 2, 3, 4, 5];
+    for x in v.iter().step_by(2).cycle().take(7) {
+        println(x);
+    }
+}
+"#,
+    );
+    // step_by(2) → 1, 3, 5. cycle.take(7) → 1, 3, 5, 1, 3, 5, 1.
+    assert_eq!(output, "1\n3\n5\n1\n3\n5\n1\n");
+}

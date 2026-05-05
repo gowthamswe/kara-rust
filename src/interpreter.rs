@@ -270,6 +270,19 @@ pub enum IteratorSource {
         f: Box<Value>,
         current_inner: Option<Box<Value>>,
     },
+    /// `.cycle()` — restart on exhaustion. `template` is the snapshot
+    /// taken at construction (cloned again on each restart);
+    /// `current` is the in-flight clone being drained. `exhausted`
+    /// flips to true when the template itself is empty (so we don't
+    /// loop forever resetting an empty source). Each cycle through
+    /// the template re-runs adaptor closures held in template's own
+    /// `steps`, with their stateful counters reset to construction
+    /// state.
+    Cycle {
+        template: Box<Value>,
+        current: Box<Value>,
+        exhausted: bool,
+    },
 }
 
 /// One step in a `Value::Iterator`'s lazy adaptor chain. Each step is a
@@ -307,6 +320,12 @@ pub enum IteratorStep {
     /// subsequent element unconditionally. The `bool` flag flips once
     /// the predicate fails so future pulls bypass it entirely.
     SkipWhile { pred: Value, done: bool },
+    /// `.step_by(n)` — yield every n-th item (n ≥ 1). The first item
+    /// is always yielded; `remaining_skip` tracks how many items to
+    /// reject before the next yield. Construction guarantees n ≥ 1
+    /// (clamped at the dispatch site); n = 0 would underflow on the
+    /// post-yield reset.
+    StepBy { n: usize, remaining_skip: usize },
 }
 
 impl std::fmt::Display for Value {
@@ -416,6 +435,7 @@ impl std::fmt::Display for Value {
                 }
                 IteratorSource::Zip { .. } => write!(f, "<iter zip>"),
                 IteratorSource::FlatMap { .. } => write!(f, "<iter flat_map>"),
+                IteratorSource::Cycle { .. } => write!(f, "<iter cycle>"),
             },
             Value::SharedCell(cell) => write!(f, "{}", cell.lock().unwrap()),
             Value::Entry {
@@ -3293,6 +3313,17 @@ impl<'a> Interpreter<'a> {
                         }
                         *done = true;
                     }
+                    IteratorStep::StepBy { n, remaining_skip } => {
+                        if *remaining_skip > 0 {
+                            *remaining_skip -= 1;
+                            keep = false;
+                            break;
+                        }
+                        // Yield this item, then skip the next n-1.
+                        // n ≥ 1 by construction (clamped at dispatch),
+                        // so the subtraction never underflows.
+                        *remaining_skip = *n - 1;
+                    }
                 }
             }
             if stop {
@@ -3487,6 +3518,93 @@ impl<'a> Interpreter<'a> {
                     }
                 }
             }
+            IteratorSource::Cycle { .. } => {
+                // Pull from `current`. If yielded, return. If
+                // exhausted, replace `current` with a fresh
+                // `template.clone()` and try once more — if THAT
+                // also yields None, the template is empty; set
+                // `exhausted = true` and stop forever (avoids the
+                // infinite-empty-loop trap).
+                if let Value::Iterator {
+                    source: IteratorSource::Cycle { exhausted, .. },
+                    ..
+                } = iter
+                {
+                    if *exhausted {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+                let first = if let Value::Iterator {
+                    source: IteratorSource::Cycle { current, .. },
+                    ..
+                } = iter
+                {
+                    let mut c = std::mem::replace(current.as_mut(), Value::Unit);
+                    let y = self.iterator_step(&mut c);
+                    if let Value::Iterator {
+                        source: IteratorSource::Cycle { current, .. },
+                        ..
+                    } = iter
+                    {
+                        **current = c;
+                    }
+                    y
+                } else {
+                    return None;
+                };
+                if first.is_some() {
+                    return first;
+                }
+                // Reset to a fresh template clone.
+                let fresh = if let Value::Iterator {
+                    source: IteratorSource::Cycle { template, .. },
+                    ..
+                } = iter
+                {
+                    (**template).clone()
+                } else {
+                    return None;
+                };
+                if let Value::Iterator {
+                    source: IteratorSource::Cycle { current, .. },
+                    ..
+                } = iter
+                {
+                    **current = fresh;
+                }
+                let second = if let Value::Iterator {
+                    source: IteratorSource::Cycle { current, .. },
+                    ..
+                } = iter
+                {
+                    let mut c = std::mem::replace(current.as_mut(), Value::Unit);
+                    let y = self.iterator_step(&mut c);
+                    if let Value::Iterator {
+                        source: IteratorSource::Cycle { current, .. },
+                        ..
+                    } = iter
+                    {
+                        **current = c;
+                    }
+                    y
+                } else {
+                    return None;
+                };
+                if second.is_some() {
+                    return second;
+                }
+                // Template is empty — sticky-stop.
+                if let Value::Iterator {
+                    source: IteratorSource::Cycle { exhausted, .. },
+                    ..
+                } = iter
+                {
+                    *exhausted = true;
+                }
+                None
+            }
         }
     }
 
@@ -3536,6 +3654,11 @@ impl<'a> Interpreter<'a> {
                     **outer = o;
                     *current_inner = None;
                 }
+            }
+            IteratorSource::Cycle { exhausted, .. } => {
+                // Just trip the sticky-stop flag; pull_source's
+                // first check returns None on every subsequent call.
+                *exhausted = true;
             }
         }
     }
@@ -3959,6 +4082,64 @@ impl<'a> Interpreter<'a> {
                             outer: Box::new(obj),
                             f: Box::new(closure),
                             current_inner: None,
+                        },
+                        steps: Vec::new(),
+                    };
+                }
+            }
+            "step_by" => {
+                // Lazy stride adaptor — yields every n-th item. Negative
+                // or zero `n` clamps to 1 at the runtime layer (the
+                // typechecker accepts any i64). n=1 makes step_by an
+                // observable no-op; n>len yields just the first item.
+                if matches!(obj, Value::Iterator { .. }) {
+                    let Some(arg) = args.first() else {
+                        return self.record_runtime_error(
+                            "Iterator.step_by() requires an integer argument".to_string(),
+                            span,
+                        );
+                    };
+                    let n = match self.eval_expr_inner(&arg.value) {
+                        Value::Int(n) => n.max(1) as usize,
+                        v => {
+                            return self.record_runtime_error(
+                                format!("Iterator.step_by() expects an integer; got {}", v),
+                                span,
+                            );
+                        }
+                    };
+                    let Value::Iterator { source, mut steps } = obj else {
+                        unreachable!()
+                    };
+                    steps.push(IteratorStep::StepBy {
+                        n,
+                        remaining_skip: 0,
+                    });
+                    return Value::Iterator { source, steps };
+                }
+            }
+            "cycle" => {
+                // Restart-on-exhaust combinator. Snapshots `self`
+                // (deep-clone via Value's derived Clone) into a
+                // `template`; each restart re-clones the template
+                // into `current`, which resets adaptor counters
+                // (Enumerate / Take / Skip / TakeWhile / SkipWhile /
+                // StepBy) for that cycle. Downstream adaptors append
+                // to the wrapping iterator's empty steps and apply
+                // uniformly across cycles.
+                if matches!(obj, Value::Iterator { .. }) {
+                    if !args.is_empty() {
+                        return self.record_runtime_error(
+                            format!("Iterator.cycle() takes no arguments, got {}", args.len()),
+                            span,
+                        );
+                    }
+                    let template = obj.clone();
+                    return Value::Iterator {
+                        source: IteratorSource::Cycle {
+                            template: Box::new(template.clone()),
+                            current: Box::new(template),
+                            exhausted: false,
                         },
                         steps: Vec::new(),
                     };

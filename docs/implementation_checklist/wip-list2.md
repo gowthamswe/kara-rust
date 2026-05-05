@@ -198,10 +198,29 @@ reviewable in isolation.
   side-effect prefixes that outer N+1 is never visited when take(N)
   is satisfied earlier).
 
-- [ ] **10. `step_by(n)` + `cycle()`.** `step_by` yields every n-th element
-  (n ≥ 1). `cycle` requires the source to be cloneable — when exhausted,
-  restarts from a stored copy. Document the cloning requirement in the
-  diagnostic.
+- [x] **10. `step_by(n)` + `cycle()`.** `step_by` is a new
+  `IteratorStep::StepBy { n, remaining_skip }` variant — yields the
+  current item when `remaining_skip == 0` and resets to `n - 1`;
+  otherwise rejects and decrements. n is clamped to `n.max(1)` at the
+  dispatch site so the post-yield reset never underflows; the
+  typechecker accepts any i64 (matching `take` / `skip`'s clamp
+  policy). `cycle` is a new `IteratorSource::Cycle { template,
+  current, exhausted }` variant — `template` is the snapshot taken at
+  construction (deep-clone via Value's derived Clone), `current` is
+  the in-flight clone being drained; on exhaust, `current` is
+  replaced by a fresh `template.clone()`. The `exhausted` sticky
+  flag flips true if the template itself is empty (avoids the
+  infinite-empty-loop trap) — detected at runtime via "if a fresh
+  template clone yields None on first pull, stop forever". The
+  "cloneable source" requirement noted in design.md is implicit:
+  every Value derives Clone, so any iterator can cycle. 7 typechecker
+  tests + 14 interpreter tests cover stride correctness (including
+  n=0/1/larger-than-length clamps), state persistence across
+  `next()` pulls, cycle-with-take, cycle-on-empty (no infinite
+  loop), pre-cycle adaptors that re-run each cycle (filter,
+  enumerate counters reset), post-cycle adaptors that apply
+  uniformly across cycles, composition (`step_by.cycle`,
+  `enumerate.cycle`), and arity / non-int errors.
 
 - [ ] **11. `inspect(f)` + `scan(state, f)`.** `inspect` runs the closure on
   each element for side effects; passes the element through. `scan` threads

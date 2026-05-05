@@ -6685,3 +6685,96 @@ fn test_iter_flat_map_wrong_arg_count_rejected() {
         errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
     );
 }
+
+#[test]
+fn test_iter_step_by_returns_same_item_type() {
+    typecheck_ok(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().step_by(2);
+             let _x: i64 = it.next().unwrap();
+         }",
+    );
+}
+
+#[test]
+fn test_iter_step_by_after_map_uses_mapped_type() {
+    typecheck_ok(
+        r#"fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().map(|x| if x > 0 { "pos" } else { "neg" }).step_by(3);
+             let _s: String = it.next().unwrap();
+         }"#,
+    );
+}
+
+#[test]
+fn test_iter_step_by_argument_must_be_integer() {
+    let errs = typecheck_errors(
+        r#"fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().step_by("nope");
+         }"#,
+    );
+    assert!(
+        errs.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch on step_by(non-int), got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_step_by_wrong_arg_count_rejected() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().step_by();
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
+                && e.message.contains("Iterator.step_by()")),
+        "expected WrongNumberOfArgs for step_by() with no args, got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_iter_cycle_returns_same_item_type() {
+    typecheck_ok(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().cycle().take(5);
+             let _x: i64 = it.next().unwrap();
+         }",
+    );
+}
+
+#[test]
+fn test_iter_cycle_after_map_uses_mapped_type() {
+    typecheck_ok(
+        r#"fn main() {
+             let v: Vec[i64] = Vec.new();
+             let mut it = v.iter().map(|x| if x > 0 { "pos" } else { "neg" }).cycle().take(3);
+             let _s: String = it.next().unwrap();
+         }"#,
+    );
+}
+
+#[test]
+fn test_iter_cycle_with_arg_rejected() {
+    let errs = typecheck_errors(
+        "fn main() {
+             let v: Vec[i64] = Vec.new();
+             let _it = v.iter().cycle(5);
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs
+                && e.message.contains("Iterator.cycle()")),
+        "expected WrongNumberOfArgs for cycle(arg), got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+    );
+}
