@@ -4153,12 +4153,7 @@ impl<'ctx> Codegen<'ctx> {
                             let zero = i64_t.const_zero();
                             let is_empty = self
                                 .builder
-                                .build_int_compare(
-                                    IntPredicate::EQ,
-                                    len,
-                                    zero,
-                                    "slice.is_empty",
-                                )
+                                .build_int_compare(IntPredicate::EQ, len, zero, "slice.is_empty")
                                 .unwrap();
                             return Ok(is_empty.into());
                         }
@@ -7256,11 +7251,7 @@ impl<'ctx> Codegen<'ctx> {
     /// body is `*dst = *src` — single load + store. Covers every Copy-by-
     /// memcpy type (i8…i64, u8…u64, f32/f64, bool, char, unit). Cache-keyed
     /// on `type_name` so repeat callers reuse the same fn.
-    fn emit_primitive_clone_fn(
-        &mut self,
-        type_name: &str,
-        te: &TypeExpr,
-    ) -> FunctionValue<'ctx> {
+    fn emit_primitive_clone_fn(&mut self, type_name: &str, te: &TypeExpr) -> FunctionValue<'ctx> {
         let fn_name = format!("karac_clone_{type_name}");
         if let Some(f) = self.module.get_function(&fn_name) {
             self.clone_fn_cache.insert(type_name.to_string(), f);
@@ -7273,9 +7264,9 @@ impl<'ctx> Codegen<'ctx> {
             .context
             .void_type()
             .fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
-        let clone_fn =
-            self.module
-                .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
+        let clone_fn = self
+            .module
+            .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
         self.clone_fn_cache.insert(type_name.to_string(), clone_fn);
 
         let entry_bb = self.context.append_basic_block(clone_fn, "entry");
@@ -7312,9 +7303,9 @@ impl<'ctx> Codegen<'ctx> {
             .context
             .void_type()
             .fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
-        let clone_fn =
-            self.module
-                .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
+        let clone_fn = self
+            .module
+            .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
         self.clone_fn_cache.insert(type_name, clone_fn);
 
         let entry_bb = self.context.append_basic_block(clone_fn, "entry");
@@ -7322,11 +7313,7 @@ impl<'ctx> Codegen<'ctx> {
         let src = clone_fn.get_nth_param(0).unwrap().into_pointer_value();
         let dst = clone_fn.get_nth_param(1).unwrap().into_pointer_value();
         self.builder
-            .build_call(
-                self.karac_string_clone_fn,
-                &[src.into(), dst.into()],
-                "",
-            )
+            .build_call(self.karac_string_clone_fn, &[src.into(), dst.into()], "")
             .unwrap();
         self.builder.build_return(None).unwrap();
 
@@ -7369,9 +7356,9 @@ impl<'ctx> Codegen<'ctx> {
             .context
             .void_type()
             .fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
-        let clone_fn =
-            self.module
-                .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
+        let clone_fn = self
+            .module
+            .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
         self.clone_fn_cache.insert(type_name, clone_fn);
 
         let entry_bb = self.context.append_basic_block(clone_fn, "entry");
@@ -7500,10 +7487,7 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap();
 
         self.builder.position_at_end(bdy_bb);
-        let offset = self
-            .builder
-            .build_int_mul(i_val, elem_size, "off")
-            .unwrap();
+        let offset = self.builder.build_int_mul(i_val, elem_size, "off").unwrap();
         let src_elem = unsafe {
             self.builder
                 .build_gep(i8_t, src_data, &[offset], "src.elem")
@@ -7545,11 +7529,7 @@ impl<'ctx> Codegen<'ctx> {
     /// Set[T] reuses this path with V = unit (empty-tuple). The runtime's
     /// `(key_size + val_size).max(1)` keeps the bucket allocation valid
     /// when val_size = 0.
-    fn emit_map_clone_fn(
-        &mut self,
-        key_te: &TypeExpr,
-        val_te: &TypeExpr,
-    ) -> FunctionValue<'ctx> {
+    fn emit_map_clone_fn(&mut self, key_te: &TypeExpr, val_te: &TypeExpr) -> FunctionValue<'ctx> {
         let key_name = Self::display_mangle_te(key_te);
         let val_name = Self::display_mangle_te(val_te);
         let type_name = format!("Map_{key_name}_{val_name}");
@@ -7576,9 +7556,9 @@ impl<'ctx> Codegen<'ctx> {
             .context
             .void_type()
             .fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
-        let clone_fn =
-            self.module
-                .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
+        let clone_fn = self
+            .module
+            .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
         self.clone_fn_cache.insert(type_name, clone_fn);
 
         let entry_bb = self.context.append_basic_block(clone_fn, "entry");
@@ -7598,8 +7578,12 @@ impl<'ctx> Codegen<'ctx> {
         // on empty-tuple returns i64 → size 8. For a true zero-size value,
         // we'd need extra plumbing; the runtime's `.max(1)` already keeps
         // the allocation valid so 8-byte slots are harmless overhead.
-        let key_size = key_ty.size_of().unwrap_or_else(|| i64_t.const_int(8, false));
-        let val_size = val_ty.size_of().unwrap_or_else(|| i64_t.const_int(8, false));
+        let key_size = key_ty
+            .size_of()
+            .unwrap_or_else(|| i64_t.const_int(8, false));
+        let val_size = val_ty
+            .size_of()
+            .unwrap_or_else(|| i64_t.const_int(8, false));
         let new_handle = self
             .builder
             .build_call(
@@ -7665,7 +7649,11 @@ impl<'ctx> Codegen<'ctx> {
         self.builder
             .build_call(
                 self.karac_map_insert_fn(),
-                &[new_handle.into(), key_clone_slot.into(), val_clone_slot.into()],
+                &[
+                    new_handle.into(),
+                    key_clone_slot.into(),
+                    val_clone_slot.into(),
+                ],
                 "",
             )
             .unwrap();
@@ -7733,9 +7721,9 @@ impl<'ctx> Codegen<'ctx> {
             .context
             .void_type()
             .fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
-        let clone_fn =
-            self.module
-                .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
+        let clone_fn = self
+            .module
+            .add_function(&fn_name, clone_fn_ty, Some(Linkage::Internal));
         self.clone_fn_cache.insert(type_name, clone_fn);
 
         let entry_bb = self.context.append_basic_block(clone_fn, "entry");
@@ -7778,10 +7766,7 @@ impl<'ctx> Codegen<'ctx> {
     /// the cloned value lives in subtask 6 — at this layer the alloca is
     /// just a temporary; the binding's slot inherits ownership when the
     /// `let` stores into it.
-    fn try_compile_clone(
-        &mut self,
-        object: &Expr,
-    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+    fn try_compile_clone(&mut self, object: &Expr) -> Result<Option<BasicValueEnum<'ctx>>, String> {
         let ExprKind::Identifier(name) = &object.kind else {
             return Ok(None);
         };
@@ -7825,15 +7810,16 @@ impl<'ctx> Codegen<'ctx> {
                 .map_key_type_exprs
                 .get(name_owned.as_str())
                 .cloned()
-                .ok_or_else(|| {
-                    format!("clone: missing map_key_type_exprs for '{}'", name_owned)
-                })?;
+                .ok_or_else(|| format!("clone: missing map_key_type_exprs for '{}'", name_owned))?;
             let v = self
                 .var_elem_type_exprs
                 .get(name_owned.as_str())
                 .cloned()
                 .ok_or_else(|| {
-                    format!("clone: missing var_elem_type_exprs (val) for '{}'", name_owned)
+                    format!(
+                        "clone: missing var_elem_type_exprs (val) for '{}'",
+                        name_owned
+                    )
                 })?;
             mk_path("Map", vec![k, v])
         } else if self.vec_elem_types.contains_key(name_owned.as_str()) {
@@ -7863,10 +7849,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder
             .build_call(clone_fn, &[src_slot.ptr.into(), dst.into()], "")
             .unwrap();
-        let dst_val = self
-            .builder
-            .build_load(llvm_ty, dst, "clone.val")
-            .unwrap();
+        let dst_val = self.builder.build_load(llvm_ty, dst, "clone.val").unwrap();
         Ok(Some(dst_val))
     }
 
@@ -8382,9 +8365,7 @@ impl<'ctx> Codegen<'ctx> {
                 if args.is_empty() {
                     return Err(format!("Set.{method} requires another set as argument"));
                 }
-                let other_handle = self
-                    .compile_expr(&args[0].value)?
-                    .into_pointer_value();
+                let other_handle = self.compile_expr(&args[0].value)?.into_pointer_value();
                 // Element TypeExpr drives clone/hash/eq fn synthesis. Without
                 // it we can't deep-clone non-Copy elements (String, …) safely.
                 let elem_te = self
@@ -8392,9 +8373,7 @@ impl<'ctx> Codegen<'ctx> {
                     .get(var_name)
                     .cloned()
                     .ok_or_else(|| {
-                        format!(
-                            "codegen: Set.{method} missing elem TypeExpr for '{var_name}'"
-                        )
+                        format!("codegen: Set.{method} missing elem TypeExpr for '{var_name}'")
                     })?;
 
                 let elem_size = elem_ty
@@ -8495,7 +8474,11 @@ impl<'ctx> Codegen<'ctx> {
 
         let iter_handle = self
             .builder
-            .build_call(self.karac_map_iter_new_fn, &[src_handle.into()], "setop.iter")
+            .build_call(
+                self.karac_map_iter_new_fn,
+                &[src_handle.into()],
+                "setop.iter",
+            )
             .unwrap()
             .try_as_basic_value()
             .unwrap_basic()

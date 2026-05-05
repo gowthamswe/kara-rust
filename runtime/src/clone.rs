@@ -52,10 +52,7 @@ struct KaracString {
 ///   typically registered with the codegen scope-cleanup machinery via
 ///   the same `track_vec_var` path Strings already use.
 #[no_mangle]
-pub unsafe extern "C" fn karac_string_clone(
-    src: *const c_void,
-    dst: *mut c_void,
-) {
+pub unsafe extern "C" fn karac_string_clone(src: *const c_void, dst: *mut c_void) {
     let src = &*(src as *const KaracString);
     let dst = &mut *(dst as *mut KaracString);
 
