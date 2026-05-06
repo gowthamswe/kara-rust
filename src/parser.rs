@@ -865,6 +865,13 @@ impl Parser {
         let start = self.current_span();
         self.expect(&Token::Type)?;
         let name = self.expect_identifier()?;
+        let name_span = self.span_from(&start);
+        self.check_ident_class(
+            &name,
+            IdentClass::Type,
+            "associated type",
+            name_span,
+        );
         let mut bounds = Vec::new();
         if self.eat(&Token::Colon) {
             loop {
@@ -1308,6 +1315,11 @@ impl Parser {
         let start = self.current_span();
         self.expect(&Token::Layout)?;
         let name = self.expect_identifier()?;
+        // Layout names are Value-class — they bind to a logical collection
+        // (e.g., `layout entities: Collection[Entity]`). The Type-class
+        // identifier is the *element* type, not the layout itself.
+        let name_span = self.span_from(&start);
+        self.check_ident_class(&name, IdentClass::Value, "layout", name_span);
         self.expect(&Token::Colon)?;
         let collection_type = self.parse_type()?;
 
@@ -1885,6 +1897,17 @@ impl Parser {
             if self.check(&Token::Const) {
                 self.advance();
                 let name = self.expect_identifier()?;
+                let pname_span = self.span_from(&pstart);
+                // Const generic params follow the same Type-class convention
+                // as type generic params (see design.md § Identifiers and
+                // Naming). Single uppercase letters (`N`, `K`) and
+                // PascalCase names both classify as Type-class.
+                self.check_ident_class(
+                    &name,
+                    IdentClass::Type,
+                    "const generic parameter",
+                    pname_span,
+                );
                 self.expect(&Token::Colon)?;
                 let ty = self.parse_type()?;
                 params.push(GenericParam {

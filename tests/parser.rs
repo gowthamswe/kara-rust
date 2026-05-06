@@ -4327,6 +4327,53 @@ fn test_ident_class_struct_field_snake_ok() {
     parse_ok("struct Foo { my_field: i32, }");
 }
 
+#[test]
+fn test_ident_class_const_generic_param_must_be_type_class() {
+    // Const generic params follow the Type-class convention (single
+    // uppercase letter or PascalCase). `n` is Value-class — rejected.
+    let (_, errors) =
+        parse_with_errors("fn zeros[const n: usize]() -> Array[f64, n] { Array.new() }");
+    assert!(
+        !errors.is_empty(),
+        "expected naming error for snake_case const generic param"
+    );
+    assert!(errors_contain(&errors, "n"), "{errors:?}");
+}
+
+#[test]
+fn test_ident_class_const_generic_param_single_upper_ok() {
+    // Single uppercase letter is Type-class — `N` accepted.
+    parse_ok("fn zeros[const N: usize]() -> Array[f64, N] { Array.new() }");
+}
+
+#[test]
+fn test_ident_class_assoc_type_must_be_type_class() {
+    let (_, errors) = parse_with_errors("trait It { type item; }");
+    assert!(
+        !errors.is_empty(),
+        "expected naming error for snake_case associated type"
+    );
+    assert!(errors_contain(&errors, "item"), "{errors:?}");
+}
+
+#[test]
+fn test_ident_class_assoc_type_pascal_ok() {
+    parse_ok("trait It { type Item; }");
+    parse_ok("trait It { type Item: Iterator; }");
+}
+
+#[test]
+fn test_ident_class_layout_name_must_be_value_class() {
+    let (_, errors) = parse_with_errors(
+        "struct Entity { id: i64 } layout MyEntities: Vec[Entity] { id }",
+    );
+    assert!(
+        !errors.is_empty(),
+        "expected naming error for PascalCase layout name"
+    );
+    assert!(errors_contain(&errors, "MyEntities"), "{errors:?}");
+}
+
 // ── Doc comment attachment (List 1: karac doc) ─────────────────────────
 
 #[test]
