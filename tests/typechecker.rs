@@ -2812,6 +2812,113 @@ fn test_set_prefix_literal_empty_with_annotation() {
     typecheck_ok("fn main() { let s: Set[i64] = Set[]; }");
 }
 
+// ── E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION ────────────────────────
+//
+// Per design.md § Collection Literals — an empty prefix-literal has no
+// element type to infer. Synthesis-mode use (no enclosing annotation)
+// emits a focused diagnostic; check-mode (annotated bindings, typed
+// call args, typed struct-field initializers) still recovers via the
+// expected type.
+
+fn assert_one_typecheck_error_containing(source: &str, substrings: &[&str]) {
+    let errors = typecheck_errors(source);
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one type error for source `{source}`; got {errors:#?}"
+    );
+    let msg = &errors[0].message;
+    for s in substrings {
+        assert!(
+            msg.contains(s),
+            "expected message to contain `{s}`; got `{msg}`"
+        );
+    }
+}
+
+#[test]
+fn empty_vec_literal_without_annotation_emits_focused_diagnostic() {
+    assert_one_typecheck_error_containing(
+        "fn main() { let v = Vec[]; }",
+        &[
+            "E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION",
+            "empty `Vec[]` literal",
+            "let v: Vec[T] = Vec[]",
+            "Vec.new()",
+        ],
+    );
+}
+
+#[test]
+fn empty_set_literal_without_annotation_emits_focused_diagnostic() {
+    assert_one_typecheck_error_containing(
+        "fn main() { let s = Set[]; }",
+        &[
+            "E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION",
+            "empty `Set[]` literal",
+            "Set[T]",
+            "Set.new()",
+        ],
+    );
+}
+
+#[test]
+fn empty_map_literal_without_annotation_emits_focused_diagnostic() {
+    assert_one_typecheck_error_containing(
+        "fn main() { let m = Map[]; }",
+        &[
+            "E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION",
+            "empty `Map[]` literal",
+            "Map[K, V]",
+            "Map.new()",
+        ],
+    );
+}
+
+#[test]
+fn empty_array_literal_without_annotation_emits_focused_diagnostic() {
+    let errors = typecheck_errors("fn main() { let a = Array[]; }");
+    let any_match = errors.iter().any(|e| {
+        e.message.contains("E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION")
+            && e.message.contains("empty `Array[]` literal")
+            && e.message.contains("Array[T, 0]")
+    });
+    assert!(
+        any_match,
+        "expected focused empty-array diagnostic, got: {errors:#?}"
+    );
+}
+
+#[test]
+fn empty_vec_literal_with_annotation_keeps_passing() {
+    typecheck_ok("fn main() { let v: Vec[i64] = Vec[]; }");
+}
+
+#[test]
+fn empty_map_literal_with_annotation_keeps_passing() {
+    typecheck_ok("fn main() { let m: Map[i32, i32] = Map[]; }");
+}
+
+#[test]
+fn empty_array_literal_with_annotation_keeps_passing() {
+    typecheck_ok("fn main() { let a: Array[i64, 0] = Array[]; }");
+}
+
+#[test]
+fn empty_vec_literal_at_typed_call_arg_keeps_passing() {
+    typecheck_ok(
+        "fn take(v: Vec[i64]) -> i64 { 0 } fn main() { let _ = take(Vec[]); }",
+    );
+}
+
+#[test]
+fn empty_set_literal_in_typed_struct_field_keeps_passing() {
+    typecheck_ok(
+        "struct Bag { items: Set[i64] } \
+         fn main() { let b = Bag { items: Set[] }; }",
+    );
+}
+
 #[test]
 fn test_repeat_literal_count_must_be_integer() {
     // Non-integer count emits a clear diagnostic.

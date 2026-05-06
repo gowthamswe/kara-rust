@@ -1333,6 +1333,31 @@ impl<'a> TypeChecker<'a> {
         });
     }
 
+    /// Emit `error[E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION]` for an empty
+    /// `Vec[]` / `Array[]` / `Set[]` / `Map[]` literal that reached
+    /// synthesis mode without an enclosing annotation. The diagnostic body
+    /// names the literal kind, supplies a per-kind annotation skeleton, and
+    /// suggests the corresponding constructor (`Vec.new()` / `Set.new()` /
+    /// `Map.new()`) per design.md § Collection Literals.
+    fn report_empty_prefix_literal(&mut self, type_name: &str, span: &Span) {
+        let (annotation_skeleton, constructor) = match type_name {
+            "Vec" => ("Vec[T]", Some("Vec.new()")),
+            "Array" => ("Array[T, 0]", None),
+            "Set" => ("Set[T]", Some("Set.new()")),
+            "Map" => ("Map[K, V]", Some("Map.new()")),
+            _ => (type_name, None),
+        };
+        let mut msg = format!(
+            "error[E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION]: cannot infer \
+             element type from empty `{type_name}[]` literal — \
+             add a binding annotation: `let v: {annotation_skeleton} = {type_name}[]`"
+        );
+        if let Some(ctor) = constructor {
+            msg.push_str(&format!(", or use `{ctor}`"));
+        }
+        self.type_error(msg, span.clone(), TypeErrorKind::TypeMismatch);
+    }
+
     /// Emit `NoMethodFound` for an unknown stdlib method only when a close
     /// candidate exists in `known_methods` (edit distance ≤ 2 via
     /// `edit_distance::suggest_similar`). Used by per-type `infer_*_method`
@@ -5508,6 +5533,28 @@ impl<'a> TypeChecker<'a> {
     /// in `into_conversions`; for everything else, falls back to `infer_expr`
     /// plus a `check_assignable` boundary.
     fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Type {
+        // Empty prefix-literal (`Vec[]` / `Array[]` / `Set[]` / `Map[]`) at
+        // a check-mode position: recover via the expected type. Synthesis-
+        // mode use (no annotation, no expected-type carrier) hits the
+        // matching arm in `infer_expr_inner` and emits
+        // `E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION`. Per design.md
+        // § Collection Literals: an empty prefix-literal has no element
+        // type to infer.
+        if let ExprKind::PrefixCollectionLiteral { type_name, items } = &expr.kind {
+            if items.is_empty() {
+                let matches_expected = match (type_name.as_str(), expected) {
+                    ("Vec", Type::Named { name, .. }) => name == "Vec",
+                    ("Set", Type::Named { name, .. }) => name == "Set",
+                    ("Map", Type::Named { name, .. }) => name == "Map" || name == "HashMap",
+                    ("Array", Type::Array { .. }) => true,
+                    _ => false,
+                };
+                if matches_expected {
+                    self.record_expr_type(&expr.span, expected);
+                    return expected.clone();
+                }
+            }
+        }
         // Bare-identifier call at an expected-type position: `default()` where
         // expected is `T: Default` or a concrete type with an `impl Default`.
         // Intercepts before normal inference so the typechecker can substitute
@@ -6568,84 +6615,75 @@ impl<'a> TypeChecker<'a> {
             }
 
             ExprKind::PrefixCollectionLiteral { type_name, items } => {
+                // Empty prefix-literal in synthesis mode — no element type
+                // to infer. Check-mode (`let v: Vec[T] = Vec[]`, typed call
+                // arguments, typed struct-field initializers) intercepts
+                // earlier in `check_expr` and recovers via the expected
+                // type. Anything that reaches this branch had no annotation
+                // and gets the focused
+                // `E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION` diagnostic per
+                // design.md § Collection Literals.
+                if items.is_empty() {
+                    self.report_empty_prefix_literal(type_name, &expr.span);
+                    return match type_name.as_str() {
+                        "Array" => Type::Array {
+                            element: Box::new(Type::Error),
+                            size: 0,
+                        },
+                        _ => Type::Named {
+                            name: type_name.clone(),
+                            args: vec![Type::Error],
+                        },
+                    };
+                }
                 match type_name.as_str() {
                     "Array" => {
-                        if items.is_empty() {
-                            Type::Array {
-                                element: Box::new(Type::Error),
-                                size: 0,
-                            }
-                        } else {
-                            let first_ty = self.infer_expr(&items[0]);
-                            for item in &items[1..] {
-                                let ty = self.infer_expr(item);
-                                self.check_assignable(&first_ty, &ty, item.span.clone());
-                            }
-                            Type::Array {
-                                element: Box::new(first_ty),
-                                size: items.len(),
-                            }
+                        let first_ty = self.infer_expr(&items[0]);
+                        for item in &items[1..] {
+                            let ty = self.infer_expr(item);
+                            self.check_assignable(&first_ty, &ty, item.span.clone());
+                        }
+                        Type::Array {
+                            element: Box::new(first_ty),
+                            size: items.len(),
                         }
                     }
                     "Vec" => {
-                        if items.is_empty() {
-                            Type::Named {
-                                name: "Vec".to_string(),
-                                args: vec![Type::Error],
-                            }
-                        } else {
-                            let first_ty = self.infer_expr(&items[0]);
-                            for item in &items[1..] {
-                                let ty = self.infer_expr(item);
-                                self.check_assignable(&first_ty, &ty, item.span.clone());
-                            }
-                            Type::Named {
-                                name: "Vec".to_string(),
-                                args: vec![first_ty],
-                            }
+                        let first_ty = self.infer_expr(&items[0]);
+                        for item in &items[1..] {
+                            let ty = self.infer_expr(item);
+                            self.check_assignable(&first_ty, &ty, item.span.clone());
+                        }
+                        Type::Named {
+                            name: "Vec".to_string(),
+                            args: vec![first_ty],
                         }
                     }
                     "Set" => {
-                        // `Set[v1, v2, ...]` — element type is the unified
-                        // type of items. Empty `Set[]` falls to `Type::Error`
-                        // for the element; binding-site annotations
-                        // (`let s: Set[i64] = Set[]`) recover the type via
-                        // the assignment check downstream (mirrors
-                        // `design.md` line 1462's empty-collection rule).
-                        if items.is_empty() {
-                            Type::Named {
-                                name: "Set".to_string(),
-                                args: vec![Type::Error],
-                            }
-                        } else {
-                            let first_ty = self.infer_expr(&items[0]);
-                            for item in &items[1..] {
-                                let ty = self.infer_expr(item);
-                                self.check_assignable(&first_ty, &ty, item.span.clone());
-                            }
-                            Type::Named {
-                                name: "Set".to_string(),
-                                args: vec![first_ty],
-                            }
+                        let first_ty = self.infer_expr(&items[0]);
+                        for item in &items[1..] {
+                            let ty = self.infer_expr(item);
+                            self.check_assignable(&first_ty, &ty, item.span.clone());
+                        }
+                        Type::Named {
+                            name: "Set".to_string(),
+                            args: vec![first_ty],
                         }
                     }
                     other => {
-                        // Map and other prefix-collection forms — infer all
-                        // items, return Named type. Map's `Map[k: v, ...]`
-                        // form goes through `ExprKind::MapLiteral` separately;
-                        // this arm catches future prefix-literal types.
-                        let elem_ty = if items.is_empty() {
-                            Type::Error
-                        } else {
-                            let first_ty = self.infer_expr(&items[0]);
-                            for item in &items[1..] {
-                                self.infer_expr(item);
-                            }
-                            first_ty
-                        };
+                        // Map's `Map[k: v, ...]` form goes through
+                        // `ExprKind::MapLiteral` separately; this arm
+                        // catches future prefix-literal types and the
+                        // `Map[v1, v2, ...]` (positional-only, no `:`) shape
+                        // — which the parser does not emit today but is
+                        // future-compatible.
+                        let first_ty = self.infer_expr(&items[0]);
+                        for item in &items[1..] {
+                            self.infer_expr(item);
+                        }
                         Type::Named {
                             name: other.to_string(),
-                            args: vec![elem_ty],
+                            args: vec![first_ty],
                         }
                     }
                 }
@@ -10195,13 +10233,19 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        // Type-check field values
+        // Type-check field values. Use `check_expr` against the field's
+        // declared type when known so check-mode coercions (empty
+        // `Vec[]` / `Set[]` / `Array[]`, `Into` / `TryInto`, closure
+        // pushdown, etc.) fire at struct-field initializer positions.
+        // Fall back to synthesis when the field is not declared on the
+        // struct (already diagnosed above as an extra field).
         for f in fields {
-            let value_ty = self.infer_expr(&f.value);
             if let Some((_, expected_ty, _)) =
                 struct_info.fields.iter().find(|(n, _, _)| n == &f.name)
             {
-                self.check_assignable(expected_ty, &value_ty, f.value.span.clone());
+                self.check_expr(&f.value, &expected_ty.clone());
+            } else {
+                self.infer_expr(&f.value);
             }
         }
 
