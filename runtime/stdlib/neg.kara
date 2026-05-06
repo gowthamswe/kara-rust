@@ -1,0 +1,7 @@
+// runtime/stdlib/neg.kara
+//
+// CR-202 slice 5l. Per design.md § Operator Traits — unary arithmetic.
+
+trait Neg {
+    fn neg(self) -> Self;
+}

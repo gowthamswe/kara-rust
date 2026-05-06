@@ -3666,23 +3666,19 @@ impl<'a> TypeChecker<'a> {
             ("Into", &[]),
             ("TryFrom", &["Error"]),
             ("TryInto", &["Error"]),
-            // Arithmetic operators. `Add` / `Sub` / `Mul` / `Div`
-            // (CR-202 slices 5h–5k) are now provided by
-            // `runtime/stdlib/{add,sub,mul,div}.kara`. `Rem` / `Neg`
-            // stay hardcoded.
-            ("Rem", &[]),
-            ("Neg", &[]),
-            // Equality and ordering. `Eq` (slice 5b) and `Ord` (slice 5d)
-            // are now provided by `runtime/stdlib/{eq,ord}.kara`; the
-            // bake walk at the top of `register_builtin_types` registers
-            // them via `env_add_trait`.
-            // Bitwise operators
-            ("BitAnd", &[]),
-            ("BitOr", &[]),
-            ("BitXor", &[]),
-            ("Shl", &[]),
-            ("Shr", &[]),
+            // Arithmetic and bitwise operators (CR-202 slices 5h-5l):
+            // `Add` / `Sub` / `Mul` / `Div` / `Rem` / `Neg` /
+            // `BitAnd` / `BitOr` / `BitXor` / `Shl` / `Shr` are now
+            // provided by `runtime/stdlib/*.kara`; the bake walk at the
+            // top of `register_builtin_types` registers them via
+            // `env_add_trait`. `Not` stays hardcoded — its method name
+            // collides with Kāra's `not` keyword, so authoring the
+            // declaration as Kāra source requires a parser change
+            // (contextual-keyword escape at method-name position) that
+            // is out of scope for slice 5.
             ("Not", &[]),
+            // Equality and ordering. `Eq` (slice 5b) and `Ord` (slice 5d)
+            // are likewise provided by `runtime/stdlib/{eq,ord}.kara`.
             // Indexing — Output is the element type
             ("Index", &["Output"]),
             ("IndexMut", &["Output"]),

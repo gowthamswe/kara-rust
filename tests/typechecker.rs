@@ -9081,6 +9081,23 @@ fn baked_arithmetic_traits_resolvable_as_bounds() {
 }
 
 #[test]
+fn baked_extra_operator_traits_resolvable_as_bounds() {
+    // CR-202 slice 5l: Rem / Neg / BitAnd / BitOr / BitXor / Shl / Shr
+    // joined the baked surface (Not held back — `not` is a Kāra
+    // keyword, so the method name in the trait declaration would not
+    // parse). Pin that bound resolution still finds them.
+    typecheck_ok(
+        "fn use_rem[T: Rem](a: T, b: T) -> T { a.rem(b) }\n\
+         fn use_neg[T: Neg](a: T) -> T { a.neg() }\n\
+         fn use_bitand[T: BitAnd](a: T, b: T) -> T { a.bitand(b) }\n\
+         fn use_bitor[T: BitOr](a: T, b: T) -> T { a.bitor(b) }\n\
+         fn use_bitxor[T: BitXor](a: T, b: T) -> T { a.bitxor(b) }\n\
+         fn use_shl[T: Shl](a: T, b: T) -> T { a.shl(b) }\n\
+         fn use_shr[T: Shr](a: T, b: T) -> T { a.shr(b) }",
+    );
+}
+
+#[test]
 fn baked_hash_user_impl_typechecks() {
     // CR-202 slice 5e: `Hash` is now a real registered trait. The
     // method has a method-level generic param `H` for the hasher type.

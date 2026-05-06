@@ -1,0 +1,7 @@
+// runtime/stdlib/rem.kara
+//
+// CR-202 slice 5l. Per design.md § Operator Traits.
+
+trait Rem {
+    fn rem(self, rhs: Self) -> Self;
+}

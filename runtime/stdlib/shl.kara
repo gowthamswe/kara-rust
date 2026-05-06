@@ -1,0 +1,8 @@
+// runtime/stdlib/shl.kara
+//
+// CR-202 slice 5l. Per design.md § Operator Traits — bit shift left.
+// rhs = Self per v1 homogeneity rule.
+
+trait Shl {
+    fn shl(self, rhs: Self) -> Self;
+}

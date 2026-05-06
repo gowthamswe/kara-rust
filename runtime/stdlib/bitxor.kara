@@ -1,0 +1,7 @@
+// runtime/stdlib/bitxor.kara
+//
+// CR-202 slice 5l. Per design.md § Operator Traits — binary bitwise.
+
+trait BitXor {
+    fn bitxor(self, rhs: Self) -> Self;
+}
