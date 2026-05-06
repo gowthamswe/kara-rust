@@ -9065,6 +9065,22 @@ fn baked_debug_user_impl_typechecks() {
 }
 
 #[test]
+fn baked_arithmetic_traits_resolvable_as_bounds() {
+    // CR-202 slices 5h-5k: Add / Sub / Mul / Div migrated from
+    // `register_stdlib_traits` to baked source. User impls of these
+    // for non-stdlib types are still rejected by the resolver
+    // (operator-trait carve-out), so the test pin is in trait-bound
+    // position. If any of the four were accidentally dropped from
+    // env.traits, the bound would fail to resolve.
+    typecheck_ok(
+        "fn use_add[T: Add](a: T, b: T) -> T { a.add(b) }\n\
+         fn use_sub[T: Sub](a: T, b: T) -> T { a.sub(b) }\n\
+         fn use_mul[T: Mul](a: T, b: T) -> T { a.mul(b) }\n\
+         fn use_div[T: Div](a: T, b: T) -> T { a.div(b) }",
+    );
+}
+
+#[test]
 fn baked_hash_user_impl_typechecks() {
     // CR-202 slice 5e: `Hash` is now a real registered trait. The
     // method has a method-level generic param `H` for the hasher type.

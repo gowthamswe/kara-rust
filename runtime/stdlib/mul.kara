@@ -1,0 +1,7 @@
+// runtime/stdlib/mul.kara
+//
+// CR-202 slice 5j. Per design.md § Operator Traits.
+
+trait Mul {
+    fn mul(self, rhs: Self) -> Self;
+}

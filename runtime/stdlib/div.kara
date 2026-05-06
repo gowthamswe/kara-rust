@@ -1,0 +1,7 @@
+// runtime/stdlib/div.kara
+//
+// CR-202 slice 5k. Per design.md § Operator Traits.
+
+trait Div {
+    fn div(self, rhs: Self) -> Self;
+}

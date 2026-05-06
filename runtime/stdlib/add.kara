@@ -1,0 +1,7 @@
+// runtime/stdlib/add.kara
+//
+// CR-202 slice 5h. Per design.md § Operator Traits.
+
+trait Add {
+    fn add(self, rhs: Self) -> Self;
+}

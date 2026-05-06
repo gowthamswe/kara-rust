@@ -3666,11 +3666,10 @@ impl<'a> TypeChecker<'a> {
             ("Into", &[]),
             ("TryFrom", &["Error"]),
             ("TryInto", &["Error"]),
-            // Arithmetic operators
-            ("Add", &[]),
-            ("Sub", &[]),
-            ("Mul", &[]),
-            ("Div", &[]),
+            // Arithmetic operators. `Add` / `Sub` / `Mul` / `Div`
+            // (CR-202 slices 5h–5k) are now provided by
+            // `runtime/stdlib/{add,sub,mul,div}.kara`. `Rem` / `Neg`
+            // stay hardcoded.
             ("Rem", &[]),
             ("Neg", &[]),
             // Equality and ordering. `Eq` (slice 5b) and `Ord` (slice 5d)

@@ -1,0 +1,7 @@
+// runtime/stdlib/sub.kara
+//
+// CR-202 slice 5i. Per design.md § Operator Traits.
+
+trait Sub {
+    fn sub(self, rhs: Self) -> Self;
+}
