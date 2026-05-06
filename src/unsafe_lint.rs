@@ -166,7 +166,8 @@ fn walk_expr(expr: &Expr, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagno
         ExprKind::Block(block)
         | ExprKind::Loop { body: block, .. }
         | ExprKind::Seq(block)
-        | ExprKind::Par(block) => walk_block(block, lines, deny, diags),
+        | ExprKind::Par(block)
+        | ExprKind::Try(block) => walk_block(block, lines, deny, diags),
         ExprKind::Lock { body, .. } | ExprKind::Providers { body, .. } => {
             walk_block(body, lines, deny, diags)
         }

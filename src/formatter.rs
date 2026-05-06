@@ -1500,6 +1500,10 @@ impl Formatter {
                 self.write_str("unsafe ");
                 self.format_block(block);
             }
+            ExprKind::Try(block) => {
+                self.write_str("try ");
+                self.format_block(block);
+            }
             ExprKind::Seq(block) => {
                 self.write_str("seq ");
                 self.format_block(block);

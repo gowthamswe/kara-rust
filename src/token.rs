@@ -126,6 +126,10 @@ pub enum Token {
     // Defer
     Defer,
     ErrDefer,
+    /// `try { ... }` — try block. Parsed at v1; the typechecker pipeline
+    /// (?-retargeting + error-type unification) lands in P1. See
+    /// design.md § Error Handling > Try Blocks (try { ... }).
+    Try,
     // Assembly
     Asm,
     GlobalAsm,

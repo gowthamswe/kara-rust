@@ -5238,7 +5238,10 @@ impl<'a> TypeChecker<'a> {
                 }
             }
 
-            ExprKind::Par(body) | ExprKind::Seq(body) | ExprKind::Unsafe(body) => {
+            ExprKind::Par(body)
+            | ExprKind::Seq(body)
+            | ExprKind::Unsafe(body)
+            | ExprKind::Try(body) => {
                 self.walk_capture_consume_block(body, mode, outer, shadows, reason);
             }
             ExprKind::Lock { body, .. } => {
@@ -6650,6 +6653,26 @@ impl<'a> TypeChecker<'a> {
             }
 
             ExprKind::Unsafe(block) => self.infer_block(block),
+
+            ExprKind::Try(block) => {
+                // v1 stub — typechecker pipeline (?-retargeting against
+                // the block, error-type unification, From-chain coercion)
+                // lands in P1 per design.md § Error Handling > Try Blocks.
+                // We still type-check inner expressions so unrelated
+                // errors inside the body still surface; the block's
+                // overall type is the error sentinel.
+                self.infer_block(block);
+                self.type_error(
+                    "error[E_TRY_BLOCK_NOT_IMPLEMENTED_YET]: try block syntax \
+                     is recognized but the typechecker pipeline lands in P1 \
+                     — extract the body into a helper function returning \
+                     Result for now"
+                        .to_string(),
+                    expr.span.clone(),
+                    TypeErrorKind::TypeMismatch,
+                );
+                Type::Error
+            }
 
             ExprKind::WhileLet { value, body, .. } => {
                 self.infer_expr(value);

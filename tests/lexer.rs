@@ -1132,7 +1132,7 @@ fn test_v60_reserved_for_future_use_keywords() {
     // Per design.md § Reserved-for-Future-Use Keywords (v60 item 9). Each must
     // be rejected at the lexer level so they cannot be used as identifiers.
     for keyword in [
-        "gen", "become", "do", "final", "override", "priv", "try", "typeof", "virtual", "async",
+        "gen", "become", "do", "final", "override", "priv", "typeof", "virtual", "async",
         "await", "comptime", "pure", "box",
     ] {
         let tokens = tokens_only(keyword);

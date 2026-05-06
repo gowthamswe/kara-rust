@@ -159,7 +159,8 @@ fn walk_expr(
         | ExprKind::Loop { body: block, .. }
         | ExprKind::Seq(block)
         | ExprKind::Par(block)
-        | ExprKind::Unsafe(block) => walk_block(block, ffi_fns, diags),
+        | ExprKind::Unsafe(block)
+        | ExprKind::Try(block) => walk_block(block, ffi_fns, diags),
         ExprKind::Lock { body, .. } | ExprKind::Providers { body, .. } => {
             walk_block(body, ffi_fns, diags)
         }

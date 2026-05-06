@@ -1006,7 +1006,7 @@ impl<'a> OwnershipChecker<'a> {
             ExprKind::Loop { body, .. } => {
                 Self::collect_closure_let_bindings(body, out);
             }
-            ExprKind::Par(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) => {
+            ExprKind::Par(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) | ExprKind::Try(b) => {
                 Self::collect_closure_let_bindings(b, out);
             }
             ExprKind::Lock { body, .. } => Self::collect_closure_let_bindings(body, out),
@@ -1125,7 +1125,7 @@ impl<'a> OwnershipChecker<'a> {
             ExprKind::Loop { body, .. } => {
                 Self::collect_escaping_closures(body, closure_lets, out);
             }
-            ExprKind::Par(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) => {
+            ExprKind::Par(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) | ExprKind::Try(b) => {
                 Self::collect_escaping_closures(b, closure_lets, out);
             }
             ExprKind::Lock { body, .. } => Self::collect_escaping_closures(body, closure_lets, out),
@@ -1407,7 +1407,7 @@ impl<'a> OwnershipChecker<'a> {
                 Self::walk_block_for_calls(body, visit);
             }
             ExprKind::Loop { body, .. } => Self::walk_block_for_calls(body, visit),
-            ExprKind::Par(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) => {
+            ExprKind::Par(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) | ExprKind::Try(b) => {
                 Self::walk_block_for_calls(b, visit);
             }
             ExprKind::Lock { body, .. } => Self::walk_block_for_calls(body, visit),
@@ -1890,6 +1890,7 @@ impl<'a> OwnershipChecker<'a> {
             }
             ExprKind::Block(block)
             | ExprKind::Unsafe(block)
+            | ExprKind::Try(block)
             | ExprKind::Seq(block)
             | ExprKind::Par(block)
             | ExprKind::Lock { body: block, .. } => {
@@ -2572,7 +2573,10 @@ impl<'a> OwnershipChecker<'a> {
                 self.check_block(body, states, param_types, param_usage);
                 restore_uninit_after_loop(pre_uninit, states);
             }
-            ExprKind::Unsafe(body) | ExprKind::Seq(body) | ExprKind::Par(body) => {
+            ExprKind::Unsafe(body)
+            | ExprKind::Try(body)
+            | ExprKind::Seq(body)
+            | ExprKind::Par(body) => {
                 self.check_block(body, states, param_types, param_usage);
             }
             ExprKind::Lock { body, .. } => {
@@ -3360,6 +3364,7 @@ fn scan_expr_for_par_uses(
         ExprKind::Block(block)
         | ExprKind::Loop { body: block, .. }
         | ExprKind::Unsafe(block)
+        | ExprKind::Try(block)
         | ExprKind::Seq(block)
         | ExprKind::Lock { body: block, .. } => {
             scan_block_for_par_uses(

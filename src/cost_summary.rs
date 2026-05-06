@@ -257,9 +257,11 @@ fn walk_expr_for_with_provider(expr: &Expr, out: &mut Vec<WithProviderSite>) {
                 walk_expr_for_with_provider(&a.value, out);
             }
         }
-        ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Seq(b) | ExprKind::Par(b) => {
-            walk_block_for_with_provider(b, out)
-        }
+        ExprKind::Block(b)
+        | ExprKind::Unsafe(b)
+        | ExprKind::Try(b)
+        | ExprKind::Seq(b)
+        | ExprKind::Par(b) => walk_block_for_with_provider(b, out),
         ExprKind::If {
             condition,
             then_block,

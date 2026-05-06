@@ -2307,6 +2307,10 @@ impl<'a> Resolver<'a> {
                 self.resolve_block(block);
             }
 
+            ExprKind::Try(block) => {
+                self.resolve_block(block);
+            }
+
             ExprKind::ArrayLiteral(elements) => {
                 for elem in elements {
                     self.resolve_expr(elem);

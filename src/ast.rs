@@ -928,6 +928,13 @@ pub enum ExprKind {
     // Unsafe
     Unsafe(Block),
 
+    /// `try { ... }` — try block. The body may use `?` to short-circuit
+    /// out of the block; the block itself produces a `Result`-shaped
+    /// value. Parsed at v1; the typechecker pipeline (?-retargeting
+    /// against the block, error-type unification, From-chain coercion)
+    /// lands in P1. See design.md § Error Handling > Try Blocks.
+    Try(Block),
+
     // Sequential block (suppresses auto-parallelism)
     Seq(Block),
 

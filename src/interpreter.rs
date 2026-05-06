@@ -976,7 +976,7 @@ fn collect_free_idents_expr(expr: &Expr, bound: &mut HashSet<String>, out: &mut 
             collect_free_idents_expr(left, bound, out);
             collect_free_idents_expr(right, bound, out);
         }
-        ExprKind::Par(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) => {
+        ExprKind::Par(b) | ExprKind::Seq(b) | ExprKind::Unsafe(b) | ExprKind::Try(b) => {
             collect_free_idents_block(b, bound, out);
         }
         ExprKind::Lock { body, alias, .. } => {
@@ -2256,6 +2256,19 @@ impl<'a> Interpreter<'a> {
                 Ok(v) => v,
                 Err(cf) => self.set_cf(cf),
             },
+
+            ExprKind::Try(block) => {
+                // v1 stub — typechecker rejects every `try { ... }` use
+                // with E_TRY_BLOCK_NOT_IMPLEMENTED_YET; the interpreter
+                // never sees a valid try block in a typechecker-clean
+                // program. We still walk the body for any debug-mode use
+                // that bypasses the typechecker so the form has a defined
+                // shape until P1 ships ?-retargeting.
+                match self.eval_block_inner(block) {
+                    Ok(v) => v,
+                    Err(cf) => self.set_cf(cf),
+                }
+            }
 
             ExprKind::Seq(block) => match self.eval_block_inner(block) {
                 Ok(v) => v,

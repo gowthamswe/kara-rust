@@ -510,7 +510,10 @@ impl<'a> UseClassifier<'a> {
             // classified rather than falling through to the default Read.
             // Round 12.13: paired with the matching cfg.rs arm so the
             // CFG and classifier agree on what use sites exist.
-            ExprKind::Par(body) | ExprKind::Seq(body) | ExprKind::Unsafe(body) => {
+            ExprKind::Par(body)
+            | ExprKind::Seq(body)
+            | ExprKind::Unsafe(body)
+            | ExprKind::Try(body) => {
                 self.walk_block(body, mode);
             }
             ExprKind::Lock { body, .. } => self.walk_block(body, mode),

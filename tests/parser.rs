@@ -980,6 +980,53 @@ fn test_trait_alias_does_not_break_regular_trait() {
     parse_ok("trait Foo: Bar { fn baz(self); }");
 }
 
+// ── Try blocks (parser/AST + v1 stub) ───────────────────────────────
+//
+// `try { ... }` per design.md § Error Handling > Try Blocks (v60 item
+// 42). v1 parses the form; the typechecker pipeline (?-retargeting +
+// error-type unification + From-chain coercion) lands in P1.
+
+#[test]
+fn test_try_block_basic() {
+    let prog = parse_ok("fn main() { let r = try { 42 }; }");
+    let f = match &prog.items[0] {
+        Item::Function(f) => f,
+        _ => panic!("expected function"),
+    };
+    let stmt = &f.body.stmts[0];
+    let value = match &stmt.kind {
+        StmtKind::Let { value, .. } => value,
+        _ => panic!("expected let"),
+    };
+    assert!(
+        matches!(value.kind, ExprKind::Try(_)),
+        "expected ExprKind::Try, got {:?}",
+        value.kind
+    );
+}
+
+#[test]
+fn test_try_block_with_inner_question_mark_parses() {
+    // The inner `?` is parsed by ordinary expression machinery; the
+    // parser doesn't need to know about retargeting yet.
+    parse_ok(
+        "fn parse(s: String) -> Result[i64, IoError] { Ok(0) } \
+         fn main() { let r = try { let n = parse(\"1\")?; n }; }",
+    );
+}
+
+#[test]
+fn test_try_block_nested() {
+    parse_ok("fn main() { let r = try { try { 1 } }; }");
+}
+
+#[test]
+fn test_try_block_no_longer_reserved_keyword_error() {
+    // `try` previously emitted the reserved-future-use-keyword error;
+    // it now lexes as Token::Try and parses as a try block.
+    parse_ok("fn main() { let _ = try { 0 }; }");
+}
+
 #[test]
 fn test_trait_default_method() {
     let prog = parse_ok(

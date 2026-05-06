@@ -127,7 +127,8 @@ fn walk_expr_children(expr: &Expr, diags: &mut Vec<LintDiagnostic>) {
         | ExprKind::Loop { body: block, .. }
         | ExprKind::Seq(block)
         | ExprKind::Par(block)
-        | ExprKind::Unsafe(block) => walk_block(block, diags),
+        | ExprKind::Unsafe(block)
+        | ExprKind::Try(block) => walk_block(block, diags),
         ExprKind::Lock { body, .. } | ExprKind::Providers { body, .. } => walk_block(body, diags),
         ExprKind::If {
             condition,

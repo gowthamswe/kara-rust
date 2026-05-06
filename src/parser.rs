@@ -3717,6 +3717,19 @@ impl Parser {
                 })
             }
 
+            // Try block (`try { ... }`) — v60 item 42 / design.md § Error
+            // Handling > Try Blocks. v1 parses the form; the typechecker
+            // pipeline (`?`-retargeting against the block, error-type
+            // unification, From-chain coercion) lands in P1.
+            Token::Try => {
+                self.advance();
+                let block = self.parse_block()?;
+                Some(Expr {
+                    span: self.span_from(&start),
+                    kind: ExprKind::Try(block),
+                })
+            }
+
             // Seq block
             Token::Seq => {
                 self.advance();

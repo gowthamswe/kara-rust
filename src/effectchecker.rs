@@ -1552,6 +1552,7 @@ impl<'a> EffectChecker<'a> {
             }
             ExprKind::Loop { body, .. }
             | ExprKind::Unsafe(body)
+            | ExprKind::Try(body)
             | ExprKind::Seq(body)
             | ExprKind::Par(body) => {
                 let block_calls = self.collect_calls_in_block(body, bounds);
@@ -2724,7 +2725,11 @@ impl<'a> EffectChecker<'a> {
                     self.check_with_e_in_expr(v);
                 }
             }
-            ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Seq(b) | ExprKind::Par(b) => {
+            ExprKind::Block(b)
+            | ExprKind::Unsafe(b)
+            | ExprKind::Try(b)
+            | ExprKind::Seq(b)
+            | ExprKind::Par(b) => {
                 self.check_with_e_in_block(b);
             }
             ExprKind::Lock { body, .. } => self.check_with_e_in_block(body),
@@ -3114,6 +3119,7 @@ impl<'a> EffectChecker<'a> {
             }
             ExprKind::Loop { body, .. }
             | ExprKind::Unsafe(body)
+            | ExprKind::Try(body)
             | ExprKind::Seq(body)
             | ExprKind::Par(body) => {
                 self.check_subtyping_in_block_owned(body);

@@ -1081,6 +1081,7 @@ impl<'a> Lexer<'a> {
             "continue" => Token::Continue,
             "defer" => Token::Defer,
             "errdefer" => Token::ErrDefer,
+            "try" => Token::Try,
             "asm" => Token::Asm,
             "global_asm" => Token::GlobalAsm,
             // Bindings
@@ -1154,7 +1155,7 @@ impl<'a> Lexer<'a> {
                 "'bf16' is a reserved keyword for a future numeric type; not available until Phase 7".to_string(),
             ),
             // Reserved-for-future-use keywords — see design.md § Reserved-for-Future-Use Keywords.
-            "gen" | "become" | "do" | "final" | "override" | "priv" | "try" | "typeof"
+            "gen" | "become" | "do" | "final" | "override" | "priv" | "typeof"
             | "virtual" | "async" | "await" | "comptime" | "pure" | "box" => Token::Error(
                 format!("'{text}' is reserved for future use and cannot be used as an identifier"),
             ),

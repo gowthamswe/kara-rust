@@ -269,7 +269,9 @@ impl<'a> Lowerer<'a> {
                     self.lower_expr(e);
                 }
             }
-            ExprKind::Unsafe(b) | ExprKind::Seq(b) | ExprKind::Par(b) => self.lower_block(b),
+            ExprKind::Unsafe(b) | ExprKind::Try(b) | ExprKind::Seq(b) | ExprKind::Par(b) => {
+                self.lower_block(b)
+            }
             ExprKind::Lock { body, .. } => self.lower_block(body),
             ExprKind::Providers { bindings, body } => {
                 for b in bindings {

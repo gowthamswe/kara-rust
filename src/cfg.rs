@@ -930,9 +930,10 @@ impl<'a> CfgBuilder<'a> {
             // and silently drop their bodies' use sites — see parity test
             // `parity_t1_in_par_block_predicate_matches_legacy` for the
             // shape that exposed this gap.
-            ExprKind::Par(body) | ExprKind::Seq(body) | ExprKind::Unsafe(body) => {
-                self.lower_block(body, cur, exit, loops)
-            }
+            ExprKind::Par(body)
+            | ExprKind::Seq(body)
+            | ExprKind::Unsafe(body)
+            | ExprKind::Try(body) => self.lower_block(body, cur, exit, loops),
             ExprKind::Lock { body, .. } => self.lower_block(body, cur, exit, loops),
             ExprKind::Providers { bindings, body } => {
                 let mut c = cur;

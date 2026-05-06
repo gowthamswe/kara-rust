@@ -560,6 +560,7 @@ impl<'a> ConcurrencyChecker<'a> {
             }
             ExprKind::Block(block)
             | ExprKind::Unsafe(block)
+            | ExprKind::Try(block)
             | ExprKind::Seq(block)
             | ExprKind::Par(block) => {
                 self.collect_block_reads(block, reads);
@@ -773,6 +774,7 @@ impl<'a> ConcurrencyChecker<'a> {
             }
             ExprKind::Block(block)
             | ExprKind::Unsafe(block)
+            | ExprKind::Try(block)
             | ExprKind::Seq(block)
             | ExprKind::Par(block) => {
                 self.collect_block_effects(block, info);

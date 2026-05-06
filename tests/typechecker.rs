@@ -2980,6 +2980,41 @@ fn trait_alias_declaration_alone_typechecks() {
     typecheck_ok("trait Numeric = Copy + Clone;");
 }
 
+// ── Try block v1 stub diagnostic ────────────────────────────────────
+
+#[test]
+fn try_block_emits_v1_stub_diagnostic() {
+    let errors = typecheck_errors("fn main() { let _ = try { 42 }; }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_TRY_BLOCK_NOT_IMPLEMENTED_YET")
+                && e.message.contains("extract the body into a helper")),
+        "expected v1 stub, got: {errors:?}"
+    );
+}
+
+#[test]
+fn try_block_still_walks_body_for_inner_errors() {
+    // The stub walks the body so unrelated errors inside still surface.
+    // Here the body refers to an undefined identifier — we expect the
+    // parse/resolve error PLUS the v1 stub. (Resolver would have flagged
+    // `undefined_thing`, but resolver errors abort before the typechecker
+    // sees the body — adapt the test to a typecheck-time inner error.)
+    let errors = typecheck_errors("fn main() { let _ = try { 1 + true }; }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_TRY_BLOCK_NOT_IMPLEMENTED_YET")),
+        "expected v1 stub diagnostic, got: {errors:?}"
+    );
+    // The inner `1 + true` is also a type error.
+    assert!(
+        errors.len() >= 2,
+        "expected both stub and inner error, got: {errors:?}"
+    );
+}
+
 #[test]
 fn test_repeat_literal_count_must_be_integer() {
     // Non-integer count emits a clear diagnostic.
