@@ -186,6 +186,7 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
     ("result.kara", include_str!("../runtime/stdlib/result.kara")),
     ("vec.kara", include_str!("../runtime/stdlib/vec.kara")),
     ("partial_eq.kara", include_str!("../runtime/stdlib/partial_eq.kara")),
+    ("eq.kara", include_str!("../runtime/stdlib/eq.kara")),
 ];
 
 /// Parsed AST of every entry in [`STDLIB_SOURCES`]. Parsed lazily on first
@@ -499,6 +500,17 @@ mod tests {
     }
 
     #[test]
+    fn stdlib_sources_contains_eq_kara() {
+        // CR-202 slice 5b: `Eq` joins the baked surface with `: PartialEq`.
+        let names: Vec<&str> = STDLIB_SOURCES.iter().map(|(n, _)| *n).collect();
+        assert!(
+            names.contains(&"eq.kara"),
+            "STDLIB_SOURCES should contain eq.kara, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
     fn stdlib_sources_have_nonempty_bodies() {
         for &(name, src) in STDLIB_SOURCES {
             assert!(
@@ -681,6 +693,39 @@ mod tests {
             })
             .collect();
         assert_eq!(method_names, vec!["eq"]);
+    }
+
+    #[test]
+    fn synthetic_prelude_items_returns_baked_eq_with_partial_eq_supertrait() {
+        // CR-202 slice 5b: `Eq` is now `Eq: PartialEq` from baked source.
+        // Pre-5b the hardcoded `register_stdlib_traits` array registered
+        // `Eq` with no supertraits.
+        let items = synthetic_prelude_items();
+        let eq = find_prelude_item(&items, "Eq").expect("synthetic prelude exposes Eq");
+        let Item::TraitDef(t) = eq else {
+            panic!("Eq should be spliced as TraitDef (baked), got {:?}", eq);
+        };
+        assert!(t.span.line > 0, "baked Eq should carry a real source span");
+        assert!(
+            t.stdlib_origin,
+            "baked Eq should be tagged stdlib_origin = true"
+        );
+        let supertrait_names: Vec<&str> = t
+            .supertraits
+            .iter()
+            .map(|b| b.path.last().map(|s| s.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            supertrait_names,
+            vec!["PartialEq"],
+            "baked Eq should declare `PartialEq` as its sole supertrait"
+        );
+        let method_count = t
+            .items
+            .iter()
+            .filter(|i| matches!(i, crate::ast::TraitItem::Method(_)))
+            .count();
+        assert_eq!(method_count, 0, "Eq should declare no methods of its own");
     }
 
     #[test]

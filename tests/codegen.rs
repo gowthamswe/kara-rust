@@ -2352,9 +2352,14 @@ fn main() {
     fn test_ir_user_impl_method_emitted() {
         // User impl methods land in the module as LLVM functions named
         // `Type.method`. Regression guard for the impl-block codegen pass.
+        // CR-202 slice 5b: companion `impl PartialEq for Point` keeps the
+        // typecheck pass clean now that `Eq: PartialEq`.
         let ir = ir_for(
             r#"
 struct Point { x: i64, y: i64 }
+impl PartialEq for Point {
+    fn eq(ref self, other: ref Point) -> bool { self.x == other.x and self.y == other.y }
+}
 impl Eq for Point {
     fn eq(self, other: Point) -> bool { self.x == other.x and self.y == other.y }
 }
@@ -2511,9 +2516,16 @@ fn main() {
     fn test_e2e_user_impl_eq_drives_equality() {
         // End-to-end: `a == b` on user type lowers to `Point.eq(a, b)`,
         // which routes through the codegen-compiled impl method.
+        // CR-202 slice 5b: companion `impl PartialEq for Point` satisfies
+        // the new `Eq: PartialEq` supertrait edge.
         let out = run_program(
             r#"
 struct Point { x: i64, y: i64 }
+impl PartialEq for Point {
+    fn eq(ref self, other: ref Point) -> bool {
+        self.x == other.x and self.y == other.y
+    }
+}
 impl Eq for Point {
     fn eq(self, other: Point) -> bool {
         self.x == other.x and self.y == other.y

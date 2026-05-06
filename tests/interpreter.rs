@@ -112,9 +112,16 @@ fn test_bitnot_and_not_post_lowering() {
 fn test_user_impl_eq_drives_equality_operator() {
     // `impl Eq for Point` is registered, and `a == b` lowers to
     // `Point.eq(a, b)` — routed through the user-defined method rather than
-    // any structural fallback.
+    // any structural fallback. CR-202 slice 5b: companion
+    // `impl PartialEq for Point` satisfies the new `Eq: PartialEq`
+    // supertrait edge so the typecheck pass stays clean.
     assert_eq!(
         run("struct Point { x: i64, y: i64 }
+             impl PartialEq for Point {
+                 fn eq(ref self, other: ref Point) -> bool {
+                     self.x == other.x and self.y == other.y
+                 }
+             }
              impl Eq for Point {
                  fn eq(self, other: Point) -> bool {
                      self.x == other.x and self.y == other.y

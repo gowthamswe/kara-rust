@@ -1133,9 +1133,17 @@ fn test_user_impl_from_still_allowed() {
 fn test_user_impl_eq_ord_for_struct_allowed() {
     // Eq/Ord are carved out of the operator-trait restriction — user types
     // routinely need custom equality/ordering, and the operator lowering
-    // pass routes `==`/`<` through these impls.
+    // pass routes `==`/`<` through these impls. CR-202 slice 5b added
+    // `Eq: PartialEq` as a supertrait edge, so `impl Eq for Point` now
+    // also requires `impl PartialEq for Point` (typechecker-level
+    // `MissingSupertrait`; resolver-level passes are unaffected, but the
+    // impl is added here so the same source resolves cleanly through
+    // typecheck too).
     resolve_ok(
         "struct Point { x: i64, y: i64 }\n\
+         impl PartialEq for Point {\n\
+             fn eq(ref self, other: ref Point) -> bool { self.x == other.x and self.y == other.y }\n\
+         }\n\
          impl Eq for Point {\n\
              fn eq(self, other: Point) -> bool { self.x == other.x and self.y == other.y }\n\
          }\n\

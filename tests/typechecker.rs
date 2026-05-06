@@ -8986,3 +8986,44 @@ fn baked_partial_eq_method_signature_uses_self_correctly() {
     );
 }
 
+// ── Baked Eq (CR-202 slice 5b verification) ────────────────────
+// `Eq: PartialEq` is the design's supertrait edge. Pre-5b the hardcoded
+// path registered `Eq` with empty supertraits; post-5b the bake walk
+// reads the supertrait list from `runtime/stdlib/eq.kara`. The
+// behavioral effect: user-written `impl Eq for X` now requires a
+// companion `impl PartialEq for X` (typechecker `MissingSupertrait`).
+
+#[test]
+fn baked_eq_user_impl_with_partial_eq_companion_typechecks() {
+    typecheck_ok(
+        "struct Tag { value: i64 }\n\
+         impl PartialEq for Tag {\n\
+             fn eq(ref self, other: ref Tag) -> bool { self.value == other.value }\n\
+         }\n\
+         impl Eq for Tag {}",
+    );
+}
+
+#[test]
+fn baked_eq_user_impl_without_partial_eq_companion_fails() {
+    // The supertrait check fires here; pre-5b this snippet would have
+    // typechecked clean.
+    let parsed = parse(
+        "struct Tag { value: i64 }\n\
+         impl Eq for Tag {}",
+    );
+    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    let resolved = resolve(&parsed.program);
+    assert!(resolved.errors.is_empty(), "resolve errors: {:?}", resolved.errors);
+    let typed = typecheck(&parsed.program, &resolved);
+    assert!(
+        typed
+            .errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::MissingSupertrait),
+        "expected MissingSupertrait, got: {:?}",
+        typed.errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+    );
+}
+
+
