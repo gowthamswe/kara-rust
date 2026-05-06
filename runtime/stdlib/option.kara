@@ -1,0 +1,15 @@
+// runtime/stdlib/option.kara
+//
+// First baked stdlib type (CR-202 slice 3, pilot). The corresponding
+// `register_builtin_types` arm is retired in slice 3c so this file is
+// the single source of truth for Option's shape.
+//
+// Pilot scope is the type only — methods (`is_some`, `unwrap`, `map`,
+// the `?`-operator desugar, etc.) continue to dispatch through the
+// hardcoded `infer_option_method` / interpreter paths until slice 4
+// migrates the impl-block surface.
+
+enum Option[T] {
+    Some(T),
+    None,
+}

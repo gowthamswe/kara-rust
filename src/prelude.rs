@@ -32,9 +32,10 @@
 //! [`Item`]: crate::ast::Item
 
 use crate::ast::{
-    Block, Function, GenericParam, GenericParams, Item, StructDef, TraitDef, Visibility,
+    Block, Function, GenericParam, GenericParams, Item, Program, StructDef, TraitDef, Visibility,
 };
 use crate::token::Span;
+use std::sync::LazyLock;
 
 /// Canonical path of the synthetic prelude module: `std.prelude`. Stored as
 /// `&'static str` segments here; callers that need an owned `Vec<String>`
@@ -156,6 +157,58 @@ pub const PRELUDE_EFFECT_RESOURCES: &[&str] = &[
     "Stderr",
     "FileSystem",
 ];
+
+// ── Baked stdlib source (CR-202 slice 3a) ───────────────────────────
+//
+// Real Kāra source for prelude types is authored under `runtime/stdlib/*.kara`
+// and embedded into the compiler binary via `include_str!`. The pilot scope
+// is `Option` only (slice 3); slice 4+ adds one file at a time, retiring the
+// corresponding arm of `register_builtin_types` at each step.
+//
+// 3a is plumbing-only: this constant and [`STDLIB_PROGRAMS`] expose the
+// parsed AST for downstream consumption, but no current pipeline code
+// reads them. Slice 3c will splice the parsed `EnumDef` for Option into
+// the synthetic prelude module's items list, replacing the stub
+// `StructDef` that lives in this file today.
+
+/// Embedded stdlib sources, keyed by their on-disk basename (relative to
+/// `runtime/stdlib/`). Sources are baked at compile time via `include_str!`
+/// so the resulting binary is self-contained.
+pub const STDLIB_SOURCES: &[(&str, &str)] = &[(
+    "option.kara",
+    include_str!("../runtime/stdlib/option.kara"),
+)];
+
+/// Parsed AST of every entry in [`STDLIB_SOURCES`]. Parsed lazily on first
+/// access and cached for the lifetime of the process. The vector preserves
+/// the source order from `STDLIB_SOURCES`, so callers that need
+/// deterministic load order (e.g. resolve trait/struct dependencies) get
+/// it for free.
+///
+/// Panics if any baked source fails to parse — a parse failure indicates
+/// a bug in the stdlib source itself, not in user code, and there is no
+/// recoverable path. The error message names the offending file so the
+/// fix is obvious.
+pub static STDLIB_PROGRAMS: LazyLock<Vec<(&'static str, Program)>> = LazyLock::new(|| {
+    let mut out = Vec::with_capacity(STDLIB_SOURCES.len());
+    for &(name, src) in STDLIB_SOURCES {
+        let parsed = crate::parse(src);
+        if !parsed.errors.is_empty() {
+            let msgs = parsed
+                .errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            panic!(
+                "baked stdlib source `{}` failed to parse:\n  {}",
+                name, msgs
+            );
+        }
+        out.push((name, parsed.program));
+    }
+    out
+});
 
 /// Compiler builtins / I/O functions visible without import. Implementations
 /// stay compiler-side (`!` return type, source-location capture, release
@@ -321,4 +374,110 @@ pub fn is_prelude_path(path: &[String]) -> bool {
 #[allow(dead_code)]
 pub fn prelude_visibility() -> Visibility {
     Visibility::Pub
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{EnumDef, Item, VariantKind};
+
+    /// Find the `EnumDef` for `name` among the items of the parsed stdlib
+    /// program at the given index in `STDLIB_PROGRAMS`. Test helper.
+    fn find_enum(idx: usize, name: &str) -> &'static EnumDef {
+        let (_, program) = &STDLIB_PROGRAMS[idx];
+        for item in &program.items {
+            if let Item::EnumDef(e) = item {
+                if e.name == name {
+                    return e;
+                }
+            }
+        }
+        panic!("expected enum `{}` in stdlib program at index {}", name, idx);
+    }
+
+    #[test]
+    fn stdlib_sources_contains_option_kara() {
+        let names: Vec<&str> = STDLIB_SOURCES.iter().map(|(n, _)| *n).collect();
+        assert!(
+            names.contains(&"option.kara"),
+            "STDLIB_SOURCES should contain option.kara, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn stdlib_sources_have_nonempty_bodies() {
+        for &(name, src) in STDLIB_SOURCES {
+            assert!(
+                !src.trim().is_empty(),
+                "stdlib source `{}` should not be empty",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn stdlib_programs_parses_option_cleanly() {
+        // Forces evaluation of the LazyLock; would panic with a parse-error
+        // message if the bake source is malformed.
+        let programs: &Vec<(&'static str, Program)> = &STDLIB_PROGRAMS;
+        assert_eq!(
+            programs.len(),
+            STDLIB_SOURCES.len(),
+            "STDLIB_PROGRAMS should have one entry per STDLIB_SOURCES entry"
+        );
+    }
+
+    #[test]
+    fn baked_option_has_some_and_none_variants() {
+        let opt = find_enum(0, "Option");
+        let variant_names: Vec<&str> = opt.variants.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(
+            variant_names,
+            vec!["Some", "None"],
+            "baked Option should declare exactly Some(T), None"
+        );
+    }
+
+    #[test]
+    fn baked_option_has_one_generic_param_named_t() {
+        let opt = find_enum(0, "Option");
+        let params = opt
+            .generic_params
+            .as_ref()
+            .expect("baked Option should declare a generic parameter list");
+        let names: Vec<&str> = params.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["T"]);
+    }
+
+    #[test]
+    fn baked_option_some_variant_carries_type_param() {
+        let opt = find_enum(0, "Option");
+        let some = opt
+            .variants
+            .iter()
+            .find(|v| v.name == "Some")
+            .expect("Some variant should exist");
+        match &some.kind {
+            VariantKind::Tuple(types) => {
+                assert_eq!(types.len(), 1, "Some(T) should carry exactly one type");
+            }
+            other => panic!("expected Some to be Tuple-shaped, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn baked_option_none_variant_is_unit() {
+        let opt = find_enum(0, "Option");
+        let none = opt
+            .variants
+            .iter()
+            .find(|v| v.name == "None")
+            .expect("None variant should exist");
+        assert!(
+            matches!(none.kind, VariantKind::Unit),
+            "None should be a Unit variant, got {:?}",
+            none.kind
+        );
+    }
 }
