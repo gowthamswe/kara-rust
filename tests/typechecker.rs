@@ -794,6 +794,313 @@ fn test_binding_makes_exhaustive() {
     );
 }
 
+// ── Maranget field-level recursion (exhaustiveness slice 2) ──────
+
+#[test]
+fn test_exhaustive_some_literal_payloads_non_exhaustive() {
+    // Pre-Maranget: Some(0) and Some(1) counted as covering all `Some`.
+    // Under slice 2's field-level recursion they're distinct rows, so the
+    // match is correctly flagged non-exhaustive on Option[i64] (no
+    // `Some(_)` arm).
+    let errors = typecheck_errors(
+        "fn f(opt: Option[i64]) -> i64 {\n\
+             match opt {\n\
+                 Some(0) => 0,\n\
+                 Some(1) => 1,\n\
+                 None    => -1,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::NonExhaustiveMatch),
+        "expected NonExhaustiveMatch — Some(0)/Some(1) shouldn't cover all Some, got: {errors:?}"
+    );
+}
+
+#[test]
+fn test_exhaustive_some_binding_payload_is_exhaustive() {
+    // `Some(x)` binds the payload as a wildcard; combined with `None`,
+    // that's full coverage of Option.
+    typecheck_ok(
+        "fn f(opt: Option[i64]) -> i64 {\n\
+             match opt {\n\
+                 Some(x) => x,\n\
+                 None    => 0,\n\
+             }\n\
+         }",
+    );
+}
+
+#[test]
+fn test_exhaustive_some_wildcard_payload_is_exhaustive() {
+    // Same as above but with explicit `_` instead of a binding.
+    typecheck_ok(
+        "fn f(opt: Option[i64]) -> i64 {\n\
+             match opt {\n\
+                 Some(_) => 1,\n\
+                 None    => 0,\n\
+             }\n\
+         }",
+    );
+}
+
+// ── Maranget irrefutability (exhaustiveness slice 6) ────────────
+
+#[test]
+fn test_irrefutable_let_struct_destructure_passes() {
+    // Plain struct destructure with all-binding fields — Maranget reports
+    // irrefutable, agreeing with the legacy syntactic check. Ensures the
+    // migration didn't regress this baseline.
+    typecheck_ok(
+        "struct Point { x: i64, y: i64 }\n\
+         fn main() {\n\
+             let p = Point { x: 1, y: 2 };\n\
+             let Point { x, y } = p;\n\
+             let _ = x;\n\
+             let _ = y;\n\
+         }",
+    );
+}
+
+#[test]
+fn test_irrefutable_let_refutable_enum_variant_rejected_via_maranget() {
+    // The `let Some(x) = opt;` case routes through Maranget — Option is a
+    // handled scrutinee type — and the witness `None` proves refutability.
+    let errors = typecheck_errors(
+        "fn main() { let opt: Option[i32] = Option.None; let Option.Some(x) = opt; }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::RefutablePattern),
+        "expected RefutablePattern error via Maranget irrefutability check, got: {errors:?}"
+    );
+}
+
+// ── Maranget reachability (exhaustiveness slice 5) ──────────────
+
+#[test]
+fn test_reachability_duplicate_unguarded_arm_unreachable() {
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         fn name(c: Color) -> i64 {\n\
+             match c {\n\
+                 Red   => 1,\n\
+                 Red   => 2,\n\
+                 Green => 3,\n\
+                 Blue  => 4,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.kind == TypeErrorKind::UnreachableArm),
+        "expected an UnreachableArm warning for the duplicate Red arm, got warnings: {:?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn test_reachability_arm_after_wildcard_unreachable() {
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         fn name(c: Color) -> i64 {\n\
+             match c {\n\
+                 _     => 0,\n\
+                 Red   => 1,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.kind == TypeErrorKind::UnreachableArm),
+        "expected an UnreachableArm warning for Red after _, got warnings: {:?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn test_reachability_guarded_arm_does_not_cover_following() {
+    // Guarded arm `Red if true` doesn't fully cover `Red`, so the second
+    // unguarded `Red` is reachable. No warning.
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         fn check(c: Color) -> i64 {\n\
+             match c {\n\
+                 Red if true => 1,\n\
+                 Red         => 2,\n\
+                 Green       => 3,\n\
+                 Blue        => 4,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .all(|w| w.kind != TypeErrorKind::UnreachableArm),
+        "expected no UnreachableArm warnings, got: {:?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn test_reachability_clean_match_no_warnings() {
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         fn name(c: Color) -> i64 {\n\
+             match c {\n\
+                 Red   => 1,\n\
+                 Green => 2,\n\
+                 Blue  => 3,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        result.warnings.is_empty(),
+        "expected zero warnings on a clean match, got: {:?}",
+        result.warnings
+    );
+}
+
+// ── Maranget witness construction (exhaustiveness slice 4) ──────
+
+#[test]
+fn test_witness_for_some_literal_payloads_is_compound() {
+    // The witness for Some(0)/Some(1)/None should be a Some(_)-shaped
+    // pattern, demonstrating that the recursion built up a structured
+    // witness instead of just listing top-level missing constructors.
+    let errors = typecheck_errors(
+        "fn f(opt: Option[i64]) -> i64 {\n\
+             match opt {\n\
+                 Some(0) => 0,\n\
+                 Some(1) => 1,\n\
+                 None    => -1,\n\
+             }\n\
+         }",
+    );
+    let exhaust_err = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NonExhaustiveMatch)
+        .expect("expected NonExhaustiveMatch error");
+    assert!(
+        exhaust_err.message.contains("Some("),
+        "expected witness to be a Some(_) pattern, got: {}",
+        exhaust_err.message
+    );
+}
+
+#[test]
+fn test_witness_for_tuple_scrutinee_is_compound() {
+    let errors = typecheck_errors(
+        "fn check(t: (i32, i32)) -> i32 {\n\
+             match t {\n\
+                 (0, 0) => 0,\n\
+                 (1, 1) => 1,\n\
+             }\n\
+         }",
+    );
+    let exhaust_err = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NonExhaustiveMatch)
+        .expect("expected NonExhaustiveMatch error");
+    assert!(
+        exhaust_err.message.contains('(') && exhaust_err.message.contains(')'),
+        "expected witness to be a tuple pattern, got: {}",
+        exhaust_err.message
+    );
+}
+
+// ── Maranget type-specific handling (exhaustiveness slice 3) ─────
+
+#[test]
+fn test_exhaustive_integer_scrutinee_requires_wildcard() {
+    // Pre-Maranget: silently exhaustive (skipped). Slice 3: open-domain
+    // i32 demands a `_` arm.
+    let errors = typecheck_errors(
+        "fn classify(n: i32) -> i32 {\n\
+             match n {\n\
+                 0 => 0,\n\
+                 1 => 1,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::NonExhaustiveMatch),
+        "expected NonExhaustiveMatch on integer match without wildcard, got: {errors:?}"
+    );
+}
+
+#[test]
+fn test_exhaustive_integer_scrutinee_with_wildcard_passes() {
+    typecheck_ok(
+        "fn classify(n: i32) -> i32 {\n\
+             match n {\n\
+                 0 => 0,\n\
+                 1 => 1,\n\
+                 _ => 99,\n\
+             }\n\
+         }",
+    );
+}
+
+#[test]
+fn test_exhaustive_string_scrutinee_requires_wildcard() {
+    let errors = typecheck_errors(
+        "fn classify(s: String) -> i32 {\n\
+             match s {\n\
+                 \"a\" => 1,\n\
+                 \"b\" => 2,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::NonExhaustiveMatch),
+        "expected NonExhaustiveMatch on String match without wildcard, got: {errors:?}"
+    );
+}
+
+#[test]
+fn test_exhaustive_tuple_scrutinee_open_field_requires_wildcard() {
+    // Single-ctor tuple type, but the integer field is open-domain.
+    let errors = typecheck_errors(
+        "fn check(t: (i32, i32)) -> i32 {\n\
+             match t {\n\
+                 (0, 0) => 0,\n\
+                 (1, 1) => 1,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::NonExhaustiveMatch),
+        "expected NonExhaustiveMatch on tuple match with open-domain fields, got: {errors:?}"
+    );
+}
+
+#[test]
+fn test_exhaustive_tuple_scrutinee_with_wildcard_passes() {
+    typecheck_ok(
+        "fn check(t: (i32, i32)) -> i32 {\n\
+             match t {\n\
+                 (0, 0) => 0,\n\
+                 _      => 99,\n\
+             }\n\
+         }",
+    );
+}
+
 // ── Category 9: Method Calls and Impl Blocks ────────────────────
 
 #[test]

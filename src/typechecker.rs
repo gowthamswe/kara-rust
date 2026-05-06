@@ -1078,6 +1078,11 @@ pub enum TypeErrorKind {
     /// Method-resolution Step 7 — see phase-4-interpreter.md § TypeChecker:
     /// implement full method resolution algorithm.
     NoMethodFound,
+    /// A match arm pattern is fully covered by an earlier (unguarded) arm,
+    /// so its body can never execute. Emitted as a warning, not an error —
+    /// codegen retains the arm. Reachability slice of the Maranget
+    /// exhaustiveness upgrade (step 6).
+    UnreachableArm,
 }
 
 impl std::fmt::Display for TypeError {
@@ -1094,6 +1099,10 @@ impl std::fmt::Display for TypeError {
 
 pub struct TypeCheckResult {
     pub errors: Vec<TypeError>,
+    /// Non-fatal diagnostics: typecheck-time signals that don't block
+    /// later phases. Currently carries `UnreachableArm` from the Maranget
+    /// reachability pass; future signals belong here too.
+    pub warnings: Vec<TypeError>,
     pub expr_types: HashMap<SpanKey, Type>,
     pub struct_info: HashMap<String, StructInfo>,
     pub enum_info: HashMap<String, EnumInfo>,
@@ -1218,6 +1227,7 @@ pub struct TypeChecker<'a> {
     env: TypeEnv,
     local_scope: LocalTypeScope,
     errors: Vec<TypeError>,
+    warnings: Vec<TypeError>,
     expr_types: HashMap<SpanKey, Type>,
     current_return_type: Option<Type>,
     current_self_type: Option<Type>,
@@ -1296,6 +1306,7 @@ impl<'a> TypeChecker<'a> {
             env: TypeEnv::new(),
             local_scope: LocalTypeScope::new(),
             errors: Vec::new(),
+            warnings: Vec::new(),
             expr_types: HashMap::new(),
             current_return_type: None,
             current_self_type: None,
@@ -1343,6 +1354,7 @@ impl<'a> TypeChecker<'a> {
         let distinct_type_traits = self.env.distinct_types.clone();
         TypeCheckResult {
             errors: self.errors,
+            warnings: self.warnings,
             expr_types: self.expr_types,
             struct_info: self.env.structs,
             enum_info: self.env.enums,
@@ -1361,6 +1373,14 @@ impl<'a> TypeChecker<'a> {
 
     fn type_error(&mut self, message: String, span: Span, kind: TypeErrorKind) {
         self.errors.push(TypeError {
+            message,
+            span,
+            kind,
+        });
+    }
+
+    fn type_warning(&mut self, message: String, span: Span, kind: TypeErrorKind) {
+        self.warnings.push(TypeError {
             message,
             span,
             kind,
@@ -5491,8 +5511,8 @@ impl<'a> TypeChecker<'a> {
 
         // Validate and bind parameters
         for param in &f.params {
-            self.check_param_irrefutable(param);
             let ty = self.lower_type_expr(&param.ty, &gp);
+            self.check_param_irrefutable(param, &ty);
             self.bind_pattern_types(&param.pattern, &ty);
         }
 
@@ -5717,7 +5737,7 @@ impl<'a> TypeChecker<'a> {
                 // `while let`. The check inherits through `@` bindings
                 // — `let x @ Option.Some(y) = opt` is rejected because
                 // the inner `Option.Some(y)` is refutable.
-                if !self.is_irrefutable_param_pattern(pattern) {
+                if !self.is_irrefutable_pattern(pattern, &expected_ty) {
                     self.type_error(
                         "refutable pattern in `let` binding; use `let ... else { ... }`, \
                          `if let`, or `match` for patterns that may not match"
@@ -5964,18 +5984,18 @@ impl<'a> TypeChecker<'a> {
                     .iter()
                     .zip(expected_params.iter())
                     .map(|(p, expected_pty)| {
-                        if !self.is_irrefutable_param_pattern(&p.pattern) {
+                        let ty = p
+                            .ty
+                            .as_ref()
+                            .map(|t| self.lower_type_expr(t, &[]))
+                            .unwrap_or_else(|| expected_pty.clone());
+                        if !self.is_irrefutable_pattern(&p.pattern, &ty) {
                             self.type_error(
                                 "refutable pattern in closure parameter; use `if let` or `match` for patterns that may not match".to_string(),
                                 p.pattern.span.clone(),
                                 TypeErrorKind::RefutablePattern,
                             );
                         }
-                        let ty = p
-                            .ty
-                            .as_ref()
-                            .map(|t| self.lower_type_expr(t, &[]))
-                            .unwrap_or_else(|| expected_pty.clone());
                         self.bind_pattern_types(&p.pattern, &ty);
                         ty
                     })
@@ -6720,17 +6740,17 @@ impl<'a> TypeChecker<'a> {
                 let param_types: Vec<Type> = params
                     .iter()
                     .map(|p| {
-                        if !self.is_irrefutable_param_pattern(&p.pattern) {
+                        let ty =
+                            p.ty.as_ref()
+                                .map(|t| self.lower_type_expr(t, &[]))
+                                .unwrap_or_else(|| self.env.fresh_type_var());
+                        if !self.is_irrefutable_pattern(&p.pattern, &ty) {
                             self.type_error(
                                 "refutable pattern in closure parameter; use `if let` or `match` for patterns that may not match".to_string(),
                                 p.pattern.span.clone(),
                                 TypeErrorKind::RefutablePattern,
                             );
                         }
-                        let ty =
-                            p.ty.as_ref()
-                                .map(|t| self.lower_type_expr(t, &[]))
-                                .unwrap_or_else(|| self.env.fresh_type_var());
                         self.bind_pattern_types(&p.pattern, &ty);
                         ty
                     })
@@ -10744,101 +10764,34 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn check_exhaustiveness(&mut self, scrutinee_type: &Type, arms: &[MatchArm], span: Span) {
-        // bool is a two-constructor type: matching both `true` and `false` is exhaustive
-        // without a wildcard (F-072).
-        if *scrutinee_type == Type::Bool {
-            let mut has_true = false;
-            let mut has_false = false;
-            let mut has_wildcard = false;
-            for arm in arms {
-                if arm.guard.is_some() {
-                    continue;
-                }
-                match &arm.pattern.kind {
-                    PatternKind::Wildcard => has_wildcard = true,
-                    PatternKind::Literal(LiteralPattern::Bool(true)) => has_true = true,
-                    PatternKind::Literal(LiteralPattern::Bool(false)) => has_false = true,
-                    PatternKind::Binding(_) => {
-                        // A bare identifier binding (not a variant name) is a catch-all.
-                        has_wildcard = true;
+        use crate::exhaustive::{check_match_exhaustive, unreachable_arms, ExhaustiveResult};
+        for idx in unreachable_arms(scrutinee_type, arms, &self.env) {
+            self.type_warning(
+                "unreachable match arm: pattern is fully covered by an earlier arm".to_string(),
+                arms[idx].pattern.span.clone(),
+                TypeErrorKind::UnreachableArm,
+            );
+        }
+        match check_match_exhaustive(scrutinee_type, arms, &self.env) {
+            ExhaustiveResult::Exhaustive | ExhaustiveResult::Skipped => {}
+            ExhaustiveResult::NonExhaustive { witness } => {
+                // Preserve the prior diagnostic wording for bool and enum
+                // scrutinees when the witness names a single top-level
+                // constructor (no nested compound payload). Compound
+                // witnesses and non-enum scrutinees use the pattern form.
+                let is_simple_witness = !witness.contains('(') && !witness.contains('{');
+                let message = match scrutinee_type {
+                    Type::Bool if is_simple_witness => {
+                        format!("non-exhaustive match on bool: missing {witness}")
                     }
-                    _ => {}
-                }
-            }
-            if !(has_wildcard || has_true && has_false) {
-                let missing = match (has_true, has_false) {
-                    (false, false) => "true, false",
-                    (false, true) => "true",
-                    (true, false) => "false",
-                    (true, true) => unreachable!(),
+                    Type::Named { name, .. }
+                        if is_simple_witness && self.env.enums.contains_key(name) =>
+                    {
+                        format!("non-exhaustive match: missing variants: {witness}")
+                    }
+                    _ => format!("non-exhaustive match: pattern `{witness}` not covered"),
                 };
-                self.type_error(
-                    format!("non-exhaustive match on bool: missing {missing}"),
-                    span,
-                    TypeErrorKind::NonExhaustiveMatch,
-                );
-            }
-            return;
-        }
-
-        let enum_name = match scrutinee_type {
-            Type::Named { name, .. } if self.env.enums.contains_key(name) => name.clone(),
-            _ => return,
-        };
-
-        let enum_info = match self.env.enums.get(&enum_name) {
-            Some(info) => info.clone(),
-            None => return,
-        };
-
-        let all_variants: HashSet<String> = enum_info
-            .variants
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect();
-        let mut covered: HashSet<String> = HashSet::new();
-        let mut has_wildcard = false;
-
-        for arm in arms {
-            // Guarded arms may not execute — they don't satisfy exhaustiveness.
-            if arm.guard.is_some() {
-                continue;
-            }
-            match &arm.pattern.kind {
-                PatternKind::Wildcard => {
-                    has_wildcard = true;
-                }
-                PatternKind::Binding(name) => {
-                    // A binding that matches an enum variant name covers that variant.
-                    // A binding that doesn't match any variant is a catch-all.
-                    if all_variants.contains(name) {
-                        covered.insert(name.clone());
-                    } else {
-                        has_wildcard = true;
-                    }
-                }
-                PatternKind::TupleVariant { path, .. } | PatternKind::Struct { path, .. } => {
-                    if let Some(name) = path.last() {
-                        covered.insert(name.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if !has_wildcard {
-            let missing: Vec<&String> = all_variants.difference(&covered).collect();
-            if !missing.is_empty() {
-                let mut sorted: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
-                sorted.sort();
-                self.type_error(
-                    format!(
-                        "non-exhaustive match: missing variants: {}",
-                        sorted.join(", ")
-                    ),
-                    span,
-                    TypeErrorKind::NonExhaustiveMatch,
-                );
+                self.type_error(message, span, TypeErrorKind::NonExhaustiveMatch);
             }
         }
     }
@@ -10980,9 +10933,22 @@ impl<'a> TypeChecker<'a> {
 
     // ── Irrefutability Check for Parameter Patterns ──────────────
 
-    /// Returns true if `pat` is irrefutable (guaranteed to match any value of
-    /// its type). Only irrefutable patterns are legal in function / closure
-    /// parameter position.
+    /// Returns true if `pat` is irrefutable for a value of type `ty`. Prefers
+    /// the Maranget machinery (`U([PAT], _) == false`) when the type is in
+    /// the handled set; falls back to the legacy syntactic check on
+    /// `ref`/`function`/`typeparam`/etc. types that Maranget skips. Slice 6
+    /// of the exhaustiveness upgrade.
+    fn is_irrefutable_pattern(&self, pat: &Pattern, ty: &Type) -> bool {
+        match crate::exhaustive::is_pattern_irrefutable(pat, ty, &self.env) {
+            Some(b) => b,
+            None => self.is_irrefutable_param_pattern(pat),
+        }
+    }
+
+    /// Legacy syntactic refutability check. Retained as the fallback for
+    /// types Maranget doesn't reason about (refs, function values, generic
+    /// parameters, etc.). Prefer `is_irrefutable_pattern` when a type is
+    /// available.
     fn is_irrefutable_param_pattern(&self, pat: &Pattern) -> bool {
         match &pat.kind {
             PatternKind::Binding(_) | PatternKind::Wildcard => true,
@@ -11027,9 +10993,10 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Emit a `RefutablePattern` error if `param`'s pattern is refutable.
-    fn check_param_irrefutable(&mut self, param: &Param) {
-        if !self.is_irrefutable_param_pattern(&param.pattern) {
+    /// Emit a `RefutablePattern` error if `param`'s pattern is refutable
+    /// for its declared type.
+    fn check_param_irrefutable(&mut self, param: &Param, ty: &Type) {
+        if !self.is_irrefutable_pattern(&param.pattern, ty) {
             self.type_error(
                 "refutable pattern in function parameter; use `if let` or `match` for patterns that may not match".to_string(),
                 param.pattern.span.clone(),

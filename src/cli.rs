@@ -1338,6 +1338,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 crate::typechecker::TypeErrorKind::CannotInferAssocFn => "E0234",
                 crate::typechecker::TypeErrorKind::OnceFnIntoFnSlot => "E0235",
                 crate::typechecker::TypeErrorKind::NoMethodFound => "E0236",
+                crate::typechecker::TypeErrorKind::UnreachableArm => "W0237",
             };
             diags.add(DiagEntry {
                 id: &format!("d{id_counter}"),
@@ -1348,6 +1349,26 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 message: &err.message,
                 filename,
                 span: &err.span,
+                suggestion: None,
+                extra_json: None,
+            });
+        }
+        for warn in &t.warnings {
+            id_counter += 1;
+            let code = match warn.kind {
+                crate::typechecker::TypeErrorKind::UnreachableArm => "W0237",
+                // Other kinds aren't expected to appear as warnings today.
+                _ => "W0299",
+            };
+            diags.add(DiagEntry {
+                id: &format!("d{id_counter}"),
+                severity: "warning",
+                phase: "typecheck",
+                code,
+                category: "typecheck",
+                message: &warn.message,
+                filename,
+                span: &warn.span,
                 suggestion: None,
                 extra_json: None,
             });
