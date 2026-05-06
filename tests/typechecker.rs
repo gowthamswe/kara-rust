@@ -8570,5 +8570,136 @@ fn test_subsume_function_identity_unchanged() {
     );
 }
 
+// ── #[compiler_builtin] dispatch (CR-202 slice 2) ───────────────
+// Stdlib-source declarations of `#[compiler_builtin] fn foo(...)` register
+// their signature in env.functions (the contract callers are checked
+// against) and add their name to env.compiler_builtins (the marker that
+// the body is replaced by Rust dispatch and should not be type-checked).
+// Test fixtures load via `with_stdlib_source(true)` since slice 1's
+// resolver gate (`E0237`) rejects the attribute outside stdlib source.
 
+fn typecheck_stdlib_source(source: &str) -> TypeCheckResult {
+    let parsed = parse(source);
+    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    let resolved = karac::resolver::Resolver::new(&parsed.program)
+        .with_stdlib_source(true)
+        .resolve();
+    assert!(
+        resolved.errors.is_empty(),
+        "resolve errors: {:?}",
+        resolved.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    typecheck(&parsed.program, &resolved)
+}
+
+#[test]
+fn test_compiler_builtin_registers_signature_and_marks_intrinsic() {
+    let result = typecheck_stdlib_source(
+        "#[compiler_builtin]\nfn id_intrinsic[T](v: T) -> T { v }",
+    );
+    assert!(result.errors.is_empty(), "type errors: {:?}", result.errors);
+    assert!(
+        result.compiler_builtins.contains("id_intrinsic"),
+        "compiler_builtins should contain id_intrinsic, got: {:?}",
+        result.compiler_builtins
+    );
+}
+
+#[test]
+fn test_compiler_builtin_body_is_not_type_checked() {
+    // Body returns a literal i64 (`42`) but the declared return type is `T`.
+    // Without slice 2's body-skip, this would surface as a TypeMismatch.
+    // With it, the body is treated as a placeholder that Rust dispatch
+    // replaces, so the (deliberately wrong) body passes silently.
+    let result = typecheck_stdlib_source(
+        "#[compiler_builtin]\nfn id_intrinsic[T](v: T) -> T { 42 }",
+    );
+    assert!(
+        result.errors.is_empty(),
+        "expected no errors (body should be skipped), got: {:?}",
+        result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    assert!(result.compiler_builtins.contains("id_intrinsic"));
+}
+
+#[test]
+fn test_compiler_builtin_signature_validates_caller() {
+    // The stdlib-source declaration registers `id_intrinsic[T](T) -> T`.
+    // A user-side caller that respects the signature (i64 in, i64 out)
+    // should typecheck cleanly.
+    let result = typecheck_stdlib_source(
+        "#[compiler_builtin]\nfn id_intrinsic[T](v: T) -> T { v }\n\
+         fn use_it() -> i64 { id_intrinsic(42) }",
+    );
+    assert!(
+        result.errors.is_empty(),
+        "expected no errors, got: {:?}",
+        result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_compiler_builtin_signature_rejects_mismatched_caller_return() {
+    // Same intrinsic, caller declares `-> bool` but the call returns i64
+    // (T solved to i64 from the argument). The signature-driven check
+    // catches the return-type mismatch.
+    let parsed = parse(
+        "#[compiler_builtin]\nfn id_intrinsic[T](v: T) -> T { v }\n\
+         fn use_it() -> bool { id_intrinsic(42) }",
+    );
+    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    let resolved = karac::resolver::Resolver::new(&parsed.program)
+        .with_stdlib_source(true)
+        .resolve();
+    assert!(
+        resolved.errors.is_empty(),
+        "resolve errors: {:?}",
+        resolved.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    let result = typecheck(&parsed.program, &resolved);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch on bool/i64, got: {:?}",
+        result.errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_compiler_builtin_existing_intrinsic_dbg_round_trip() {
+    // Slice 2's stated equivalence check: declaring an existing intrinsic
+    // (`dbg`) as `#[compiler_builtin]` in stdlib source should produce the
+    // same observable typecheck behavior as today's `register_builtin_types`
+    // shim path. The hardcoded typechecker path for `dbg` already accepts
+    // any T → T call shape; the stdlib-source declaration adds the
+    // signature to env.functions and marks it as a builtin, but the call
+    // still typechecks via the existing path. This test pins the
+    // no-regression property.
+    let result = typecheck_stdlib_source(
+        "#[compiler_builtin]\nfn dbg[T](v: T) -> T { v }\n\
+         fn use_it() -> i64 { dbg(7) }",
+    );
+    assert!(
+        result.errors.is_empty(),
+        "expected no errors, got: {:?}",
+        result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    assert!(result.compiler_builtins.contains("dbg"));
+}
+
+#[test]
+fn test_compiler_builtin_empty_in_user_only_program() {
+    // Sanity pin: a user-only program (without with_stdlib_source) cannot
+    // populate compiler_builtins — slice 1 rejects the attribute outright,
+    // and the resolver-gate check fires before the typechecker sees it.
+    // Confirm the registry is empty for an ordinary program.
+    let result = typecheck_ok("fn ordinary() -> i64 { 0 }");
+    assert!(
+        result.compiler_builtins.is_empty(),
+        "expected empty registry for user-only program, got: {:?}",
+        result.compiler_builtins
+    );
+}
 

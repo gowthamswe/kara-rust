@@ -1199,6 +1199,14 @@ pub struct TypeEnv {
     /// Used by `resolve_assoc_projections` to substitute `T.Item` after `T`
     /// is solved to a concrete named type.
     pub impl_assoc_types: HashMap<(String, String), Type>,
+    /// Names of functions declared with `#[compiler_builtin]` in stdlib
+    /// source (CR-202 slice 2). The signature still lives in `functions`
+    /// — the entry here marks the function as having its body replaced by
+    /// Rust dispatch, so `check_items` skips body type-checking and the
+    /// interpreter knows not to evaluate the placeholder body. Slice 1's
+    /// resolver gate (`E0237`) prevents user code from getting entries
+    /// into this set.
+    pub compiler_builtins: HashSet<String>,
     #[allow(dead_code)]
     next_type_var: u32,
     #[allow(dead_code)]
@@ -1220,6 +1228,7 @@ impl TypeEnv {
             impls: Vec::new(),
             impls_by_trait: HashMap::new(),
             impl_assoc_types: HashMap::new(),
+            compiler_builtins: HashSet::new(),
             next_type_var: 0,
             substitutions: HashMap::new(),
         }
@@ -1587,6 +1596,12 @@ pub struct TypeCheckResult {
     /// Only `Type::Named` types are recorded (primitives, refs, etc. don't
     /// need the reconstruction step).
     pub pattern_binding_types: HashMap<SpanKey, String>,
+    /// Names of functions declared with `#[compiler_builtin]` (CR-202
+    /// slice 2). The signature lives in `env.functions`; the entry here
+    /// flags the function as having its body replaced by Rust dispatch.
+    /// Empty in user-only programs (slice 1's resolver gate `E0237`
+    /// prevents the attribute outside stdlib source).
+    pub compiler_builtins: HashSet<String>,
 }
 
 // ── Cross-module visibility helpers (CR-24 slice 6) ─────────────
@@ -1773,6 +1788,7 @@ impl<'a> TypeChecker<'a> {
             .filter_map(|imp| imp.trait_name.clone().map(|t| (t, imp.target_type.clone())))
             .collect();
         let distinct_type_traits = self.env.distinct_types.clone();
+        let compiler_builtins = self.env.compiler_builtins.clone();
         TypeCheckResult {
             errors: self.errors,
             warnings: self.warnings,
@@ -1789,6 +1805,7 @@ impl<'a> TypeChecker<'a> {
             bare_assoc_fn_targets: self.bare_assoc_fn_targets,
             call_type_subs: self.call_type_subs,
             pattern_binding_types: self.pattern_binding_types,
+            compiler_builtins,
         }
     }
 
@@ -4385,6 +4402,9 @@ impl<'a> TypeChecker<'a> {
                 return_type,
             },
         );
+        if f.attributes.iter().any(|a| a.name == "compiler_builtin") {
+            self.env.compiler_builtins.insert(f.name.clone());
+        }
     }
 
     fn env_add_impl(&mut self, imp: &ImplBlock) {
@@ -4554,7 +4574,19 @@ impl<'a> TypeChecker<'a> {
         let items: Vec<Item> = self.program.items.clone();
         for item in &items {
             match item {
-                Item::Function(f) => self.check_function(f, None, &[]),
+                Item::Function(f) => {
+                    // `#[compiler_builtin]` declarations carry a placeholder
+                    // body that is replaced by Rust dispatch at runtime
+                    // (CR-202 slice 2). The signature is the contract callers
+                    // are checked against; the body itself is irrelevant, so
+                    // skip body-checking entirely. This lets stdlib source
+                    // pair an attribute with whatever body keeps the parser
+                    // happy without that body being held to type-correctness.
+                    if self.env.compiler_builtins.contains(&f.name) {
+                        continue;
+                    }
+                    self.check_function(f, None, &[]);
+                }
                 Item::ImplBlock(imp) => self.check_impl_block(imp),
                 Item::TraitDef(t) => self.check_trait_def(t),
                 Item::ConstDecl(c) => self.check_const_decl(c),
