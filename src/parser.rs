@@ -32,6 +32,21 @@ pub struct ParseResult {
     pub errors: Vec<ParseError>,
 }
 
+/// Surrounding signature kind for parameter parsing — selects between the
+/// trait-method and free-function anonymous-parameter diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FnContext {
+    /// `fn` inside a `trait { ... }` body. Drives `E_TRAIT_METHOD_ANONYMOUS_PARAM`.
+    TraitMethod,
+    /// Free function, impl method, or extern function. Drives
+    /// `E_FN_ANONYMOUS_PARAM`. Impl methods reuse the free-function
+    /// diagnostic per design.md § Trait method parameter names — required;
+    /// the rule only requires *trait declarations* to name parameters,
+    /// but the focused diagnostic for free fns helps catch the equivalent
+    /// type-only paste typo.
+    Function,
+}
+
 // `.` is both the path separator and the field/method access operator. The parser
 // disambiguates using the case class of the initial identifier: Type- and Const-class
 // names (uppercase leading letter) start paths; Value-class names (lowercase) start
@@ -54,6 +69,13 @@ pub struct Parser {
     /// field. Cleared after consumption so a subsequent item without docs
     /// gets `None`.
     pending_doc: Option<String>,
+    /// Stack of `FnContext`s for the function-like signature we are currently
+    /// parsing parameters for. Drives the anonymous-parameter focused
+    /// diagnostic: trait-method bodies emit `E_TRAIT_METHOD_ANONYMOUS_PARAM`
+    /// while free / impl / extern function bodies emit
+    /// `E_FN_ANONYMOUS_PARAM`. Empty when we are not inside a parameter
+    /// list (e.g., parsing a struct field or top-level expression).
+    fn_context_stack: Vec<FnContext>,
     /// Stack of effect-variable names declared in the enclosing function /
     /// trait method's `[with E]` generic params. Pushed when entering a
     /// signature with declared effect vars; popped when leaving. Consulted
@@ -73,6 +95,7 @@ impl Parser {
             loop_labels: Vec::new(),
             errors: Vec::new(),
             pending_doc: None,
+            fn_context_stack: Vec::new(),
             effect_var_stack: Vec::new(),
         }
     }
@@ -293,7 +316,9 @@ impl Parser {
         self.effect_var_stack.push(effect_vars.clone());
 
         self.expect(&Token::LeftParen)?;
+        self.fn_context_stack.push(FnContext::Function);
         let (self_param, params) = self.parse_fn_params()?;
+        self.fn_context_stack.pop();
         self.expect(&Token::RightParen)?;
 
         let return_type = if self.eat(&Token::Arrow) {
@@ -416,6 +441,29 @@ impl Parser {
         // list to avoid clobbering.
         self.collect_leading_doc_comments();
         let start = self.current_span();
+
+        // Focused diagnostic for the anonymous-parameter shape — `fn f(Type)`
+        // / `trait T { fn m(self, Type); }`. Try to recognize a TYPE in
+        // parameter position with no preceding name+colon; if it succeeds,
+        // emit `E_TRAIT_METHOD_ANONYMOUS_PARAM` / `E_FN_ANONYMOUS_PARAM`
+        // (per design.md § Trait method parameter names — required) and
+        // recover by treating the parameter as `_: TY`.
+        if let Some(ty) = self.try_parse_anonymous_param_type() {
+            let doc_comment = self.take_pending_doc();
+            let ty_span = ty.span.clone();
+            let pattern = Pattern {
+                kind: PatternKind::Wildcard,
+                span: ty_span,
+            };
+            return Some(Param {
+                span: self.span_from(&start),
+                pattern,
+                ty,
+                default_value: None,
+                doc_comment,
+            });
+        }
+
         let pattern = self.parse_param_pattern()?;
         self.expect(&Token::Colon)?;
         let ty = self.parse_type()?;
@@ -432,6 +480,76 @@ impl Parser {
             default_value,
             doc_comment,
         })
+    }
+
+    /// Speculatively recognize the shape `fn f(TYPE)` — a TYPE in parameter
+    /// position with no preceding name+colon. Returns `Some(ty)` after
+    /// emitting the focused anonymous-parameter diagnostic; the caller
+    /// recovers by treating the parameter as `_: TY` so the rest of the
+    /// signature keeps parsing. Returns `None` if the position does not
+    /// look like an anonymous param (the parser state is fully restored,
+    /// including any errors `parse_type` produced before deciding the
+    /// position was something else).
+    fn try_parse_anonymous_param_type(&mut self) -> Option<TypeExpr> {
+        // Cheap rule-out: positions that start a normal name-bound parameter.
+        match self.peek_token() {
+            // `_: TY` — the wildcard pattern path; treat as a normal param.
+            Token::Underscore => return None,
+            // `name: TY` and `name { … }` (struct destructure) and
+            // `name(…)` (tuple-struct destructure) all start a pattern.
+            Token::Identifier { .. } => {
+                let next = self.tokens.get(self.pos + 1).map(|t| &t.token);
+                if matches!(
+                    next,
+                    Some(Token::Colon) | Some(Token::LeftBrace) | Some(Token::LeftParen)
+                ) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+
+        let saved_pos = self.pos;
+        let saved_errors_len = self.errors.len();
+        let ty = self.parse_type();
+
+        // Only recognize the anonymous shape when the type parse succeeded
+        // and landed on a token that ends a parameter (`,` / `)` / `=`).
+        // Anything else means we miss-classified — restore state so the
+        // caller's normal pattern-then-type parse runs and produces the
+        // existing diagnostic.
+        let landed_well = matches!(
+            self.peek_token(),
+            Token::Comma | Token::RightParen | Token::Equal
+        );
+        let ty = match (ty, landed_well) {
+            (Some(ty), true) => ty,
+            _ => {
+                self.pos = saved_pos;
+                self.errors.truncate(saved_errors_len);
+                return None;
+            }
+        };
+
+        let (code, kind_label) = match self.fn_context_stack.last() {
+            Some(FnContext::TraitMethod) => {
+                ("E_TRAIT_METHOD_ANONYMOUS_PARAM", "trait method")
+            }
+            // Default to the free-function diagnostic when the context
+            // stack is empty (defensive — every signature site should
+            // have pushed before reaching `parse_param`).
+            _ => ("E_FN_ANONYMOUS_PARAM", "function"),
+        };
+        let type_text = render_type_for_diagnostic(&ty);
+        self.errors.push(ParseError {
+            message: format!(
+                "error[{code}]: {kind_label} parameters require a name; \
+                 write `_: {type_text}` for an unused parameter, or \
+                 `arg: {type_text}` for a meaningful name"
+            ),
+            span: ty.span.clone(),
+        });
+        Some(ty)
     }
 
     /// Parse an irrefutable pattern for a function parameter position.
@@ -779,7 +897,9 @@ impl Parser {
         self.effect_var_stack.push(effect_vars.clone());
 
         self.expect(&Token::LeftParen)?;
+        self.fn_context_stack.push(FnContext::TraitMethod);
         let (self_param, params) = self.parse_fn_params()?;
+        self.fn_context_stack.pop();
         self.expect(&Token::RightParen)?;
 
         let return_type = if self.eat(&Token::Arrow) {
@@ -1520,6 +1640,7 @@ impl Parser {
         let doc_comment = self.take_pending_doc();
         self.expect(&Token::LeftParen)?;
 
+        self.fn_context_stack.push(FnContext::Function);
         let mut params = Vec::new();
         while !self.check(&Token::RightParen) && !self.is_at_end() {
             params.push(self.parse_param()?);
@@ -1527,6 +1648,7 @@ impl Parser {
                 break;
             }
         }
+        self.fn_context_stack.pop();
         self.expect(&Token::RightParen)?;
 
         let return_type = if self.eat(&Token::Arrow) {
@@ -4600,5 +4722,104 @@ impl Parser {
                 }
             }
         }
+    }
+}
+
+// ── Diagnostic helpers ──────────────────────────────────────────
+
+/// Render a `TypeExpr` back to a compact source-style string for inclusion
+/// in parser diagnostics (e.g., the `_: <type>` fix-it on
+/// `E_FN_ANONYMOUS_PARAM`). Covers every `TypeKind` variant the parser
+/// can build; not byte-for-byte identical to the original source, but
+/// produces a copy-pasteable surface form.
+fn render_type_for_diagnostic(ty: &TypeExpr) -> String {
+    let mut out = String::new();
+    write_type_for_diagnostic(ty, &mut out);
+    out
+}
+
+fn write_type_for_diagnostic(ty: &TypeExpr, out: &mut String) {
+    match &ty.kind {
+        TypeKind::Path(path) => {
+            for (i, seg) in path.segments.iter().enumerate() {
+                if i > 0 {
+                    out.push('.');
+                }
+                out.push_str(seg);
+            }
+            if let Some(args) = &path.generic_args {
+                if !args.is_empty() {
+                    out.push('[');
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        match arg {
+                            crate::ast::GenericArg::Type(t) => write_type_for_diagnostic(t, out),
+                            crate::ast::GenericArg::Const(_) => out.push('_'),
+                        }
+                    }
+                    out.push(']');
+                }
+            }
+        }
+        TypeKind::Tuple(types) => {
+            out.push('(');
+            for (i, t) in types.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_type_for_diagnostic(t, out);
+            }
+            out.push(')');
+        }
+        TypeKind::Array { element, .. } => {
+            out.push('[');
+            write_type_for_diagnostic(element, out);
+            out.push_str("; _]");
+        }
+        TypeKind::Pointer { is_mut, inner } => {
+            out.push('*');
+            out.push_str(if *is_mut { "mut " } else { "const " });
+            write_type_for_diagnostic(inner, out);
+        }
+        TypeKind::FnType {
+            params,
+            return_type,
+            is_once,
+            ..
+        } => {
+            out.push_str(if *is_once { "OnceFn(" } else { "Fn(" });
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_type_for_diagnostic(p, out);
+            }
+            out.push(')');
+            if let Some(rt) = return_type {
+                out.push_str(" -> ");
+                write_type_for_diagnostic(rt, out);
+            }
+        }
+        TypeKind::Ref(inner) => {
+            out.push_str("ref ");
+            write_type_for_diagnostic(inner, out);
+        }
+        TypeKind::MutRef(inner) => {
+            out.push_str("mut ref ");
+            write_type_for_diagnostic(inner, out);
+        }
+        TypeKind::MutSlice(element) => {
+            out.push_str("mut Slice[");
+            write_type_for_diagnostic(element, out);
+            out.push(']');
+        }
+        TypeKind::Weak(inner) => {
+            out.push_str("weak ");
+            write_type_for_diagnostic(inner, out);
+        }
+        TypeKind::Unit => out.push_str("()"),
+        TypeKind::Error => out.push('_'),
     }
 }

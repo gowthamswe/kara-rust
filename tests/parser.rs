@@ -4818,3 +4818,123 @@ fn raw_ident_roundtrip_in_function_name_and_field() {
     assert!(formatted.contains("fn r#try"), "formatted:\n{formatted}");
     assert!(formatted.contains(".r#await"), "formatted:\n{formatted}");
 }
+
+// ── Anonymous-parameter focused diagnostic ──────────────────────────
+//
+// `fn f(Type)` and trait `fn f(Type)` are rejected with a focused
+// diagnostic that names the type and offers `_: Type` / `arg: Type`
+// fix-it forms. See design.md § Trait method parameter names — required
+// (v60 item 53) and the matching phase-8 checklist entry.
+
+fn assert_one_error_containing(errors: &[karac::parser::ParseError], substrings: &[&str]) {
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one parse error, got {errors:#?}"
+    );
+    let msg = &errors[0].message;
+    for s in substrings {
+        assert!(
+            msg.contains(s),
+            "expected error message to contain `{s}`; got `{msg}`"
+        );
+    }
+}
+
+#[test]
+fn anon_param_in_free_fn_emits_focused_diagnostic() {
+    let (_prog, errors) = parse_with_errors("fn free(i32) { 0 }");
+    assert_one_error_containing(
+        &errors,
+        &[
+            "E_FN_ANONYMOUS_PARAM",
+            "function parameters require a name",
+            "_: i32",
+            "arg: i32",
+        ],
+    );
+}
+
+#[test]
+fn anon_param_in_trait_method_emits_focused_diagnostic() {
+    let (_prog, errors) =
+        parse_with_errors("trait V { fn visit(ref self, Node); }");
+    assert_one_error_containing(
+        &errors,
+        &[
+            "E_TRAIT_METHOD_ANONYMOUS_PARAM",
+            "trait method parameters require a name",
+            "_: Node",
+            "arg: Node",
+        ],
+    );
+}
+
+#[test]
+fn anon_param_recovers_so_remaining_params_keep_parsing() {
+    // After the focused diagnostic fires on the second param, the third
+    // param's name+colon shape is still recognized — we get one error
+    // for the anonymous param, not a cascade.
+    let (_prog, errors) =
+        parse_with_errors("fn f(a: i32, Node, c: bool) { }");
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one error from the anonymous param; got {errors:#?}"
+    );
+    assert!(errors[0].message.contains("E_FN_ANONYMOUS_PARAM"));
+}
+
+#[test]
+fn anon_param_with_generics_renders_full_type() {
+    let (_prog, errors) = parse_with_errors("fn f(Vec[i32]) { }");
+    assert_one_error_containing(
+        &errors,
+        &["E_FN_ANONYMOUS_PARAM", "_: Vec[i32]", "arg: Vec[i32]"],
+    );
+}
+
+#[test]
+fn anon_param_with_ref_and_path() {
+    let (_prog, errors) = parse_with_errors("fn f(ref Foo) { }");
+    assert_one_error_containing(
+        &errors,
+        &["E_FN_ANONYMOUS_PARAM", "_: ref Foo", "arg: ref Foo"],
+    );
+}
+
+#[test]
+fn underscore_pattern_is_not_an_anon_param() {
+    // `_: T` is the canonical "unused parameter" form — must keep parsing
+    // without emitting the focused diagnostic.
+    parse_ok("fn free(_: i32) { }");
+    parse_ok("trait V { fn visit(ref self, _: Node); }");
+}
+
+#[test]
+fn named_param_with_primitive_type_is_not_an_anon_param() {
+    // `i32: i32` — a value-class binding that happens to share a name
+    // with the primitive type. The peek-ahead guard sees `:` and skips
+    // the anonymous-param probe entirely.
+    parse_ok("fn f(i32: i32) -> i32 { i32 }");
+}
+
+#[test]
+fn destructure_pattern_in_param_is_not_an_anon_param() {
+    // Tuple destructure `(a, b): T` — the speculative parse_type won't
+    // land on `,` / `)` (it'd require `T` after the tuple), so we fall
+    // through to the existing pattern path.
+    parse_ok("fn f((a, b): (i32, i32)) -> i32 { a + b }");
+    // Struct destructure `Foo { a }: Foo` — same reasoning.
+    parse_ok("struct Foo { a: i32 } fn f(Foo { a }: Foo) -> i32 { a }");
+}
+
+#[test]
+fn multiple_anon_params_each_get_their_own_diagnostic() {
+    let (_prog, errors) = parse_with_errors("fn f(i32, bool) { }");
+    assert_eq!(errors.len(), 2, "expected one error per anonymous param");
+    assert!(errors[0].message.contains("E_FN_ANONYMOUS_PARAM"));
+    assert!(errors[1].message.contains("E_FN_ANONYMOUS_PARAM"));
+    assert!(errors[0].message.contains("_: i32"));
+    assert!(errors[1].message.contains("_: bool"));
+}
