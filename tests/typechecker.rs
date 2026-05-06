@@ -8486,5 +8486,89 @@ fn test_fresh_metavar_multi_param_solved_independently() {
     );
 }
 
+// ── Bidirectional sub-step 3: function-type subsumption (item 131) ─
+
+#[test]
+fn test_subsume_function_into_oncefn_let_slot() {
+    // A capture-free closure synthesizes as `Type::Function(i64) -> i64`.
+    // The let annotation is `OnceFn(i64) -> i64`. Sub-step 3's `is_subtype`
+    // admits this via the cross-arm Fn → OnceFn subsumption rule
+    // (a repeatable callable trivially satisfies the callable-once contract).
+    typecheck_ok(
+        "fn main() {\n\
+             let f: OnceFn(i64) -> i64 = |x| x + 1;\n\
+             let _ = f(7);\n\
+         }",
+    );
+}
+
+#[test]
+fn test_subsume_function_into_oncefn_call_arg_slot() {
+    // Function-typed closure argument flows into a parameter slot typed as
+    // `OnceFn(i64) -> i64`. The slot's contract permits a single call;
+    // a Fn closure can be called once just fine.
+    typecheck_ok(
+        "fn run(f: OnceFn(i64) -> i64) -> i64 { f(5) }\n\
+         fn main() {\n\
+             let r = run(|x| x + 1);\n\
+         }",
+    );
+}
+
+#[test]
+fn test_subsume_oncefn_into_fn_slot_still_rejects() {
+    // Regression for round 12.45 / E0235: the reverse direction stays
+    // rejected. A closure that consumes a captured non-Copy binding
+    // synthesizes as OnceFunction; passing it into a `Fn(...)` slot must
+    // still produce OnceFnIntoFnSlot, not slip through the new
+    // subsumption admit-arm (which only fires in the upward direction).
+    let errors = typecheck_errors(
+        "struct Cfg { name: i64 }\n\
+         fn run(f: Fn() -> i64) -> i64 { f() }\n\
+         fn main() {\n\
+             let c = Cfg { name: 7 };\n\
+             let r = run(|| { let _ = c; 0 });\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::OnceFnIntoFnSlot)),
+        "expected OnceFnIntoFnSlot for OnceFn → Fn (sub-step 3 must not weaken \
+         the rejection direction); got: {errors:?}"
+    );
+}
+
+#[test]
+fn test_subsume_function_into_oncefn_through_intermediate_let() {
+    // Sub-step 3 admits the upward direction across multi-step flow: a
+    // closure stored in a `Fn(...)`-typed binding (so the value is a
+    // first-class Function, not a closure literal) is then passed into an
+    // OnceFn slot. The check_assignable on the call arg sees
+    // (expected = OnceFunction, found = Function) and is_subtype admits.
+    typecheck_ok(
+        "fn run(f: OnceFn(i64) -> i64) -> i64 { f(5) }\n\
+         fn main() {\n\
+             let f: Fn(i64) -> i64 = |x| x + 1;\n\
+             let r = run(f);\n\
+         }",
+    );
+}
+
+#[test]
+fn test_subsume_function_identity_unchanged() {
+    // Function → Function with matching signature still typechecks. Sanity
+    // pin: the new is_subtype rule for the same-arm case (contravariant
+    // params + covariant return) reduces to identity for primitives, so
+    // existing Fn-to-Fn flows are not regressed.
+    typecheck_ok(
+        "fn run(f: Fn(i64) -> i64) -> i64 { f(5) }\n\
+         fn main() {\n\
+             let f: Fn(i64) -> i64 = |x| x + 1;\n\
+             let r = run(f);\n\
+         }",
+    );
+}
+
 
 

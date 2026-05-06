@@ -871,6 +871,76 @@ fn find_unbound_type_param<'a>(ty: &'a Type, in_scope: &HashSet<&str>) -> Option
     }
 }
 
+/// Directional subsumption: can a value of type `sub_ty` be used where
+/// `super_ty` is expected? Used by `check_assignable` (item 131 sub-step 3).
+///
+/// Differs from `types_compatible` in two ways:
+///   1. **Function-type variance** — params are contravariant
+///      (`is_subtype(b_p, s_p)` per pair) and return is covariant
+///      (`is_subtype(s_r, b_r)`). For Kāra v1 with no user-declared
+///      subtyping, this is observationally equivalent to the symmetric
+///      check on the body — the variance plumbing is foundational for
+///      future subtyping (refinement narrowing, declarable trait variance).
+///   2. **`Fn → OnceFn` upward subtyping** — a `Type::Function` value
+///      satisfies a `Type::OnceFunction` slot (callable-once is a weaker
+///      contract than repeatedly-callable). The reverse direction is
+///      rejected here and produces the focused E0235 (`OnceFnIntoFnSlot`)
+///      diagnostic via `check_assignable`'s `is_once_into_fn_shape` arm.
+///
+/// Borrow forms (`Ref`/`MutRef`) recurse through `is_subtype` so the
+/// function-arm subsumption applies under references too. Everything
+/// else delegates to `types_compatible`; deep variance on nested
+/// compound types (`Vec[Fn(...)]` → `Vec[OnceFn(...)]`, tuple element
+/// subsumption) is intentionally out of scope until Kāra introduces
+/// declarable variance for user-defined generics.
+///
+/// Effect-set variance (the third leg of design.md § Type Inference's
+/// subsumption rule) is deferred until phase-3 lands effect variables
+/// on `Type::Function` — the type lacks an effect-set field today.
+fn is_subtype(super_ty: &Type, sub_ty: &Type) -> bool {
+    if super_ty == sub_ty {
+        return true;
+    }
+    match (super_ty, sub_ty) {
+        (
+            Type::Function {
+                params: sp,
+                return_type: sr,
+            },
+            Type::Function {
+                params: bp,
+                return_type: br,
+            },
+        )
+        | (
+            Type::OnceFunction {
+                params: sp,
+                return_type: sr,
+            },
+            Type::OnceFunction {
+                params: bp,
+                return_type: br,
+            },
+        )
+        | (
+            Type::OnceFunction {
+                params: sp,
+                return_type: sr,
+            },
+            Type::Function {
+                params: bp,
+                return_type: br,
+            },
+        ) => {
+            sp.len() == bp.len()
+                && sp.iter().zip(bp.iter()).all(|(s, b)| is_subtype(b, s))
+                && is_subtype(sr, br)
+        }
+        (Type::Ref(s), Type::Ref(b)) | (Type::MutRef(s), Type::MutRef(b)) => is_subtype(s, b),
+        _ => types_compatible(super_ty, sub_ty),
+    }
+}
+
 fn types_compatible(a: &Type, b: &Type) -> bool {
     if a == b {
         return true;
@@ -2192,7 +2262,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn check_assignable(&mut self, expected: &Type, found: &Type, span: Span) -> bool {
-        if types_compatible(expected, found) {
+        if is_subtype(expected, found) {
             return true;
         }
         if Self::is_once_into_fn_shape(expected, found) {
@@ -6334,13 +6404,29 @@ impl<'a> TypeChecker<'a> {
             return coerced;
         }
         // Closure pushdown: when expected is `Type::Function { params, return }`
-        // and `expr` is a closure literal, seed each closure param's type from
-        // the expected param type instead of letting the synth path fall back
-        // to `fresh_type_var()`. Required for compound type+effect polymorphism
+        // (or `Type::OnceFunction { ... }`, item 131 sub-step 3) and `expr` is
+        // a closure literal, seed each closure param's type from the expected
+        // param type instead of letting the synth path fall back to
+        // `fresh_type_var()`. Required for compound type+effect polymorphism
         // (round 10.1 step 2): once the call site has solved `T = Iter[i32]`
         // and substituted `T.Item -> &i32` into the param's `Fn(T.Item) -> ...`,
         // the closure body must be type-checked against that concrete shape.
         // Explicit param annotations on the closure still take priority.
+        // OnceFunction slots use the same pushdown — the slot's signature
+        // describes call arity/types regardless of repeat-callability, and
+        // sub-step 3's `is_subtype` then admits a Function-typed closure
+        // into an OnceFunction slot via the cross-arm subsumption rule.
+        let expected_fn_shape = match expected {
+            Type::Function {
+                params,
+                return_type,
+            }
+            | Type::OnceFunction {
+                params,
+                return_type,
+            } => Some((params.as_slice(), return_type.as_ref())),
+            _ => None,
+        };
         if let (
             ExprKind::Closure {
                 params,
@@ -6348,11 +6434,8 @@ impl<'a> TypeChecker<'a> {
                 prefix_span: _,
                 body,
             },
-            Type::Function {
-                params: expected_params,
-                return_type: expected_ret,
-            },
-        ) = (&expr.kind, expected)
+            Some((expected_params, expected_ret)),
+        ) = (&expr.kind, expected_fn_shape)
         {
             if params.len() == expected_params.len() {
                 // Round 12.44 (Step 2) — once-callability inference must run
@@ -12273,29 +12356,31 @@ mod once_fn_container_slot_tests {
     }
 
     #[test]
-    fn vec_oncefn_annotation_lowers_to_once_function_type() {
-        // Round-trip the parser/lowering: `Vec[OnceFn() -> i64]` annotation
-        // on a let binding lowers to the OnceFunction carrier. Confirm by
-        // pushing a Function-typed closure (capture-free, no consume) — the
-        // slot expects OnceFunction, the closure synthesizes Function, and
-        // since types_compatible rejects the cross-pair (Step 1 baseline),
-        // a TypeMismatch fires. This pins that the annotation is *not*
-        // silently lowered to Function.
+    fn vec_oncefn_slot_accepts_function_closure_via_subsumption() {
+        // Item 131 sub-step 3 (bidirectional subsumption): a Function-typed
+        // closure (repeatable) flows into a Vec[OnceFn] slot. Fn is a subtype
+        // of OnceFn — a repeatable callable trivially satisfies the
+        // callable-once contract. `is_subtype(OnceFunction, Function)` returns
+        // true at check_assignable, so neither TypeMismatch nor
+        // OnceFnIntoFnSlot fires.
+        //
+        // Pre-sub-step-3 this fired TypeMismatch (the old test name was
+        // `vec_oncefn_annotation_lowers_to_once_function_type` — which
+        // observed the rejection as a side effect of the symmetric
+        // types_compatible cross-pair rejection). The annotation is still
+        // correctly lowered to OnceFunction; what changed is that the upward
+        // direction is now admitted at the slot.
         let src = "fn main() {\n\
                        let mut v: Vec[OnceFn() -> i64] = Vec.new();\n\
                        v.push(|| 7);\n\
                    }";
         let result = typecheck_src(src);
-        // The closure synthesizes as Function() -> i64. Slot wants
-        // OnceFunction() -> i64. types_compatible returns false on the
-        // cross-pair → TypeMismatch fires (NOT OnceFnIntoFnSlot, which only
-        // triggers in the OnceFn → Fn direction).
         let mismatch = errors_of_kind(&result, &TypeErrorKind::TypeMismatch);
         assert!(
-            !mismatch.is_empty(),
-            "expected TypeMismatch when pushing Function into Vec[OnceFn] slot; \
-             all errors: {:?}",
-            result.errors
+            mismatch.is_empty(),
+            "Function → OnceFn slot is admitted by sub-step 3 subsumption; \
+             expected no TypeMismatch but got: {:?}",
+            mismatch
         );
         let once_hits = errors_of_kind(&result, &TypeErrorKind::OnceFnIntoFnSlot);
         assert!(
