@@ -1027,11 +1027,15 @@ fn slice8_synthetic_prelude_module_is_in_program_tree() {
         m.is_synthetic,
         "std.prelude should be flagged synthetic so per-module passes skip it",
     );
+    // CR-202 slice 3c: Option is now provided by the real
+    // `runtime/stdlib/option.kara` source, spliced into the prelude
+    // module as an `Item::EnumDef` (its actual shape). Prior to slice 3c
+    // this was a placeholder `Item::StructDef` produced by `stub_struct`.
     assert!(
         m.items
             .iter()
-            .any(|i| matches!(i, karac::ast::Item::StructDef(s) if s.name == "Option")),
-        "synthetic prelude exposes Option as a top-level item",
+            .any(|i| matches!(i, karac::ast::Item::EnumDef(e) if e.name == "Option")),
+        "synthetic prelude exposes Option as an EnumDef (baked source) top-level item",
     );
 }
 

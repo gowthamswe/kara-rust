@@ -256,7 +256,17 @@ pub fn synthetic_prelude_items() -> Vec<Item> {
     let mut items: Vec<Item> = Vec::new();
 
     for &name in PRELUDE_TYPES {
-        items.push(stub_struct(name, &span));
+        // Slice 3c: prelude type names that have a baked source declaration
+        // splice in the real `Item` from `STDLIB_PROGRAMS` (with
+        // `stdlib_origin = true` so the slice-3b resolver gate bypass
+        // applies even though user-mode resolver sessions walk this
+        // module). All other names continue to use the placeholder stub.
+        // Slice 4 grows the baked surface one type at a time.
+        if let Some(item) = baked_item_for(name) {
+            items.push(item);
+        } else {
+            items.push(stub_struct(name, &span));
+        }
     }
     for &name in PRELUDE_TRAITS {
         items.push(stub_trait(name, &span));
@@ -271,6 +281,39 @@ pub fn synthetic_prelude_items() -> Vec<Item> {
     // mirroring Rust, where `use std::option::Some;` is not the path users
     // import variants through. Users that need to qualify a variant write
     // `Option.Some(x)` or import the enum and use `Some(x)` unqualified.
+}
+
+/// Look up a top-level item by name across every baked stdlib program.
+/// Returns a clone with `stdlib_origin = true` flipped on the matching
+/// item kind so the resolver's slice-3b gate bypass applies. Slice 3c
+/// uses this from `synthetic_prelude_items`; slice 3d wires the same
+/// helper into `register_builtin_types` so the typechecker registers
+/// from baked source instead of the hardcoded shape.
+fn baked_item_for(name: &str) -> Option<Item> {
+    for (_, program) in STDLIB_PROGRAMS.iter() {
+        for item in &program.items {
+            let matches = match item {
+                Item::Function(f) => f.name == name,
+                Item::StructDef(s) => s.name == name,
+                Item::EnumDef(e) => e.name == name,
+                Item::TraitDef(t) => t.name == name,
+                _ => false,
+            };
+            if !matches {
+                continue;
+            }
+            let mut cloned = item.clone();
+            match &mut cloned {
+                Item::Function(f) => f.stdlib_origin = true,
+                Item::StructDef(s) => s.stdlib_origin = true,
+                Item::EnumDef(e) => e.stdlib_origin = true,
+                Item::TraitDef(t) => t.stdlib_origin = true,
+                _ => {}
+            }
+            return Some(cloned);
+        }
+    }
+    None
 }
 
 fn stub_struct(name: &str, span: &Span) -> Item {

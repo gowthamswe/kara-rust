@@ -8,7 +8,14 @@
 // the `?`-operator desugar, etc.) continue to dispatch through the
 // hardcoded `infer_option_method` / interpreter paths until slice 4
 // migrates the impl-block surface.
+//
+// The structural derives below match what the legacy hardcoded
+// registration in `register_builtin_types` set on Option's
+// `derived_traits` set. They flow into `EnumInfo.derived_traits` via
+// `extract_derived_traits` during `env_add_enum`, so callers that ask
+// "does Option support Eq?" get the same answer as before.
 
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd)]
 enum Option[T] {
     Some(T),
     None,

@@ -2809,14 +2809,55 @@ impl<'a> TypeChecker<'a> {
 
     /// Register built-in stdlib types (F32, F64, Atomic, Ordering, etc.)
     ///
-    /// CR-24 slice 8: this is the *shim* that backs the synthetic
+    /// CR-24 slice 8: this was originally the *shim* that backs the synthetic
     /// `std.prelude` module added by `module::build_program_tree`. The
     /// stub items in `crate::prelude::synthetic_prelude_items` exist only
     /// so cross-module resolution can find a path for `import std.prelude.X;`;
-    /// the real type-environment entries live here. The follow-up
-    /// stdlib-materialisation CR replaces this function with parsed Kāra
-    /// source from `runtime/stdlib/*.kara`.
+    /// the real type-environment entries live here.
+    ///
+    /// CR-202 is incrementally migrating the prelude surface to real
+    /// `runtime/stdlib/*.kara` source. The first pass below walks every
+    /// item in `prelude::STDLIB_PROGRAMS` and registers it via the same
+    /// `env_add_*` path that user items use; the hardcoded blocks below
+    /// stay in place for everything not yet migrated, and are deleted in
+    /// per-type slice 4+ commits as the bake surface grows. The pilot
+    /// (`Option`, slice 3) is the first deletion.
     fn register_builtin_types(&mut self) {
+        // ── Baked stdlib source (CR-202 source-of-truth swap) ─────────────
+        // For every item in `runtime/stdlib/*.kara`, register it through
+        // the same path user items use. This replaces the corresponding
+        // hardcoded blocks below as each prelude type is migrated.
+        let baked: Vec<Item> = crate::prelude::STDLIB_PROGRAMS
+            .iter()
+            .flat_map(|(_, p)| p.items.iter().cloned())
+            .collect();
+        for item in &baked {
+            match item {
+                Item::Function(f) => self.env_add_function(f),
+                Item::StructDef(s) => self.env_add_struct(s),
+                Item::EnumDef(e) => self.env_add_enum(e),
+                Item::TraitDef(t) => self.env_add_trait(t),
+                Item::ImplBlock(i) => self.env_add_impl(i),
+                Item::TraitAlias(_)
+                | Item::MarkerTrait(_)
+                | Item::ConstDecl(_)
+                | Item::TypeAlias(_)
+                | Item::ExternFunction(_)
+                | Item::DistinctType(_)
+                | Item::EffectResource(_)
+                | Item::EffectGroup(_)
+                | Item::EffectVerbDecl(_)
+                | Item::UseDecl(_)
+                | Item::Import(_)
+                | Item::LayoutDef(_)
+                | Item::AliasDecl(_)
+                | Item::IndependentDecl(_) => {
+                    // Not yet exercised by baked stdlib source — slice 4+
+                    // will broaden this match as the surface grows.
+                }
+            }
+        }
+
         // Map[K, V] — insertion-order key-value map. Method dispatch is handled
         // by `infer_map_method`. Registered with two type params K, V.
         self.env.structs.insert(
@@ -3005,27 +3046,16 @@ impl<'a> TypeChecker<'a> {
             },
         );
 
-        // Prelude enum `Option[T]` — structural traits apply when T does
-        // (bound-checking of type args is deferred; see register_stdlib_impls).
+        // CR-202 slice 3c: `Option` is now provided by
+        // `runtime/stdlib/option.kara` via the baked-source pass at the top
+        // of this function. The structural derives (`Eq`, `PartialEq`,
+        // `Hash`, `Ord`, `PartialOrd`) come from `#[derive(...)]` on the
+        // baked `enum Option[T]`. `Result` and the rest stay hardcoded
+        // until slice 4 migrates them.
         let structural_traits: HashSet<String> = ["Eq", "PartialEq", "Hash", "Ord", "PartialOrd"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        self.env.enums.insert(
-            "Option".to_string(),
-            EnumInfo {
-                generic_params: vec!["T".to_string()],
-                variants: vec![
-                    (
-                        "Some".to_string(),
-                        VariantTypeInfo::Tuple(vec![Type::TypeParam("T".to_string())]),
-                    ),
-                    ("None".to_string(), VariantTypeInfo::Unit),
-                ],
-                derived_traits: structural_traits.clone(),
-                is_shared: false,
-            },
-        );
 
         // Prelude enum `Result[T, E]`
         self.env.enums.insert(
