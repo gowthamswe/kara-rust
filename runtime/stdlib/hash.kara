@@ -1,0 +1,16 @@
+// runtime/stdlib/hash.kara
+//
+// CR-202 slice 5e. Per design.md § Hash — Hash is parameterized over
+// the hasher type so that `Map[K, V, FxBuildHasher]` and
+// `Map[K, V, SipHashBuildHasher]` can share key impls. The actual
+// `Hasher` trait is not yet baked, so this declaration omits the
+// `H: Hasher` bound — the bound resurfaces when slice 5+ migrates the
+// `Hasher` trait alongside the rest of the hashing infrastructure.
+//
+// Pre-5e Hash was not registered in `env.traits` at all
+// (register_stdlib_traits's array doesn't list it). Slice 5e is
+// strictly additive.
+
+trait Hash {
+    fn hash[H](ref self, hasher: mut ref H);
+}

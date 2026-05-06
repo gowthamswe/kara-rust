@@ -9040,6 +9040,21 @@ fn baked_ord_user_impl_with_full_companion_chain_typechecks() {
 }
 
 #[test]
+fn baked_hash_user_impl_typechecks() {
+    // CR-202 slice 5e: `Hash` is now a real registered trait. The
+    // method has a method-level generic param `H` for the hasher type.
+    // Pin that user code can implement Hash and the generic-on-method
+    // form lowers correctly.
+    typecheck_ok(
+        "struct FakeHasher { state: i64 }\n\
+         struct Tag { value: i64 }\n\
+         impl Hash for Tag {\n\
+             fn hash[H](ref self, hasher: mut ref H) {}\n\
+         }",
+    );
+}
+
+#[test]
 fn baked_ord_user_impl_without_partial_ord_companion_fails() {
     // Pre-5d an impl Ord without PartialOrd companion typechecked
     // clean; post-5d this fires MissingSupertrait.

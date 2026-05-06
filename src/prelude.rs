@@ -124,6 +124,8 @@ pub const PRELUDE_TRAITS: &[&str] = &[
     // counterpart to PartialEq.
     "PartialOrd",
     "Ord",
+    // CR-202 slice 5e.
+    "Hash",
     "BitAnd",
     "BitOr",
     "BitXor",
@@ -192,6 +194,7 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
     ("eq.kara", include_str!("../runtime/stdlib/eq.kara")),
     ("partial_ord.kara", include_str!("../runtime/stdlib/partial_ord.kara")),
     ("ord.kara", include_str!("../runtime/stdlib/ord.kara")),
+    ("hash.kara", include_str!("../runtime/stdlib/hash.kara")),
 ];
 
 /// Parsed AST of every entry in [`STDLIB_SOURCES`]. Parsed lazily on first
@@ -533,6 +536,18 @@ mod tests {
         assert!(
             names.contains(&"ord.kara"),
             "STDLIB_SOURCES should contain ord.kara, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn stdlib_sources_contains_hash_kara() {
+        // CR-202 slice 5e: `Hash` joins the baked surface (without the
+        // `Hasher` bound — that lands when Hasher itself is baked).
+        let names: Vec<&str> = STDLIB_SOURCES.iter().map(|(n, _)| *n).collect();
+        assert!(
+            names.contains(&"hash.kara"),
+            "STDLIB_SOURCES should contain hash.kara, got: {:?}",
             names
         );
     }
