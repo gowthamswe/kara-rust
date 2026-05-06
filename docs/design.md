@@ -99,7 +99,7 @@ The current truth. All committed design decisions in their final form.
    | **Temporal safety** | No use-after-free, no dangling pointers | Ownership checker (move semantics); RC fallback (reference counting prevents dangling). Holds in all tiers including `embedded`/`kernel` profiles, which forbid RC but preserve move semantics. |
    | **Type safety** | No type confusion | Type system with no implicit coercions. `unsafe` is the only escape. |
    | **Data race freedom** | No simultaneous mutable + read access across concurrent branches | Effect conflict analysis serializes conflicting accesses in `par {}` regions; RC→Arc promotion ensures shared values are atomically reference-counted. Structurally enforced — not an opt-in `Send`/`Sync` system. |
-   | **Spatial safety** | No out-of-bounds reads or writes | Slice bounds checking in safe code. On `embedded`/`isr` profiles this may be configured — see § Project Profiles. Any weakening is explicit, not silent. |
+   | **Spatial safety** | No out-of-bounds reads or writes | Slice bounds checking in safe code. Bounds checks are emitted in a form LLVM's range analysis can elide when the index is provably in-bounds (e.g., `for i in 0..xs.len()`); the `unsafe { xs.get_unchecked(i) }` escape hatch covers cases the compiler cannot prove. On `embedded`/`isr` profiles bounds checking may be disabled at the profile level — see § Project Profiles. Any weakening is explicit, not silent. See § Bounds-Check Elision and the `get_unchecked` Escape Hatch. |
    | **Integer overflow** | Defined behavior — never undefined | Panics by default (`checked` arithmetic on `app`/`lib`); `wrapping` on `embedded` profile by default. See § Arithmetic Overflow. No profile produces UB on overflow; the behavior changes but is always defined. |
 
 ---
@@ -459,6 +459,8 @@ let b = pick(panic!(), panic!()); // b : Never    — only Never constraints; fa
 
 **Trait bounds.** A metavariable for a bound parameter `T: Ord + Hash` carries its bound list. Resolution succeeds when the metavariable is solved to a concrete type and every bound has an applicable `impl` (orphan rules govern candidate selection). A missing impl is a compile error naming the concrete type and the unsatisfied bound.
 
+**Bounds enforcement at monomorphization.** The bound check above is enforced at each concrete instantiation, not just at the trait-bound parse / validate step. Rationale: monomorphization is what actually emits code; a bound that the typechecker accepted but no impl resolves at instantiation must surface as a compile error at the call site, not silently produce ill-typed IR or panic at runtime. The check happens at the call site (where the concrete type is known) and is re-verified at codegen monomorphization request time (catching cross-module call paths that bypass the front-end check). This is the foundational guarantee that lets monomorphic collection types (`Map[K, V]` requiring `K: Hash + Eq`) trust their bound declarations: a `K` lacking `Hash` cannot reach the `Map`'s implementation. See § Generics and Monomorphization Strategy for the broader context and `implementation_checklist/phase-7-codegen.md` for the enforcement work.
+
 **Effect variables — a separate namespace.**
 
 Effect variables (`with E`) are **not** type metavariables. They live in a separate solution map with their own rules. When checking a closure against an effect-polymorphic parameter, `E` remains symbolic until the closure body is inferred; the effects collected from the body (via the effect lattice) are then **unified** with `E`. "Unify" here is a single-assignment rule: `E` may be solved at most once per call. A second use of the same `E` that resolves to a different effect set is an effect-variable-conflict error. The conflict scope is **per call** — each call to a function with an effect variable `E` gets a fresh instance of `E`, so conflicts are local to that call site. Type metavariables and effect variables never meet on the same lattice.
@@ -613,6 +615,49 @@ The audit is the v1 commitment. Adding a new stdlib parametric type without a va
 **Higher-kinded polymorphism and phantom variance markers are deferred (P2 — no committed design; see [deferred.md § Higher-Kinded Polymorphism and Phantom Variance](deferred.md#higher-kinded-polymorphism-and-phantom-variance)).** The v1 surface — position-based + per-stdlib-type — covers every case the realistic v1 stdlib reaches. P2 work explores HKP and phantom-marker patterns once real workloads demonstrate need.
 
 **Implementation status.** See `docs/implementation_checklist/` for the current implementation gap and per-item phase targets. The spec above is the target; existing `typechecker.rs` code that conflicts with it is to be replaced, not grandfathered.
+
+### Generics and Monomorphization Strategy
+
+Kāra emits **one specialized implementation per concrete type tuple** for every generic — both user-defined generic functions and standard-library collection types (`Vec[T]`, `Map[K, V]`, `Set[T]`, future `BTreeMap[K, V]`, etc.). This is the same model Rust uses for `std::collections::HashMap[K, V]`. There is no type-erased / vtable-based dispatch for generics at v1, no boxed-trait-object style erasure for collections, and no function-pointer indirection at the runtime collection boundary.
+
+This is a **codegen design property**, not an implementation detail subject to revision. The decision affects ABI shape, optimizer reach, and runtime architecture; future collection types and generic-using language features must conform.
+
+#### What monomorphizes
+
+- **User-defined generic functions.** `fn identity[T](x: T) -> T` called with `i64` and `str` produces two LLVM functions: `identity$i64` and `identity$str`. Each call site routes to the matching specialization; deduplication is keyed on the concrete type tuple so `identity[i64]` is emitted once regardless of how many call sites use it.
+- **User-defined generic types.** `struct Pair[A, B] { ... }` instantiated as `Pair[i64, str]` and `Pair[str, str]` produces two distinct compiled types with their own method specializations.
+- **Standard-library collection types.** `Vec[T]`, `Map[K, V]`, `Set[T]`, sorted-collection types — all monomorphic per concrete type tuple. Hash and equality functions for `K` are inlined into the `Map[K, V]` implementation; LLVM sees through the entire collection body.
+- **Trait method dispatch on monomorphic generics.** `fn process[T: Display](xs: Slice[T])` invokes `T.to_string` directly per specialization — `process$i64` calls `i64.to_string`, `process$MyStruct` calls `MyStruct.to_string`. No vtable.
+
+#### What does not monomorphize
+
+- **`dyn Trait` objects** (when added — they are P1 deferred — see [`deferred.md § Trait Objects`](deferred.md#trait-objects-dyn-trait--when-added)). A `dyn Display` value carries a vtable; trait-object dispatch is dynamic by design. This is a separate language feature from generics and is the only v1+ surface where dynamic dispatch is part of the model.
+- **Effect parameters.** Effect-polymorphism (`fn handle[E: Effect](...)`) is orthogonal to type-monomorphization and uses its own monomorphization mechanism — see § Effect Polymorphism.
+
+#### Trait-bound enforcement at monomorphization
+
+Trait bounds in generic signatures (`fn sort[T: Ord](xs: Slice[T])`, `Map[K: Hash + Eq, V]`) are enforced at the moment the compiler emits a concrete instantiation. If a call site supplies a `T` that does not satisfy the declared bounds, the compiler emits a structured error pointing at the call site, naming the missing bound, and suggesting where the impl could be added. This is foundational to the safety story for collections — `Map[K, V]` requires `K: Hash + Eq`, and `K` having neither at the instantiation site must be a compile error, not a runtime crash.
+
+This enforcement happens in the typechecker at the call site (where the concrete type is known) and in codegen at the monomorphization request (where the specialized function is emitted). The two checks are not redundant: typechecker covers paths that typecheck-only tooling sees; codegen covers monomorphization requests that originate from cross-module call graphs after typecheck.
+
+#### Runtime architecture: monomorphizable source, not pre-built archive
+
+Standard-library collection source ships as **monomorphizable code compiled per user crate**, like `std::collections` in Rust — not as a pre-built C archive whose entry points are called via FFI. `libkarac_runtime.a` shrinks to non-monomorphizable primitives (panic infrastructure, allocator interface, FFI bridges, OS bindings); collection implementations live in source form and are emitted into each user binary at the concrete instantiations the user reaches.
+
+This is the v1 architecture. The v0 design used a type-erased C runtime — function-pointer dispatch on hash and equality, byte-blob storage, dynamic-size memcpy on insert / get. That model was simpler but cost ~25% steady-state perf vs Rust's `std::collections::HashMap` on i64 workloads (microbench-validated 2026-05-06; the indirect-call tax was ~75% of the total Karac-vs-std hash-map gap). v1 replaces the erased runtime; the cost decision is captured in the v62 brainstorming archive.
+
+#### Cost trade-offs
+
+Monomorphization grows binary size with the count of concrete type tuples used in the program. A program with `Map[i64, i64]`, `Map[str, i64]`, `Map[str, Vec[i64]]`, and `Set[str]` instantiates four distinct `Map`/`Set` implementations and ships them all. Static binary-size optimization (strip + LTO + DCE; see § Linker Control Attributes) mitigates by removing unused method specializations per instantiation, but the per-instantiation floor is real. For the typical small program (one or two collection instantiations), final binary sizes are competitive with Rust; for programs with many instantiations, expect linear scaling.
+
+The trade-off is intentional: monomorphization gives Kāra near-Rust steady-state perf on collections, full LLVM optimizer reach into collection bodies (constant folding through hash, vectorization of bulk operations, scalar replacement of aggregates on the key type), and avoids the indirect-call tax that erasure imposes on every probe. Binary-size growth is the price; the choice is to optimize for runtime perf rather than archive footprint, consistent with the broader "Kāra ≈ Rust perf" framing.
+
+#### Cross-references
+
+- Collection floor: § Standard Data Structures (Vec, Map, Set semantics).
+- Effect-side monomorphization: § Effect Polymorphism > *Monomorphization order for compound polymorphism*.
+- Implementation tracking: [`implementation_checklist/phase-7-codegen.md`](implementation_checklist/phase-7-codegen.md) for monomorphization codegen + trait-bound enforcement work.
+- Permanent omission: [`deferred.md § Permanent Omissions`](deferred.md#permanent-omissions) — dynamic linking is off the table; monomorphization is the alternative to plugin-style runtime extensibility.
 
 ### Error Handling
 
@@ -10314,9 +10359,93 @@ Kāra is designed for AI-first code generation. Compilation frequency is high �
 
 ---
 
+## Execution Model and Compilation Targets
+
+Kāra has a single execution backend (LLVM) and two delivery modes built on it: **AOT** (`karac build` produces a native binary) and **JIT** (`karac repl` and `karac test` lazy-compile each function on first call via LLJIT). Both modes emit the same monomorphic LLVM IR — a function executed in the REPL is compiled identically to the same function in a built binary, and exhibits identical effect, ownership, and perf behavior. The tree-walk interpreter from Phase 4 is retained as a development / debugging tool but is not the runtime backend for any user-facing workflow.
+
+### AOT — `karac build`
+
+The default path. Source → `lex` → `parse` → `resolve` → `typecheck` → `effect` → `ownership` → `concurrency` → `codegen` → LLVM object → linked native binary via `cc`. Produces a statically-linked executable with the runtime archive (`libkarac_runtime.a`) embedded. Optimization level is configurable (`-O0` … `-O3`); default is `-O2`. `--target-cpu=native` is exposed as an opt-in flag once bounds-check elision lets autovectorization fire (see § Spatial safety).
+
+### JIT — `karac repl` and `karac test`
+
+Same compiler pipeline as AOT, but the codegen output is loaded into an in-process LLJIT engine instead of written to an object file. Functions are compiled lazily: each function declared in a REPL session or a test module is compiled on its first call, cached for subsequent calls. There is **no hybrid tree-walk + JIT dispatch**: every user function goes through LLJIT.
+
+**Cold-start cost.** First call to each function pays the LLJIT compile latency — measured as the v1 perf headline alongside binary size and steady-state perf. Trivial cells (`let x = 1+1`) pay the same per-cell compile cost as non-trivial cells; the cost is **uniform and expected**, not a mystery slowdown. This is by design: a known, predictable cold-start latency ("REPL has built-in compile latency") is preferable to a hybrid model where some cells run fast and others run slow with no clear rule.
+
+**Why always-JIT, not hybrid.** A hybrid scheme (tree-walk for trivial cells, JIT for hot loops) was considered and rejected for v1. The argument: a known and uniform 5 ms vs 100 ms gap is acceptable user experience; an unexpected 2 s vs 20 s gap (when a "trivial" cell turns out to need JIT and the heuristic misses) forces the user to investigate across code, data, language, library, network, and dependencies — orders of magnitude more user pain than a flat predictable cost. Hybrid optimization remains a purely-additive future axis if real-world v1 data shows the predictable cost is unacceptable; v1 ships the simple model.
+
+**Why LLJIT, not MCJIT or Cranelift.** Three options were considered:
+- **MCJIT** (the JIT engine that `inkwell` exposes today). Feature-frozen by LLVM upstream; `clients should migrate to LLJIT` per the official guidance. Used as a sanity-check prototype only — not a shipping vehicle for v1.
+- **LLJIT / ORC v2** (the modern LLVM JIT). Requires dropping to `llvm-sys::orc2` directly because `inkwell` doesn't expose it, but keeps Kāra on a single LLVM stack across AOT and JIT. **Selected for v1.**
+- **Cranelift** (a separate JIT-focused codegen). ~10× faster compile than LLVM at ~14% worse code quality; would require maintaining a second backend. Deferred to v2 evaluation — Kāra's headline path is `karac build` to native, not REPL-as-primary; the cost of a dual-backend story isn't justified by v1 data.
+
+### Crash diagnostics
+
+**Level 2 (DWARF instruction-level, v1).** Every LLVM IR instruction is tagged with its source span via `DIBuilder`. The runtime panic handler walks the stack and resolves machine addresses to source `file:line:col` via the emitted DWARF; users see `panic at file:line:col in fn_name`. As a bonus, LLJIT/ORC's GDB JIT interface gives `gdb` / `lldb` users symbolic backtraces for free when attaching to a Kāra REPL or test process.
+
+**Level 3 (rustc-style snippets, P1).** Builds on the same DWARF infrastructure plus a diagnostic-formatter integration: panics print rustc-style snippets with caret pointers and AST-node-aware messages (e.g., `this index operation panicked` rather than `panicked at <addr>`). Ships as a v1 patch release rather than blocking v1 itself.
+
+### Bounds-check elision and the `get_unchecked` escape hatch
+
+Slice and array indexing in safe code is bounds-checked at every access. Naively emitted, this places a side-exit in the middle of every loop body — which prevents LLVM's loop-optimization passes (autovectorizer, loop-invariant code motion, scalar replacement of aggregates) from firing, since their prerequisite analyses don't tolerate per-iteration exits. The result is that bumping `-O2` to `-O3` produces no measurable improvement on loop-heavy code: there is no extra room at `-O3` because the IR doesn't expose any.
+
+Kāra addresses this with a **two-part strategy** for v1, plus a deferred third option:
+
+**(a) LLVM-friendly bounds-check emission (P0, v1).** The compiler emits each bounds check in a form LLVM's range-analysis passes (SCEV, GVN) can prove redundant when the index is provably in-bounds from surrounding loop structure. Concrete shape: a `cmp + branch` against the slice's `len`, with the panic block marked `cold` (so it's hoisted out of the hot path) and the success-path range communicated to LLVM via `llvm.assume` annotations where appropriate. For idiomatic loops (`for i in 0..xs.len() { xs[i] }`, nested stride-based induction over slices), LLVM's existing analyses then hoist or eliminate the check entirely — the same mechanism `rustc` uses. Constant-index accesses (`xs[3]` where `3 < xs.len()` is statically known) skip the runtime check at codegen time, before LLVM ever sees the IR.
+
+This is invisible to users — bounds checks remain semantically present in safe code; the optimization is purely a codegen shape choice.
+
+**(c) `unsafe { xs.get_unchecked(i) }` escape hatch (P0, v1).** When the programmer knows the index is in-bounds but the compiler cannot prove it (e.g., a computed index whose validity depends on an external invariant), `Slice[T].get_unchecked(i)` provides the explicit opt-out. Same shape and semantics as Rust's `<[T]>::get_unchecked`: an `unsafe fn` returning `ref T`, with the safety contract that `i < self.len()` is the caller's obligation. The `unsafe` block at the call site documents the rationale per the `undocumented_unsafe` lint (see § Unsafe Escape Hatch). Used sparingly — most cases close under (a) — but available as the canonical recourse for the residual cases (a) misses.
+
+```kara
+// (a): idiomatic for-loop — bounds check elided by LLVM analysis
+fn sum(xs: ref Slice[i64]) -> i64 {
+    let mut total: i64 = 0;
+    for i in 0..xs.len() {
+        total += xs[i]; // bounds check present in IR; LLVM proves it redundant from loop bound
+    }
+    total
+}
+
+// (c): manual escape hatch when (a) can't prove the index
+fn sum_strided(xs: ref Slice[i64], stride: usize, n: usize) -> i64 {
+    let mut total: i64 = 0;
+    for k in 0..n {
+        // Safety: caller guarantees `k * stride < xs.len()` for all k in 0..n
+        unsafe { total += *xs.get_unchecked(k * stride); }
+    }
+    total
+}
+```
+
+**(b) Karac-side BCE pass (P2 contingent).** A compiler-internal pass that pattern-matches safe-indexing idioms and rewrites them to skip the runtime bounds check before LLVM codegen runs. Catches a different class of cases than (a) — patterns where the programmer knows the bound but neither the compiler's range analysis nor LLVM's reaches them. Deferred to P2 with a promotion gate: build the pass when post-v1 user data shows ≥2 distinct workload classes where (a) leaves a >1.5× perf gap. See [`deferred.md § Karac-Side Bounds-Check Elimination Pass`](deferred.md#karac-side-bounds-check-elimination-pass).
+
+**Profile-level disable.** The `embedded` and `isr` profiles may set `bounds_checks = false` in `kara.toml` to disable runtime bounds-checking panics entirely (see § Project Profiles). This is an explicit opt-in that the profile author takes responsibility for; safe code on `app` and `lib` profiles always has runtime bounds checks (subject to (a)'s elision for provably-redundant cases).
+
+**Cross-references:** § Spatial safety (memory-safety overview); § Unsafe Escape Hatch (`get_unchecked` is one of the canonical use cases for `unsafe`); `implementation_checklist/phase-7-codegen.md` (BCE codegen tracking); `deferred.md § Karac-Side Bounds-Check Elimination Pass` (P2 follow-on).
+
+### Tree-walk interpreter (dev / debug only)
+
+The Phase 4 tree-walk interpreter remains in the source tree as a **dev / debug tool**, not as a runtime backend for `karac repl` / `karac test`. Use cases:
+
+- **Compiler-internal validation.** When working on language semantics or new compiler passes, the tree-walk interpreter is a fast iteration target — no LLJIT round-trip, runs in process directly.
+- **Stepping through code.** Future debugger affordances (REPL stepping, expression-level introspection) build naturally on a tree-walk interpreter; LLJIT gives you native stack frames but not the same fine-grained control.
+- **Fallback for environments without LLVM.** If a deployment context can't or shouldn't host LLVM (e.g., a stripped-down embedded REPL), the tree-walk interpreter is the answer.
+
+Behavioral parity between tree-walk and LLJIT is maintained for all user-observable semantics — same effect output, same panic messages, same ownership errors. Performance parity is **not** maintained: tree-walk is ~38× slower than CPython on tight loops (i.e., orders of magnitude slower than LLJIT). Users are directed to `karac build` or `karac repl` (LLJIT-backed) for any perf-sensitive workload.
+
+### Cross-references
+
+- Implementation: [`implementation_checklist/phase-7-codegen.md`](implementation_checklist/phase-7-codegen.md) for the LLJIT integration tracking, including `llvm-sys::orc2` wrapping milestones.
+- Roadmap: [`roadmap.md § Core Strategy`](../roadmap.md#core-strategy) item 2 + 6 for the strategic framing.
+- Interactive surfaces (REPL, browser playground, Jupyter kernel) are specified in § Interactive Evaluation Model below.
+
+---
+
 ## Interactive Evaluation Model
 
-Kāra ships interactive evaluation as a first-class delivery alongside the compiler. The tree-walk interpreter (kept in semantic parity with codegen, per Compilation Model above) backs three surfaces:
+Kāra ships interactive evaluation as a first-class delivery alongside the compiler. The LLJIT execution backend (per § Execution Model and Compilation Targets above) backs three surfaces:
 
 - **`karac repl`** (v1). Terminal REPL binary. Line-based with multi-line continuation; persistent session; meta-commands `:help`, `:quit`, `:type expr`, `:effects`, `:save file.kara`, `:provide R = expr` / `:end-provide R` (see *Cross-Cell Providers*), `:dep name = "..."` (v1.1; see *Session Dependencies*).
 - **Browser playground** (v1). Zero-install entry point hosting the interpreter behind a web frontend. No Python, no install, no IDE — intended as the common first-try surface.
@@ -11525,6 +11654,18 @@ worst case of an over-applied `#[used]` is dead bytes. The attributes that
 *do* expose the symbol (`#[unsafe(no_mangle)]`, `#[unsafe(link_section)]`)
 carry their own wrap; layering `#[unsafe(used)]` on top would be ceremony
 without information.
+
+### Build-profile linker flags
+
+The attributes above operate at the per-symbol level. Two related concerns operate at the **build-profile** level — they affect every symbol the linker sees, set in `kara.toml` or via build-flag defaults rather than at individual definitions:
+
+**Strip + dead-code elimination.** Release builds run `strip -x` on the linked binary (drops `__LINKEDIT` symbol tables, ~18% size reduction on macOS) and pass linker DCE flags (`-Wl,-dead_strip` on macOS, `-Wl,--gc-sections` on Linux + ELF builds with `-ffunction-sections -fdata-sections`). The Mach-O linker has function-level dead stripping always-on via `.subsections_via_symbols`, so macOS gets per-function DCE by default; Linux ELF requires the explicit flags. Cross-archive LTO (`lto = "thin"` in the runtime crate's release profile) gives the linker visibility into runtime-internal symbols for further DCE.
+
+**Panic strategy and unwinding tables.** `panic = "abort"` in the runtime crate's release profile drops `__eh_frame` and `__unwind_info` sections (~114 KB on a representative binary). Default for `embedded` / `kernel` / `isr` / `gpu` profiles, where unwinding is forbidden anyway. App / lib profiles use `panic = "unwind"` by default to preserve `catch_panic` semantics; users can switch to `panic = "abort"` per-build for additional binary-size savings, accepting the loss of `catch_panic` (which becomes a compile error under `abort`).
+
+These flags are profile-driven, not per-symbol. Soundness obligations stay at the symbol level via the `#[unsafe(...)]` attributes above. The build-profile flags are a separate layer concerned with binary footprint and panic-strategy uniformity, not with symbol-name uniqueness or section validity. Implementation tracking lives in [`implementation_checklist/phase-7-codegen.md`](implementation_checklist/phase-7-codegen.md).
+
+**Cross-references:** § Project Profiles (where `panic = "abort"` defaults are set per profile); § Panic Strategy (the unwind / abort semantic split); § Catching Panics (`catch_panic[T]` requires `panic = "unwind"`).
 
 ---
 

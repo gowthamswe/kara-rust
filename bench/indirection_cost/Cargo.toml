@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "indirection_cost"
+version = "0.0.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "config_a_std_hashmap"
+path = "src/config_a.rs"
+
+[[bin]]
+name = "config_b_karac_mono"
+path = "src/config_b.rs"
+
+[[bin]]
+name = "config_c_karac_ffi"
+path = "src/config_c.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false

@@ -2365,6 +2365,28 @@ This is correct but requires wrapping each iteration as a closure, which is verb
 
 ---
 
+### Karac-Side Bounds-Check Elimination Pass
+
+A compiler-internal pass that pattern-matches common safe-indexing idioms (`for i in 0..xs.len() { xs[i] }`, `if i < xs.len() { xs[i] }`, monotone-step induction over slices) and rewrites the indexing to skip the runtime bounds check before LLVM codegen runs. Sits *above* the v1 BCE strategy (LLVM-friendly emission via `llvm.assume` + cold-attribute panic blocks + SCEV/GVN-friendly idioms — see `design.md § Spatial safety`), catching cases where Karac knows the bound is satisfied but LLVM's range analysis does not.
+
+**Why deferred:** Empirical motivation is missing. The v1 BCE strategy (LLVM-friendly emission + `unsafe { xs.get_unchecked(i) }` escape hatch) is sufficient for every workload measured in the v62 bench suite — sieve (4.3×), brute_force (3.0×), coin_change (1.7×) all sit in stride-1 / step-based induction territory that LLVM's SCEV/GVN handles natively. A Karac-side pass would catch a *different* class of cases (computed indices the user proves safe, multi-dimensional indexing patterns LLVM can't relate, custom range-bound idioms) that haven't surfaced in measured workloads. Building the pass before real-world data shows the gap risks designing for hypothetical patterns.
+
+**Promotion gate:** Promote to P1 (or P0 v1.x) when post-v1 user data shows ≥2 distinct workload classes where the v1 BCE strategy leaves a >1.5× perf gap that the user would have to close via `get_unchecked`. The trigger is *frequency in real code*, not theoretical coverage — one rare pattern doesn't justify a Karac-side pass.
+
+**Why non-breaking:** Purely additive. The pass either eliminates a bounds check (faster) or leaves the LLVM-friendly form in place (current behavior). No semantic change. Existing programs run identically or faster. `unsafe { xs.get_unchecked(i) }` continues to be the user-visible escape hatch regardless of whether the pass exists.
+
+**Design shape (sketch — finalize at promotion):**
+
+- Karac-side pass running between typecheck and codegen.
+- Pattern-matches `for i in 0..xs.len()` / `for i in 0..N where N == xs.len()` / `if i < xs.len() { xs[i] }` and similar.
+- Marks each matched indexing site as "skip bounds check" before lowering to LLVM IR.
+- Falls back to LLVM-friendly emission for non-matched sites.
+- Diagnostic affordance: `karac explain` should be able to point at an indexing site and say "this could not be elided because *X*; consider rewriting *Y* or using `get_unchecked`."
+
+**Cross-reference:** `design.md § Spatial safety` (v1 BCE strategy and the `get_unchecked` escape hatch); `implementation_checklist/phase-7-codegen.md` (LLVM-friendly bounds-check emission tracking).
+
+---
+
 ## P3 — Post-v1 Build Targets (library / ecosystem)
 
 Items that are **not language features** and will not be added to `design.md` — they are libraries or frameworks built on top of the language. They live here because, post-v1, the project author may choose to build them directly rather than wait for community ownership. Each entry describes the scope, what it rests on in the language, and what would need to be in place before building it.
@@ -2643,3 +2665,29 @@ All functions carry `writes(Stdout)` so they participate in conflict analysis an
 - `writes(Stdout)` effect, which is already in v1
 
 **Cross-reference:** `design.md § I/O Functions` — `print`/`println` with `writes(Stdout)` are the v1 primitive; this module is an ergonomic layer above them.
+
+---
+
+## Permanent Omissions
+
+Features the project has explicitly chosen *not* to build. Distinct from P1/P2/P3 (which all express some degree of "will or might ship"): permanent-omission entries record decisions that the language will *not* allocate design surface or stdlib infrastructure to a given feature, even post-v1. The category exists so the decision is durable — future contributors can see *why* the omission is intentional rather than rediscovering the question and re-litigating it.
+
+A permanent omission is not "we'll never reconsider." If a future ecosystem reality genuinely changes the trade-offs, an entry can be moved out of this section and reopened. The bar for that motion is high: a concrete real-world need that the omission's stated rationale fails to address.
+
+### Dynamic Linking (Runtime `dlopen` / Plugin Loading)
+
+**Decision:** Static linking is the canonical default. Kāra does not provide dynamic-linking (`dlopen`, `dlsym`, plugin system, runtime `.so`/`.dll` loading) as a first-class feature. The runtime is statically linked into every `karac build` artifact; users who need plugin-style extensibility use one of the alternatives below.
+
+**Why permanent:** Dynamic linking trades binary size for distribution headache (versioned runtime dependency on the target machine, ABI stability burden, package-manager friction, install-dance for the runtime, dlopen-at-startup overhead). Static linking matches Kāra's value proposition: predictable memory layout, zero-cost abstractions, compile-time effect verification, "ship one binary, run it anywhere with the right architecture." Dynamic linking would also blur the effect system at the FFI boundary — runtime-loaded code can't participate in compile-time effect verification, so any plugin ABI ends up bypassing the language's main correctness story.
+
+The binary-size cost that motivates dynamic-linking adoption in C/C++ is addressed in Kāra by other means: monomorphized collections (post-v1, see `roadmap.md`), strip + LTO + DCE in release builds, and runtime decomposition into per-feature archives if shipping data ever justifies it. The wins available from those mechanisms are sufficient without changing the deployment model.
+
+**Alternatives (when extensibility is genuinely needed):**
+
+1. **IPC + effect-typed services.** Separate processes communicating over channels; effects are tracked per-process boundary. This is the recommended pattern for plugin-style extensibility in Kāra — it preserves the language's correctness guarantees and matches the auto-concurrency story.
+2. **WASM plugins.** AOT-compiled plugin code, fully sandboxed, effect-safe by construction. Phase 10 (additional compilation targets) will support WASM as a target, enabling this pattern.
+3. **Hand-rolled `dlopen` in `unsafe` blocks.** Users who need raw C-style plugins (e.g., loading vendor-supplied `.so` files) can use the FFI surface in `unsafe` blocks. They opt out of the effect system at that boundary and accept manual responsibility for the loaded code's behavior. This is a v1-supported escape hatch, not a recommended default.
+
+**Why non-breaking:** Not a restriction on existing code. Purely a statement that the language does not allocate first-class surface or stdlib infrastructure to dynamic linking. Users who need the feature today construct it through FFI; those mechanisms remain available.
+
+**Cross-reference:** `design.md § Foreign Function Interface` (manual `dlopen` in `unsafe` blocks); `roadmap.md § Phase 10` (WASM target as the supported plugin pattern); `design.md § Auto-Concurrency via Effect Analysis` (IPC + channels as the in-language extensibility pattern).
