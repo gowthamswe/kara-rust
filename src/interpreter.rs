@@ -181,6 +181,12 @@ impl FieldCell {
 /// (each a `Value::SharedStruct(Arc::clone(...))`) share one inner;
 /// mutation through any holder is visible to all. Aliasing is by
 /// `Arc` clone — `let b = a` bumps the refcount, no deep copy.
+///
+/// Weak fields (declared `weak T` or `mut weak T`) live in dedicated
+/// `weak_*_fields` maps backed by `std::sync::Weak<SharedStructInner>`
+/// per design.md § Shared Types — Weak references. They never surface
+/// to user code as a "raw weak" — field reads auto-upgrade and yield
+/// `Option[T]`; writes accept a strong reference and downgrade.
 #[derive(Debug)]
 pub struct SharedStructInner {
     pub name: String,
@@ -188,6 +194,16 @@ pub struct SharedStructInner {
     pub immutable_fields: HashMap<String, Value>,
     /// Fields declared `mut` — each carries its own borrow flag.
     pub mut_fields: HashMap<String, FieldCell>,
+    /// Fields declared `weak T` (no `mut`) — set at construction,
+    /// not reassignable. `std::sync::Weak` mirrors the spec's storage
+    /// model: assignment downgrades a strong reference; reads upgrade
+    /// to `Option[T]`. Empty in v1 codegen — interpreter only.
+    pub weak_immutable_fields: HashMap<String, std::sync::Weak<SharedStructInner>>,
+    /// Fields declared `mut weak T` — set at construction or later
+    /// via field assignment. The `RwLock` only guards the `Weak`
+    /// handle itself (assignment vs concurrent read of the slot);
+    /// upgrade to `Arc` is atomic via `Weak::upgrade`.
+    pub weak_mut_fields: HashMap<String, RwLock<std::sync::Weak<SharedStructInner>>>,
 }
 
 /// Newtype wrapping [`Value`] that implements [`Ord`] via [`value_compare`]
@@ -264,7 +280,7 @@ impl PartialEq for Value {
                 if a.mut_fields.len() != b.mut_fields.len() {
                     return false;
                 }
-                a.mut_fields.iter().all(|(k, fa)| {
+                let mut_eq = a.mut_fields.iter().all(|(k, fa)| {
                     b.mut_fields
                         .get(k)
                         .map(|fb| {
@@ -272,6 +288,39 @@ impl PartialEq for Value {
                             let vb = fb.value.try_read().ok();
                             match (va, vb) {
                                 (Some(x), Some(y)) => *x == *y,
+                                _ => false,
+                            }
+                        })
+                        .unwrap_or(false)
+                });
+                if !mut_eq {
+                    return false;
+                }
+                // Weak fields: compare by referent identity (Arc::ptr_eq
+                // on upgraded handles). Two dangling weaks are equal;
+                // a dangling weak is not equal to a live weak.
+                if a.weak_immutable_fields.len() != b.weak_immutable_fields.len()
+                    || a.weak_mut_fields.len() != b.weak_mut_fields.len()
+                {
+                    return false;
+                }
+                let weak_imm_eq = a.weak_immutable_fields.iter().all(|(k, wa)| {
+                    b.weak_immutable_fields
+                        .get(k)
+                        .map(|wb| weak_referent_eq(wa, wb))
+                        .unwrap_or(false)
+                });
+                if !weak_imm_eq {
+                    return false;
+                }
+                a.weak_mut_fields.iter().all(|(k, sa)| {
+                    b.weak_mut_fields
+                        .get(k)
+                        .map(|sb| {
+                            let wa = sa.try_read().ok();
+                            let wb = sb.try_read().ok();
+                            match (wa, wb) {
+                                (Some(x), Some(y)) => weak_referent_eq(&x, &y),
                                 _ => false,
                             }
                         })
@@ -553,6 +602,23 @@ impl std::fmt::Display for Value {
                     );
                     write!(f, "{}: {}", k, *v)?;
                 }
+                for (k, weak) in &inner.weak_immutable_fields {
+                    if !first {
+                        write!(f, ", ")?;
+                    }
+                    first = false;
+                    write!(f, "{}: {}", k, upgrade_weak_to_option(weak))?;
+                }
+                for (k, slot) in &inner.weak_mut_fields {
+                    if !first {
+                        write!(f, ", ")?;
+                    }
+                    first = false;
+                    let weak = slot.try_read().expect(
+                        "shared struct weak field write-locked during Display — unreachable in single-task interpreter",
+                    );
+                    write!(f, "{}: {}", k, upgrade_weak_to_option(&weak))?;
+                }
                 write!(f, " }}")
             }
             Value::EnumVariant { variant, data, .. } => match data {
@@ -678,6 +744,15 @@ impl Value {
                     );
                     parts.push(format!("{}: {}", k, v.debug_fmt()));
                 }
+                for (k, weak) in &inner.weak_immutable_fields {
+                    parts.push(format!("{}: {}", k, upgrade_weak_to_option(weak).debug_fmt()));
+                }
+                for (k, slot) in &inner.weak_mut_fields {
+                    let weak = slot.try_read().expect(
+                        "shared struct weak field write-locked during debug_fmt — unreachable in single-task interpreter",
+                    );
+                    parts.push(format!("{}: {}", k, upgrade_weak_to_option(&weak).debug_fmt()));
+                }
                 format!("{} {{ {} }}", inner.name, parts.join(", "))
             }
             Value::EnumVariant { variant, data, .. } => match data {
@@ -799,6 +874,42 @@ impl ExitPath {
 
     fn is_error(&self) -> bool {
         !matches!(self, ExitPath::Normal)
+    }
+}
+
+/// Identity comparison between two `Weak<SharedStructInner>` handles
+/// for use in `Value::SharedStruct` PartialEq. Two weaks are equal iff
+/// they point at the same allocation (`Arc::ptr_eq` after upgrade) or
+/// both are dangling. A dangling weak is never equal to a live one.
+fn weak_referent_eq(
+    a: &std::sync::Weak<SharedStructInner>,
+    b: &std::sync::Weak<SharedStructInner>,
+) -> bool {
+    match (a.upgrade(), b.upgrade()) {
+        (None, None) => true,
+        (Some(x), Some(y)) => Arc::ptr_eq(&x, &y),
+        _ => false,
+    }
+}
+
+/// Upgrade a stored `Weak<SharedStructInner>` to a runtime `Option[T]`
+/// per design.md § Shared Types — Weak references. Returns
+/// `Some(SharedStruct)` when the referent is still alive (the upgrade
+/// bumps the strong RC), or `None` if every strong holder has been
+/// dropped. Used at every `weak`-field read site and any `.upgrade()`
+/// dispatch.
+fn upgrade_weak_to_option(weak: &std::sync::Weak<SharedStructInner>) -> Value {
+    match weak.upgrade() {
+        Some(arc) => Value::EnumVariant {
+            enum_name: "Option".to_string(),
+            variant: "Some".to_string(),
+            data: EnumData::Tuple(vec![Value::SharedStruct(arc)]),
+        },
+        None => Value::EnumVariant {
+            enum_name: "Option".to_string(),
+            variant: "None".to_string(),
+            data: EnumData::Unit,
+        },
     }
 }
 
@@ -7505,6 +7616,27 @@ impl<'a> Interpreter<'a> {
                         }
                     }
                 }
+                // Weak field reads are the upgrade point per spec
+                // § Shared Types — Weak references. Yields
+                // `Some(strong_ref)` if the referent is alive (RC
+                // bumped), or `None` if it has been deallocated.
+                if let Some(weak) = inner.weak_immutable_fields.get(field) {
+                    return upgrade_weak_to_option(weak);
+                }
+                if let Some(slot) = inner.weak_mut_fields.get(field) {
+                    match slot.try_read() {
+                        Ok(guard) => return upgrade_weak_to_option(&guard),
+                        Err(_) => {
+                            return self.record_runtime_error(
+                                format!(
+                                    "shared struct field '{}.{}' read while a write borrow is active",
+                                    inner.name, field
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                }
                 unreachable!(
                     "field '{}' not found on shared struct '{}' at {}:{}; should be caught by typechecker",
                     field, inner.name, span.line, span.column
@@ -7529,6 +7661,13 @@ impl<'a> Interpreter<'a> {
     ) -> Value {
         let name = path.last().cloned().unwrap_or_default();
         let mut field_vals: HashMap<String, Value> = HashMap::new();
+        // Weak handles encountered via spread or explicit field init are
+        // routed here so the construction step can re-store them as
+        // `Weak<SharedStructInner>` without an upgrade-then-downgrade
+        // round trip (which would lose the "is the referent alive"
+        // signal at the spread point).
+        let mut weak_overrides: HashMap<String, std::sync::Weak<SharedStructInner>> =
+            HashMap::new();
         if let Some(spread_expr) = spread {
             match self.eval_expr_inner(spread_expr) {
                 Value::Struct {
@@ -7547,6 +7686,15 @@ impl<'a> Interpreter<'a> {
                         );
                         field_vals.insert(k.clone(), v.clone());
                     }
+                    for (k, weak) in &inner.weak_immutable_fields {
+                        weak_overrides.insert(k.clone(), weak.clone());
+                    }
+                    for (k, slot) in &inner.weak_mut_fields {
+                        let weak = slot.try_read().expect(
+                            "shared struct weak field write-locked during spread — unreachable in single-task interpreter",
+                        );
+                        weak_overrides.insert(k.clone(), weak.clone());
+                    }
                 }
                 _ => {}
             }
@@ -7563,19 +7711,66 @@ impl<'a> Interpreter<'a> {
                     .filter(|f| f.is_mut)
                     .map(|f| f.name.clone())
                     .collect();
+                let weak_field_names: HashSet<String> = def
+                    .fields
+                    .iter()
+                    .filter(|f| matches!(f.ty.kind, TypeKind::Weak(_)))
+                    .map(|f| f.name.clone())
+                    .collect();
                 let mut immutable_fields: HashMap<String, Value> = HashMap::new();
                 let mut mut_fields: HashMap<String, FieldCell> = HashMap::new();
+                let mut weak_immutable_fields: HashMap<String, std::sync::Weak<SharedStructInner>> =
+                    HashMap::new();
+                let mut weak_mut_fields: HashMap<
+                    String,
+                    RwLock<std::sync::Weak<SharedStructInner>>,
+                > = HashMap::new();
                 for (k, v) in field_vals {
-                    if mut_field_names.contains(&k) {
+                    let is_mut = mut_field_names.contains(&k);
+                    let is_weak = weak_field_names.contains(&k);
+                    if is_weak {
+                        // Spec § Shared Types: assignment to a weak
+                        // field accepts a strong reference and
+                        // downgrades. Non-shared rhs is a typechecker
+                        // error; we record a runtime error as
+                        // defense-in-depth. Spread-only weak fields
+                        // (no explicit init in the literal) are
+                        // handled by the `weak_overrides` drain below.
+                        let weak = match &v {
+                            Value::SharedStruct(arc) => Arc::downgrade(arc),
+                            _ => {
+                                self.runtime_errors.push(RuntimeError {
+                                    message: format!(
+                                        "weak field '{}.{}' initialized with non-shared value",
+                                        name, k
+                                    ),
+                                    span: Span::default(),
+                                    left: None,
+                                    right: None,
+                                });
+                                std::sync::Weak::new()
+                            }
+                        };
+                        weak_overrides.insert(k, weak);
+                    } else if is_mut {
                         mut_fields.insert(k, FieldCell::new(v));
                     } else {
                         immutable_fields.insert(k, v);
+                    }
+                }
+                for (k, weak) in weak_overrides {
+                    if mut_field_names.contains(&k) {
+                        weak_mut_fields.insert(k, RwLock::new(weak));
+                    } else {
+                        weak_immutable_fields.insert(k, weak);
                     }
                 }
                 return Value::SharedStruct(Arc::new(SharedStructInner {
                     name,
                     immutable_fields,
                     mut_fields,
+                    weak_immutable_fields,
+                    weak_mut_fields,
                 }));
             }
         }
@@ -7602,7 +7797,9 @@ impl<'a> Interpreter<'a> {
                     // Aliasing: `inner` is a clone of the Arc held by `name`'s
                     // slot. Both point to the same allocation; mutating
                     // through `inner` is visible to every other holder.
-                    if inner.immutable_fields.contains_key(field) {
+                    if inner.immutable_fields.contains_key(field)
+                        || inner.weak_immutable_fields.contains_key(field)
+                    {
                         // Defense-in-depth: typechecker already rejects
                         // writes to non-`mut` fields. If we reach here,
                         // the static check missed.
@@ -7622,6 +7819,40 @@ impl<'a> Interpreter<'a> {
                         match cell.value.try_write() {
                             Ok(mut guard) => {
                                 *guard = val;
+                            }
+                            Err(_) => {
+                                self.record_runtime_error(
+                                    format!(
+                                        "shared struct field '{}.{}' write while another borrow is active",
+                                        inner.name, field
+                                    ),
+                                    &object.span,
+                                );
+                            }
+                        }
+                    } else if let Some(slot) = inner.weak_mut_fields.get(field) {
+                        // Spec § Shared Types: assignment to a weak
+                        // field accepts a strong reference and
+                        // downgrades it. `Weak::new()` (an empty weak)
+                        // is the safe fallback for a non-shared rhs;
+                        // typechecker should reject that case but
+                        // record a runtime error as defense-in-depth.
+                        let weak = match &val {
+                            Value::SharedStruct(arc) => Arc::downgrade(arc),
+                            _ => {
+                                self.record_runtime_error(
+                                    format!(
+                                        "weak field '{}.{}' assigned a non-shared value",
+                                        inner.name, field
+                                    ),
+                                    &object.span,
+                                );
+                                std::sync::Weak::new()
+                            }
+                        };
+                        match slot.try_write() {
+                            Ok(mut guard) => {
+                                *guard = weak;
                             }
                             Err(_) => {
                                 self.record_runtime_error(

@@ -2285,11 +2285,31 @@ impl Parser {
             let attributes = self.parse_attributes();
             let is_pub = self.eat(&Token::Pub);
             let is_mut = self.eat(&Token::Mut);
+            // Field-modifier `weak` per design.md § Shared Types — Weak
+            // references. `mut weak field: T` and `weak field: T` are
+            // both legal; the modifier wraps the parsed field type in
+            // `TypeKind::Weak`. This is sugar — the type-position form
+            // `field: weak T` is also accepted via `parse_type`.
+            let weak_modifier_span = if matches!(self.peek_token(), Token::Weak) {
+                let span = self.current_span();
+                self.advance();
+                Some(span)
+            } else {
+                None
+            };
             let name = self.expect_identifier()?;
             let name_span = self.span_from(&start);
             self.check_ident_class(&name, IdentClass::Value, "struct field", name_span);
             self.expect(&Token::Colon)?;
-            let ty = self.parse_type()?;
+            let inner_ty = self.parse_type()?;
+            let ty = if let Some(span) = weak_modifier_span {
+                TypeExpr {
+                    kind: TypeKind::Weak(Box::new(inner_ty)),
+                    span,
+                }
+            } else {
+                inner_ty
+            };
             let doc_comment = self.take_pending_doc();
             fields.push(StructField {
                 span: self.span_from(&start),

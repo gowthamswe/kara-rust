@@ -1035,6 +1035,141 @@ fn test_shared_struct_per_field_independence_across_methods() {
     );
 }
 
+// ── Weak references on shared struct fields ────────────────────
+
+#[test]
+fn test_weak_field_alive_yields_some() {
+    // Per design.md § Shared Types — Weak references: a `weak` field
+    // read is the upgrade point. While a strong holder of the referent
+    // is in scope, the upgrade succeeds and yields `Some(strong_ref)`.
+    assert_eq!(
+        run("shared struct Parent { id: i64 }\n\
+             shared struct Child { id: i64, mut weak parent: Parent }\n\
+             fn main() {\n\
+                 let p = Parent { id: 7 };\n\
+                 let c = Child { id: 2, parent: p };\n\
+                 match c.parent {\n\
+                     Some(parent_ref) => println(parent_ref.id),\n\
+                     None => println(\"dangling\"),\n\
+                 }\n\
+             }"),
+        "7\n"
+    );
+}
+
+#[test]
+fn test_weak_field_after_strong_drop_yields_none() {
+    // After every strong holder of the referent is dropped, the
+    // referent's allocation is freed and the weak field upgrade
+    // returns `None`. `make_orphan` returns a Child whose only handle
+    // to `Parent` is a weak reference; when the function frame exits,
+    // the local strong `p` is dropped and the Arc count hits zero.
+    assert_eq!(
+        run("shared struct Parent { id: i64 }\n\
+             shared struct Child { id: i64, mut weak parent: Parent }\n\
+             fn make_orphan() -> Child {\n\
+                 let p = Parent { id: 7 };\n\
+                 Child { id: 2, parent: p }\n\
+             }\n\
+             fn main() {\n\
+                 let c = make_orphan();\n\
+                 match c.parent {\n\
+                     Some(parent_ref) => println(parent_ref.id),\n\
+                     None => println(\"dangling\"),\n\
+                 }\n\
+             }"),
+        "dangling\n"
+    );
+}
+
+#[test]
+fn test_weak_field_multiple_aliases_all_see_drop() {
+    // Two children weakly-reference the same parent. When the parent
+    // is dropped, both children's weak fields upgrade to None.
+    assert_eq!(
+        run("shared struct Parent { id: i64 }\n\
+             shared struct Child { id: i64, mut weak parent: Parent }\n\
+             fn make_pair() -> (Child, Child) {\n\
+                 let p = Parent { id: 1 };\n\
+                 (Child { id: 10, parent: p }, Child { id: 11, parent: p })\n\
+             }\n\
+             fn main() {\n\
+                 let pair = make_pair();\n\
+                 let (a, b) = pair;\n\
+                 match a.parent { Some(_) => println(\"a:alive\"), None => println(\"a:dangling\") }\n\
+                 match b.parent { Some(_) => println(\"b:alive\"), None => println(\"b:dangling\") }\n\
+             }"),
+        "a:dangling\nb:dangling\n"
+    );
+}
+
+#[test]
+fn test_weak_field_reassignment_restores_some() {
+    // A `mut weak` field can be reassigned after construction. The
+    // assignment auto-downgrades the strong rhs. Reading after the
+    // first assignment's referent dies yields None; assigning a fresh
+    // live parent restores Some.
+    assert_eq!(
+        run("shared struct Parent { id: i64 }\n\
+             shared struct Child { id: i64, mut weak parent: Parent }\n\
+             fn main() {\n\
+                 let p1 = Parent { id: 1 };\n\
+                 let c = Child { id: 9, parent: p1 };\n\
+                 let p2 = Parent { id: 2 };\n\
+                 c.parent = p2;\n\
+                 match c.parent {\n\
+                     Some(parent_ref) => println(parent_ref.id),\n\
+                     None => println(\"dangling\"),\n\
+                 }\n\
+             }"),
+        "2\n"
+    );
+}
+
+#[test]
+fn test_weak_field_immutable_form_set_at_construction() {
+    // `weak parent: Parent` (no `mut`) is set at construction and
+    // never reassigned. While the strong parent lives, upgrade yields
+    // Some; after the strong parent's frame exits, upgrade yields None.
+    assert_eq!(
+        run("shared struct Parent { id: i64 }\n\
+             shared struct Child { id: i64, weak parent: Parent }\n\
+             fn build() -> Child {\n\
+                 let p = Parent { id: 42 };\n\
+                 Child { id: 1, parent: p }\n\
+             }\n\
+             fn main() {\n\
+                 let c = build();\n\
+                 match c.parent {\n\
+                     Some(parent_ref) => println(parent_ref.id),\n\
+                     None => println(\"dangling\"),\n\
+                 }\n\
+             }"),
+        "dangling\n"
+    );
+}
+
+#[test]
+fn test_weak_field_upgrade_observes_strong_field_data() {
+    // The Some arm of a weak upgrade is a normal SharedStruct handle —
+    // its other fields are reachable as usual. Pins that the Arc
+    // returned by Weak::upgrade carries the full referent contents,
+    // not a stub.
+    assert_eq!(
+        run("shared struct Parent { id: i64, mut count: i64 }\n\
+             shared struct Child { mut weak parent: Parent }\n\
+             fn main() {\n\
+                 let p = Parent { id: 5, count: 100 };\n\
+                 let c = Child { parent: p };\n\
+                 match c.parent {\n\
+                     Some(parent_ref) => { parent_ref.count = parent_ref.count + 1; println(p.count); },\n\
+                     None => println(\"dangling\"),\n\
+                 }\n\
+             }"),
+        "101\n"
+    );
+}
+
 // ── Array methods ──────────────────────────────────────────────
 
 #[test]
