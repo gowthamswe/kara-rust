@@ -1147,6 +1147,9 @@ fn test_user_impl_eq_ord_for_struct_allowed() {
          impl Eq for Point {\n\
              fn eq(self, other: Point) -> bool { self.x == other.x and self.y == other.y }\n\
          }\n\
+         impl PartialOrd for Point {\n\
+             fn partial_cmp(ref self, other: ref Point) -> Option[Ordering] { Some(self.x.cmp(other.x)) }\n\
+         }\n\
          impl Ord for Point {\n\
              fn lt(self, other: Point) -> bool { self.x < other.x }\n\
              fn le(self, other: Point) -> bool { self.x <= other.x }\n\

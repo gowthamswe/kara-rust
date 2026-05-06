@@ -1,0 +1,15 @@
+// runtime/stdlib/ord.kara
+//
+// CR-202 slice 5d. Per design.md § Operator Traits — `Ord` is the
+// total-ordering subset of `PartialOrd` ("my PartialOrd is a total
+// order, and my equality is reflexive"). Ord requires both
+// PartialOrd (for `partial_cmp`) and Eq (for total equality).
+//
+// Pre-5d the hardcoded `register_stdlib_traits` array registered Ord
+// with empty supertraits. Slice 5d adds the supertrait edges
+// `PartialOrd + Eq`, surfacing `MissingSupertrait` when user code
+// implements Ord without companion PartialOrd / Eq impls.
+
+trait Ord: PartialOrd + Eq {
+    fn cmp(ref self, other: ref Self) -> Ordering;
+}

@@ -3673,12 +3673,10 @@ impl<'a> TypeChecker<'a> {
             ("Div", &[]),
             ("Rem", &[]),
             ("Neg", &[]),
-            // Equality and ordering. `Eq` is now provided by
-            // `runtime/stdlib/eq.kara` (CR-202 slice 5b) — the bake walk
-            // at the top of `register_builtin_types` registers it via
-            // `env_add_trait`, so this loop no longer lists it. `Ord`
-            // stays hardcoded until slice 5d migrates it.
-            ("Ord", &[]),
+            // Equality and ordering. `Eq` (slice 5b) and `Ord` (slice 5d)
+            // are now provided by `runtime/stdlib/{eq,ord}.kara`; the
+            // bake walk at the top of `register_builtin_types` registers
+            // them via `env_add_trait`.
             // Bitwise operators
             ("BitAnd", &[]),
             ("BitOr", &[]),

@@ -143,8 +143,18 @@ fn test_user_impl_ord_drives_comparison_operators() {
     // `impl Ord for Point` with direct `lt`/`le`/`gt`/`ge` methods — `<`
     // lowers to `Point.lt(a, b)`, etc. Domain-specific ordering (here by x
     // only) rather than the interpreter's hardcoded primitive path.
+    // CR-202 slice 5d: companion PartialEq/Eq/PartialOrd impls satisfy
+    // the new `Ord: PartialOrd + Eq` supertrait edges (typecheck-clean;
+    // interpreter execution behavior is unchanged).
     assert_eq!(
         run("struct Point { x: i64, y: i64 }
+             impl PartialEq for Point {
+                 fn eq(ref self, other: ref Point) -> bool { self.x == other.x and self.y == other.y }
+             }
+             impl Eq for Point {}
+             impl PartialOrd for Point {
+                 fn partial_cmp(ref self, other: ref Point) -> Option[Ordering] { Some(self.x.cmp(other.x)) }
+             }
              impl Ord for Point {
                  fn lt(self, other: Point) -> bool { self.x < other.x }
                  fn le(self, other: Point) -> bool { self.x <= other.x }

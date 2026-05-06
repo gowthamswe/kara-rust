@@ -9020,6 +9020,54 @@ fn baked_partial_ord_user_impl_typechecks() {
 }
 
 #[test]
+fn baked_ord_user_impl_with_full_companion_chain_typechecks() {
+    // `Ord: PartialOrd + Eq` requires a longer companion chain than
+    // PartialOrd alone. Pin that the slice-5d supertrait list reaches
+    // both edges via env_add_trait.
+    typecheck_ok(
+        "struct Tag { value: i64 }\n\
+         impl PartialEq for Tag {\n\
+             fn eq(ref self, other: ref Tag) -> bool { self.value == other.value }\n\
+         }\n\
+         impl Eq for Tag {}\n\
+         impl PartialOrd for Tag {\n\
+             fn partial_cmp(ref self, other: ref Tag) -> Option[Ordering] { Some(self.value.cmp(other.value)) }\n\
+         }\n\
+         impl Ord for Tag {\n\
+             fn cmp(ref self, other: ref Tag) -> Ordering { self.value.cmp(other.value) }\n\
+         }",
+    );
+}
+
+#[test]
+fn baked_ord_user_impl_without_partial_ord_companion_fails() {
+    // Pre-5d an impl Ord without PartialOrd companion typechecked
+    // clean; post-5d this fires MissingSupertrait.
+    let parsed = parse(
+        "struct Tag { value: i64 }\n\
+         impl PartialEq for Tag {\n\
+             fn eq(ref self, other: ref Tag) -> bool { self.value == other.value }\n\
+         }\n\
+         impl Eq for Tag {}\n\
+         impl Ord for Tag {\n\
+             fn cmp(ref self, other: ref Tag) -> Ordering { self.value.cmp(other.value) }\n\
+         }",
+    );
+    assert!(parsed.errors.is_empty());
+    let resolved = resolve(&parsed.program);
+    assert!(resolved.errors.is_empty());
+    let typed = typecheck(&parsed.program, &resolved);
+    assert!(
+        typed
+            .errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::MissingSupertrait),
+        "expected MissingSupertrait, got: {:?}",
+        typed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn baked_eq_user_impl_without_partial_eq_companion_fails() {
     // The supertrait check fires here; pre-5b this snippet would have
     // typechecked clean.
