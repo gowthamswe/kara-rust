@@ -743,6 +743,12 @@ pub struct TypeEnv {
     pub constants: HashMap<String, Type>,
     pub type_aliases: HashMap<String, Type>,
     pub traits: HashMap<String, TraitInfo>,
+    /// Names of declared trait aliases (`trait NAME = bound1 + ...;`).
+    /// Recognized at parse + resolver time; the typechecker emits
+    /// `E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET` at every use site as a v1
+    /// stub. Bound substitution lands in P1 (see `docs/deferred.md` §
+    /// Trait Aliases — Expansion).
+    pub trait_aliases: HashSet<String>,
     pub impls: Vec<ImplInfo>,
     /// Indices into `impls` keyed by trait name. Trait-less inherent impls
     /// are not indexed here.
@@ -769,6 +775,7 @@ impl TypeEnv {
             constants: HashMap::new(),
             type_aliases: HashMap::new(),
             traits: HashMap::new(),
+            trait_aliases: HashSet::new(),
             impls: Vec::new(),
             impls_by_trait: HashMap::new(),
             impl_assoc_types: HashMap::new(),
@@ -2137,6 +2144,7 @@ impl<'a> TypeChecker<'a> {
                 Item::EnumDef(e) => self.env_add_enum(e),
                 Item::Function(f) => self.env_add_function(f),
                 Item::TraitDef(t) => self.env_add_trait(t),
+                Item::TraitAlias(t) => self.env_add_trait_alias(t),
                 Item::ImplBlock(i) => self.env_add_impl(i),
                 Item::ConstDecl(c) => self.env_add_const(c),
                 Item::TypeAlias(t) => self.env_add_type_alias(t),
@@ -3882,6 +3890,13 @@ impl<'a> TypeChecker<'a> {
         );
     }
 
+    fn env_add_trait_alias(&mut self, t: &TraitAliasDef) {
+        // v1 stub registration — record the name so use sites can emit
+        // `E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET`. Bound substitution + the
+        // matching `TraitInfo` shape land in P1.
+        self.env.trait_aliases.insert(t.name.clone());
+    }
+
     fn env_add_type_alias(&mut self, t: &TypeAliasDef) {
         let gp = Self::generic_param_names(&t.generic_params);
         let ty = self.lower_type_expr(&t.ty, &gp);
@@ -4320,12 +4335,58 @@ impl<'a> TypeChecker<'a> {
             "Iterator",
         ];
         self.env.traits.contains_key(trait_name)
+            || self.env.trait_aliases.contains(trait_name)
             || DERIVE_ONLY_BUILTINS.contains(&trait_name)
-            || self
-                .program
-                .items
-                .iter()
-                .any(|item| matches!(item, Item::TraitDef(t) if t.name == trait_name))
+            || self.program.items.iter().any(|item| match item {
+                Item::TraitDef(t) => t.name == trait_name,
+                Item::TraitAlias(t) => t.name == trait_name,
+                _ => false,
+            })
+    }
+
+    /// True iff `trait_name` was declared as `trait NAME = bound1 + ...;`
+    /// rather than a regular trait. v1 stubs use this to emit
+    /// `E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET` at every use site (bound /
+    /// where-clause / dyn). Bound substitution lands in P1.
+    fn is_trait_alias(&self, trait_name: &str) -> bool {
+        self.env.trait_aliases.contains(trait_name)
+            || self.program.items.iter().any(
+                |item| matches!(item, Item::TraitAlias(t) if t.name == trait_name),
+            )
+    }
+
+    /// Bound list of a declared trait alias for inclusion in the v1 stub
+    /// diagnostic — copy-pasting the bound list back lets the user apply
+    /// the workaround directly. Returns `None` when the name is not an
+    /// alias or its declaration is not in the current program.
+    fn trait_alias_bound_list(&self, trait_name: &str) -> Option<String> {
+        for item in &self.program.items {
+            if let Item::TraitAlias(alias) = item {
+                if alias.name == trait_name {
+                    let parts: Vec<String> =
+                        alias.bounds.iter().map(|b| b.path.join(".")).collect();
+                    return Some(parts.join(" + "));
+                }
+            }
+        }
+        None
+    }
+
+    /// Emit the v1 trait-alias stub diagnostic at a use site.
+    fn report_trait_alias_use(&mut self, trait_name: &str, span: &Span) {
+        let bound_list = self
+            .trait_alias_bound_list(trait_name)
+            .unwrap_or_else(|| "<bounds>".to_string());
+        self.type_error(
+            format!(
+                "error[E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET]: trait alias \
+                 '{trait_name}' is recognized but not yet expanded; the \
+                 implementation lands in P1 — write the bound list \
+                 explicitly for now: `{bound_list}`"
+            ),
+            span.clone(),
+            TypeErrorKind::TypeMismatch,
+        );
     }
 
     /// Validate inline bounds on generic parameters (e.g. `fn sort[T: Ord]`).
@@ -4336,7 +4397,9 @@ impl<'a> TypeChecker<'a> {
         for param in &params {
             for bound in &param.bounds {
                 let trait_name = bound.path.last().cloned().unwrap_or_default();
-                if !self.is_known_trait(&trait_name) {
+                if self.is_trait_alias(&trait_name) {
+                    self.report_trait_alias_use(&trait_name, &bound.span);
+                } else if !self.is_known_trait(&trait_name) {
                     self.type_error(
                         format!(
                             "unknown trait '{}' in inline bound on type parameter '{}'",
@@ -4372,7 +4435,9 @@ impl<'a> TypeChecker<'a> {
                     // Verify each bound trait is a known trait or built-in
                     for bound in bounds {
                         let trait_name = bound.path.last().cloned().unwrap_or_default();
-                        if !self.is_known_trait(&trait_name) {
+                        if self.is_trait_alias(&trait_name) {
+                            self.report_trait_alias_use(&trait_name, &bound.span);
+                        } else if !self.is_known_trait(&trait_name) {
                             self.type_error(
                                 format!("unknown trait '{}' in where clause", trait_name),
                                 bound.span.clone(),
@@ -5327,6 +5392,25 @@ impl<'a> TypeChecker<'a> {
         // and that all supertrait impls exist for the same target type.
         if let Some(ref trait_path) = imp.trait_name {
             let trait_name = trait_path.segments.last().cloned().unwrap_or_default();
+            // `impl TraitAlias for T` is rejected at v1: trait aliases are
+            // not implementable directly. Per design.md § Trait Aliases —
+            // implement each component trait separately. The bound list is
+            // copy-pasted into the diagnostic so the user can apply the
+            // workaround inline.
+            if self.is_trait_alias(&trait_name) {
+                let bound_list = self
+                    .trait_alias_bound_list(&trait_name)
+                    .unwrap_or_else(|| "<bounds>".to_string());
+                self.type_error(
+                    format!(
+                        "error[E_IMPL_TRAIT_ALIAS]: cannot implement trait alias \
+                         '{trait_name}'; implement each component trait \
+                         separately: `{bound_list}`"
+                    ),
+                    imp.span.clone(),
+                    TypeErrorKind::TypeMismatch,
+                );
+            }
             if let Some(trait_info) = self.env.traits.get(&trait_name).cloned() {
                 let provided: HashSet<String> = imp
                     .items

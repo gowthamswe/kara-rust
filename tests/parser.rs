@@ -900,6 +900,86 @@ fn test_trait_pure_method() {
     }
 }
 
+// ── Trait Aliases (parser/AST/resolver — v1 stub) ──────────────────
+//
+// `trait NAME = bound1 + bound2 + ...;` per design.md § Trait Aliases
+// (v60 item 40). v1 parser/AST/resolver work — typechecker emits
+// `E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET` at every use site.
+
+#[test]
+fn test_trait_alias_basic() {
+    let prog = parse_ok("trait Numeric = Copy + Clone;");
+    let alias = match &prog.items[0] {
+        Item::TraitAlias(t) => t,
+        other => panic!("expected TraitAlias, got {other:?}"),
+    };
+    assert_eq!(alias.name, "Numeric");
+    assert_eq!(alias.bounds.len(), 2);
+    assert_eq!(alias.bounds[0].path, vec!["Copy".to_string()]);
+    assert_eq!(alias.bounds[1].path, vec!["Clone".to_string()]);
+    assert!(alias.where_clause.is_none());
+    assert!(!alias.is_pub);
+}
+
+#[test]
+fn test_trait_alias_pub() {
+    let prog = parse_ok("pub trait Ord2 = PartialOrd + Eq;");
+    if let Item::TraitAlias(t) = &prog.items[0] {
+        assert!(t.is_pub);
+        assert_eq!(t.name, "Ord2");
+    } else {
+        panic!("expected TraitAlias");
+    }
+}
+
+#[test]
+fn test_trait_alias_with_generics() {
+    let prog = parse_ok("trait IteratorOver[T] = Iterator;");
+    if let Item::TraitAlias(t) = &prog.items[0] {
+        assert!(t.generic_params.is_some());
+        let gps = t.generic_params.as_ref().unwrap();
+        assert_eq!(gps.params.len(), 1);
+        assert_eq!(gps.params[0].name, "T");
+    } else {
+        panic!("expected TraitAlias");
+    }
+}
+
+#[test]
+fn test_trait_alias_with_where_clause() {
+    let prog = parse_ok("trait OrderedFloat[T] = Ord where T: Copy;");
+    if let Item::TraitAlias(t) = &prog.items[0] {
+        assert!(t.where_clause.is_some());
+        assert_eq!(t.bounds.len(), 1);
+        assert_eq!(t.bounds[0].path, vec!["Ord".to_string()]);
+    } else {
+        panic!("expected TraitAlias");
+    }
+}
+
+#[test]
+fn test_trait_alias_empty_bound_list_rejected() {
+    let (_, errors) = parse_with_errors("trait Foo = ;");
+    assert!(
+        !errors.is_empty(),
+        "expected error for empty trait-alias bound list"
+    );
+    assert!(
+        errors[0]
+            .message
+            .contains("at least one trait bound"),
+        "got: {:?}",
+        errors[0].message
+    );
+}
+
+#[test]
+fn test_trait_alias_does_not_break_regular_trait() {
+    // Sanity: regular `trait Foo { ... }` form still parses correctly.
+    parse_ok("trait Foo { fn bar(self) -> i64; }");
+    parse_ok("trait Foo: Bar { fn baz(self); }");
+}
+
 #[test]
 fn test_trait_default_method() {
     let prog = parse_ok(

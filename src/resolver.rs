@@ -63,6 +63,11 @@ pub enum SymbolKind {
     Trait {
         method_names: Vec<String>,
     },
+    /// `trait NAME = bound1 + bound2 + ...;` — recognized at parse but
+    /// not yet expanded. Use sites in typechecker emit
+    /// `E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET`. Bound substitution lands in
+    /// P1 (see `docs/deferred.md` § Trait Aliases — Expansion).
+    TraitAlias,
     Constant,
     TypeParam,
     EffectResource,
@@ -496,6 +501,7 @@ fn module_top_level_names_for_id(tree: &ProgramTree, id: ModuleId) -> Vec<String
             Item::StructDef(s) => names.push(s.name.clone()),
             Item::EnumDef(e) => names.push(e.name.clone()),
             Item::TraitDef(t) => names.push(t.name.clone()),
+            Item::TraitAlias(t) => names.push(t.name.clone()),
             Item::ConstDecl(c) => names.push(c.name.clone()),
             Item::TypeAlias(t) => names.push(t.name.clone()),
             Item::DistinctType(d) => names.push(d.name.clone()),
@@ -688,6 +694,7 @@ impl<'a> Resolver<'a> {
                 Item::StructDef(s) => self.collect_struct(s),
                 Item::EnumDef(e) => self.collect_enum(e),
                 Item::TraitDef(t) => self.collect_trait(t),
+                Item::TraitAlias(t) => self.collect_trait_alias(t),
                 Item::ImplBlock(i) => self.collect_impl(i),
                 Item::EffectResource(e) => self.collect_effect_resource(e),
                 Item::EffectGroup(e) => self.collect_effect_group(e),
@@ -1019,6 +1026,17 @@ impl<'a> Resolver<'a> {
         if let Err(e) = self.table.define(
             t.name.clone(),
             SymbolKind::Trait { method_names },
+            t.span.clone(),
+            t.is_pub,
+        ) {
+            self.errors.push(e);
+        }
+    }
+
+    fn collect_trait_alias(&mut self, t: &TraitAliasDef) {
+        if let Err(e) = self.table.define(
+            t.name.clone(),
+            SymbolKind::TraitAlias,
             t.span.clone(),
             t.is_pub,
         ) {

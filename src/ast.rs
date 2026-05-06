@@ -107,6 +107,12 @@ pub enum Item {
     StructDef(StructDef),
     EnumDef(EnumDef),
     TraitDef(TraitDef),
+    /// `trait NAME[GENERICS] = bound1 + bound2 + ... [where ...];` — a
+    /// trait alias declaration. v60 item 40 / design.md § Trait Aliases.
+    /// At v1 the parser, AST, and resolver recognize the form; the
+    /// typechecker emits a stub diagnostic (`E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET`)
+    /// at every use site. Bound substitution lands in P1.
+    TraitAlias(TraitAliasDef),
     ImplBlock(ImplBlock),
     EffectResource(EffectResourceDecl),
     EffectGroup(EffectGroupDecl),
@@ -292,6 +298,23 @@ pub struct TraitDef {
 pub enum TraitItem {
     Method(Box<TraitMethod>),
     AssocType(AssocTypeDecl),
+}
+
+/// `trait NAME[GENERICS] = bound1 + bound2 + ... [where ...];`
+/// (v60 item 40 / design.md § Trait Aliases). Parallel in shape to
+/// `TraitDef` so resolver reuse is mechanical; bound substitution at
+/// use sites is deferred to P1.
+#[derive(Debug, Clone)]
+pub struct TraitAliasDef {
+    pub span: Span,
+    pub attributes: Vec<Attribute>,
+    pub doc_comment: Option<String>,
+    pub is_pub: bool,
+    pub is_private: bool,
+    pub name: String,
+    pub generic_params: Option<GenericParams>,
+    pub bounds: Vec<TraitBound>,
+    pub where_clause: Option<WhereClause>,
 }
 
 #[derive(Debug, Clone)]

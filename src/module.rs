@@ -666,6 +666,7 @@ fn module_defines_local_item(module: &Module, name: &str) -> bool {
         Item::StructDef(s) => s.name == name,
         Item::EnumDef(e) => e.name == name,
         Item::TraitDef(t) => t.name == name,
+        Item::TraitAlias(t) => t.name == name,
         Item::ConstDecl(c) => c.name == name,
         Item::TypeAlias(t) => t.name == name,
         Item::DistinctType(d) => d.name == name,

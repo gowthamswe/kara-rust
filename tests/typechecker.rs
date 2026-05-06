@@ -2919,6 +2919,67 @@ fn empty_set_literal_in_typed_struct_field_keeps_passing() {
     );
 }
 
+// ── Trait alias use-site stub diagnostic ────────────────────────────
+//
+// Per design.md § Trait Aliases / phase-8 checklist: declarations parse,
+// resolver registers the name, but every use site (bound / where-clause /
+// future dyn position) emits `E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET` at v1.
+
+#[test]
+fn trait_alias_in_inline_bound_emits_v1_stub() {
+    let errors = typecheck_errors(
+        "trait Numeric = Copy + Clone; \
+         fn need_copy[T: Numeric](x: T) -> T { x }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET")
+                && e.message.contains("Numeric")
+                && e.message.contains("Copy + Clone")),
+        "expected v1 stub diagnostic with bound list, got: {errors:?}"
+    );
+}
+
+#[test]
+fn trait_alias_in_where_clause_emits_v1_stub() {
+    let errors = typecheck_errors(
+        "trait Numeric = Copy + Clone; \
+         fn need_copy[T](x: T) -> T where T: Numeric { x }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_TRAIT_ALIAS_NOT_IMPLEMENTED_YET")
+                && e.message.contains("Numeric")),
+        "expected v1 stub diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
+fn impl_trait_alias_rejected() {
+    let errors = typecheck_errors(
+        "trait Numeric = Copy + Clone; \
+         struct Foo { x: i64 } \
+         impl Numeric for Foo { }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_IMPL_TRAIT_ALIAS")
+                && e.message.contains("Numeric")
+                && e.message.contains("Copy + Clone")),
+        "expected E_IMPL_TRAIT_ALIAS with bound list, got: {errors:?}"
+    );
+}
+
+#[test]
+fn trait_alias_declaration_alone_typechecks() {
+    // A declared but unused trait alias must not emit the v1 stub
+    // diagnostic — only use sites do.
+    typecheck_ok("trait Numeric = Copy + Clone;");
+}
+
 #[test]
 fn test_repeat_literal_count_must_be_integer() {
     // Non-integer count emits a clear diagnostic.

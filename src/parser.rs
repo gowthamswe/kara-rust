@@ -228,9 +228,7 @@ impl Parser {
                     }
                 }
             }
-            Token::Trait => Some(Item::TraitDef(
-                self.parse_trait_def(attributes, is_pub, is_private)?,
-            )),
+            Token::Trait => self.parse_trait_or_alias(attributes, is_pub, is_private),
             Token::Impl => Some(Item::ImplBlock(self.parse_impl_block(attributes)?)),
             Token::Effect => self.parse_effect_decl(is_pub, false, false),
             Token::Stable => {
@@ -799,23 +797,62 @@ impl Parser {
 
     // ── Traits ───────────────────────────────────────────────────
 
-    fn parse_trait_def(
+    /// Top-level dispatch for the `trait` keyword. Reads the trait header
+    /// (name + optional generic params), then peeks the next token: `=`
+    /// enters the trait-alias path (`trait NAME = bounds;` per v60 item
+    /// 40 / design.md § Trait Aliases); anything else falls through to
+    /// the regular trait-def path.
+    fn parse_trait_or_alias(
         &mut self,
         attributes: Vec<Attribute>,
         is_pub: bool,
         is_private: bool,
-    ) -> Option<TraitDef> {
+    ) -> Option<Item> {
         let start = self.current_span();
         self.expect(&Token::Trait)?;
         let name = self.expect_identifier()?;
         let name_span = self.span_from(&start);
         self.check_ident_class(&name, IdentClass::Type, "trait", name_span);
-        // Take the item-level doc *before* descending into the body —
-        // per-param doc collection (via `parse_trait_method` →
-        // `parse_fn_params`) would otherwise overwrite it.
         let doc_comment = self.take_pending_doc();
         let generic_params = self.parse_optional_generic_params();
 
+        if self.check(&Token::Equal) {
+            return self
+                .parse_trait_alias_tail(
+                    attributes,
+                    is_pub,
+                    is_private,
+                    name,
+                    generic_params,
+                    doc_comment,
+                    &start,
+                )
+                .map(Item::TraitAlias);
+        }
+
+        self.parse_trait_def_tail(
+            attributes,
+            is_pub,
+            is_private,
+            name,
+            generic_params,
+            doc_comment,
+            &start,
+        )
+        .map(Item::TraitDef)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parse_trait_def_tail(
+        &mut self,
+        attributes: Vec<Attribute>,
+        is_pub: bool,
+        is_private: bool,
+        name: String,
+        generic_params: Option<GenericParams>,
+        doc_comment: Option<String>,
+        start: &Span,
+    ) -> Option<TraitDef> {
         // Optional supertrait list: `trait Foo: Bar + Baz`
         let mut supertraits = Vec::new();
         if self.eat(&Token::Colon) {
@@ -847,7 +884,7 @@ impl Parser {
         self.expect(&Token::RightBrace)?;
 
         Some(TraitDef {
-            span: self.span_from(&start),
+            span: self.span_from(start),
             attributes,
             doc_comment,
             is_pub,
@@ -860,6 +897,73 @@ impl Parser {
             items,
         })
     }
+
+    /// Parse the tail of `trait NAME[GENERICS] = bound1 + bound2 + ...
+    /// [where ...];` after the header (`trait`, name, generics) has been
+    /// consumed. Per syntax.md §3.4 `TRAIT_ALIAS_DEF`. An empty bound
+    /// list is a parse error; effect-predicate keywords (`reads`,
+    /// `panics`, ...) cannot reach the bound parser, so the
+    /// `E_EFFECT_IN_TRAIT_ALIAS` diagnostic from design.md is
+    /// structurally unreachable here.
+    #[allow(clippy::too_many_arguments)]
+    fn parse_trait_alias_tail(
+        &mut self,
+        attributes: Vec<Attribute>,
+        is_pub: bool,
+        is_private: bool,
+        name: String,
+        generic_params: Option<GenericParams>,
+        doc_comment: Option<String>,
+        start: &Span,
+    ) -> Option<TraitAliasDef> {
+        self.expect(&Token::Equal)?;
+
+        // `trait Foo = ;` — empty bound list rejected at parse with a
+        // focused diagnostic.
+        if self.check(&Token::Semicolon) || self.check(&Token::Where) {
+            self.error(
+                "trait alias requires at least one trait bound on the right-hand side; \
+                 write `trait Foo = SomeTrait;` instead of `trait Foo = ;`",
+            );
+            // Recover by consuming the rest of the form.
+            self.parse_optional_where_clause();
+            self.eat(&Token::Semicolon);
+            return None;
+        }
+
+        // Parse the `+`-separated trait bound list. Effect predicates
+        // (`reads`, `writes`, `panics`, ...) are keyword tokens at the
+        // lexer level and cannot syntactically appear in trait-bound
+        // position, so the design.md `E_EFFECT_IN_TRAIT_ALIAS` diagnostic
+        // is structurally unreachable here — `parse_trait_bound` would
+        // fail to match the keyword token before the alias parser saw
+        // it. Effect-group references for the alias body land via the
+        // P1 expansion work alongside the broader trait-alias surface.
+        let mut bounds = Vec::new();
+        loop {
+            let bound = self.parse_trait_bound()?;
+            bounds.push(bound);
+            if !self.eat(&Token::Plus) {
+                break;
+            }
+        }
+
+        let where_clause = self.parse_optional_where_clause();
+        self.expect(&Token::Semicolon)?;
+
+        Some(TraitAliasDef {
+            span: self.span_from(start),
+            attributes,
+            doc_comment,
+            is_pub,
+            is_private,
+            name,
+            generic_params,
+            bounds,
+            where_clause,
+        })
+    }
+
 
     fn parse_assoc_type_decl(&mut self) -> Option<AssocTypeDecl> {
         let start = self.current_span();
