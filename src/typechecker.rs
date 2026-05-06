@@ -419,52 +419,15 @@ fn contains_type_param(ty: &Type) -> bool {
     }
 }
 
-/// Walk `param_ty` and `arg_ty` in parallel. When we encounter a
-/// `Type::TypeParam(name)` on the param side, record `name -> arg_ty` in
-/// `solutions`. First solution wins — conflicts are left to later
-/// `check_assignable` calls on the substituted signature to diagnose.
-/// **Deprecated** — superseded by `unify_types` + `resolve_type_vars`
-/// in item 131 sub-step 2b. The free-function call-site solver was
-/// replaced in `check_call_args_with_substitution`. Kept for slice
-/// 2c (method dispatch) until that migration lands; deletion happens
-/// in slice 2d.
-#[allow(dead_code)]
-fn solve_type_params(param_ty: &Type, arg_ty: &Type, solutions: &mut HashMap<String, Type>) {
-    match (param_ty, arg_ty) {
-        (Type::TypeParam(name), _) => {
-            solutions
-                .entry(name.clone())
-                .or_insert_with(|| arg_ty.clone());
-        }
-        (Type::Tuple(ps), Type::Tuple(as_)) if ps.len() == as_.len() => {
-            for (p, a) in ps.iter().zip(as_.iter()) {
-                solve_type_params(p, a, solutions);
-            }
-        }
-        (Type::Array { element: pe, .. }, Type::Array { element: ae, .. }) => {
-            solve_type_params(pe, ae, solutions)
-        }
-        (Type::Slice { element: pe, .. }, Type::Slice { element: ae, .. }) => {
-            solve_type_params(pe, ae, solutions)
-        }
-        (Type::Ref(p), Type::Ref(a)) | (Type::MutRef(p), Type::MutRef(a)) => {
-            solve_type_params(p, a, solutions)
-        }
-        (Type::Named { name: pn, args: pa }, Type::Named { name: an, args: aa })
-            if pn == an && pa.len() == aa.len() =>
-        {
-            for (p, a) in pa.iter().zip(aa.iter()) {
-                solve_type_params(p, a, solutions);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Substitute any `Type::TypeParam(name)` in `ty` with the solution
-/// recorded in `subs`, leaving unsolved params untouched (they flow to
-/// `check_assignable` and fall under the permissive `TypeParam` arm of
-/// `types_compatible`).
+/// Structural substitution of `Type::TypeParam(name)` → concrete type
+/// from `subs`. Surviving callers (`element_type_of`,
+/// `dispatch_trait_assoc_fn`, `check_pattern_against`) all build `subs`
+/// externally from concrete types and use this purely as a tree-walk
+/// utility — they do *not* perform type inference. Inference at call
+/// sites uses the metavar substrate (`instantiate_signature_with_fresh_vars`
+/// + `unify_types` + `resolve_type_vars`, item 131 sub-step 2b) instead.
+///
+/// Unsolved params pass through unchanged.
 fn substitute_type_params(ty: &Type, subs: &HashMap<String, Type>) -> Type {
     match ty {
         Type::TypeParam(name) => subs.get(name).cloned().unwrap_or_else(|| ty.clone()),
