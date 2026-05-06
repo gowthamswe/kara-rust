@@ -8703,3 +8703,92 @@ fn test_compiler_builtin_empty_in_user_only_program() {
     );
 }
 
+// ── Baked Option (CR-202 slice 3d verification) ─────────────────
+// Pin that the source-of-truth swap (slice 3c) actually went through:
+// `enum_info["Option"]` reads back the shape declared in
+// `runtime/stdlib/option.kara`, not the legacy hardcoded shape from
+// `register_builtin_types`. If a future refactor accidentally drops the
+// baked source from `register_builtin_types`'s leading walk, this test
+// fails — the legacy shape is gone, so `enum_info["Option"]` would be
+// missing entirely.
+
+#[test]
+fn baked_option_registers_correct_variant_shape_in_enum_info() {
+    let result = typecheck_ok("");
+    let info = result
+        .enum_info
+        .get("Option")
+        .expect("Option must be registered in enum_info from baked source");
+    assert_eq!(info.generic_params, vec!["T".to_string()]);
+    assert_eq!(info.variants.len(), 2, "Option has exactly two variants");
+
+    let some = info
+        .variants
+        .iter()
+        .find(|(n, _)| n == "Some")
+        .expect("Some variant present");
+    match &some.1 {
+        VariantTypeInfo::Tuple(types) => {
+            assert_eq!(types.len(), 1, "Some carries one payload type");
+            assert_eq!(
+                types[0],
+                Type::TypeParam("T".to_string()),
+                "Some(T) payload should be the generic param T"
+            );
+        }
+        other => panic!("Some should be Tuple-shaped, got {:?}", other),
+    }
+
+    let none = info
+        .variants
+        .iter()
+        .find(|(n, _)| n == "None")
+        .expect("None variant present");
+    assert_eq!(
+        none.1,
+        VariantTypeInfo::Unit,
+        "None should be a Unit variant"
+    );
+}
+
+#[test]
+fn baked_option_carries_structural_derived_traits() {
+    // The hardcoded path inserted these traits directly. After 3c, they
+    // come from `#[derive(Eq, PartialEq, Hash, Ord, PartialOrd)]` on the
+    // baked source. If the derive annotation is dropped (or
+    // `extract_derived_traits` is skipped on baked items), Option's
+    // `==`/`Hash`/`Ord` participation breaks and this catches it.
+    let result = typecheck_ok("");
+    let info = result.enum_info.get("Option").expect("Option registered");
+    for trait_name in ["Eq", "PartialEq", "Hash", "Ord", "PartialOrd"] {
+        assert!(
+            info.derived_traits.contains(trait_name),
+            "Option should derive {}, derived_traits = {:?}",
+            trait_name,
+            info.derived_traits
+        );
+    }
+    assert!(
+        !info.is_shared,
+        "Option is not declared as shared (no `shared enum`)"
+    );
+}
+
+#[test]
+fn baked_option_user_code_still_typechecks() {
+    // End-to-end behavioral pin: regular Option construction, pattern
+    // matching, and method dispatch all continue to typecheck against
+    // the baked declaration just as they did against the hardcoded
+    // shape. If the swap left any caller path looking at the wrong
+    // EnumInfo, this surfaces it.
+    typecheck_ok(
+        "fn use_option() -> i64 {\n\
+             let x: Option[i64] = Some(42);\n\
+             match x {\n\
+                 Some(v) => v,\n\
+                 None => 0,\n\
+             }\n\
+         }",
+    );
+}
+

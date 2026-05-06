@@ -526,4 +526,96 @@ mod tests {
             none.kind
         );
     }
+
+    // ── Slice 3d verification: synthetic_prelude_items splices baked Option ──
+
+    fn find_prelude_item<'a>(items: &'a [Item], name: &str) -> Option<&'a Item> {
+        items.iter().find(|i| match i {
+            Item::Function(f) => f.name == name,
+            Item::StructDef(s) => s.name == name,
+            Item::EnumDef(e) => e.name == name,
+            Item::TraitDef(t) => t.name == name,
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn synthetic_prelude_items_returns_baked_option_as_enum_def() {
+        // Pre-3c the prelude module exposed Option as `Item::StructDef`
+        // (a placeholder stub from `stub_struct`). After 3c the splice
+        // should be the real `Item::EnumDef` parsed from
+        // `runtime/stdlib/option.kara`.
+        let items = synthetic_prelude_items();
+        let opt = find_prelude_item(&items, "Option")
+            .expect("synthetic prelude exposes Option");
+        assert!(
+            matches!(opt, Item::EnumDef(_)),
+            "Option should be spliced as EnumDef (baked), got {:?}",
+            opt
+        );
+    }
+
+    #[test]
+    fn baked_option_has_real_source_span_not_synthetic() {
+        // The placeholder stubs use `synthetic_span()` (line 0, column 0,
+        // offset 0). The baked source's span is set by the parser based
+        // on the actual byte offset of the `enum Option` declaration in
+        // `runtime/stdlib/option.kara`, so it has a non-zero line. This
+        // is what 3d's diagnostic-span improvement rests on:
+        // Option-related diagnostics now point at the real source rather
+        // than the synthetic origin.
+        let items = synthetic_prelude_items();
+        let opt = find_prelude_item(&items, "Option").unwrap();
+        let Item::EnumDef(e) = opt else {
+            panic!("expected EnumDef");
+        };
+        assert!(
+            e.span.line > 0,
+            "baked Option's span should point at the real source (non-zero line), got line={}",
+            e.span.line
+        );
+    }
+
+    #[test]
+    fn baked_option_carries_stdlib_origin_tag() {
+        // The slice-3b gate bypass relies on `stdlib_origin = true` on
+        // baked items. `baked_item_for` flips it after cloning; verify
+        // the splice preserves the flag end to end.
+        let items = synthetic_prelude_items();
+        let opt = find_prelude_item(&items, "Option").unwrap();
+        let Item::EnumDef(e) = opt else {
+            panic!("expected EnumDef");
+        };
+        assert!(
+            e.stdlib_origin,
+            "baked Option should be tagged stdlib_origin = true"
+        );
+    }
+
+    #[test]
+    fn placeholder_stub_for_unbaked_prelude_type_keeps_synthetic_span() {
+        // Slice-3 contract: only types with a baked source file get the
+        // real-source treatment. Other prelude names (Vec, Result, etc.)
+        // continue to use `stub_struct` with a synthetic span. This pins
+        // the partial-migration property until slice 4+ broadens the
+        // baked surface.
+        let items = synthetic_prelude_items();
+        // Pick a name that's in PRELUDE_TYPES but has no baked source today.
+        let vec_item = find_prelude_item(&items, "Vec")
+            .expect("Vec is still a prelude name");
+        match vec_item {
+            Item::StructDef(s) => {
+                assert_eq!(
+                    s.span.line, 0,
+                    "non-baked prelude type should still use synthetic span"
+                );
+                assert!(
+                    s.stdlib_origin,
+                    "stubs are still tagged stdlib_origin = true \
+                     (the synthetic prelude module IS stdlib origin)"
+                );
+            }
+            other => panic!("Vec should still be a stub StructDef, got {:?}", other),
+        }
+    }
 }
