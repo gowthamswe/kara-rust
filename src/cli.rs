@@ -1339,6 +1339,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 crate::typechecker::TypeErrorKind::OnceFnIntoFnSlot => "E0235",
                 crate::typechecker::TypeErrorKind::NoMethodFound => "E0236",
                 crate::typechecker::TypeErrorKind::UnreachableArm => "W0237",
+                crate::typechecker::TypeErrorKind::CannotInferTypeParam => "E0238",
             };
             diags.add(DiagEntry {
                 id: &format!("d{id_counter}"),

@@ -527,6 +527,56 @@ fn substitute_type_params(ty: &Type, subs: &HashMap<String, Type>) -> Type {
     }
 }
 
+/// Walk `ty` for a `TypeParam(name)` whose name is **not** in
+/// `in_scope`. Returns the first such name. Used by the unsolved-T
+/// diagnostic (item 131 sub-step 2a) at synthesis-mode let bindings:
+/// any TypeParam that didn't get pinned by arguments and doesn't
+/// belong to an enclosing function/impl generic is unsolved at this
+/// site.
+fn find_unbound_type_param<'a>(ty: &'a Type, in_scope: &HashSet<&str>) -> Option<&'a str> {
+    match ty {
+        Type::TypeParam(name) => {
+            if in_scope.contains(name.as_str()) {
+                None
+            } else {
+                Some(name.as_str())
+            }
+        }
+        Type::Tuple(elems) => elems
+            .iter()
+            .find_map(|e| find_unbound_type_param(e, in_scope)),
+        Type::Array { element, .. } | Type::Slice { element, .. } => {
+            find_unbound_type_param(element, in_scope)
+        }
+        Type::Ref(inner) | Type::MutRef(inner) | Type::Weak(inner) => {
+            find_unbound_type_param(inner, in_scope)
+        }
+        Type::Pointer { inner, .. } => find_unbound_type_param(inner, in_scope),
+        Type::Named { args, .. } => args
+            .iter()
+            .find_map(|a| find_unbound_type_param(a, in_scope)),
+        Type::Function {
+            params,
+            return_type,
+        }
+        | Type::OnceFunction {
+            params,
+            return_type,
+        } => params
+            .iter()
+            .find_map(|p| find_unbound_type_param(p, in_scope))
+            .or_else(|| find_unbound_type_param(return_type, in_scope)),
+        Type::AssocProjection { param, .. } => {
+            if in_scope.contains(param.as_str()) {
+                None
+            } else {
+                Some(param.as_str())
+            }
+        }
+        _ => None,
+    }
+}
+
 fn types_compatible(a: &Type, b: &Type) -> bool {
     if a == b {
         return true;
@@ -1083,6 +1133,13 @@ pub enum TypeErrorKind {
     /// codegen retains the arm. Reachability slice of the Maranget
     /// exhaustiveness upgrade (step 6).
     UnreachableArm,
+    /// A generic call's return type contains a `TypeParam(T)` that no
+    /// argument or expected-type context pinned. Today the permissive
+    /// `TypeParam` arm of `types_compatible` lets these silently flow
+    /// through; this diagnostic surfaces them at the consuming context
+    /// (currently: synthesis-mode `let` bindings without an annotation).
+    /// Item 131 sub-step 2a.
+    CannotInferTypeParam,
 }
 
 impl std::fmt::Display for TypeError {
@@ -2164,13 +2221,18 @@ impl<'a> TypeChecker<'a> {
         where_clause: &Option<WhereClause>,
     ) -> HashMap<String, Vec<crate::ast::TraitBound>> {
         let mut map: HashMap<String, Vec<crate::ast::TraitBound>> = HashMap::new();
+        // Pre-populate with every generic param name (empty bound vec
+        // when none were declared). Callers rely on `enclosing_bounds`
+        // doubling as the "names in scope" set — sub-step 2a's
+        // unsolved-T diagnostic uses `keys()` to skip type params that
+        // belong to an enclosing function/impl. Pre-2a callers used
+        // `.get(name)?` and short-circuited on absence; with always-
+        // present entries they get `Some(vec![])` and proceed to find
+        // no matching trait-bound candidates — same final outcome.
         if let Some(ref gp) = generics {
             for param in &gp.params {
-                if !param.bounds.is_empty() {
-                    map.entry(param.name.clone())
-                        .or_default()
-                        .extend(param.bounds.iter().cloned());
-                }
+                let entry = map.entry(param.name.clone()).or_default();
+                entry.extend(param.bounds.iter().cloned());
             }
         }
         if let Some(ref wc) = where_clause {
@@ -5714,6 +5776,33 @@ impl<'a> TypeChecker<'a> {
         ty
     }
 
+    /// Diagnose unsolved generic type parameters in a synthesis-mode
+    /// inferred type. Currently called from `let x = e;` and
+    /// `let pat = e else …` when the user supplied no type annotation:
+    /// without a check-mode expected type to pin them, any `TypeParam(T)`
+    /// in `inferred` that isn't an enclosing function/impl generic is
+    /// unsolvable at this site. Item 131 sub-step 2a.
+    fn check_unsolved_type_param(&mut self, inferred: &Type, span: &Span) {
+        if matches!(inferred, Type::Error) {
+            return;
+        }
+        let in_scope: HashSet<&str> = self
+            .enclosing_bounds
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        if let Some(name) = find_unbound_type_param(inferred, &in_scope) {
+            self.type_error(
+                format!(
+                    "cannot infer type parameter '{}'; add a type annotation to this binding",
+                    name
+                ),
+                span.clone(),
+                TypeErrorKind::CannotInferTypeParam,
+            );
+        }
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Let {
@@ -5727,7 +5816,9 @@ impl<'a> TypeChecker<'a> {
                     self.check_expr(value, &declared);
                     declared
                 } else {
-                    self.infer_expr(value)
+                    let inferred = self.infer_expr(value);
+                    self.check_unsolved_type_param(&inferred, &value.span);
+                    inferred
                 };
                 // Per design.md: `let PAT = expr;` requires `PAT` to be
                 // irrefutable (the binding has no else-arm; a missed
@@ -5774,7 +5865,9 @@ impl<'a> TypeChecker<'a> {
                     self.check_expr(value, &declared);
                     declared
                 } else {
-                    self.infer_expr(value)
+                    let inferred = self.infer_expr(value);
+                    self.check_unsolved_type_param(&inferred, &value.span);
+                    inferred
                 };
                 self.bind_pattern_types(pattern, &expected_ty);
                 let else_ty = self.infer_block(else_block);

@@ -8308,3 +8308,103 @@ fn test_branch_pushdown_if_let_else_closure() {
     );
 }
 
+// ── Bidirectional sub-step 2a: unsolved-T diagnostic (item 131) ─
+
+#[test]
+fn test_unsolved_t_generic_call_returning_vec_t() {
+    // A user-defined generic that returns `Vec[T]` with no arg from
+    // which to solve T. Lands cleanly at the synth let position.
+    let errors = typecheck_errors(
+        "fn empty_vec[T]() -> Vec[T] { todo() }\n\
+         fn main() { let v = empty_vec(); }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::CannotInferTypeParam)
+                && e.message.contains("'T'")),
+        "expected CannotInferTypeParam naming 'T', got: {errors:?}"
+    );
+}
+
+#[test]
+fn test_unsolved_t_none_at_unannotated_let() {
+    // `let x = None;` — the `None` constructor produces
+    // `Option[TypeParam("T")]` per CR-32. Without an annotation,
+    // T cannot be inferred. Pre-fix: silently typed as Option[T]
+    // and the binding becomes useless.
+    let errors = typecheck_errors("fn main() { let x = None; }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::CannotInferTypeParam)),
+        "expected CannotInferTypeParam for unannotated None, got: {errors:?}"
+    );
+}
+
+#[test]
+fn test_unsolved_t_generic_id_no_arg_context() {
+    // `let v = id();` — id is a generic identity-style helper whose
+    // signature `[T]() -> T` has no argument from which to solve T.
+    // This is the cleanest "no consumer" case.
+    let errors = typecheck_errors(
+        "fn id[T]() -> T { todo() }\n\
+         fn main() { let v = id(); }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::CannotInferTypeParam)
+                && e.message.contains("'T'")),
+        "expected CannotInferTypeParam, got: {errors:?}"
+    );
+}
+
+#[test]
+fn test_unsolved_t_annotation_silences_diagnostic() {
+    // Same `id()` call, but with an annotation: check_expr's pushdown
+    // pins T = i64 and no diagnostic should fire.
+    typecheck_ok(
+        "fn id[T]() -> T { todo() }\n\
+         fn main() { let v: i64 = id(); }",
+    );
+}
+
+#[test]
+fn test_unsolved_t_concrete_arg_silences_diagnostic() {
+    // Generic identity called with a concrete argument: the arg
+    // pins T = i64 via solve_type_params; no unsolved metavar.
+    typecheck_ok(
+        "fn id[T](x: T) -> T { x }\n\
+         fn main() { let v = id(7); }",
+    );
+}
+
+#[test]
+fn test_unsolved_t_only_at_synthesis_let() {
+    // The diagnostic fires only at the let-without-annotation
+    // position. A generic call inside a discarded statement
+    // expression (e.g. wrapped in {}) produces no binding, so no
+    // diagnostic is currently expected — the consuming check_expr
+    // path either pins it or accepts the discarded result.
+    typecheck_ok(
+        "fn id[T]() -> T { todo() }\n\
+         fn pin() -> i64 { id() }\n\
+         fn main() { let _ = pin(); }",
+    );
+}
+
+#[test]
+fn test_unsolved_t_in_enclosing_generic_does_not_fire() {
+    // Inside `fn outer[U]()`, `U` is a legitimately-unsolved type
+    // param at the local site — it's bound by the enclosing function.
+    // The diagnostic must skip names that match an enclosing generic.
+    typecheck_ok(
+        "fn id[T](x: T) -> T { x }\n\
+         fn outer[U](u: U) {\n\
+             let v = id(u);\n\
+         }",
+    );
+}
+
+
