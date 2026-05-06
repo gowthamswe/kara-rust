@@ -4296,6 +4296,45 @@ fn test_range_both_bounds_inclusive_still_parses() {
 // ── Half-open range patterns ─────────────────────────────────────────────────
 
 #[test]
+fn test_range_pattern_value_class_scrutinee_with_dotdot_arm() {
+    // Regression: `match n { ..0 => -1, _ => 0 }` previously misparsed
+    // because `looks_like_struct_literal` matched `n { ..0 ... }` as a
+    // struct-update literal. Struct literals only fire on Type-class
+    // identifiers; this test pins that.
+    parse_ok("fn main() { let n: i32 = 1; let _ = match n { ..0 => 0, _ => 1 }; }");
+}
+
+#[test]
+fn test_range_pattern_bounded_exclusive() {
+    // `lo..hi` (bounded exclusive) — five-form coverage from
+    // design.md § Range Patterns.
+    let prog = parse_ok("fn main() { match n { 10..100 => big, _ => other, } }");
+    if let Item::Function(f) = &prog.items[0] {
+        if let Some(expr) = &f.body.final_expr {
+            if let ExprKind::Match { arms, .. } = &expr.kind {
+                if let PatternKind::RangePattern {
+                    start,
+                    end,
+                    inclusive,
+                } = &arms[0].pattern.kind
+                {
+                    assert!(start.is_some(), "expected bounded start");
+                    assert!(end.is_some(), "expected bounded end");
+                    assert!(!*inclusive, "lo..hi is exclusive");
+                } else {
+                    panic!("expected RangePattern, got {:?}", arms[0].pattern.kind);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_range_pattern_bounded_exclusive_char() {
+    parse_ok("fn main() { match c { 'a'..'z' => 0, _ => 1, } }");
+}
+
+#[test]
 fn test_range_pattern_to_inclusive_only_end() {
     // `..=100` — pattern matching up to 100 inclusive
     let prog = parse_ok("fn main() { match n { ..=100 => small, _ => big, } }");

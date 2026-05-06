@@ -3087,6 +3087,23 @@ fn cast_int_as_int_still_works() {
 }
 
 #[test]
+fn match_with_full_range_pattern_set_typechecks() {
+    // Five-form range pattern coverage: `..lo`, `lo..hi`, `lo..=hi`,
+    // `lo..`, `..=hi`. Plus bare `_` for non-exhaustive recovery.
+    typecheck_ok(
+        "fn classify(n: i32) -> i32 { \
+         match n { \
+         ..0 => -1, \
+         0..=9 => 1, \
+         10..100 => 2, \
+         100.. => 3, \
+         _ => 0, \
+         } \
+         }",
+    );
+}
+
+#[test]
 fn cast_float_as_int_still_works() {
     typecheck_ok("fn main() { let _ = 3.7f64 as i32; let _ = 1.5f32 as u8; }");
 }

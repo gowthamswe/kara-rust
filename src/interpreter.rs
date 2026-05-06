@@ -6656,7 +6656,11 @@ impl<'a> Interpreter<'a> {
             PatternKind::Or(alternatives) => alternatives
                 .iter()
                 .any(|p| self.try_match_pattern(p, value)),
-            PatternKind::RangePattern { .. } => true, // simplified
+            PatternKind::RangePattern {
+                start,
+                end,
+                inclusive,
+            } => Self::value_in_range_pattern(value, start.as_ref(), end.as_ref(), *inclusive),
             PatternKind::AtBinding { pattern, .. } => self.try_match_pattern(pattern, value),
         }
     }
@@ -6851,6 +6855,56 @@ impl<'a> Interpreter<'a> {
     fn set_cf(&mut self, cf: ControlFlow) -> Value {
         self.pending_cf = Some(cf);
         Value::Unit
+    }
+
+    /// Match `value` against a range pattern with optional `start` / `end`
+    /// bounds. Bounds are integer or char literals (the parser limits
+    /// `LiteralPattern` in range position to those two forms). Half-open
+    /// forms — `lo..` (`end = None`), `..hi` (`start = None`) — accept
+    /// everything past the present bound. Bounded-exclusive (`lo..hi`),
+    /// bounded-inclusive (`lo..=hi`), and the half-open inclusive form
+    /// (`..=hi`) all share the same comparison.
+    fn value_in_range_pattern(
+        value: &Value,
+        start: Option<&LiteralPattern>,
+        end: Option<&LiteralPattern>,
+        inclusive: bool,
+    ) -> bool {
+        // Project the scrutinee value into a sortable scalar key (i128 to
+        // accommodate i64 + char in the same comparison space).
+        let key: i128 = match value {
+            Value::Int(n) => *n as i128,
+            Value::Char(c) => (*c as u32) as i128,
+            _ => return false,
+        };
+        let bound_key = |lit: &LiteralPattern| -> Option<i128> {
+            match lit {
+                LiteralPattern::Integer(n, _) => Some(*n as i128),
+                LiteralPattern::Char(c) => Some((*c as u32) as i128),
+                _ => None,
+            }
+        };
+        if let Some(lo) = start {
+            let Some(lo_key) = bound_key(lo) else {
+                return false;
+            };
+            if key < lo_key {
+                return false;
+            }
+        }
+        if let Some(hi) = end {
+            let Some(hi_key) = bound_key(hi) else {
+                return false;
+            };
+            if inclusive {
+                if key > hi_key {
+                    return false;
+                }
+            } else if key >= hi_key {
+                return false;
+            }
+        }
+        true
     }
 
     fn literal_to_value(&self, lit: &LiteralPattern) -> Value {

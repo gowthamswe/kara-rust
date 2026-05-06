@@ -6897,3 +6897,78 @@ fn main() {
     );
     assert_eq!(output, "2\n");
 }
+
+// ── Range pattern matching (interpreter) ────────────────────────────
+//
+// All five forms — `..hi`, `lo..hi`, `lo..=hi`, `..=hi`, `lo..` — must
+// match the value space correctly. Previously the interpreter had a
+// "simplified" RangePattern arm that always returned `true`; this test
+// pins the per-form semantics.
+
+#[test]
+fn test_range_pattern_matches_correctly() {
+    let output = run_no_errors(
+        r#"
+fn classify(n: i32) -> i32 {
+    match n {
+        ..0 => -1,
+        0..=9 => 1,
+        10..100 => 2,
+        100.. => 3,
+        _ => 0,
+    }
+}
+fn main() {
+    println(classify(-5));
+    println(classify(0));
+    println(classify(5));
+    println(classify(9));
+    println(classify(10));
+    println(classify(50));
+    println(classify(99));
+    println(classify(100));
+    println(classify(200));
+}
+"#,
+    );
+    assert_eq!(output, "-1\n1\n1\n1\n2\n2\n2\n3\n3\n");
+}
+
+#[test]
+fn test_range_pattern_char_bounded_inclusive() {
+    let output = run_no_errors(
+        r#"
+fn classify(c: char) -> i32 {
+    match c {
+        'a'..='z' => 1,
+        'A'..='Z' => 2,
+        _ => 0,
+    }
+}
+fn main() {
+    println(classify('m'));
+    println(classify('M'));
+    println(classify('1'));
+}
+"#,
+    );
+    assert_eq!(output, "1\n2\n0\n");
+}
+
+#[test]
+fn test_range_pattern_char_bounded_exclusive() {
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let c: char = 'g';
+    let r = match c {
+        'a'..'h' => 1,
+        _ => 0,
+    };
+    println(r);
+}
+"#,
+    );
+    // 'g' is in [a, h) — should match.
+    assert_eq!(output, "1\n");
+}

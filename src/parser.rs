@@ -3020,10 +3020,17 @@ impl Parser {
                     });
                 }
                 if self.eat(&Token::DotDot) {
+                    // `lo..hi` (bounded exclusive) when the next token is
+                    // a literal; `lo..` (half-open) otherwise.
+                    let end = if Self::starts_literal_pattern(&self.peek_token()) {
+                        Some(self.parse_literal_pattern()?)
+                    } else {
+                        None
+                    };
                     return Some(Pattern {
                         kind: PatternKind::RangePattern {
                             start: Some(lit),
-                            end: None,
+                            end,
                             inclusive: false,
                         },
                         span: self.span_from(&start),
@@ -3065,10 +3072,17 @@ impl Parser {
                     });
                 }
                 if self.eat(&Token::DotDot) {
+                    // `'a'..'z'` (bounded exclusive) when the next token
+                    // is a literal; `'a'..` (half-open) otherwise.
+                    let end = if Self::starts_literal_pattern(&self.peek_token()) {
+                        Some(self.parse_literal_pattern()?)
+                    } else {
+                        None
+                    };
                     return Some(Pattern {
                         kind: PatternKind::RangePattern {
                             start: Some(lit),
-                            end: None,
+                            end,
                             inclusive: false,
                         },
                         span: self.span_from(&start),
@@ -4352,8 +4366,18 @@ impl Parser {
             });
         }
 
-        // Check for struct literal: Name { field: value }
-        if self.check(&Token::LeftBrace) && self.looks_like_struct_literal() {
+        // Check for struct literal: `Name { field: value }`. Only valid
+        // when the leading identifier is Type-class — `n { ..0 => x }` in
+        // a `match n { ... }` arm-list start would otherwise misparse as
+        // a struct update of a struct named `n` (looks_like_struct_literal
+        // matches `{ .. }` for the struct-update form). Value-class names
+        // never form struct literals, so the `{` here belongs to whatever
+        // wraps this expression (a match scrutinee's arm list, a loop's
+        // body, etc.).
+        if starts_upper(&name)
+            && self.check(&Token::LeftBrace)
+            && self.looks_like_struct_literal()
+        {
             return self.parse_struct_literal_body(vec![name], &start);
         }
 
@@ -4614,6 +4638,14 @@ impl Parser {
     // ── Pattern Helpers ───────────────────────────────────────────
 
     /// Parse a literal for use in range patterns (integer or char).
+    /// True when `tok` starts a literal pattern (integer or char). Used
+    /// by the range-pattern parser to disambiguate the bounded-exclusive
+    /// form `lo..hi` from the half-open form `lo..` — only the former
+    /// has a literal in end position.
+    fn starts_literal_pattern(tok: &Token) -> bool {
+        matches!(tok, Token::Integer(..) | Token::CharLiteral(_))
+    }
+
     fn parse_literal_pattern(&mut self) -> Option<LiteralPattern> {
         match self.peek_token() {
             Token::Integer(n, sfx) => {
