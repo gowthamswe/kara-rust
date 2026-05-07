@@ -1,0 +1,13 @@
+// runtime/stdlib/var_error.kara
+//
+// CR-202 slice 6.1j. Error type returned by `env.var(name)`.
+// Resolved as `std.env.VarError` per brainstorming v49 (Q2=B). Two
+// unit variants — `Result[String, VarError]` stays
+// forward-compatible if we ever add reasons (e.g. permission
+// errors), but no payload today: Kāra's strict-UTF-8 `String` rules
+// out a Rust-style `NotUnicode(OsString)` carrier.
+
+enum VarError {
+    NotPresent,
+    NotUnicode,
+}

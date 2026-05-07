@@ -3001,40 +3001,8 @@ impl<'a> TypeChecker<'a> {
         // ever add reasons (e.g. permission errors), but no payload today —
         // Kāra's strict-UTF-8 `String` rules out a Rust-style
         // `NotUnicode(OsString)` carrier.
-        self.env.enums.insert(
-            "VarError".to_string(),
-            EnumInfo {
-                generic_params: vec![],
-                variants: vec![
-                    ("NotPresent".to_string(), VariantTypeInfo::Unit),
-                    ("NotUnicode".to_string(), VariantTypeInfo::Unit),
-                ],
-                derived_traits: HashSet::new(),
-                is_shared: false,
-            },
-        );
-
-        // `IoError` — error type returned by I/O standard library functions.
-        // Variants: NotFound, PermissionDenied, AlreadyExists, UnexpectedEof,
-        // InvalidUtf8, Interrupted (all unit), and Other(String) with payload.
-        // Lives in the prelude so it does not need an import.
-        self.env.enums.insert(
-            "IoError".to_string(),
-            EnumInfo {
-                generic_params: vec![],
-                variants: vec![
-                    ("NotFound".to_string(), VariantTypeInfo::Unit),
-                    ("PermissionDenied".to_string(), VariantTypeInfo::Unit),
-                    ("AlreadyExists".to_string(), VariantTypeInfo::Unit),
-                    ("UnexpectedEof".to_string(), VariantTypeInfo::Unit),
-                    ("InvalidUtf8".to_string(), VariantTypeInfo::Unit),
-                    ("Interrupted".to_string(), VariantTypeInfo::Unit),
-                    ("Other".to_string(), VariantTypeInfo::Tuple(vec![Type::Str])),
-                ],
-                derived_traits: HashSet::new(),
-                is_shared: false,
-            },
-        );
+        // `VarError` and `IoError` are now provided by their respective
+        // baked source files (CR-202 slice 6.1j).
 
         // ── Standard I/O function signatures ───────────────────────────────────
 

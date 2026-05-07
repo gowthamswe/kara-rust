@@ -1,0 +1,14 @@
+// runtime/stdlib/io_error.kara
+//
+// CR-202 slice 6.1j. Error type returned by I/O standard library
+// functions. Lives in the prelude so it does not need an import.
+
+enum IoError {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    UnexpectedEof,
+    InvalidUtf8,
+    Interrupted,
+    Other(String),
+}

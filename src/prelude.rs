@@ -208,6 +208,8 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
     ("encoding.kara", include_str!("../runtime/stdlib/encoding.kara")),
     ("ordering.kara", include_str!("../runtime/stdlib/ordering.kara")),
     ("entry.kara", include_str!("../runtime/stdlib/entry.kara")),
+    ("io_error.kara", include_str!("../runtime/stdlib/io_error.kara")),
+    ("var_error.kara", include_str!("../runtime/stdlib/var_error.kara")),
     ("partial_eq.kara", include_str!("../runtime/stdlib/partial_eq.kara")),
     ("eq.kara", include_str!("../runtime/stdlib/eq.kara")),
     ("partial_ord.kara", include_str!("../runtime/stdlib/partial_ord.kara")),
