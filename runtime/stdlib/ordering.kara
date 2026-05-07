@@ -1,0 +1,18 @@
+// runtime/stdlib/ordering.kara
+//
+// CR-202 slice 6.1h. The variant names below match what the legacy
+// `register_builtin_types` arm registered. Note: the variant names
+// are the *memory ordering* set used by `Atomic` operations — the
+// design.md `Ord.cmp` return-type description (Less/Equal/Greater)
+// is not yet implemented as a separate type. Whether to split into
+// two distinct types is a pre-existing design question outside this
+// slice's scope; this commit preserves the current registration.
+
+#[derive(Eq, Copy)]
+enum Ordering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}

@@ -2976,24 +2976,10 @@ impl<'a> TypeChecker<'a> {
         // `Eq`/`Ord`/`Hash`/`PartialEq`/`PartialOrd`/`Copy` derives;
         // `Atomic[T]` is opaque.
 
-        // Ordering enum for Atomic operations
-        let ordering_traits: HashSet<String> =
-            ["Eq", "Copy"].iter().map(|s| s.to_string()).collect();
-        self.env.enums.insert(
-            "Ordering".to_string(),
-            EnumInfo {
-                generic_params: vec![],
-                variants: vec![
-                    ("Relaxed".to_string(), VariantTypeInfo::Unit),
-                    ("Acquire".to_string(), VariantTypeInfo::Unit),
-                    ("Release".to_string(), VariantTypeInfo::Unit),
-                    ("AcqRel".to_string(), VariantTypeInfo::Unit),
-                    ("SeqCst".to_string(), VariantTypeInfo::Unit),
-                ],
-                derived_traits: ordering_traits,
-                is_shared: false,
-            },
-        );
+        // `Ordering` is now provided by `runtime/stdlib/ordering.kara`
+        // (CR-202 slice 6.1h). Variants are memory-ordering names
+        // (Relaxed/Acquire/Release/AcqRel/SeqCst); see the file's
+        // header for the design-vs-implementation note.
 
         // CR-202: `Option` (slice 3c) and `Result` (slice 4a) are now
         // provided by `runtime/stdlib/{option,result}.kara` via the
