@@ -1094,7 +1094,7 @@ impl Parser {
     fn parse_trait_method(&mut self) -> Option<TraitMethod> {
         let start = self.current_span();
         self.expect(&Token::Fn)?;
-        let name = self.expect_identifier()?;
+        let name = self.expect_method_name()?;
         let name_span = self.span_from(&start);
         self.check_ident_class(&name, IdentClass::Value, "fn", name_span);
         let generic_params = self.parse_optional_generic_params();
@@ -4855,6 +4855,43 @@ impl Parser {
     /// inside `#[test(...)]`-style attributes; treating them as identifiers
     /// only here keeps the contract grammar untouched while letting
     /// design-conformant attribute syntax parse without quoting.
+    /// Like [`expect_identifier`] but accepts the logical-operator
+    /// keywords `not` / `and` / `or` as identifier-equivalents. Used
+    /// at trait-method-name and impl-method-name positions so the
+    /// stdlib can declare `trait Not { fn not(self) -> Self }` —
+    /// design.md's bitwise-Not trait — without a separate raw-ident
+    /// syntax. The lexer eagerly tokenizes these as `Token::Not` /
+    /// `Token::And` / `Token::Or` regardless of context, so a
+    /// targeted post-parse escape is the cleanest fix. Mirrors
+    /// `expect_attr_arg_name`'s treatment of `requires` / `ensures`.
+    fn expect_method_name(&mut self) -> Option<String> {
+        match self.peek_token() {
+            Token::Identifier { name, .. } => {
+                self.advance();
+                Some(name)
+            }
+            Token::Not => {
+                self.advance();
+                Some("not".to_string())
+            }
+            Token::And => {
+                self.advance();
+                Some("and".to_string())
+            }
+            Token::Or => {
+                self.advance();
+                Some("or".to_string())
+            }
+            _ => {
+                self.error(&format!(
+                    "Expected method name, found {:?}",
+                    self.peek_token()
+                ));
+                None
+            }
+        }
+    }
+
     fn expect_attr_arg_name(&mut self) -> Option<String> {
         match self.peek_token() {
             Token::Identifier { name, .. } => {

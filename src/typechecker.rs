@@ -3419,48 +3419,13 @@ impl<'a> TypeChecker<'a> {
         // function signatures (Base64.encode, Hex.decode, …) stay in
         // this function until slice 6.3 migrates them.
 
-        self.register_stdlib_traits();
+        // `register_stdlib_traits` retired — every trait it registered
+        // moved to baked source under `runtime/stdlib/*.kara` across
+        // CR-202 slices 5a–5l, 6.2a–6.2e. The only remaining hardcoded
+        // trait registration is the `Iterator` / `IntoIterator` pseudo-
+        // struct + assoc-type pair below (slice 6.2d migrated the trait
+        // shape; the pseudo-struct stays in code).
         self.register_stdlib_impls();
-    }
-
-    /// Register stdlib operator and conversion traits in `env.traits`.
-    /// Trait method signatures and impls are registered in subsequent steps;
-    /// this pass only seeds the trait names so where-clause validation,
-    /// resolver prelude, and impl lookup have something to key off.
-    fn register_stdlib_traits(&mut self) {
-        // (name, assoc_types)
-        let traits: &[(&str, &[&str])] = &[
-            // Conversion traits
-            // `From` / `Into` (slice 6.2b) and `TryFrom` / `TryInto`
-            // (slice 6.2c) migrated to baked source.
-            // Arithmetic and bitwise operators (CR-202 slices 5h-5l):
-            // `Add` / `Sub` / `Mul` / `Div` / `Rem` / `Neg` /
-            // `BitAnd` / `BitOr` / `BitXor` / `Shl` / `Shr` are now
-            // provided by `runtime/stdlib/*.kara`; the bake walk at the
-            // top of `register_builtin_types` registers them via
-            // `env_add_trait`. `Not` stays hardcoded — its method name
-            // collides with Kāra's `not` keyword, so authoring the
-            // declaration as Kāra source requires a parser change
-            // (contextual-keyword escape at method-name position) that
-            // is out of scope for slice 5.
-            ("Not", &[]),
-            // Equality and ordering. `Eq` (slice 5b) and `Ord` (slice 5d)
-            // are likewise provided by `runtime/stdlib/{eq,ord}.kara`.
-            // Indexing — `Index` and `IndexMut` migrated to baked
-            // source (`runtime/stdlib/index.kara`, CR-202 slice 6.2a).
-            // String conversion (used by f-string interpolation) — now
-            // provided by `runtime/stdlib/display.kara` (CR-202 slice 5f);
-            // the bake walk registers it via `env_add_trait`.
-        ];
-        for (name, assoc) in traits {
-            self.env
-                .traits
-                .entry(name.to_string())
-                .or_insert_with(|| TraitInfo {
-                    assoc_types: assoc.iter().map(|s| s.to_string()).collect(),
-                    supertraits: Vec::new(),
-                });
-        }
     }
 
     /// Register stdlib trait impls for primitives, String, and F32/F64 wrappers.

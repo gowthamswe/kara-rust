@@ -1,0 +1,13 @@
+// runtime/stdlib/not.kara
+//
+// CR-202 slice 6.2e. Per design.md § Operator Traits — unary
+// bitwise complement. The method name `not` collides with Kāra's
+// logical-not keyword (`Token::Not`); the parser's
+// `expect_method_name()` helper (alongside `expect_attr_arg_name`'s
+// existing escape for `requires` / `ensures`) accepts the keyword
+// as identifier-equivalent at trait-method-name position so this
+// declaration parses.
+
+trait Not {
+    fn not(self) -> Self;
+}
