@@ -1,0 +1,17 @@
+// runtime/stdlib/http.kara
+//
+// CR-202 slice 6.1g. HTTP client surface (Client / Response /
+// HttpError). Method signatures (`Client.get`, `Response.body`,
+// `HttpError.message`, …) stay in `register_builtin_types` until
+// slice 6.3 migrates them as `impl` blocks.
+
+struct Client { }
+
+struct Response {
+    status: i64,
+    body: String,
+}
+
+struct HttpError {
+    message: String,
+}

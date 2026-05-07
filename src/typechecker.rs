@@ -3421,40 +3421,10 @@ impl<'a> TypeChecker<'a> {
                 return_type: Type::Str,
             },
         );
-        // Register Client, Response, HttpError as structs
-        self.env
-            .structs
-            .entry("Client".to_string())
-            .or_insert_with(|| StructInfo {
-                generic_params: vec![],
-                fields: vec![],
-                derived_traits: HashSet::new(),
-                no_rc: false,
-                is_shared: false,
-            });
-        self.env
-            .structs
-            .entry("Response".to_string())
-            .or_insert_with(|| StructInfo {
-                generic_params: vec![],
-                fields: vec![
-                    ("status".to_string(), Type::Int(IntSize::I64), false),
-                    ("body".to_string(), Type::Str, false),
-                ],
-                derived_traits: HashSet::new(),
-                no_rc: false,
-                is_shared: false,
-            });
-        self.env
-            .structs
-            .entry("HttpError".to_string())
-            .or_insert_with(|| StructInfo {
-                generic_params: vec![],
-                fields: vec![("message".to_string(), Type::Str, false)],
-                derived_traits: HashSet::new(),
-                no_rc: false,
-                is_shared: false,
-            });
+        // Client / Response / HttpError are now provided by
+        // `runtime/stdlib/http.kara` (CR-202 slice 6.1g). Method
+        // signatures (Client.get, Response.body, HttpError.message)
+        // stay in this function until slice 6.3 migrates them.
 
         // ── std.encoding namespace (Base64 / Hex / Url) ───────────────────────
         // Interpreter-only. Pure-Rust helpers in `eval_encoding_fn`. Effect-free
@@ -3537,28 +3507,10 @@ impl<'a> TypeChecker<'a> {
                 return_type: result_string,
             },
         );
-        for name in &["Base64", "Hex", "Url"] {
-            self.env
-                .structs
-                .entry((*name).to_string())
-                .or_insert_with(|| StructInfo {
-                    generic_params: vec![],
-                    fields: vec![],
-                    derived_traits: HashSet::new(),
-                    no_rc: false,
-                    is_shared: false,
-                });
-        }
-        self.env
-            .structs
-            .entry("DecodeError".to_string())
-            .or_insert_with(|| StructInfo {
-                generic_params: vec![],
-                fields: vec![("message".to_string(), Type::Str, false)],
-                derived_traits: HashSet::new(),
-                no_rc: false,
-                is_shared: false,
-            });
+        // Base64 / Hex / Url / DecodeError are now provided by
+        // `runtime/stdlib/encoding.kara` (CR-202 slice 6.1g). Free
+        // function signatures (Base64.encode, Hex.decode, …) stay in
+        // this function until slice 6.3 migrates them.
 
         self.register_stdlib_traits();
         self.register_stdlib_impls();

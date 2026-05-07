@@ -1,0 +1,17 @@
+// runtime/stdlib/encoding.kara
+//
+// CR-202 slice 6.1g. Base64 / Hex / Url namespaces, plus the shared
+// `DecodeError`. Each namespace struct is opaque — users only call
+// associated functions on it. Free functions (Base64.encode,
+// Hex.decode, Url.encode, …) stay in `register_builtin_types` until
+// slice 6.3 migrates them.
+
+struct Base64 { }
+
+struct Hex { }
+
+struct Url { }
+
+struct DecodeError {
+    message: String,
+}
