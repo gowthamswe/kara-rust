@@ -3080,80 +3080,14 @@ impl<'a> TypeChecker<'a> {
         // `impl Stats { #[compiler_builtin] fn ... }`. See
         // `runtime/stdlib/stats.kara`.
 
-        // ── Regex namespace ───────────────────────────────────────────────────
-        // Interpreter-only (no codegen). Backed by the `regex` crate at runtime.
-        let regex_ty = Type::Named {
-            name: "Regex".to_string(),
-            args: vec![],
-        };
-        let regex_error_ty = Type::Named {
-            name: "RegexError".to_string(),
-            args: vec![],
-        };
-        let result_regex = Type::Named {
-            name: "Result".to_string(),
-            args: vec![regex_ty.clone(), regex_error_ty.clone()],
-        };
-        let match_ty = Type::Named {
-            name: "Match".to_string(),
-            args: vec![],
-        };
-        let option_match = Type::Named {
-            name: "Option".to_string(),
-            args: vec![match_ty.clone()],
-        };
-        let vec_match = Type::Named {
-            name: "Vec".to_string(),
-            args: vec![match_ty.clone()],
-        };
-        // Regex.compile(pattern: str) -> Result[Regex, RegexError]
-        self.env.functions.insert(
-            "Regex.compile".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("pattern".to_string())],
-                params: vec![Type::Str],
-                return_type: result_regex,
-            },
-        );
-        // Regex methods — registered as Regex.method in the function table so
-        // resolve_path_type can find them. Actual dispatch is in eval_method_call.
-        self.env.functions.insert(
-            "Regex.is_match".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("s".to_string())],
-                params: vec![Type::Str],
-                return_type: Type::Bool,
-            },
-        );
-        self.env.functions.insert(
-            "Regex.find".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("s".to_string())],
-                params: vec![Type::Str],
-                return_type: option_match,
-            },
-        );
-        self.env.functions.insert(
-            "Regex.find_all".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("s".to_string())],
-                params: vec![Type::Str],
-                return_type: vec_match,
-            },
-        );
-        self.env.functions.insert(
-            "Regex.replace_all".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("s".to_string()), Some("replacement".to_string())],
-                params: vec![Type::Str, Type::Str],
-                return_type: Type::Str,
-            },
-        );
+        // ── Regex namespace ──────────────────────────────────────────────────
+        // CR-202 slice 6.3: every Regex method now lives in baked source as
+        // `impl Regex { #[compiler_builtin] fn ... }`. See
+        // `runtime/stdlib/regex.kara`. Instance-method calls
+        // (`r.is_match(s)`, …) still route through `infer_regex_method` /
+        // `eval_regex_method`; only the path-call form `Regex.compile(...)`
+        // and the env.functions surface migrated.
+
         // ── std.http namespace ────────────────────────────────────────────────
         // Interpreter-only. Backed by the `ureq` crate at runtime.
         // Effects: Client.get / Client.post carry sends(Network) + receives(Network).

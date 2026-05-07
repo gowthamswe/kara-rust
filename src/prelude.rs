@@ -911,43 +911,84 @@ mod tests {
     // by `tests/typechecker.rs::test_stats_*_ok` and
     // `tests/interpreter.rs::test_stats_*`.
 
-    #[test]
-    fn baked_stats_carries_inherent_impl_with_compiler_builtin_methods() {
-        let stats_program = STDLIB_PROGRAMS
+    /// Assert that the baked stdlib file `file_basename` declares an
+    /// inherent (no trait_name) impl block on `target_type` whose methods
+    /// include each name in `expected` and that every method carries the
+    /// `#[compiler_builtin]` attribute. Test helper used to pin slice-6.3
+    /// migrations across multiple types.
+    fn assert_inherent_impl_compiler_builtin(
+        file_basename: &str,
+        target_type: &str,
+        expected: &[&str],
+    ) {
+        let program = STDLIB_PROGRAMS
             .iter()
-            .find(|(name, _)| *name == "stats.kara")
+            .find(|(name, _)| *name == file_basename)
             .map(|(_, p)| p)
-            .expect("stats.kara should be in STDLIB_PROGRAMS");
-        let imp = stats_program
+            .unwrap_or_else(|| panic!("{} should be in STDLIB_PROGRAMS", file_basename));
+        let impls: Vec<_> = program
             .items
             .iter()
-            .find_map(|i| match i {
+            .filter_map(|i| match i {
                 Item::ImplBlock(b) => Some(b),
                 _ => None,
             })
-            .expect("stats.kara should declare an impl block");
-        assert!(
-            imp.trait_name.is_none(),
-            "Stats impl should be inherent, not trait — got trait_name = {:?}",
-            imp.trait_name
-        );
-        let expected = [
-            "sum", "prod", "mean", "variance", "stddev", "median", "min", "max",
-        ];
+            .collect();
+        let imp = impls
+            .iter()
+            .find(|b| {
+                b.trait_name.is_none()
+                    && match &b.target_type.kind {
+                        crate::ast::TypeKind::Path(p) => {
+                            p.segments.last().is_some_and(|s| s == target_type)
+                        }
+                        _ => false,
+                    }
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} should declare an inherent impl block on `{}`",
+                    file_basename, target_type
+                )
+            });
         for name in expected {
             let method = imp
                 .items
                 .iter()
                 .find_map(|item| match item {
-                    crate::ast::ImplItem::Method(m) if m.name == name => Some(m),
+                    crate::ast::ImplItem::Method(m) if m.name == *name => Some(m),
                     _ => None,
                 })
-                .unwrap_or_else(|| panic!("Stats impl should declare method `{}`", name));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`impl {}` in {} should declare method `{}`",
+                        target_type, file_basename, name
+                    )
+                });
             assert!(
                 method.attributes.iter().any(|a| a.name == "compiler_builtin"),
-                "Stats.{} should carry #[compiler_builtin]",
+                "{}.{} should carry #[compiler_builtin]",
+                target_type,
                 name
             );
         }
+    }
+
+    #[test]
+    fn baked_stats_carries_inherent_impl_with_compiler_builtin_methods() {
+        assert_inherent_impl_compiler_builtin(
+            "stats.kara",
+            "Stats",
+            &["sum", "prod", "mean", "variance", "stddev", "median", "min", "max"],
+        );
+    }
+
+    #[test]
+    fn baked_regex_carries_inherent_impl_with_compiler_builtin_methods() {
+        assert_inherent_impl_compiler_builtin(
+            "regex.kara",
+            "Regex",
+            &["compile", "is_match", "find", "find_all", "replace_all"],
+        );
     }
 }

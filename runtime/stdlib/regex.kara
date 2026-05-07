@@ -1,8 +1,11 @@
 // runtime/stdlib/regex.kara
 //
-// CR-202 slice 6.1f. Compiled regex pattern. Method signatures
-// (compile, is_match, find, find_all, replace_all) stay in
-// `register_builtin_types` until slice 6.3 migrates them.
+// CR-202 slice 6.1f / 6.3. Compiled regex pattern. Method signatures
+// migrated to `impl` blocks 2026-05-06; instance dispatch still routes
+// through the hand-rolled `infer_regex_method` /
+// `eval_regex_method` arms in typechecker / interpreter, so the impl
+// bodies are `#[compiler_builtin]` placeholders the typechecker accepts
+// but never type-checks.
 
 struct Regex {
     pattern: String,
@@ -16,4 +19,23 @@ struct Match {
     text: String,
     start: i64,
     end: i64,
+}
+
+impl Regex {
+    #[compiler_builtin]
+    fn compile(pattern: String) -> Result[Regex, RegexError] {
+        Err(RegexError { message: "" })
+    }
+
+    #[compiler_builtin]
+    fn is_match(ref self, s: String) -> bool { false }
+
+    #[compiler_builtin]
+    fn find(ref self, s: String) -> Option[Match] { None }
+
+    #[compiler_builtin]
+    fn find_all(ref self, s: String) -> Vec[Match] { Vec.new() }
+
+    #[compiler_builtin]
+    fn replace_all(ref self, s: String, replacement: String) -> String { "" }
 }
