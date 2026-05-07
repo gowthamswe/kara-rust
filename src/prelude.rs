@@ -1002,4 +1002,19 @@ mod tests {
         );
         assert_inherent_impl_compiler_builtin("http.kara", "HttpError", &["message"]);
     }
+
+    #[test]
+    fn baked_encoding_carries_inherent_impl_with_compiler_builtin_methods() {
+        assert_inherent_impl_compiler_builtin(
+            "encoding.kara",
+            "Base64",
+            &["encode", "encode_url_safe", "decode"],
+        );
+        assert_inherent_impl_compiler_builtin(
+            "encoding.kara",
+            "Hex",
+            &["encode", "encode_upper", "decode"],
+        );
+        assert_inherent_impl_compiler_builtin("encoding.kara", "Url", &["encode", "decode"]);
+    }
 }

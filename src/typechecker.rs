@@ -3095,91 +3095,11 @@ impl<'a> TypeChecker<'a> {
         // through `infer_http_*_method` / `eval_http_*_method`; only
         // `Client.new()` (associated) and the env.functions surface migrated.
 
-        // ── std.encoding namespace (Base64 / Hex / Url) ───────────────────────
-        // Interpreter-only. Pure-Rust helpers in `eval_encoding_fn`. Effect-free
-        // (encoding/decoding does not touch any tracked resource).
-        let slice_u8 = Type::Slice {
-            element: Box::new(Type::UInt(UIntSize::U8)),
-            mutable: false,
-        };
-        let vec_u8 = Type::Named {
-            name: "Vec".to_string(),
-            args: vec![Type::UInt(UIntSize::U8)],
-        };
-        let decode_error_ty = Type::Named {
-            name: "DecodeError".to_string(),
-            args: vec![],
-        };
-        let result_bytes = Type::Named {
-            name: "Result".to_string(),
-            args: vec![vec_u8.clone(), decode_error_ty.clone()],
-        };
-        let result_string = Type::Named {
-            name: "Result".to_string(),
-            args: vec![Type::Str, decode_error_ty.clone()],
-        };
-        for name in &["Base64.encode", "Base64.encode_url_safe"] {
-            self.env.functions.insert(
-                name.to_string(),
-                FunctionSig {
-                    generic_params: vec![],
-                    param_names: vec![Some("bytes".to_string())],
-                    params: vec![slice_u8.clone()],
-                    return_type: Type::Str,
-                },
-            );
-        }
-        self.env.functions.insert(
-            "Base64.decode".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("s".to_string())],
-                params: vec![Type::Str],
-                return_type: result_bytes.clone(),
-            },
-        );
-        for name in &["Hex.encode", "Hex.encode_upper"] {
-            self.env.functions.insert(
-                name.to_string(),
-                FunctionSig {
-                    generic_params: vec![],
-                    param_names: vec![Some("bytes".to_string())],
-                    params: vec![slice_u8.clone()],
-                    return_type: Type::Str,
-                },
-            );
-        }
-        self.env.functions.insert(
-            "Hex.decode".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("s".to_string())],
-                params: vec![Type::Str],
-                return_type: result_bytes,
-            },
-        );
-        self.env.functions.insert(
-            "Url.encode".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("s".to_string())],
-                params: vec![Type::Str],
-                return_type: Type::Str,
-            },
-        );
-        self.env.functions.insert(
-            "Url.decode".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("s".to_string())],
-                params: vec![Type::Str],
-                return_type: result_string,
-            },
-        );
-        // Base64 / Hex / Url / DecodeError are now provided by
-        // `runtime/stdlib/encoding.kara` (CR-202 slice 6.1g). Free
-        // function signatures (Base64.encode, Hex.decode, …) stay in
-        // this function until slice 6.3 migrates them.
+        // ── std.encoding namespace (Base64 / Hex / Url) ──────────────────────
+        // CR-202 slice 6.3: every Base64 / Hex / Url method now lives in
+        // baked source as `impl <Type> { #[compiler_builtin] fn ... }`.
+        // See `runtime/stdlib/encoding.kara`. Interpreter dispatches each
+        // call by matching on the path string in `eval_encoding_fn`.
 
         // `register_stdlib_traits` retired — every trait it registered
         // moved to baked source under `runtime/stdlib/*.kara` across

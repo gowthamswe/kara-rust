@@ -1,10 +1,11 @@
 // runtime/stdlib/encoding.kara
 //
-// CR-202 slice 6.1g. Base64 / Hex / Url namespaces, plus the shared
-// `DecodeError`. Each namespace struct is opaque — users only call
-// associated functions on it. Free functions (Base64.encode,
-// Hex.decode, Url.encode, …) stay in `register_builtin_types` until
-// slice 6.3 migrates them.
+// CR-202 slice 6.1g / 6.3. Base64 / Hex / Url namespaces, plus the
+// shared `DecodeError`. Each namespace struct is opaque — users only
+// call associated functions on it. Method signatures migrated to
+// `impl` blocks 2026-05-06; interpreter still dispatches each call by
+// matching on the path string in `eval_encoding_fn`, so the impl
+// bodies are `#[compiler_builtin]` placeholders.
 
 struct Base64 { }
 
@@ -14,4 +15,40 @@ struct Url { }
 
 struct DecodeError {
     message: String,
+}
+
+impl Base64 {
+    #[compiler_builtin]
+    fn encode(bytes: Slice[u8]) -> String { "" }
+
+    #[compiler_builtin]
+    fn encode_url_safe(bytes: Slice[u8]) -> String { "" }
+
+    #[compiler_builtin]
+    fn decode(s: String) -> Result[Vec[u8], DecodeError] {
+        Err(DecodeError { message: "" })
+    }
+}
+
+impl Hex {
+    #[compiler_builtin]
+    fn encode(bytes: Slice[u8]) -> String { "" }
+
+    #[compiler_builtin]
+    fn encode_upper(bytes: Slice[u8]) -> String { "" }
+
+    #[compiler_builtin]
+    fn decode(s: String) -> Result[Vec[u8], DecodeError] {
+        Err(DecodeError { message: "" })
+    }
+}
+
+impl Url {
+    #[compiler_builtin]
+    fn encode(s: String) -> String { "" }
+
+    #[compiler_builtin]
+    fn decode(s: String) -> Result[String, DecodeError] {
+        Err(DecodeError { message: "" })
+    }
 }
