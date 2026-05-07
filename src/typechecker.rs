@@ -2988,42 +2988,9 @@ impl<'a> TypeChecker<'a> {
         // through `#[derive(...)]` on the baked enums. `Entry` and the
         // rest stay hardcoded until later slices migrate them.
 
-        // Prelude enum `Entry[K, V]` — view returned by `Map.entry(k)` for
-        // O(1) insert-or-modify without double-hashing. See design.md
-        // § Entry[K, V]. First stdlib type with `mut ref` payload fields.
-        self.env.enums.insert(
-            "Entry".to_string(),
-            EnumInfo {
-                generic_params: vec!["K".to_string(), "V".to_string()],
-                variants: vec![
-                    (
-                        "Occupied".to_string(),
-                        VariantTypeInfo::Struct(vec![(
-                            "value".to_string(),
-                            Type::MutRef(Box::new(Type::TypeParam("V".to_string()))),
-                        )]),
-                    ),
-                    (
-                        "Vacant".to_string(),
-                        VariantTypeInfo::Struct(vec![
-                            ("key".to_string(), Type::TypeParam("K".to_string())),
-                            (
-                                "map".to_string(),
-                                Type::MutRef(Box::new(Type::Named {
-                                    name: "Map".to_string(),
-                                    args: vec![
-                                        Type::TypeParam("K".to_string()),
-                                        Type::TypeParam("V".to_string()),
-                                    ],
-                                })),
-                            ),
-                        ]),
-                    ),
-                ],
-                derived_traits: HashSet::new(),
-                is_shared: false,
-            },
-        );
+        // `Entry[K, V]` is now provided by `runtime/stdlib/entry.kara`
+        // (CR-202 slice 6.1i). First baked enum with struct-style
+        // variants and `mut ref` payload fields.
 
         // `VarError` — error type returned by `env.var(name)`. Resolved as
         // `std.env.VarError` per brainstorming v49 (Q2=B): not part of the

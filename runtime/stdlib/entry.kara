@@ -1,0 +1,10 @@
+// runtime/stdlib/entry.kara
+//
+// CR-202 slice 6.1i. View returned by `Map.entry(k)` for O(1)
+// insert-or-modify without double-hashing. Per design.md § Entry[K, V].
+// First stdlib type with `mut ref` payload fields.
+
+enum Entry[K, V] {
+    Occupied { value: mut ref V },
+    Vacant { key: K, map: mut ref Map[K, V] },
+}
