@@ -991,4 +991,15 @@ mod tests {
             &["compile", "is_match", "find", "find_all", "replace_all"],
         );
     }
+
+    #[test]
+    fn baked_http_carries_inherent_impl_with_compiler_builtin_methods() {
+        assert_inherent_impl_compiler_builtin("http.kara", "Client", &["new", "get", "post"]);
+        assert_inherent_impl_compiler_builtin(
+            "http.kara",
+            "Response",
+            &["status", "body", "header"],
+        );
+        assert_inherent_impl_compiler_builtin("http.kara", "HttpError", &["message"]);
+    }
 }

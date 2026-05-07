@@ -3088,100 +3088,12 @@ impl<'a> TypeChecker<'a> {
         // `eval_regex_method`; only the path-call form `Regex.compile(...)`
         // and the env.functions surface migrated.
 
-        // ── std.http namespace ────────────────────────────────────────────────
-        // Interpreter-only. Backed by the `ureq` crate at runtime.
-        // Effects: Client.get / Client.post carry sends(Network) + receives(Network).
-        let client_ty = Type::Named {
-            name: "Client".to_string(),
-            args: vec![],
-        };
-        let response_ty = Type::Named {
-            name: "Response".to_string(),
-            args: vec![],
-        };
-        let http_error_ty = Type::Named {
-            name: "HttpError".to_string(),
-            args: vec![],
-        };
-        let result_response = Type::Named {
-            name: "Result".to_string(),
-            args: vec![response_ty.clone(), http_error_ty.clone()],
-        };
-        let option_str = Type::Named {
-            name: "Option".to_string(),
-            args: vec![Type::Str],
-        };
-        // Client.new() -> Client
-        self.env.functions.insert(
-            "Client.new".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![],
-                params: vec![],
-                return_type: client_ty,
-            },
-        );
-        // Client methods (registered in function table for path-call resolution)
-        self.env.functions.insert(
-            "Client.get".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("url".to_string())],
-                params: vec![Type::Str],
-                return_type: result_response.clone(),
-            },
-        );
-        self.env.functions.insert(
-            "Client.post".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("url".to_string()), Some("body".to_string())],
-                params: vec![Type::Str, Type::Str],
-                return_type: result_response.clone(),
-            },
-        );
-        // Response methods
-        self.env.functions.insert(
-            "Response.status".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![],
-                params: vec![],
-                return_type: Type::Int(IntSize::I64),
-            },
-        );
-        self.env.functions.insert(
-            "Response.body".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![],
-                params: vec![],
-                return_type: Type::Str,
-            },
-        );
-        self.env.functions.insert(
-            "Response.header".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![Some("name".to_string())],
-                params: vec![Type::Str],
-                return_type: option_str,
-            },
-        );
-        // HttpError.message() -> str
-        self.env.functions.insert(
-            "HttpError.message".to_string(),
-            FunctionSig {
-                generic_params: vec![],
-                param_names: vec![],
-                params: vec![],
-                return_type: Type::Str,
-            },
-        );
-        // Client / Response / HttpError are now provided by
-        // `runtime/stdlib/http.kara` (CR-202 slice 6.1g). Method
-        // signatures (Client.get, Response.body, HttpError.message)
-        // stay in this function until slice 6.3 migrates them.
+        // ── std.http namespace ───────────────────────────────────────────────
+        // CR-202 slice 6.3: every Client / Response / HttpError method now
+        // lives in baked source as `impl <Type> { #[compiler_builtin] fn ... }`.
+        // See `runtime/stdlib/http.kara`. Instance-method calls still route
+        // through `infer_http_*_method` / `eval_http_*_method`; only
+        // `Client.new()` (associated) and the env.functions surface migrated.
 
         // ── std.encoding namespace (Base64 / Hex / Url) ───────────────────────
         // Interpreter-only. Pure-Rust helpers in `eval_encoding_fn`. Effect-free

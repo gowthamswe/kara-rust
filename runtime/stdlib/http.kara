@@ -1,9 +1,10 @@
 // runtime/stdlib/http.kara
 //
-// CR-202 slice 6.1g. HTTP client surface (Client / Response /
-// HttpError). Method signatures (`Client.get`, `Response.body`,
-// `HttpError.message`, …) stay in `register_builtin_types` until
-// slice 6.3 migrates them as `impl` blocks.
+// CR-202 slice 6.1g / 6.3. HTTP client surface (Client / Response /
+// HttpError). Method signatures migrated to `impl` blocks 2026-05-06;
+// instance dispatch still routes through `infer_http_*_method` /
+// `eval_http_*_method`, so the impl bodies are `#[compiler_builtin]`
+// placeholders.
 
 struct Client { }
 
@@ -14,4 +15,35 @@ struct Response {
 
 struct HttpError {
     message: String,
+}
+
+impl Client {
+    #[compiler_builtin]
+    fn new() -> Client { Client { } }
+
+    #[compiler_builtin]
+    fn get(ref self, url: String) -> Result[Response, HttpError] {
+        Err(HttpError { message: "" })
+    }
+
+    #[compiler_builtin]
+    fn post(ref self, url: String, body: String) -> Result[Response, HttpError] {
+        Err(HttpError { message: "" })
+    }
+}
+
+impl Response {
+    #[compiler_builtin]
+    fn status(ref self) -> i64 { 0 }
+
+    #[compiler_builtin]
+    fn body(ref self) -> String { "" }
+
+    #[compiler_builtin]
+    fn header(ref self, name: String) -> Option[String] { None }
+}
+
+impl HttpError {
+    #[compiler_builtin]
+    fn message(ref self) -> String { "" }
 }
