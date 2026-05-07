@@ -1,19 +1,39 @@
 // runtime/stdlib/stats.kara
 //
-// CR-202 slice 6.1f. `Stats` is a namespace for free statistical
-// functions (`Stats.sum`, `Stats.mean`, …). The struct itself is
-// opaque — users only call associated functions on it.
+// CR-202 slice 6.1f / 6.3. `Stats` is a namespace for free statistical
+// functions (`Stats.sum`, `Stats.mean`, …). The struct itself is opaque
+// — users only call associated functions on it.
 //
-// Slice 6.3 pilot: `sum` migrates to a `#[compiler_builtin]` impl-block
-// method. The typechecker reads its signature from this file (via
-// `register_baked_stdlib`'s `env_add_impl` walk); the interpreter still
-// dispatches the call programmatically by matching on the path string
-// `"Stats.sum"`. The other Stats methods stay registered in
-// `register_compiler_intrinsic_env` until the pilot proves out.
+// Slice 6.3 (pilot 2026-05-06, full batch follow-up): every method
+// signature lives here as a `#[compiler_builtin]` placeholder body.
+// The typechecker reads them via `register_baked_stdlib`'s
+// `env_add_impl` walk; the interpreter still dispatches each call by
+// matching on the path string `"Stats.<method>"` in `eval_call`.
 
 struct Stats { }
 
 impl Stats {
     #[compiler_builtin]
     fn sum(xs: Slice[f64]) -> f64 { 0.0 }
+
+    #[compiler_builtin]
+    fn prod(xs: Slice[f64]) -> f64 { 0.0 }
+
+    #[compiler_builtin]
+    fn mean(xs: Slice[f64]) -> f64 { 0.0 }
+
+    #[compiler_builtin]
+    fn variance(xs: Slice[f64]) -> f64 { 0.0 }
+
+    #[compiler_builtin]
+    fn stddev(xs: Slice[f64]) -> f64 { 0.0 }
+
+    #[compiler_builtin]
+    fn median(xs: Slice[f64]) -> f64 { 0.0 }
+
+    #[compiler_builtin]
+    fn min(xs: Slice[f64]) -> Option[f64] { None }
+
+    #[compiler_builtin]
+    fn max(xs: Slice[f64]) -> Option[f64] { None }
 }

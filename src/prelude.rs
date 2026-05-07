@@ -902,16 +902,17 @@ mod tests {
         }
     }
 
-    // ── Slice 6.3 pilot: Stats.sum migrated to impl-block ───────────
+    // ── Slice 6.3: Stats methods migrated to impl-block ─────────────
     //
-    // CR-202 slice 6.3 retires `env.functions["Stats.sum"]` in favour of
-    // `impl Stats { #[compiler_builtin] fn sum(...) }` in baked source.
-    // These tests pin the AST shape; the dispatch round-trip is covered
-    // by `tests/typechecker.rs::test_stats_sum_ok` and
-    // `tests/interpreter.rs::test_stats_sum`.
+    // CR-202 slice 6.3 retires `env.functions["Stats.<method>"]` for
+    // every Stats method in favour of
+    // `impl Stats { #[compiler_builtin] fn ... }` in baked source.
+    // This test pins the AST shape; the dispatch round-trip is covered
+    // by `tests/typechecker.rs::test_stats_*_ok` and
+    // `tests/interpreter.rs::test_stats_*`.
 
     #[test]
-    fn baked_stats_carries_inherent_impl_with_sum_method() {
+    fn baked_stats_carries_inherent_impl_with_compiler_builtin_methods() {
         let stats_program = STDLIB_PROGRAMS
             .iter()
             .find(|(name, _)| *name == "stats.kara")
@@ -930,17 +931,23 @@ mod tests {
             "Stats impl should be inherent, not trait — got trait_name = {:?}",
             imp.trait_name
         );
-        let method = imp
-            .items
-            .iter()
-            .find_map(|item| match item {
-                crate::ast::ImplItem::Method(m) if m.name == "sum" => Some(m),
-                _ => None,
-            })
-            .expect("Stats impl should declare a `sum` method");
-        assert!(
-            method.attributes.iter().any(|a| a.name == "compiler_builtin"),
-            "Stats.sum should carry #[compiler_builtin]"
-        );
+        let expected = [
+            "sum", "prod", "mean", "variance", "stddev", "median", "min", "max",
+        ];
+        for name in expected {
+            let method = imp
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    crate::ast::ImplItem::Method(m) if m.name == name => Some(m),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Stats impl should declare method `{}`", name));
+            assert!(
+                method.attributes.iter().any(|a| a.name == "compiler_builtin"),
+                "Stats.{} should carry #[compiler_builtin]",
+                name
+            );
+        }
     }
 }

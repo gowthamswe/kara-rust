@@ -3075,48 +3075,10 @@ impl<'a> TypeChecker<'a> {
             },
         );
 
-        // ── Stats namespace ───────────────────────────────────────────────────
-        // Free statistical functions over Slice[f64]. Effect-free.
-        let slice_f64 = Type::Slice {
-            element: Box::new(Type::Float(FloatSize::F64)),
-            mutable: false,
-        };
-        let option_f64 = Type::Named {
-            name: "Option".to_string(),
-            args: vec![Type::Float(FloatSize::F64)],
-        };
-        // `Stats.sum` migrated to baked source as `impl Stats { fn sum }`
-        // (CR-202 slice 6.3 pilot). The remaining entries stay programmatic
-        // until the pilot proves out and the rest batch-migrate.
-        for name in &[
-            "Stats.prod",
-            "Stats.mean",
-            "Stats.variance",
-            "Stats.stddev",
-            "Stats.median",
-        ] {
-            self.env.functions.insert(
-                name.to_string(),
-                FunctionSig {
-                    generic_params: vec![],
-                    param_names: vec![Some("xs".to_string())],
-                    params: vec![slice_f64.clone()],
-                    return_type: Type::Float(FloatSize::F64),
-                },
-            );
-        }
-        // min/max return Option[f64] to be safe on empty slices
-        for name in &["Stats.min", "Stats.max"] {
-            self.env.functions.insert(
-                name.to_string(),
-                FunctionSig {
-                    generic_params: vec![],
-                    param_names: vec![Some("xs".to_string())],
-                    params: vec![slice_f64.clone()],
-                    return_type: option_f64.clone(),
-                },
-            );
-        }
+        // ── Stats namespace ──────────────────────────────────────────────────
+        // CR-202 slice 6.3: every Stats method now lives in baked source as
+        // `impl Stats { #[compiler_builtin] fn ... }`. See
+        // `runtime/stdlib/stats.kara`.
 
         // ── Regex namespace ───────────────────────────────────────────────────
         // Interpreter-only (no codegen). Backed by the `regex` crate at runtime.
