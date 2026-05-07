@@ -2925,6 +2925,79 @@ fn test_ambient_env_var_with_provider_overrides_default() {
     assert_eq!(output, "fake-foo\nerr\n");
 }
 
+#[test]
+fn test_ambient_stdout_println_resource_method_writes() {
+    // Direct `Stdout.println(s)` dispatches to the BuiltinDefault arm,
+    // which routes through `write_stdout` and lands in the harness's
+    // `captured_output` buffer. Same path the routed free `println`
+    // takes — this just exercises the user-visible Stdout surface.
+    let output = run("fn main() {\n\
+                          Stdout.println(\"hello\");\n\
+                          Stdout.println(\"world\");\n\
+                      }");
+    assert_eq!(output, "hello\nworld\n");
+}
+
+#[test]
+fn test_ambient_stdout_print_resource_method_writes_without_newline() {
+    // `Stdout.print(s)` does NOT append a newline — the test asserts
+    // two `print` calls concatenate cleanly, then a trailing `println`
+    // closes the line so the captured buffer ends with `\n`.
+    let output = run("fn main() {\n\
+                          Stdout.print(\"a\");\n\
+                          Stdout.print(\"b\");\n\
+                          Stdout.println(\"c\");\n\
+                      }");
+    assert_eq!(output, "abc\n");
+}
+
+#[test]
+fn test_free_println_routes_through_stdout_provider() {
+    // The free `println(x)` is routed through the `Stdout` provider
+    // stack — installing a `with_provider[Stdout]` fake intercepts the
+    // call. The Mute fake swallows everything; the inner `println` has
+    // no observable effect, while the outer `println` (after the scope
+    // pops back to the BuiltinDefault) still writes normally.
+    let output = run("struct Mute {}\n\
+                      impl Mute {\n\
+                          fn println(self, s: String) { }\n\
+                          fn print(self, s: String) { }\n\
+                      }\n\
+                      fn main() {\n\
+                          with_provider[Stdout](Mute {}, || {\n\
+                              println(\"hidden\");\n\
+                              println(\"also hidden\");\n\
+                          });\n\
+                          println(\"visible\");\n\
+                      }");
+    assert_eq!(output, "visible\n");
+}
+
+#[test]
+fn test_ambient_stdout_not_required_to_declare_effect_resource() {
+    // `Stdout` is a prelude effect resource — user code doesn't need
+    // `effect resource Stdout;` to call `Stdout.println(...)`.
+    let output = run("fn main() {\n\
+                          Stdout.println(\"ok\");\n\
+                      }");
+    assert_eq!(output, "ok\n");
+}
+
+#[test]
+fn test_eprintln_routes_through_stderr_provider() {
+    // `eprintln(x)` previously panicked with "variable 'eprintln' not
+    // found" — it was in PRELUDE_FUNCTIONS but had no interpreter arm.
+    // Now it routes through `Stderr.println` like `println` routes
+    // through `Stdout.println`. We can't assert the stderr contents
+    // (the test harness only captures stdout) but we can prove the
+    // call succeeds and a subsequent `println` still writes stdout.
+    let output = run("fn main() {\n\
+                          eprintln(\"to stderr\");\n\
+                          println(\"to stdout\");\n\
+                      }");
+    assert_eq!(output, "to stdout\n");
+}
+
 // ── `providers { R => p, ... } in { body }` block ───────────────
 
 #[test]

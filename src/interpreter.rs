@@ -3857,8 +3857,8 @@ impl<'a> Interpreter<'a> {
                         data: EnumData::Tuple(vec![val]),
                     };
                 }
-                "print" | "println" => {
-                    return self.eval_builtin_print(name, args);
+                "print" | "println" | "eprintln" => {
+                    return self.eval_builtin_print(name, args, span);
                 }
                 "dbg" => {
                     return self.eval_builtin_dbg(args, span);
@@ -7096,6 +7096,29 @@ impl<'a> Interpreter<'a> {
         args: &[CallArg],
         span: &Span,
     ) -> Value {
+        let arg_vals: Vec<Value> = args
+            .iter()
+            .map(|a| self.eval_expr_inner(&a.value))
+            .collect();
+        if self.check_cf() {
+            return Value::Unit;
+        }
+        self.dispatch_resource_method_with_values(resource, method, arg_vals, span)
+    }
+
+    /// Pre-evaluated-args entry into the provider-stack dispatch path.
+    /// Same lookup / BuiltinDefault / user-provider routing as
+    /// [`eval_resource_method`], but skips argument evaluation so callers
+    /// that compute their args via a different path (e.g. the print
+    /// router that formats a `Display` value into a `String` before
+    /// dispatch) can share the same final dispatch.
+    fn dispatch_resource_method_with_values(
+        &mut self,
+        resource: &str,
+        method: &str,
+        mut arg_vals: Vec<Value>,
+        span: &Span,
+    ) -> Value {
         let Some(provider_arc) = self.lookup_provider(resource) else {
             return self.record_runtime_error(
                 format!(
@@ -7116,7 +7139,12 @@ impl<'a> Interpreter<'a> {
         // Unix timestamp in seconds, etc. User-declared resources never
         // start with the `BuiltinDefault` prefix, so the check is safe.
         if let Some(resource_name) = type_name.strip_prefix("BuiltinDefault") {
-            return self.eval_builtin_resource_method(resource_name, method, args, span);
+            return self.dispatch_builtin_resource_method_with_values(
+                resource_name,
+                method,
+                arg_vals,
+                span,
+            );
         }
 
         let method_key = format!("{}.{}", type_name, method);
@@ -7145,11 +7173,8 @@ impl<'a> Interpreter<'a> {
             );
         };
 
-        let mut arg_vals: Vec<Value> = vec![provider];
-        arg_vals.extend(args.iter().map(|a| self.eval_expr_inner(&a.value)));
-        if self.check_cf() {
-            return Value::Unit;
-        }
+        // Prepend the provider as the implicit `self` argument.
+        arg_vals.insert(0, provider);
 
         self.env.push_scope();
         if let Some(ref captured) = closure_env {
@@ -7182,21 +7207,18 @@ impl<'a> Interpreter<'a> {
     /// user `with_provider` has shadowed it yet. Each primitive's method
     /// surface is hand-coded here; the set grows as additional primitives
     /// land under `PRELUDE_EFFECT_RESOURCES`.
-    fn eval_builtin_resource_method(
+    /// BuiltinDefault dispatch path. Used by the provider-stack router
+    /// when no user `with_provider` has shadowed the resource — and by
+    /// the print/println router which formats a `Display` value into a
+    /// `String` and calls through the same arms a direct
+    /// `Stdout.println(s)` call would hit.
+    fn dispatch_builtin_resource_method_with_values(
         &mut self,
         resource: &str,
         method: &str,
-        args: &[CallArg],
+        arg_vals: Vec<Value>,
         span: &Span,
     ) -> Value {
-        // Evaluate args for side-effect parity with the user-provider path.
-        let arg_vals: Vec<Value> = args
-            .iter()
-            .map(|a| self.eval_expr_inner(&a.value))
-            .collect();
-        if self.check_cf() {
-            return Value::Unit;
-        }
         match (resource, method) {
             ("Clock", "now") => {
                 let secs = std::time::SystemTime::now()
@@ -7282,10 +7304,66 @@ impl<'a> Interpreter<'a> {
             }
 
             // ── Stdout / Stderr ────────────────────────────────────
+            ("Stdout", "print") => {
+                self.track_effect("writes(Stdout)");
+                let s = match arg_vals.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => {
+                        return self.record_runtime_error(
+                            "Stdout.print expects a String argument".to_string(),
+                            span,
+                        );
+                    }
+                };
+                self.write_stdout(&s, false);
+                Value::Unit
+            }
+            ("Stdout", "println") => {
+                self.track_effect("writes(Stdout)");
+                let s = match arg_vals.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => {
+                        return self.record_runtime_error(
+                            "Stdout.println expects a String argument".to_string(),
+                            span,
+                        );
+                    }
+                };
+                self.write_stdout(&s, true);
+                Value::Unit
+            }
             ("Stdout", "flush") => {
                 self.track_effect("writes(Stdout)");
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
+                Value::Unit
+            }
+            ("Stderr", "print") => {
+                self.track_effect("writes(Stderr)");
+                let s = match arg_vals.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => {
+                        return self.record_runtime_error(
+                            "Stderr.print expects a String argument".to_string(),
+                            span,
+                        );
+                    }
+                };
+                self.write_stderr(&s, false);
+                Value::Unit
+            }
+            ("Stderr", "println") => {
+                self.track_effect("writes(Stderr)");
+                let s = match arg_vals.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => {
+                        return self.record_runtime_error(
+                            "Stderr.println expects a String argument".to_string(),
+                            span,
+                        );
+                    }
+                };
+                self.write_stderr(&s, true);
                 Value::Unit
             }
             ("Stderr", "flush") => {
@@ -7561,25 +7639,62 @@ impl<'a> Interpreter<'a> {
         self.record_runtime_error(full_msg, span)
     }
 
-    fn eval_builtin_print(&mut self, name: &str, args: &[CallArg]) -> Value {
-        self.track_effect("writes(Stdout)");
+    fn eval_builtin_print(&mut self, name: &str, args: &[CallArg], span: &Span) -> Value {
+        // Route through the Stdout / Stderr provider stack so a
+        // `with_provider[Stdout]` / `[Stderr]` install can intercept idiomatic
+        // `println(x)` calls — not just direct `Stdout.println(s)` calls.
+        // The user's provider method receives an already-formatted String;
+        // the BuiltinDefault arm writes through `write_stdout` /
+        // `write_stderr` (honoring `captured_output` for the test harness).
         let val = if let Some(arg) = args.first() {
             format!("{}", self.eval_expr_inner(&arg.value))
         } else {
             String::new()
         };
-        if let Some(ref mut output) = self.captured_output {
-            if name == "println" {
-                output.push(format!("{}\n", val));
-            } else {
-                output.push(val);
-            }
-        } else if name == "println" {
-            println!("{}", val);
-        } else {
-            print!("{}", val);
+        if self.check_cf() {
+            return Value::Unit;
         }
-        Value::Unit
+        let (resource, method) = match name {
+            "eprintln" => ("Stderr", "println"),
+            "println" => ("Stdout", "println"),
+            _ => ("Stdout", "print"),
+        };
+        self.dispatch_resource_method_with_values(
+            resource,
+            method,
+            vec![Value::String(val)],
+            span,
+        )
+    }
+
+    /// Write to stdout, honoring `captured_output` when the test harness
+    /// installed it. Used by both the free `print` / `println` router
+    /// and the `Stdout.print` / `Stdout.println` resource methods so the
+    /// two surfaces share one capture path.
+    fn write_stdout(&mut self, s: &str, newline: bool) {
+        if let Some(ref mut output) = self.captured_output {
+            if newline {
+                output.push(format!("{}\n", s));
+            } else {
+                output.push(s.to_string());
+            }
+        } else if newline {
+            println!("{}", s);
+        } else {
+            print!("{}", s);
+        }
+    }
+
+    /// Write to stderr. No capture buffer today — `captured_output` is
+    /// stdout-only and the test harness does not currently snapshot stderr.
+    /// Mirrors `write_stdout` so the `Stderr` arms have the same shape as
+    /// `Stdout`'s without forcing every Stderr test to learn a new pattern.
+    fn write_stderr(&mut self, s: &str, newline: bool) {
+        if newline {
+            eprintln!("{}", s);
+        } else {
+            eprint!("{}", s);
+        }
     }
 
     fn eval_builtin_dbg(&mut self, args: &[CallArg], span: &Span) -> Value {

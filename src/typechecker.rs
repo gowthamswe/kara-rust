@@ -6065,7 +6065,7 @@ impl<'a> TypeChecker<'a> {
         if self.local_scope.lookup(name).is_some()
             || self.env.functions.contains_key(name)
             || self.env.constants.contains_key(name)
-            || matches!(name, "todo" | "unreachable" | "println" | "print" | "panic")
+            || matches!(name, "todo" | "unreachable" | "println" | "print" | "eprintln" | "panic")
         {
             return None;
         }
@@ -7611,10 +7611,10 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        // Built-in output functions: println() and print()
+        // Built-in output functions: println() / print() / eprintln().
         // Accept 0 or 1 Display-implementing argument; return Unit.
         if let ExprKind::Identifier(name) = &callee.kind {
-            if name == "println" || name == "print" {
+            if name == "println" || name == "print" || name == "eprintln" {
                 match args.len() {
                     0 => {}
                     1 => {
@@ -8042,7 +8042,7 @@ impl<'a> TypeChecker<'a> {
         if self.local_scope.lookup(name).is_some()
             || self.env.functions.contains_key(name)
             || self.env.constants.contains_key(name)
-            || matches!(name, "todo" | "unreachable" | "println" | "print" | "panic")
+            || matches!(name, "todo" | "unreachable" | "println" | "print" | "eprintln" | "panic")
         {
             return false;
         }
