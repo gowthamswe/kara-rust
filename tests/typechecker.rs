@@ -2974,6 +2974,24 @@ fn test_memory_ordering_enum_resolves() {
 }
 
 #[test]
+fn test_ordering_helper_methods_typecheck() {
+    // `impl Ordering { fn is_lt … }` (design.md lines 5162-5168) lives in
+    // baked source. Both the typechecker (via `register_baked_stdlib`'s
+    // `env_add_impl` walk) and the interpreter (via `register_impl_methods`
+    // on STDLIB_PROGRAMS) read the methods from `runtime/stdlib/ordering.kara`.
+    typecheck_ok(
+        "fn main() {\n\
+             let o = Ordering.Less;\n\
+             let _lt: bool = o.is_lt();\n\
+             let _le: bool = o.is_le();\n\
+             let _gt: bool = o.is_gt();\n\
+             let _ge: bool = o.is_ge();\n\
+             let _eq: bool = o.is_eq();\n\
+         }",
+    );
+}
+
+#[test]
 fn test_ord_cmp_returns_comparison_ordering() {
     // The original motivator for the disambiguation CR: `Ord.cmp(a, b)` on
     // primitives returns `Ordering`, and `Ordering.Less` is now a registered

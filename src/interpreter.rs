@@ -1962,6 +1962,26 @@ impl<'a> Interpreter<'a> {
             self.bind_provider((*name).to_string(), default_provider);
         }
 
+        // Register impl-method bodies from baked stdlib source. The
+        // typechecker reads these via `register_baked_stdlib`; the
+        // interpreter does the same dispatch through `Value::Function`
+        // entries keyed by `Type.method`. Methods carrying
+        // `#[compiler_builtin]` are skipped — their bodies are
+        // placeholders, and the real dispatch lives in the path-string
+        // match earlier in `eval_call` (`Stats.sum`, `Regex.compile`, …)
+        // which fires before the env.get(method_key) fallback. Baked is
+        // registered before user items so user-program impls can
+        // override via last-write-wins on env.define.
+        let baked_items: Vec<Item> = crate::prelude::STDLIB_PROGRAMS
+            .iter()
+            .flat_map(|(_, p)| p.items.iter().cloned())
+            .collect();
+        for item in &baked_items {
+            if let Item::ImplBlock(imp) = item {
+                self.register_impl_methods(imp, /* skip_compiler_builtin = */ true);
+            }
+        }
+
         let items: Vec<Item> = self.program.items.clone();
         for item in &items {
             if let Item::EffectResource(r) = item {
@@ -2005,45 +2025,64 @@ impl<'a> Interpreter<'a> {
                     self.env.define(c.name.clone(), val);
                 }
                 Item::ImplBlock(imp) => {
-                    let type_name = match &imp.target_type.kind {
-                        TypeKind::Path(p) => p.segments.last().cloned().unwrap_or_default(),
-                        _ => continue,
-                    };
-                    for item in &imp.items {
-                        if let ImplItem::Method(method) = item {
-                            let method_key = format!("{}.{}", type_name, method.name);
-                            // For methods with a receiver, prepend a `self`
-                            // binding pattern so the unified Call dispatch can
-                            // bind args[0] to `self` without special-casing.
-                            // Associated functions (no self_param) stay as-is.
-                            let mut patterns: Vec<Pattern> = Vec::new();
-                            if method.self_param.is_some() {
-                                patterns.push(Pattern {
-                                    span: method.span.clone(),
-                                    kind: PatternKind::Binding("self".to_string()),
-                                });
-                            }
-                            patterns.extend(method.params.iter().map(|p| p.pattern.clone()));
-                            // `self` has no default; align defaults with the
-                            // extended pattern list (None for the self slot).
-                            let mut defaults: Vec<Option<crate::ast::Expr>> = Vec::new();
-                            if method.self_param.is_some() {
-                                defaults.push(None);
-                            }
-                            defaults.extend(method.params.iter().map(|p| p.default_value.clone()));
-                            let val = Value::Function {
-                                name: method.name.clone(),
-                                param_patterns: patterns,
-                                param_defaults: defaults,
-                                body: method.body.clone(),
-                                closure_env: None,
-                            };
-                            self.env.define(method_key, val);
-                        }
-                    }
+                    self.register_impl_methods(imp, /* skip_compiler_builtin = */ false);
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Walk an impl block's methods and register each as a `Value::Function`
+    /// keyed by `Type.method` in the interpreter env. Used by both the user-
+    /// program walk and the baked-stdlib walk.
+    ///
+    /// `skip_compiler_builtin` is `true` for baked source: methods marked
+    /// `#[compiler_builtin]` carry placeholder bodies, and dispatch for those
+    /// happens in `eval_call`'s path-string match (`Stats.sum`, …) which
+    /// fires before the env.get(method_key) fallback. Registering the
+    /// placeholder body would still work — the real path-string match
+    /// shadows it — but skipping is cleaner.
+    fn register_impl_methods(&mut self, imp: &ImplBlock, skip_compiler_builtin: bool) {
+        let type_name = match &imp.target_type.kind {
+            TypeKind::Path(p) => p.segments.last().cloned().unwrap_or_default(),
+            _ => return,
+        };
+        for item in &imp.items {
+            let ImplItem::Method(method) = item else {
+                continue;
+            };
+            if skip_compiler_builtin
+                && method.attributes.iter().any(|a| a.name == "compiler_builtin")
+            {
+                continue;
+            }
+            let method_key = format!("{}.{}", type_name, method.name);
+            // For methods with a receiver, prepend a `self` binding pattern
+            // so the unified Call dispatch can bind args[0] to `self` without
+            // special-casing. Associated functions (no self_param) stay as-is.
+            let mut patterns: Vec<Pattern> = Vec::new();
+            if method.self_param.is_some() {
+                patterns.push(Pattern {
+                    span: method.span.clone(),
+                    kind: PatternKind::Binding("self".to_string()),
+                });
+            }
+            patterns.extend(method.params.iter().map(|p| p.pattern.clone()));
+            // `self` has no default; align defaults with the extended
+            // pattern list (None for the self slot).
+            let mut defaults: Vec<Option<crate::ast::Expr>> = Vec::new();
+            if method.self_param.is_some() {
+                defaults.push(None);
+            }
+            defaults.extend(method.params.iter().map(|p| p.default_value.clone()));
+            let val = Value::Function {
+                name: method.name.clone(),
+                param_patterns: patterns,
+                param_defaults: defaults,
+                body: method.body.clone(),
+                closure_env: None,
+            };
+            self.env.define(method_key, val);
         }
     }
 

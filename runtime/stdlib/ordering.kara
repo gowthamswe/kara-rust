@@ -8,14 +8,19 @@
 // Acquire, Release, AcqRel, SeqCst) lives in a separate type
 // `MemoryOrdering` (see `memory_ordering.kara`); the two semantics
 // previously shared this name, which made `Ord.cmp(a, b) ==
-// Ordering.Less` fail to typecheck. The `impl Ordering { fn is_lt …
-// }` helper block from design.md lines 5162–5168 is a separate
-// follow-up (the interpreter currently doesn't walk baked stdlib
-// impl blocks; helper-method bodies wouldn't run).
+// Ordering.Less` fail to typecheck.
 
 #[derive(Eq, Copy)]
 enum Ordering {
     Less,
     Equal,
     Greater,
+}
+
+impl Ordering {
+    fn is_lt(ref self) -> bool { match self { Ordering.Less => true, _ => false } }
+    fn is_le(ref self) -> bool { match self { Ordering.Greater => false, _ => true } }
+    fn is_gt(ref self) -> bool { match self { Ordering.Greater => true, _ => false } }
+    fn is_ge(ref self) -> bool { match self { Ordering.Less => false, _ => true } }
+    fn is_eq(ref self) -> bool { match self { Ordering.Equal => true, _ => false } }
 }

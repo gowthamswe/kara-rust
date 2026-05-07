@@ -2339,6 +2339,39 @@ fn test_ordering_variants() {
 }
 
 #[test]
+fn test_ordering_helper_methods() {
+    // `impl Ordering { fn is_lt … }` per design.md § Comparison Traits
+    // (lines 5162-5168). Lives in baked source `runtime/stdlib/ordering.kara`;
+    // requires the interpreter to walk baked impl blocks.
+    let output = run("fn main() {\n\
+             let lt = Ordering.Less;\n\
+             let eq = Ordering.Equal;\n\
+             let gt = Ordering.Greater;\n\
+             println(lt.is_lt());\n\
+             println(lt.is_le());\n\
+             println(lt.is_gt());\n\
+             println(lt.is_ge());\n\
+             println(lt.is_eq());\n\
+             println(eq.is_lt());\n\
+             println(eq.is_le());\n\
+             println(eq.is_gt());\n\
+             println(eq.is_ge());\n\
+             println(eq.is_eq());\n\
+             println(gt.is_lt());\n\
+             println(gt.is_le());\n\
+             println(gt.is_gt());\n\
+             println(gt.is_ge());\n\
+             println(gt.is_eq());\n\
+         }");
+    assert_eq!(
+        output,
+        "true\ntrue\nfalse\nfalse\nfalse\n\
+         false\ntrue\nfalse\ntrue\ntrue\n\
+         false\nfalse\ntrue\ntrue\nfalse\n",
+    );
+}
+
+#[test]
 fn test_memory_ordering_variants() {
     let output = run("fn main() {\n\
              let r = MemoryOrdering.Relaxed;\n\
