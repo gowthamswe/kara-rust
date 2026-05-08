@@ -9700,3 +9700,118 @@ fn ufcs_arg_count_mismatch() {
         errors.iter().map(|e| &e.message).collect::<Vec<_>>()
     );
 }
+
+// ── Method resolution: target-args-specialized impls ────────────
+//
+// Theme-4 slice (impl-table key shape change). `ImplInfo` now carries
+// `target_args: Vec<Type>`; lookup matches iff stored args are empty
+// (generic-on-name) OR vector-equal call-site args. v1 rejects
+// generic-vs-specialized overlap at impl registration time. See
+// `phase-4-interpreter.md` § `impl Option[Ordering]` deferred entry
+// for the locked design.
+
+#[test]
+fn test_specialized_impl_does_not_apply_to_other_instantiations() {
+    // `impl Stamp for Foo[i32]` is specialized to the i32 instantiation;
+    // a `Foo[i64]` receiver must NOT see `stamp` and the call falls
+    // through to NoMethodFound.
+    let errors = typecheck_errors(
+        "struct Foo[T] { x: i64 }\n\
+         trait Stamp { fn stamp(ref self) -> i64; }\n\
+         impl Stamp for Foo[i32] { fn stamp(ref self) -> i64 { 1 } }\n\
+         fn use_foo(f: ref Foo[i64]) -> i64 { f.stamp() }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::NoMethodFound),
+        "expected NoMethodFound for Foo[i64].stamp(), got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_specialized_impl_applies_to_matching_instantiation() {
+    // Same impl, matching receiver instantiation — `stamp` resolves.
+    typecheck_ok(
+        "struct Foo[T] { x: i64 }\n\
+         trait Stamp { fn stamp(ref self) -> i64; }\n\
+         impl Stamp for Foo[i32] { fn stamp(ref self) -> i64 { 1 } }\n\
+         fn use_foo(f: ref Foo[i32]) -> i64 { f.stamp() }",
+    );
+}
+
+#[test]
+fn test_generic_impl_applies_to_all_instantiations() {
+    // `impl[T] Stamp for Foo[T]` is generic-on-name (all args contain
+    // a TypeParam → stored target_args = empty); both `Foo[i32]` and
+    // `Foo[String]` see it.
+    typecheck_ok(
+        "struct Foo[T] { x: i64 }\n\
+         trait Stamp { fn stamp(ref self) -> i64; }\n\
+         impl[T] Stamp for Foo[T] { fn stamp(ref self) -> i64 { self.x } }\n\
+         fn use_int(f: ref Foo[i32]) -> i64 { f.stamp() }\n\
+         fn use_str(f: ref Foo[String]) -> i64 { f.stamp() }",
+    );
+}
+
+#[test]
+fn test_generic_specialized_overlap_rejected() {
+    // Generic-on-name + specialized impls for the same trait + target
+    // cannot coexist in v1.
+    let errors = typecheck_errors(
+        "struct Foo[T] { x: i64 }\n\
+         trait Stamp { fn stamp(ref self) -> i64; }\n\
+         impl[T] Stamp for Foo[T] { fn stamp(ref self) -> i64 { 1 } }\n\
+         impl Stamp for Foo[i32] { fn stamp(ref self) -> i64 { 2 } }\n\
+         fn main() {}",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::ConflictingImpl),
+        "expected ConflictingImpl, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_specialized_overlap_in_either_order_rejected() {
+    // Reverse declaration order — same conflict.
+    let errors = typecheck_errors(
+        "struct Foo[T] { x: i64 }\n\
+         trait Stamp { fn stamp(ref self) -> i64; }\n\
+         impl Stamp for Foo[i32] { fn stamp(ref self) -> i64 { 1 } }\n\
+         impl[T] Stamp for Foo[T] { fn stamp(ref self) -> i64 { 2 } }\n\
+         fn main() {}",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::ConflictingImpl),
+        "expected ConflictingImpl, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_alias_expanded_at_impl_registration() {
+    // `type MyFoo = Foo[i32]; impl Stamp for MyFoo` canonicalizes to
+    // `(Foo, [i32])` at registration time; a second `impl Stamp for
+    // Foo[i32]` then conflicts.
+    let errors = typecheck_errors(
+        "struct Foo[T] { x: i64 }\n\
+         trait Stamp { fn stamp(ref self) -> i64; }\n\
+         type MyFoo = Foo[i32];\n\
+         impl Stamp for MyFoo { fn stamp(ref self) -> i64 { 1 } }\n\
+         impl Stamp for Foo[i32] { fn stamp(ref self) -> i64 { 2 } }\n\
+         fn main() {}",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::ConflictingImpl),
+        "expected ConflictingImpl from alias canonicalization, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}

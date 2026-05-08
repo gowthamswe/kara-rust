@@ -207,16 +207,17 @@ pub fn type_to_concrete_or_param_name(ty: &Type) -> Option<String> {
     }
 }
 
-/// Head name suitable for `env.impls` lookup. Primitives are keyed under
-/// their stringified name (`"i32"`, `"f64"`, `"bool"`, …) by
-/// `register_stdlib_impls`; named types under their nominal head.
+/// Head name + type-argument vector suitable for `env.impls` lookup.
+/// Primitives are keyed under their stringified name (`"i32"`, `"f64"`,
+/// `"bool"`, …) by `register_stdlib_impls` with empty args. Named types
+/// return their nominal head name and the recursive argument list.
 /// Returns `None` for type variables, function types, slices, tuples,
-/// etc. — none of which can satisfy a nominal trait bound today.
-/// Strips outer `ref` / `mut ref` so a borrowed receiver discharges
-/// against the same impls as its inner type.
-fn impl_table_key(ty: &Type) -> Option<String> {
+/// etc. — none of which can satisfy a nominal trait bound today. Strips
+/// outer `ref` / `mut ref` so a borrowed receiver discharges against
+/// the same impls as its inner type.
+fn impl_table_key(ty: &Type) -> Option<(String, Vec<Type>)> {
     match ty {
-        Type::Int(s) => Some(
+        Type::Int(s) => Some((
             match s {
                 IntSize::I8 => "i8",
                 IntSize::I16 => "i16",
@@ -224,8 +225,9 @@ fn impl_table_key(ty: &Type) -> Option<String> {
                 IntSize::I64 => "i64",
             }
             .to_string(),
-        ),
-        Type::UInt(s) => Some(
+            Vec::new(),
+        )),
+        Type::UInt(s) => Some((
             match s {
                 UIntSize::U8 => "u8",
                 UIntSize::U16 => "u16",
@@ -234,20 +236,65 @@ fn impl_table_key(ty: &Type) -> Option<String> {
                 UIntSize::Usize => "usize",
             }
             .to_string(),
-        ),
-        Type::Float(s) => Some(
+            Vec::new(),
+        )),
+        Type::Float(s) => Some((
             match s {
                 FloatSize::F32 => "f32",
                 FloatSize::F64 => "f64",
             }
             .to_string(),
-        ),
-        Type::Bool => Some("bool".to_string()),
-        Type::Char => Some("char".to_string()),
-        Type::Str => Some("String".to_string()),
-        Type::Named { name, .. } => Some(name.clone()),
+            Vec::new(),
+        )),
+        Type::Bool => Some(("bool".to_string(), Vec::new())),
+        Type::Char => Some(("char".to_string(), Vec::new())),
+        Type::Str => Some(("String".to_string(), Vec::new())),
+        Type::Named { name, args } => Some((name.clone(), args.clone())),
         Type::Ref(inner) | Type::MutRef(inner) => impl_table_key(inner),
         _ => None,
+    }
+}
+
+/// Match rule for the Theme-4 impl-table key shape: a stored impl's
+/// `target_args` matches a call-site args vector iff the stored args
+/// are empty (impl is generic-on-name and applies to any instantiation)
+/// OR the two args vectors are equal. Length mismatch when the stored
+/// args are non-empty is a non-match.
+fn impl_args_match(stored: &[Type], call_site: &[Type]) -> bool {
+    stored.is_empty() || stored == call_site
+}
+
+/// `true` iff every `TypeParam` / `TypeVar` / `AssocProjection` is
+/// absent from the type recursively. Used by `env_add_impl` to decide
+/// whether an impl's target args should be stored as specialized
+/// (fully concrete → keep) or treated as generic-on-name (any
+/// non-concrete piece → drop the args, store empty).
+fn type_is_fully_concrete(ty: &Type) -> bool {
+    match ty {
+        Type::TypeParam(_) | Type::TypeVar(_) | Type::AssocProjection { .. } => false,
+        Type::Named { args, .. } => args.iter().all(type_is_fully_concrete),
+        Type::Tuple(types) => types.iter().all(type_is_fully_concrete),
+        Type::Array { element, .. } => type_is_fully_concrete(element),
+        Type::Slice { element, .. } => type_is_fully_concrete(element),
+        Type::Ref(inner) | Type::MutRef(inner) | Type::Weak(inner) => type_is_fully_concrete(inner),
+        Type::Pointer { inner, .. } => type_is_fully_concrete(inner),
+        Type::Function {
+            params,
+            return_type,
+        }
+        | Type::OnceFunction {
+            params,
+            return_type,
+        } => params.iter().all(type_is_fully_concrete) && type_is_fully_concrete(return_type),
+        Type::Int(_)
+        | Type::UInt(_)
+        | Type::Float(_)
+        | Type::Bool
+        | Type::Char
+        | Type::Str
+        | Type::Unit
+        | Type::Never
+        | Type::Error => true,
     }
 }
 
@@ -1194,6 +1241,17 @@ pub struct FunctionSig {
 #[derive(Debug, Clone)]
 pub struct ImplInfo {
     pub target_type: String,
+    /// Type arguments of the impl target (`impl Foo for Option[Ordering]`
+    /// → `[Type::Named { name: "Ordering", args: [] }]`). Empty means the
+    /// impl is generic-on-name — it applies to every instantiation of
+    /// `target_type` (the status quo for every impl that pre-dates the
+    /// Theme-4 slice). Non-empty means the impl is specialized to the
+    /// listed concrete instantiation; lookup matches iff the call site's
+    /// args vector-equal the stored args. `env_add_impl` populates this
+    /// only when every recursive arg is fully concrete (no `TypeParam`
+    /// or `TypeVar`) — generic impls (`impl Foo for Option[T]`) keep
+    /// `target_args.is_empty()`.
+    pub target_args: Vec<Type>,
     pub trait_name: Option<String>,
     pub methods: HashMap<String, FunctionSig>,
     /// Impl-level type-parameter declarations including their inline
@@ -1295,19 +1353,32 @@ impl TypeEnv {
         idx
     }
 
-    /// Look up the impl of `trait_name` for `target_type`.
-    /// Match is on the type's nominal head — generic parameters are ignored at this layer
-    /// (callers responsible for any parameter-level subtype checks).
-    pub fn find_impl(&self, trait_name: &str, target_type: &str) -> Option<&ImplInfo> {
+    /// Look up the impl of `trait_name` for `target_type`. The match
+    /// rule is the Theme-4 args-aware shape: a stored impl's
+    /// `target_args` matches the call site iff the stored args are
+    /// empty (impl is generic-on-name, applies to any instantiation)
+    /// OR they vector-equal the call-site args. Callers without any
+    /// generic-arg context pass `&[]`, which selectively sees only
+    /// generic-on-name impls (specialized impls become invisible to
+    /// these callers — correct conservative default).
+    pub fn find_impl(
+        &self,
+        trait_name: &str,
+        target_type: &str,
+        target_args: &[Type],
+    ) -> Option<&ImplInfo> {
         self.impls_by_trait
             .get(trait_name)?
             .iter()
             .map(|&i| &self.impls[i])
-            .find(|imp| imp.target_type == target_type)
+            .find(|imp| {
+                imp.target_type == target_type && impl_args_match(&imp.target_args, target_args)
+            })
     }
 
-    pub fn has_impl(&self, trait_name: &str, target_type: &str) -> bool {
-        self.find_impl(trait_name, target_type).is_some()
+    pub fn has_impl(&self, trait_name: &str, target_type: &str, target_args: &[Type]) -> bool {
+        self.find_impl(trait_name, target_type, target_args)
+            .is_some()
     }
 
     /// Look up a method by name on `target_type` from `impls`, preferring
@@ -1315,12 +1386,19 @@ impl TypeEnv {
     /// Step 3. Returns the first inherent impl's method if any matches;
     /// otherwise the first trait impl's method. First-match within each tier
     /// — multi-inherent and multi-trait ambiguity detection is deferred to
-    /// the step-4 work tracked in phase-4-interpreter.md.
-    pub fn find_method(&self, target_type: &str, method: &str) -> Option<&FunctionSig> {
+    /// the step-4 work tracked in phase-4-interpreter.md. The `target_args`
+    /// parameter applies the Theme-4 args-match rule (see
+    /// [`Self::find_impl`]).
+    pub fn find_method(
+        &self,
+        target_type: &str,
+        target_args: &[Type],
+        method: &str,
+    ) -> Option<&FunctionSig> {
         let mut inherent: Option<&FunctionSig> = None;
         let mut trait_method: Option<&FunctionSig> = None;
         for imp in &self.impls {
-            if imp.target_type != target_type {
+            if imp.target_type != target_type || !impl_args_match(&imp.target_args, target_args) {
                 continue;
             }
             let Some(sig) = imp.methods.get(method) else {
@@ -1340,11 +1418,12 @@ impl TypeEnv {
     /// Collect every method name registered on `target_type` across both
     /// inherent and trait impls. Used for `did you mean` typo suggestions
     /// when method resolution falls through (design.md § Method Resolution
-    /// Step 7).
-    pub fn collect_method_names(&self, target_type: &str) -> Vec<String> {
+    /// Step 7). The `target_args` parameter applies the Theme-4 args-match
+    /// rule (see [`Self::find_impl`]).
+    pub fn collect_method_names(&self, target_type: &str, target_args: &[Type]) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         for imp in &self.impls {
-            if imp.target_type != target_type {
+            if imp.target_type != target_type || !impl_args_match(&imp.target_args, target_args) {
                 continue;
             }
             for name in imp.methods.keys() {
@@ -1371,7 +1450,7 @@ impl TypeEnv {
         let mut inherent: Option<&FunctionSig> = None;
         let mut trait_method: Option<&FunctionSig> = None;
         for imp in &self.impls {
-            if imp.target_type != target_type {
+            if imp.target_type != target_type || !impl_args_match(&imp.target_args, target_args) {
                 continue;
             }
             let Some(sig) = imp.methods.get(method) else {
@@ -1412,7 +1491,7 @@ impl TypeEnv {
         let mut inherent: Vec<(&ImplInfo, &FunctionSig)> = Vec::new();
         let mut trait_methods: Vec<(&ImplInfo, &FunctionSig)> = Vec::new();
         for imp in &self.impls {
-            if imp.target_type != target_type {
+            if imp.target_type != target_type || !impl_args_match(&imp.target_args, target_args) {
                 continue;
             }
             let Some(sig) = imp.methods.get(method) else {
@@ -1529,27 +1608,29 @@ impl TypeEnv {
         let Some(trait_name) = bound.path.last() else {
             return false;
         };
-        let Some(ty_key) = impl_table_key(ty) else {
+        let Some((ty_name, ty_args)) = impl_table_key(ty) else {
             // Type variables, function types, etc. don't appear in
             // `env.impls`. Conservative: drop. Generic call-site resolution
             // against bounds (item 8 of the method-resolution CR) is a
             // separate slice that handles `TypeParam` receivers properly.
             return false;
         };
-        self.type_satisfies_trait(&ty_key, trait_name)
+        self.type_satisfies_trait(&ty_name, &ty_args, trait_name)
     }
 
     /// `true` when `ty_name` impls `trait_name` directly OR impls some
     /// trait whose supertrait closure reaches `trait_name`. The walk is
-    /// finite — supertrait graphs are acyclic by construction.
-    fn type_satisfies_trait(&self, ty_name: &str, trait_name: &str) -> bool {
-        if self.has_impl(trait_name, ty_name) {
+    /// finite — supertrait graphs are acyclic by construction. The
+    /// `ty_args` parameter applies the Theme-4 args-match rule when
+    /// scanning the impl table.
+    fn type_satisfies_trait(&self, ty_name: &str, ty_args: &[Type], trait_name: &str) -> bool {
+        if self.has_impl(trait_name, ty_name, ty_args) {
             return true;
         }
         let directly_impld_traits: Vec<&str> = self
             .impls
             .iter()
-            .filter(|imp| imp.target_type == ty_name)
+            .filter(|imp| imp.target_type == ty_name && impl_args_match(&imp.target_args, ty_args))
             .filter_map(|imp| imp.trait_name.as_deref())
             .collect();
         for start in directly_impld_traits {
@@ -1608,14 +1689,22 @@ impl TypeEnv {
 
     /// Find a `From` impl mapping `source` → `target`. Disambiguates
     /// multiple `impl From[X] for T` impls for the same target by matching
-    /// the `from` method's first parameter type against `source`.
-    pub fn find_from_impl(&self, source: &Type, target: &str) -> Option<&ImplInfo> {
+    /// the `from` method's first parameter type against `source`. The
+    /// `target_args` parameter applies the Theme-4 args-match rule
+    /// (`&[]` selectively sees only generic-on-name From impls).
+    pub fn find_from_impl(
+        &self,
+        source: &Type,
+        target: &str,
+        target_args: &[Type],
+    ) -> Option<&ImplInfo> {
         self.impls_by_trait
             .get("From")?
             .iter()
             .map(|&i| &self.impls[i])
             .find(|imp| {
                 imp.target_type == target
+                    && impl_args_match(&imp.target_args, target_args)
                     && imp.methods.get("from").and_then(|sig| sig.params.first()) == Some(source)
             })
     }
@@ -1623,13 +1712,20 @@ impl TypeEnv {
     /// Find a `TryFrom` impl mapping `source` → `target`. Disambiguates
     /// multiple `impl TryFrom[X] for T` impls for the same target by matching
     /// the `try_from` method's first parameter type against `source`.
-    pub fn find_tryfrom_impl(&self, source: &Type, target: &str) -> Option<&ImplInfo> {
+    /// The `target_args` parameter applies the Theme-4 args-match rule.
+    pub fn find_tryfrom_impl(
+        &self,
+        source: &Type,
+        target: &str,
+        target_args: &[Type],
+    ) -> Option<&ImplInfo> {
         self.impls_by_trait
             .get("TryFrom")?
             .iter()
             .map(|&i| &self.impls[i])
             .find(|imp| {
                 imp.target_type == target
+                    && impl_args_match(&imp.target_args, target_args)
                     && imp
                         .methods
                         .get("try_from")
@@ -1825,6 +1921,15 @@ pub enum TypeErrorKind {
     /// (currently: synthesis-mode `let` bindings without an annotation).
     /// Item 131 sub-step 2a.
     CannotInferTypeParam,
+    /// Two impls would coexist on the same `(trait_name, target_type)`
+    /// where one is generic-on-name (`impl Foo for Bar[T]`) and the other
+    /// is specialized to a concrete instantiation (`impl Foo for
+    /// Bar[i32]`), or both are specialized to the same concrete
+    /// instantiation. v1 rejects the overlap at impl registration time
+    /// rather than picking a winner at the call site (Rust-style
+    /// specialization is post-v1). Theme-4 slice — see
+    /// `phase-4-interpreter.md` § `impl Option[Ordering]` deferred entry.
+    ConflictingImpl,
 }
 
 impl std::fmt::Display for TypeError {
@@ -2395,13 +2500,13 @@ impl<'a> TypeChecker<'a> {
             Type::Array { element, .. } => self.type_supports_partial_eq(element),
             Type::Slice { element, .. } => self.type_supports_partial_eq(element),
             Type::Ref(inner) | Type::MutRef(inner) => self.type_supports_partial_eq(inner),
-            Type::Named { name, .. } => {
+            Type::Named { name, args } => {
                 // A user-provided `impl Eq for Name` is sufficient — the
                 // lowering pass dispatches `==`/`!=` through it. Falls back
                 // to `#[derive(Eq)]`/`#[derive(PartialEq)]` when no impl is
                 // registered (e.g. for compiler-provided structural eq on
                 // built-in enums like `Option`/`Result`).
-                if self.env.has_impl("Eq", name) {
+                if self.env.has_impl("Eq", name, args) {
                     return true;
                 }
                 if let Some(info) = self.env.structs.get(name) {
@@ -2541,7 +2646,7 @@ impl<'a> TypeChecker<'a> {
                     self.type_supports_display(&args[0]) && self.type_supports_display(&args[1])
                 }
                 _ => {
-                    if self.env.has_impl("Display", name) {
+                    if self.env.has_impl("Display", name, args) {
                         return true;
                     }
                     if let Some(info) = self.env.structs.get(name) {
@@ -4107,15 +4212,6 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn env_add_impl(&mut self, imp: &ImplBlock) {
-        let type_name = match &imp.target_type.kind {
-            TypeKind::Path(p) => p.segments.last().cloned().unwrap_or_default(),
-            _ => return,
-        };
-        let trait_name = imp
-            .trait_name
-            .as_ref()
-            .and_then(|p| p.segments.last().cloned());
-
         // Impl-level generic params are in scope when lowering method
         // signatures so `T` in `impl[T] Box[T] { fn echo(v: T) -> T }` is
         // recognized as a `Type::TypeParam("T")` rather than a `Type::Named
@@ -4129,6 +4225,37 @@ impl<'a> TypeChecker<'a> {
             .as_ref()
             .map(|gp| gp.params.iter().map(|p| p.name.clone()).collect())
             .unwrap_or_default();
+
+        // Lower the target type-expression through the standard pipeline so
+        // type aliases canonicalize at registration time (`type MyOpt =
+        // Option[Ordering]; impl Foo for MyOpt` resolves to target_type
+        // "Option" + target_args [Ordering] before insertion). Theme-4
+        // slice — see `phase-4-interpreter.md` § `impl Option[Ordering]`.
+        let lowered_target = self.lower_type_expr(&imp.target_type, &impl_gp_names);
+        let (type_name, target_args) = match &lowered_target {
+            Type::Named { name, args } => {
+                // Specialized impls store the concrete arg vector;
+                // generic-on-name impls (anything containing a TypeParam
+                // recursively) collapse to empty target_args so the
+                // args-match rule treats them as wildcard-match.
+                let concrete = !args.is_empty() && args.iter().all(type_is_fully_concrete);
+                if concrete {
+                    (name.clone(), args.clone())
+                } else {
+                    (name.clone(), Vec::new())
+                }
+            }
+            // Non-path target types (`impl Foo for (i32, i32)` etc.) are
+            // unsupported in v1; bail without registering. Matches the
+            // pre-Theme-4 behavior of the path-only short-circuit.
+            _ => return,
+        };
+
+        let trait_name = imp
+            .trait_name
+            .as_ref()
+            .and_then(|p| p.segments.last().cloned());
+
         let mut methods = HashMap::new();
         for item in &imp.items {
             let method = match item {
@@ -4163,8 +4290,46 @@ impl<'a> TypeChecker<'a> {
                 },
             );
         }
+
+        // Theme-4 overlap check: reject coexistence of generic-on-name and
+        // specialized impls for the same `(trait_name, target_type)` pair,
+        // and reject duplicate specialized impls on the same concrete args.
+        // Generic-vs-generic and same-args-duplicate cases are pre-existing
+        // trait-coherence concerns left unchanged. See
+        // `phase-4-interpreter.md` § `impl Option[Ordering]` for the
+        // locked design rationale (rejection over Rust-style
+        // specialization).
+        if self.impl_overlap_exists(&trait_name, &type_name, &target_args) {
+            self.type_error(
+                format!(
+                    "conflicting impl: another `impl{} {}{}` already exists; v1 \
+                     does not support generic-vs-specialized impl overlap on the \
+                     same trait + target",
+                    trait_name
+                        .as_deref()
+                        .map(|t| format!(" {} for", t))
+                        .unwrap_or_default(),
+                    type_name,
+                    if target_args.is_empty() {
+                        String::new()
+                    } else {
+                        let rendered = target_args
+                            .iter()
+                            .map(type_display)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("[{}]", rendered)
+                    },
+                ),
+                imp.span.clone(),
+                TypeErrorKind::ConflictingImpl,
+            );
+            return;
+        }
+
         self.env.add_impl(ImplInfo {
             target_type: type_name,
+            target_args,
             trait_name,
             methods,
             generic_params: imp.generic_params.clone(),
@@ -4172,8 +4337,42 @@ impl<'a> TypeChecker<'a> {
         });
     }
 
+    /// Theme-4 overlap detection. Returns `true` iff registering an impl
+    /// with `(trait_name, target_type, target_args)` would conflict with
+    /// an already-registered impl on the same `(trait_name, target_type)`
+    /// pair under the v1 rule: generic-on-name (`target_args.is_empty()`)
+    /// cannot coexist with any specialized variant, and two specialized
+    /// variants cannot vector-equal on `target_args`. Anything else
+    /// (different concrete instantiations, different traits) is fine.
+    fn impl_overlap_exists(
+        &self,
+        trait_name: &Option<String>,
+        target_type: &str,
+        target_args: &[Type],
+    ) -> bool {
+        for existing in &self.env.impls {
+            if existing.trait_name != *trait_name || existing.target_type != target_type {
+                continue;
+            }
+            let existing_empty = existing.target_args.is_empty();
+            let new_empty = target_args.is_empty();
+            if existing_empty != new_empty {
+                // generic-on-name + specialized — overlap
+                return true;
+            }
+            if !existing_empty && existing.target_args == target_args {
+                // two specialized impls on the same concrete instantiation
+                return true;
+            }
+        }
+        false
+    }
+
     /// Register a built-in stdlib impl programmatically (no AST source).
     /// Used by `register_stdlib_impls` to seed primitive operator impls.
+    /// Compiler-internal stdlib impls are unconditional and registered
+    /// with empty `target_args` (generic-on-name) so primitive operator
+    /// dispatch (`1 + 2` etc.) continues to apply uniformly.
     #[allow(dead_code)]
     fn register_builtin_impl(
         &mut self,
@@ -4187,6 +4386,7 @@ impl<'a> TypeChecker<'a> {
             .collect();
         self.env.add_impl(ImplInfo {
             target_type: target_type.to_string(),
+            target_args: Vec::new(),
             trait_name: Some(trait_name.to_string()),
             methods,
             // Compiler-internal stdlib impls are unconditional —
@@ -5658,7 +5858,14 @@ impl<'a> TypeChecker<'a> {
         }
         if let Some((target, method)) = key.split_once('.') {
             for imp in &self.env.impls {
-                if imp.target_type == target {
+                // No call-site args context here — borrow-position lookup
+                // works off the syntactic `Type.method` key. Conservative
+                // post-Theme-4: only generic-on-name impls participate;
+                // specialized impls would need an args-aware lookup that
+                // this site doesn't carry. Slice-scope deviation (no
+                // currently-realistic specialized-impl case for borrow
+                // positions).
+                if imp.target_type == target && imp.target_args.is_empty() {
                     if let Some(sig) = imp.methods.get(method) {
                         return Some(sig.params.iter().map(Self::is_borrow_param_type).collect());
                     }
@@ -5832,7 +6039,13 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 // Supertrait constraint: every supertrait of `trait_name` must
-                // have an impl for the same target type.
+                // have an impl for the same target type. Theme-4 deviation:
+                // when `imp` is specialized (`impl Foo for Bar[i32]`), the
+                // ideal supertrait check would require `impl SuperFoo for
+                // Bar[i32]` specifically; currently we accept either a
+                // matching specialized supertrait OR a generic-on-name
+                // supertrait. Tightening is out of scope until a real
+                // specialized-with-supertrait case appears.
                 for supertrait in &trait_info.supertraits {
                     let has_impl = self.env.impls.iter().any(|info| {
                         info.trait_name.as_deref() == Some(supertrait.as_str())
@@ -6419,6 +6632,7 @@ impl<'a> TypeChecker<'a> {
                     .iter()
                     .filter(|imp| {
                         imp.target_type == *target_name
+                            && impl_args_match(&imp.target_args, target_args)
                             && imp.methods.contains_key(name)
                             && self.env.impl_bounds_discharge(imp, target_args)
                     })
@@ -6656,7 +6870,11 @@ impl<'a> TypeChecker<'a> {
             self.record_expr_type(&expr.span, &Type::Error);
             return Some(Type::Error);
         }
-        if self.env.find_from_impl(&src_ty, &target_name).is_some() {
+        if self
+            .env
+            .find_from_impl(&src_ty, &target_name, &[])
+            .is_some()
+        {
             self.into_conversions
                 .insert(SpanKey::from_span(&expr.span), target_name);
             self.record_expr_type(&expr.span, expected);
@@ -6714,7 +6932,11 @@ impl<'a> TypeChecker<'a> {
             self.record_expr_type(&expr.span, &Type::Error);
             return Some(Type::Error);
         }
-        if self.env.find_tryfrom_impl(&src_ty, &target_name).is_some() {
+        if self
+            .env
+            .find_tryfrom_impl(&src_ty, &target_name, &[])
+            .is_some()
+        {
             self.try_into_conversions
                 .insert(SpanKey::from_span(&expr.span), target_name);
             self.record_expr_type(&expr.span, expected);
@@ -7520,9 +7742,14 @@ impl<'a> TypeChecker<'a> {
                 }
             }
 
-            // Check for associated function (from impl)
+            // Check for associated function (from impl). No call-site args
+            // context — type_name comes from a Path expression without
+            // generic args. Theme-4 conservative: only generic-on-name
+            // impls participate; specialized impls (`impl Foo for
+            // Bar[i32]`) need an args-aware path-expr lookup that this
+            // site doesn't carry.
             for imp in &self.env.impls.clone() {
-                if imp.target_type == *type_name {
+                if imp.target_type == *type_name && imp.target_args.is_empty() {
                     if let Some(sig) = imp.methods.get(member) {
                         return Type::Function {
                             params: sig.params.clone(),
@@ -8288,7 +8515,11 @@ impl<'a> TypeChecker<'a> {
                         return Type::Error;
                     }
                 };
-                if self.env.find_from_impl(inner_err, &target_name).is_some() {
+                if self
+                    .env
+                    .find_from_impl(inner_err, &target_name, &[])
+                    .is_some()
+                {
                     self.question_conversions
                         .insert(SpanKey::from_span(span), target_name.clone());
                     return inner_args[0].clone();
@@ -8744,7 +8975,11 @@ impl<'a> TypeChecker<'a> {
             };
             if let Some(resource) = resource_name {
                 let impl_sig = self.env.impls.iter().find_map(|imp| {
-                    if imp.target_type == resource {
+                    // Lowercase-module dispatch (`env.args()`) targets
+                    // ambient resource impls registered with empty
+                    // target_args; specialized variants of these don't
+                    // exist today.
+                    if imp.target_type == resource && imp.target_args.is_empty() {
                         imp.methods.get(method).cloned()
                     } else {
                         None
@@ -8818,7 +9053,7 @@ impl<'a> TypeChecker<'a> {
                     if arg_ty == Type::Error {
                         return Type::Error;
                     }
-                    if let Some(imp) = self.env.find_from_impl(&arg_ty, type_name) {
+                    if let Some(imp) = self.env.find_from_impl(&arg_ty, type_name, &[]) {
                         return imp
                             .methods
                             .get("from")
@@ -8840,7 +9075,7 @@ impl<'a> TypeChecker<'a> {
                 // type with inherent-beats-trait priority per design.md
                 // § Method Resolution Step 3. Multi-inherent / multi-trait
                 // ambiguity detection (Step 4) is deferred.
-                if let Some(sig) = self.env.find_method(type_name, method).cloned() {
+                if let Some(sig) = self.env.find_method(type_name, &[], method).cloned() {
                     if args.len() != sig.params.len() {
                         self.type_error(
                             format!(
@@ -9354,7 +9589,7 @@ impl<'a> TypeChecker<'a> {
                     || self.env.enums.contains_key(&type_name))
                     && !crate::prelude::PRELUDE_TYPES.contains(&type_name.as_str());
                 if is_user_defined {
-                    let candidates = self.env.collect_method_names(&type_name);
+                    let candidates = self.env.collect_method_names(&type_name, &[]);
                     let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
                     let mut msg = format!("no method '{}' on type '{}'", method, type_name);
                     if let Some(suggestion) =
