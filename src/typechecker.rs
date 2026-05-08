@@ -4116,13 +4116,28 @@ impl<'a> TypeChecker<'a> {
             .as_ref()
             .and_then(|p| p.segments.last().cloned());
 
+        // Impl-level generic params are in scope when lowering method
+        // signatures so `T` in `impl[T] Box[T] { fn echo(v: T) -> T }` is
+        // recognized as a `Type::TypeParam("T")` rather than a `Type::Named
+        // { "T", [] }` fallback. The method's own generic params extend the
+        // scope; the per-method `generic_params` field on `FunctionSig`
+        // continues to record only the method's own names so generic-call
+        // inference at the use site doesn't accidentally rebind the
+        // impl-level params.
+        let impl_gp_names: Vec<String> = imp
+            .generic_params
+            .as_ref()
+            .map(|gp| gp.params.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
         let mut methods = HashMap::new();
         for item in &imp.items {
             let method = match item {
                 ImplItem::Method(m) => m,
                 ImplItem::AssocType(_) => continue,
             };
-            let gp = Self::generic_param_names(&method.generic_params);
+            let method_gp = Self::generic_param_names(&method.generic_params);
+            let mut lowering_scope = impl_gp_names.clone();
+            lowering_scope.extend(method_gp.iter().cloned());
             let param_names: Vec<Option<String>> = method
                 .params
                 .iter()
@@ -4131,17 +4146,17 @@ impl<'a> TypeChecker<'a> {
             let params: Vec<Type> = method
                 .params
                 .iter()
-                .map(|p| self.lower_type_expr(&p.ty, &gp))
+                .map(|p| self.lower_type_expr(&p.ty, &lowering_scope))
                 .collect();
             let return_type = method
                 .return_type
                 .as_ref()
-                .map(|t| self.lower_type_expr(t, &gp))
+                .map(|t| self.lower_type_expr(t, &lowering_scope))
                 .unwrap_or(Type::Unit);
             methods.insert(
                 method.name.clone(),
                 FunctionSig {
-                    generic_params: gp,
+                    generic_params: method_gp,
                     param_names,
                     params,
                     return_type,
@@ -8850,6 +8865,92 @@ impl<'a> TypeChecker<'a> {
                 }
                 // Known type but no matching method — fall through so the
                 // existing "method not found" diagnostic fires below.
+            }
+        }
+
+        // Concrete-type UFCS dispatch — `TypeName[T1, T2, ...].method(args)`.
+        // The parser disambiguates `TypeName[…].method(` to a single-segment
+        // `Path { generic_args: Some(...) }` object; here we route through
+        // `find_methods_with_args` so impl-level bounds discharge against
+        // the explicit type-args, then substitute each impl-level generic
+        // param with its concrete arg in the sig before validating call args.
+        // (Sub-item 5B of `phase-4-interpreter.md` § method resolution;
+        // canonical entry at `phase-2-parser-ast.md` § "Path expression with
+        // generic args — concrete-type UFCS support".)
+        if let ExprKind::Path {
+            segments,
+            generic_args: Some(generic_args),
+        } = &object.kind
+        {
+            if segments.len() == 1 {
+                let type_name = segments[0].clone();
+                let target_args: Vec<Type> = generic_args
+                    .iter()
+                    .map(|t| self.lower_type_expr(t, &[]))
+                    .collect();
+                self.method_callee_types.insert(
+                    SpanKey::from_span(span),
+                    format!("{}.{}", type_name, method),
+                );
+                let candidates: Vec<(ImplInfo, FunctionSig)> = self
+                    .env
+                    .find_methods_with_args(&type_name, &target_args, method)
+                    .into_iter()
+                    .map(|(imp, sig)| (imp.clone(), sig.clone()))
+                    .collect();
+                if let Some((imp, sig)) = candidates.first() {
+                    let subs: HashMap<String, Type> = imp
+                        .generic_params
+                        .as_ref()
+                        .map(|gp| {
+                            gp.params
+                                .iter()
+                                .zip(target_args.iter())
+                                .map(|(p, t)| (p.name.clone(), t.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let param_types: Vec<Type> = sig
+                        .params
+                        .iter()
+                        .map(|p| substitute_type_params(p, &subs))
+                        .collect();
+                    let return_ty = substitute_type_params(&sig.return_type, &subs);
+                    if args.len() != param_types.len() {
+                        self.type_error(
+                            format!(
+                                "method '{}' expects {} argument(s), found {}",
+                                method,
+                                param_types.len(),
+                                args.len()
+                            ),
+                            span.clone(),
+                            TypeErrorKind::WrongNumberOfArgs,
+                        );
+                        for arg in args {
+                            self.infer_expr(&arg.value);
+                        }
+                        return return_ty;
+                    }
+                    for (arg, param) in args.iter().zip(param_types.iter()) {
+                        let arg_ty = self.infer_expr(&arg.value);
+                        self.check_assignable(param, &arg_ty, arg.value.span.clone());
+                    }
+                    return return_ty;
+                }
+                // No matching impl-table entry. Built-in types (Vec, Option,
+                // etc.) whose methods dispatch through special-case infer
+                // paths rather than `env.impls` are out of scope for this
+                // slice; falling through to a focused diagnostic.
+                self.type_error(
+                    format!("no method '{}' on `{}[…]`", method, type_name),
+                    span.clone(),
+                    TypeErrorKind::NoMethodFound,
+                );
+                for arg in args {
+                    self.infer_expr(&arg.value);
+                }
+                return Type::Error;
             }
         }
 

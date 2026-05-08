@@ -30,7 +30,7 @@
   4. [x] **Typechecker tests.** 5 new tests in `tests/typechecker.rs`: happy path, missing TryFrom impl, multi-impl disambiguation by source, non-Result expected does not fire recognizer (asserted by inspecting `try_into_conversions` size), source-type mismatch (recognizer fires but `find_tryfrom_impl` returns None, diagnostic names the source type). *Out of scope, surfaced during testing:* method-call inference for unknown methods is currently silent (`let v: Validated = r.unknown_method()` typechecks); separate language-quality issue, not introduced by this round.
   5. [x] **Effectchecker tests.** 1 new test in `tests/effectchecker.rs` using the existing `effectcheck_full_pipeline` helper: TryFrom impl with `writes(Log)` propagates through `.try_into()` to the caller. Confirms the round-6 step-3 lowered-call path now applies via the sugar with no further effectchecker changes.
 
-- [ ] **Path expression with generic args — concrete-type UFCS support.** Discovered 2026-05-07 during method-resolution slice-2 grounding (see `phase-4-interpreter.md` item 5). `Vec[i64].new()` currently parses as `MethodCall { object: PrefixCollectionLiteral { type_name: "Vec", items: [Identifier("i64")] }, method: "new", args: [] }` — i.e., `Vec[i64]` is treated as a one-element collection literal containing the identifier `i64`. The intended parse for concrete-type UFCS (per `design.md:226` example `Vec[i32].default()`) is a path-with-generic-args expression form, e.g. `MethodCall { object: PathExpr { segments: ["Vec"], generic_args: Some([i64]) }, method: "new", ... }` or similar. Today's `ExprKind::Path` is bare `Vec<String>` with no generic-args slot, so even if the parser disambiguated, the AST couldn't carry the args.
+- [x] **Path expression with generic args — concrete-type UFCS support.** Discovered 2026-05-07 during method-resolution slice-2 grounding (see `phase-4-interpreter.md` item 5). `Vec[i64].new()` currently parses as `MethodCall { object: PrefixCollectionLiteral { type_name: "Vec", items: [Identifier("i64")] }, method: "new", args: [] }` — i.e., `Vec[i64]` is treated as a one-element collection literal containing the identifier `i64`. The intended parse for concrete-type UFCS (per `design.md:226` example `Vec[i32].default()`) is a path-with-generic-args expression form, e.g. `MethodCall { object: PathExpr { segments: ["Vec"], generic_args: Some([i64]) }, method: "new", ... }` or similar. Today's `ExprKind::Path` is bare `Vec<String>` with no generic-args slot, so even if the parser disambiguated, the AST couldn't carry the args.
 
   **Design lock (2026-05-08): option (a) — extend `ExprKind::Path`.**
   Sized via a grep pass that found 59 `ExprKind::Path` sites across 15
@@ -114,7 +114,7 @@
       option (b)-style parallel handling, which would invalidate the
       design lock).
 
-  - [ ] **Slice B — Parser disambiguation + typechecker tail.**
+  - [x] **Slice B — Parser disambiguation + typechecker tail.**
     Behavioral change; lands concrete-type UFCS as a working surface.
     - *Goal.* `Vec[i64].new()` parses to `MethodCall { object: Path { segments: ["Vec"], generic_args: Some([i64]) }, method: "new", … }`
       and typechecks through the bound-discharge engine. Sub-item 5B

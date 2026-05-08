@@ -5355,3 +5355,218 @@ fn multiple_anon_params_each_get_their_own_diagnostic() {
     assert!(errors[0].message.contains("_: i32"));
     assert!(errors[1].message.contains("_: bool"));
 }
+
+// ── Concrete-type UFCS — `TypeName[T1, ...].method(...)` ────────
+//
+// Slice B of the parser CR (phase-2-parser-ast.md § "Path expression
+// with generic args — concrete-type UFCS support"). The parser emits a
+// single-segment `Path { generic_args: Some(...) }` when an uppercase
+// identifier with `[…]` is followed by `.method(`, leaving collection-
+// literal shapes (`[1, 2]`, `Vec[1, 2]`, etc.) untouched.
+
+/// Extract the body's terminal expression from a single function program.
+fn fn_terminal_expr(program: &Program, fn_name: &str) -> Expr {
+    let Item::Function(f) = program
+        .items
+        .iter()
+        .find(|i| matches!(i, Item::Function(f) if f.name == fn_name))
+        .unwrap_or_else(|| panic!("function `{}` not found", fn_name))
+    else {
+        unreachable!()
+    };
+    (**f.body
+        .final_expr
+        .as_ref()
+        .expect("expected tail expression"))
+    .clone()
+}
+
+#[test]
+fn concrete_type_ufcs_single_arg_path_with_generic_args() {
+    // `Vec[i64].new()` parses as
+    // `MethodCall { object: Path { segments: [Vec], generic_args: Some([i64]) }, method: "new", … }`.
+    let prog = parse_ok("fn f() { Vec[i64].new() }");
+    let expr = fn_terminal_expr(&prog, "f");
+    let ExprKind::MethodCall {
+        object,
+        method,
+        args,
+        ..
+    } = &expr.kind
+    else {
+        panic!("expected MethodCall, got {:?}", expr.kind);
+    };
+    assert_eq!(method, "new");
+    assert!(args.is_empty());
+    let ExprKind::Path {
+        segments,
+        generic_args,
+    } = &object.kind
+    else {
+        panic!("expected Path object, got {:?}", object.kind);
+    };
+    assert_eq!(segments, &["Vec".to_string()]);
+    let ga = generic_args.as_ref().expect("expected Some generic_args");
+    assert_eq!(ga.len(), 1);
+    assert!(matches!(&ga[0].kind, TypeKind::Path(p) if p.segments == ["i64"]));
+}
+
+#[test]
+fn concrete_type_ufcs_multi_arg_path() {
+    // Multi-arg generic args `HashMap[String, i32].default()`. The parser
+    // doesn't recognize HashMap as a collection literal, so this exercises
+    // the disambiguation path on a non-`Vec | Array | Set | Map` type name.
+    let prog = parse_ok("fn f() { HashMap[String, i32].default() }");
+    let expr = fn_terminal_expr(&prog, "f");
+    let ExprKind::MethodCall { object, method, .. } = &expr.kind else {
+        panic!("expected MethodCall");
+    };
+    assert_eq!(method, "default");
+    let ExprKind::Path {
+        segments,
+        generic_args,
+    } = &object.kind
+    else {
+        panic!("expected Path");
+    };
+    assert_eq!(segments, &["HashMap".to_string()]);
+    let ga = generic_args.as_ref().expect("expected Some generic_args");
+    assert_eq!(ga.len(), 2);
+    assert!(matches!(&ga[0].kind, TypeKind::Path(p) if p.segments == ["String"]));
+    assert!(matches!(&ga[1].kind, TypeKind::Path(p) if p.segments == ["i32"]));
+}
+
+#[test]
+fn concrete_type_ufcs_nested_generics() {
+    // `Vec[Map[K, V]].new()` — nested generics inside the type arg.
+    // Balanced-bracket scan must skip over the inner `[K, V]` to reach the
+    // outer `]` before validating the trailing `.method(`.
+    let prog = parse_ok("fn f() { Vec[Map[K, V]].new() }");
+    let expr = fn_terminal_expr(&prog, "f");
+    let ExprKind::MethodCall { object, method, .. } = &expr.kind else {
+        panic!("expected MethodCall");
+    };
+    assert_eq!(method, "new");
+    let ExprKind::Path {
+        segments,
+        generic_args,
+    } = &object.kind
+    else {
+        panic!("expected Path");
+    };
+    assert_eq!(segments, &["Vec".to_string()]);
+    let ga = generic_args.as_ref().expect("expected Some generic_args");
+    assert_eq!(ga.len(), 1);
+    let TypeKind::Path(inner_path) = &ga[0].kind else {
+        panic!("expected nested Path type");
+    };
+    assert_eq!(inner_path.segments, vec!["Map".to_string()]);
+    let inner_ga = inner_path
+        .generic_args
+        .as_ref()
+        .expect("nested generic_args");
+    assert_eq!(inner_ga.len(), 2);
+}
+
+#[test]
+fn concrete_type_ufcs_chained_method_calls() {
+    // `Vec[i64].new().push(1)` — UFCS dispatch followed by another method
+    // call. The Pratt loop's postfix `.` handler should attach `.push(1)`
+    // to the `MethodCall { object: Path … new }` node naturally.
+    let prog = parse_ok("fn f() { Vec[i64].new().push(1) }");
+    let expr = fn_terminal_expr(&prog, "f");
+    let ExprKind::MethodCall {
+        object,
+        method,
+        args,
+        ..
+    } = &expr.kind
+    else {
+        panic!("expected outer MethodCall");
+    };
+    assert_eq!(method, "push");
+    assert_eq!(args.len(), 1);
+    let ExprKind::MethodCall {
+        method: inner_method,
+        object: inner_object,
+        ..
+    } = &object.kind
+    else {
+        panic!("expected inner MethodCall");
+    };
+    assert_eq!(inner_method, "new");
+    assert!(matches!(
+        &inner_object.kind,
+        ExprKind::Path { segments, generic_args: Some(_) } if segments == &["Vec".to_string()]
+    ));
+}
+
+#[test]
+fn collection_literal_with_int_first_element_still_parses_as_literal() {
+    // Regression guard: `Vec[1, 2].push(3)` must continue to parse as
+    // `MethodCall { object: PrefixCollectionLiteral { Vec, [1, 2] }, … }`.
+    // The disambiguation rule's first-token heuristic rejects integer-
+    // literal start, so the UFCS branch falls through to the existing
+    // PrefixCollectionLiteral path.
+    let prog = parse_ok("fn f() { Vec[1, 2].push(3) }");
+    let expr = fn_terminal_expr(&prog, "f");
+    let ExprKind::MethodCall { object, .. } = &expr.kind else {
+        panic!("expected MethodCall");
+    };
+    assert!(matches!(
+        &object.kind,
+        ExprKind::PrefixCollectionLiteral { type_name, .. } if type_name == "Vec"
+    ));
+}
+
+#[test]
+fn bare_array_literal_one_element_unchanged() {
+    // Regression guard: `[1].len()` parses as a method call on a one-
+    // element array literal, not as UFCS (no leading uppercase identifier
+    // means the disambiguation branch never fires).
+    let prog = parse_ok("fn f() { [1].len() }");
+    let expr = fn_terminal_expr(&prog, "f");
+    let ExprKind::MethodCall { object, .. } = &expr.kind else {
+        panic!("expected MethodCall");
+    };
+    assert!(matches!(&object.kind, ExprKind::ArrayLiteral(_)));
+}
+
+#[test]
+fn vec_repeat_literal_unchanged_under_ufcs_rule() {
+    // `Vec[42; 100]` must continue to parse as RepeatLiteral, not UFCS.
+    // The disambiguation lookahead bails on `[42` (first token `42` is an
+    // integer literal — not a type-start), and the existing RepeatLiteral
+    // branch consumes the bracket pair.
+    let prog = parse_ok("fn main() { let x = Vec[42; 100]; }");
+    if let Item::Function(f) = &prog.items[0] {
+        if let StmtKind::Let { value, .. } = &f.body.stmts[0].kind {
+            assert!(matches!(value.kind, ExprKind::RepeatLiteral { .. }));
+        } else {
+            panic!("expected Let");
+        }
+    } else {
+        panic!("expected Function");
+    }
+}
+
+#[test]
+fn standalone_ufcs_path_without_method_call_is_not_promoted() {
+    // `let v: Vec[i64] = Vec[]` — the type annotation is a type position
+    // (handled by parse_type) and the RHS `Vec[]` is an empty collection
+    // literal. Neither triggers UFCS because no `.method(` follows the `]`.
+    let prog = parse_ok("fn f() { let v: Vec[i64] = Vec[]; }");
+    if let Item::Function(f) = &prog.items[0] {
+        if let StmtKind::Let { value, .. } = &f.body.stmts[0].kind {
+            assert!(matches!(
+                &value.kind,
+                ExprKind::PrefixCollectionLiteral { type_name, items, .. }
+                    if type_name == "Vec" && items.is_empty()
+            ));
+        } else {
+            panic!("expected Let");
+        }
+    } else {
+        panic!("expected Function");
+    }
+}

@@ -4401,6 +4401,37 @@ impl Parser {
             return self.parse_struct_literal_body(vec![name], &start);
         }
 
+        // Concrete-type UFCS: `TypeName[Type, ...].method(...)`. When an
+        // uppercase identifier is followed by `[…]` and immediately by
+        // `.identifier(`, the `[…]` carries generic type arguments rather
+        // than a collection literal. Emit `Path { segments, generic_args }`
+        // so the postfix `.method(...)` chain produces a `MethodCall` whose
+        // object resolves through `find_method_with_args`.
+        if starts_upper(&name)
+            && self.check(&Token::LeftBracket)
+            && self.lookahead_concrete_type_ufcs()
+        {
+            self.advance(); // consume [
+            let mut args = Vec::new();
+            loop {
+                if self.check(&Token::RightBracket) {
+                    break;
+                }
+                args.push(self.parse_type()?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Token::RightBracket)?;
+            return Some(Expr {
+                span: self.span_from(&start),
+                kind: ExprKind::Path {
+                    segments: vec![name],
+                    generic_args: Some(args),
+                },
+            });
+        }
+
         // Prefix collection literal: `Vec[e1, e2, ...]` / `Array[e1, e2, ...]`
         // / `Vec[v; n]` / `Array[v; n]`. Intercept before the postfix `[` index
         // loop so the bracket is consumed as part of the literal, not as a
@@ -4480,6 +4511,72 @@ impl Parser {
             span: self.span_from(&start),
             kind: ExprKind::Identifier(name),
         })
+    }
+
+    /// Concrete-type UFCS lookahead — `self.pos` must point at the `[`
+    /// following an uppercase identifier. Returns `true` when the bracket
+    /// pair encloses a type-shaped expression (first inner token starts a
+    /// type, per [`Self::starts_type`]) AND is immediately followed by
+    /// `.identifier(` — i.e., the whole prefix forms `TypeName[…].method(`.
+    /// Balanced-bracket scan handles nested generics like `Vec[Map[K, V]]`.
+    /// On any other shape (collection literal, value-shaped subscript,
+    /// trailing `.field` field-access without parens) returns `false` so
+    /// the caller falls through to the existing parse paths.
+    fn lookahead_concrete_type_ufcs(&self) -> bool {
+        // Require at least one token inside `[…]` and check it is a
+        // type-start; rejects `Vec[1, 2].push(3)` (integer literal start)
+        // before any bracket scan.
+        let inner_start = self.pos + 1;
+        if inner_start >= self.tokens.len() {
+            return false;
+        }
+        if !Self::starts_type(&self.tokens[inner_start].token) {
+            return false;
+        }
+        // Balanced-bracket scan from the opening `[`.
+        let mut depth: usize = 0;
+        let mut i = self.pos;
+        while i < self.tokens.len() {
+            match &self.tokens[i].token {
+                Token::LeftBracket => depth += 1,
+                Token::RightBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // After matching `]`, expect `.IDENT (` for UFCS
+                        // dispatch.
+                        let a = i + 1;
+                        let b = i + 2;
+                        let c = i + 3;
+                        if c >= self.tokens.len() {
+                            return false;
+                        }
+                        return self.tokens[a].token == Token::Dot
+                            && matches!(self.tokens[b].token, Token::Identifier { .. })
+                            && self.tokens[c].token == Token::LeftParen;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// First-token heuristic for "looks like the start of a type expression"
+    /// — used by [`Self::lookahead_concrete_type_ufcs`] to reject value-
+    /// shaped collection contents (integer literals, string literals, etc.)
+    /// before committing to the UFCS branch.
+    fn starts_type(tok: &Token) -> bool {
+        matches!(
+            tok,
+            Token::Identifier { .. }
+                | Token::SelfType
+                | Token::Ref
+                | Token::Mut
+                | Token::Weak
+                | Token::Star
+                | Token::LeftParen
+        )
     }
 
     fn looks_like_struct_literal(&self) -> bool {

@@ -9594,3 +9594,109 @@ fn baked_eq_user_impl_without_partial_eq_companion_fails() {
             .collect::<Vec<_>>()
     );
 }
+
+// ── Concrete-type UFCS — `TypeName[T1, …].method(…)` ────────────
+//
+// Slice B of phase-2 parser CR (sub-item 5B of phase-4 method
+// resolution roadmap). Routes the parser's new path-with-generic-args
+// shape through `find_methods_with_args` + `impl_bounds_discharge`,
+// substituting impl-level generic params with the explicit type-args
+// before validating the call.
+
+#[test]
+fn ufcs_concrete_type_dispatches_to_impl_method() {
+    typecheck_ok(
+        "struct Box[T] { val: T }\n\
+         impl[T] Box[T] {\n\
+             fn echo(v: T) -> T { v }\n\
+         }\n\
+         fn f() -> i64 { Box[i64].echo(42) }",
+    );
+}
+
+#[test]
+fn ufcs_concrete_type_substitutes_return_type() {
+    // The receiver's explicit T=String substitutes through the impl-level
+    // generic param, so `echo` returns `String`. A binding annotated
+    // `i64` must therefore fail with TypeMismatch.
+    let errors = typecheck_errors(
+        "struct Box[T] { val: T }\n\
+         impl[T] Box[T] {\n\
+             fn echo(v: T) -> T { v }\n\
+         }\n\
+         fn f() { let _w: i64 = Box[String].echo(\"hi\"); }",
+    );
+    assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch from String-vs-i64 substitution, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ufcs_concrete_type_substitutes_param_types() {
+    // Pass an i64 to a method whose param is `T` after T=String substitution
+    // — the substituted param type is String, so the i64 argument fails.
+    let errors = typecheck_errors(
+        "struct Box[T] { val: T }\n\
+         impl[T] Box[T] {\n\
+             fn echo(v: T) -> T { v }\n\
+         }\n\
+         fn f() { let _w = Box[String].echo(42); }",
+    );
+    assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch on the i64 arg, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ufcs_concrete_type_no_method_found_diagnostic() {
+    // Method that does not exist on the impl produces NoMethodFound.
+    let errors = typecheck_errors(
+        "struct Box[T] { val: T }\n\
+         impl[T] Box[T] {\n\
+             fn echo(v: T) -> T { v }\n\
+         }\n\
+         fn f() { Box[i64].nonexistent(); }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::NoMethodFound),
+        "expected NoMethodFound, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ufcs_bound_discharge_satisfied() {
+    // `impl[T: Ord] Box[T] { fn echo(v: T) -> T }` —
+    // calling `Box[i64].echo(...)` discharges T: Ord (i64 impls Ord).
+    typecheck_ok(
+        "struct Sortable[T] { val: T }\n\
+         impl[T: Ord] Sortable[T] {\n\
+             fn echo(v: T) -> T { v }\n\
+         }\n\
+         fn f() -> i64 { Sortable[i64].echo(7) }",
+    );
+}
+
+#[test]
+fn ufcs_arg_count_mismatch() {
+    let errors = typecheck_errors(
+        "struct Box[T] { val: T }\n\
+         impl[T] Box[T] {\n\
+             fn echo(v: T) -> T { v }\n\
+         }\n\
+         fn f() { Box[i64].echo(1, 2); }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs),
+        "expected WrongNumberOfArgs, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
