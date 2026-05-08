@@ -1071,3 +1071,213 @@ fn step6_closure_created_inside_par_still_promotes_capture() {
         arc,
     );
 }
+
+// ── Phase 2 boundary: Sender.send(closure) ──────────────────────
+//
+// Theme 2 of wip-list2 (2026-05-08): teach the par-walker to flip
+// `inside_parallel_region` when traversing into a `Sender.send(...)`
+// argument expression. Captures of any RC-marked closure passed
+// through the channel get promoted to Arc by the same machinery that
+// handles `par { h(); }`. The `spawn(closure)` boundary stays
+// deferred to Phase 6.3 / v1.1 user syntax.
+
+#[test]
+fn phase2_send_closure_promotes_capture_to_arc() {
+    // Positive base case: closure h captures cfg (RC-marked from
+    // trigger 2 — capture + outer use), then the closure binding is
+    // sent via `tx.send(h)` against a Channel-destructured Sender.
+    // Theme 2 lifts cfg to Arc via the channel-send boundary.
+    let src = "struct Config { name: i64 }\n\
+               fn apply(c: Config) { }\n\
+               fn log(c: Config) { }\n\
+               fn make_handler(cfg: Config) {\n\
+                   let (tx, rx) = Channel.new();\n\
+                   let h = || apply(cfg);\n\
+                   log(cfg);\n\
+                   tx.send(h);\n\
+               }";
+    let result = run(src);
+    assert!(
+        result.errors.is_empty(),
+        "expected no errors, got {:?}",
+        result.errors
+    );
+    let entry = rc_entry(&result, "make_handler", "cfg");
+    assert_eq!(entry.trigger, RcTrigger::ClosureCaptureWithOuterUse);
+    let arc = result
+        .arc_values
+        .get("make_handler")
+        .expect("expected an Arc set for make_handler");
+    assert!(
+        arc.contains("cfg"),
+        "expected 'cfg' to be Arc-promoted via tx.send(h); got arc={:?}",
+        arc,
+    );
+}
+
+#[test]
+fn phase2_clone_send_closure_promotes_capture_to_arc() {
+    // Cloned-sender path: `tx.clone().send(h)`. The receiver of
+    // `.send(...)` is `tx.clone()`, which the resolver unwraps one
+    // level back to `tx` — itself a Sender — so the boundary still
+    // fires. Mirrors the round-8 channel-send escape detection's
+    // existing handling of cloned senders.
+    let src = "struct Config { name: i64 }\n\
+               fn apply(c: Config) { }\n\
+               fn log(c: Config) { }\n\
+               fn make_handler(cfg: Config) {\n\
+                   let (tx, rx) = Channel.new();\n\
+                   let h = || apply(cfg);\n\
+                   log(cfg);\n\
+                   tx.clone().send(h);\n\
+               }";
+    let result = run(src);
+    assert!(
+        result.errors.is_empty(),
+        "expected no errors, got {:?}",
+        result.errors
+    );
+    rc_entry(&result, "make_handler", "cfg");
+    let arc = result
+        .arc_values
+        .get("make_handler")
+        .expect("expected an Arc set for make_handler");
+    assert!(
+        arc.contains("cfg"),
+        "expected 'cfg' to be Arc-promoted through tx.clone().send(h); got arc={:?}",
+        arc,
+    );
+}
+
+#[test]
+fn phase2_send_param_typed_sender_promotes_capture() {
+    // Param-form: function takes a `tx: Sender[Fn() -> ()]` parameter
+    // — the param-seed in `promote_for_function` registers tx into
+    // `let_types` at function entry, so `tx.send(h)` inside the body
+    // resolves through the parameter annotation rather than a local
+    // Channel.new() destructure. Verifies sub-step (d) of the slice
+    // plan (function-parameter Sender[T] annotations).
+    let src = "struct Config { name: i64 }\n\
+               fn apply(c: Config) { }\n\
+               fn log(c: Config) { }\n\
+               fn make_handler(tx: Sender[Fn() -> ()], cfg: Config) {\n\
+                   let h = || apply(cfg);\n\
+                   log(cfg);\n\
+                   tx.send(h);\n\
+               }";
+    let result = run(src);
+    assert!(
+        result.errors.is_empty(),
+        "expected no errors, got {:?}",
+        result.errors
+    );
+    rc_entry(&result, "make_handler", "cfg");
+    let arc = result
+        .arc_values
+        .get("make_handler")
+        .expect("expected an Arc set for make_handler");
+    assert!(
+        arc.contains("cfg"),
+        "expected 'cfg' to be Arc-promoted via tx: Sender[T] parameter; got arc={:?}",
+        arc,
+    );
+}
+
+#[test]
+fn phase2_no_par_no_send_keeps_rc() {
+    // Negative control: closure h captures cfg (RC-marked) but is
+    // only invoked locally — no par, no Sender.send. cfg stays at Rc.
+    // Pins that the boundary fires only at the channel-send site, not
+    // for arbitrary closure invocation.
+    let src = "struct Config { name: i64 }\n\
+               fn apply(c: Config) { }\n\
+               fn log(c: Config) { }\n\
+               fn make_handler(cfg: Config) {\n\
+                   let h = || apply(cfg);\n\
+                   log(cfg);\n\
+                   h();\n\
+               }";
+    let result = run(src);
+    assert!(
+        result.errors.is_empty(),
+        "expected no errors, got {:?}",
+        result.errors
+    );
+    rc_entry(&result, "make_handler", "cfg");
+    assert!(
+        !result.arc_values.contains_key("make_handler"),
+        "expected no Arc promotion (no par, no send); got arc={:?}",
+        result.arc_values.get("make_handler")
+    );
+}
+
+#[test]
+fn phase2_send_and_par_invocation_consistent_decision() {
+    // Closure h2 invoked inside `par { h2(); }` AND a separate
+    // closure h1 sent via `tx.send(h1)` — both capture cfg. The
+    // monotonic property: any single parallel-region sighting is
+    // sufficient to promote cfg to Arc; multiple sightings produce
+    // one consistent decision (cfg in arc_values, exactly once).
+    let src = "struct Config { name: i64 }\n\
+               fn apply(c: Config) { }\n\
+               fn log(c: Config) { }\n\
+               fn make_handler(cfg: Config) {\n\
+                   let (tx, rx) = Channel.new();\n\
+                   let h1 = || apply(cfg);\n\
+                   let h2 = || apply(cfg);\n\
+                   log(cfg);\n\
+                   tx.send(h1);\n\
+                   par { h2(); }\n\
+               }";
+    let result = run(src);
+    assert!(
+        result.errors.is_empty(),
+        "expected no errors, got {:?}",
+        result.errors
+    );
+    rc_entry(&result, "make_handler", "cfg");
+    let arc = result
+        .arc_values
+        .get("make_handler")
+        .expect("expected an Arc set for make_handler");
+    assert!(
+        arc.contains("cfg"),
+        "expected 'cfg' to be Arc-promoted (consistent decision across two boundaries); got arc={:?}",
+        arc,
+    );
+}
+
+#[test]
+fn phase2_send_non_sender_method_does_not_promote() {
+    // Negative gate: a method named `send` on a non-Sender type must
+    // NOT trigger the channel-send boundary. Verifies the
+    // receiver-type gate in `resolve_receiver_is_sender` is
+    // load-bearing — otherwise any user-defined `send` method would
+    // over-promote captures spuriously. Soundness over precision:
+    // false-positive promotion is unsound from the user's perspective
+    // (turning Rc → Arc unnecessarily is a perf hit) but it's
+    // technically correct; the test pins that the gate distinguishes.
+    let src = "struct Config { name: i64 }\n\
+               struct Bag { x: i64 }\n\
+               impl Bag { fn send(ref self, c: Fn() -> ()) { } }\n\
+               fn apply(c: Config) { }\n\
+               fn log(c: Config) { }\n\
+               fn make_handler(cfg: Config) {\n\
+                   let bag = Bag { x: 1 };\n\
+                   let h = || apply(cfg);\n\
+                   log(cfg);\n\
+                   bag.send(h);\n\
+               }";
+    let result = run(src);
+    assert!(
+        result.errors.is_empty(),
+        "expected no errors, got {:?}",
+        result.errors
+    );
+    rc_entry(&result, "make_handler", "cfg");
+    assert!(
+        !result.arc_values.contains_key("make_handler"),
+        "expected no Arc promotion for non-Sender .send(); got arc={:?}",
+        result.arc_values.get("make_handler")
+    );
+}
