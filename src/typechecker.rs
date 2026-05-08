@@ -1582,6 +1582,30 @@ impl TypeEnv {
         false
     }
 
+    /// All trait names reachable from `start_trait` through
+    /// `TraitInfo::supertraits` edges, including `start_trait` itself, in
+    /// BFS order. Slice 3.5 of the method-resolution CR — the candidate
+    /// trait list for `self.method()` dispatch in a trait default body.
+    fn supertrait_closure_traits(&self, start_trait: &str) -> Vec<String> {
+        use std::collections::{HashSet, VecDeque};
+        let mut order: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut frontier: VecDeque<String> = VecDeque::new();
+        seen.insert(start_trait.to_string());
+        frontier.push_back(start_trait.to_string());
+        while let Some(name) = frontier.pop_front() {
+            order.push(name.clone());
+            if let Some(info) = self.traits.get(&name) {
+                for st in &info.supertraits {
+                    if seen.insert(st.clone()) {
+                        frontier.push_back(st.clone());
+                    }
+                }
+            }
+        }
+        order
+    }
+
     /// Find a `From` impl mapping `source` → `target`. Disambiguates
     /// multiple `impl From[X] for T` impls for the same target by matching
     /// the `from` method's first parameter type against `source`.
@@ -1996,6 +2020,17 @@ pub struct TypeChecker<'a> {
     /// path. Used to resolve bare `method(args)` calls at expected-type
     /// positions when the expected type is a generic param.
     enclosing_bounds: HashMap<String, Vec<crate::ast::TraitBound>>,
+    /// Name of the enclosing trait declaration when type-checking a default
+    /// method body. Populated on entering `check_trait_def`, cleared on exit.
+    /// Consumed by `dispatch_self_receiver_method` (slice 3.5 of the
+    /// method-resolution CR — see `phase-4-interpreter.md` item 8): when a
+    /// receiver-form `self.method()` call appears in a default body, the
+    /// candidate methods are the enclosing trait's own methods plus every
+    /// method on traits in its supertrait closure. Outside trait bodies this
+    /// is `None` and `Self` falls through to the silent pre-existing path
+    /// (impl-method bodies bind `Self` to the impl's target type via
+    /// `current_self_type`, a different mechanism).
+    enclosing_trait: Option<String>,
     /// Closure expression span → reason that closure became once-callable.
     /// Populated by `closure_type_with_capture_inference` when the body walk
     /// finds a captured-non-Copy consume; consumed by `check_assignable` so
@@ -2044,6 +2079,7 @@ impl<'a> TypeChecker<'a> {
             call_type_subs: HashMap::new(),
             pattern_binding_types: HashMap::new(),
             enclosing_bounds: HashMap::new(),
+            enclosing_trait: None,
             closure_once_reasons: HashMap::new(),
         }
     }
@@ -4287,6 +4323,13 @@ impl<'a> TypeChecker<'a> {
                 .extend(t.supertraits.iter().cloned());
         }
 
+        // Slice 3.5 of the method-resolution CR: track the enclosing trait so
+        // `self.method()` in a default body dispatches through the trait's
+        // own methods + supertrait closure rather than silently falling
+        // through.
+        let saved_enclosing_trait = self.enclosing_trait.take();
+        self.enclosing_trait = Some(t.name.clone());
+
         let self_type = Type::TypeParam("Self".to_string());
         for item in &t.items {
             if let TraitItem::Method(method) = item {
@@ -4315,6 +4358,7 @@ impl<'a> TypeChecker<'a> {
         }
 
         self.enclosing_bounds = saved_bounds;
+        self.enclosing_trait = saved_enclosing_trait;
     }
 
     /// Build a map of user-defined type names → `is_pub`. Types absent from the
@@ -8449,6 +8493,103 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Receiver-form `self.method(args)` dispatch inside a trait default
+    /// body. Slice 3.5 of the method-resolution CR — see
+    /// `phase-4-interpreter.md` item 8. Closes the explicit `name == "Self"`
+    /// silent-fallthrough that slice 2 left in place when wiring the
+    /// receiver-form `Type::TypeParam` arm.
+    ///
+    /// Candidates are gathered from the enclosing trait's *own* methods plus
+    /// every method on traits in the supertrait closure (filtered to those
+    /// declaring a `self_param`, since associated functions reach the
+    /// dispatch only through type-prefixed `Type.method()`).
+    ///
+    /// Branch on candidate count:
+    /// - zero → `NoMethodFound` (E0236).
+    /// - one → dispatch via `dispatch_trait_assoc_fn` with `target = "Self"`.
+    /// - more → `AmbiguousAssocFn` (E0233) listing each declarer with a UFCS
+    ///   hint. (Slice 3's `AmbiguousMethod` is for cross-impl ambiguity at
+    ///   concrete-receiver sites; the Self-receiver path is closer in shape
+    ///   to the type-parameter dispatcher's multi-bound case.)
+    ///
+    /// Returns `Type::Error` outside a trait body (when `enclosing_trait` is
+    /// `None`) so the caller's silent-fallthrough behavior is preserved for
+    /// non-trait `Self` cases (impl-method bodies bind `Self` to the impl's
+    /// target type via `current_self_type`, a different mechanism).
+    fn dispatch_self_receiver_method(
+        &mut self,
+        method: &str,
+        args: &[CallArg],
+        span: &Span,
+    ) -> Type {
+        let trait_name = match self.enclosing_trait.clone() {
+            Some(name) => name,
+            None => {
+                // Not inside a trait body — `Self` here resolves through a
+                // different mechanism (impl-method `current_self_type`).
+                // Preserve the pre-existing silent fallthrough.
+                for arg in args {
+                    self.infer_expr(&arg.value);
+                }
+                return Type::Error;
+            }
+        };
+
+        // Candidate traits: enclosing trait first, then its supertrait closure.
+        let candidate_traits = self.env.supertrait_closure_traits(&trait_name);
+        let candidates: Vec<(String, crate::ast::TraitMethod)> = candidate_traits
+            .iter()
+            .filter_map(|t| {
+                let m = self.find_trait_method(t, method)?;
+                // Receiver-form requires a self_param.
+                m.self_param.as_ref()?;
+                Some((t.clone(), m.clone()))
+            })
+            .collect();
+
+        match candidates.len() {
+            0 => {
+                for arg in args {
+                    self.infer_expr(&arg.value);
+                }
+                self.type_error(
+                    format!(
+                        "no method '{}' found on `Self` in trait '{}'; \
+                         declare it on the trait or a supertrait",
+                        method, trait_name,
+                    ),
+                    span.clone(),
+                    TypeErrorKind::NoMethodFound,
+                );
+                Type::Error
+            }
+            1 => {
+                let (_t, trait_method) = candidates.into_iter().next().unwrap();
+                self.dispatch_trait_assoc_fn("Self", &trait_method, args, span)
+            }
+            _ => {
+                let trait_list = candidates
+                    .iter()
+                    .map(|(t, _)| format!("`{}`", t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                for arg in args {
+                    self.infer_expr(&arg.value);
+                }
+                self.type_error(
+                    format!(
+                        "ambiguous method '{}' on `Self` in trait '{}': declared by {}. \
+                         Use UFCS `Trait.{}(self, ...)` to disambiguate.",
+                        method, trait_name, trait_list, method,
+                    ),
+                    span.clone(),
+                    TypeErrorKind::AmbiguousAssocFn,
+                );
+                Type::Error
+            }
+        }
+    }
+
     fn try_dispatch_typeparam_assoc_fn(
         &mut self,
         type_name: &str,
@@ -8944,7 +9085,18 @@ impl<'a> TypeChecker<'a> {
         };
         let (type_name, type_args) = match receiver_for_lookup {
             Type::Named { name, args } => (name.clone(), args.clone()),
-            Type::TypeParam(name) if name != "Self" => {
+            Type::TypeParam(name) if name == "Self" => {
+                // Self-receiver dispatch (slice 3.5 of the method-resolution
+                // CR — `phase-4-interpreter.md` item 8). `self.method()`
+                // inside a trait default body resolves through the enclosing
+                // trait's own methods + supertrait closure. Outside trait
+                // bodies (`enclosing_trait == None`) the dispatcher returns
+                // `Type::Error` to preserve the pre-existing silent
+                // fallthrough — impl-method bodies bind `Self` via
+                // `current_self_type`, a different mechanism.
+                return self.dispatch_self_receiver_method(method, args, span);
+            }
+            Type::TypeParam(name) => {
                 // Receiver-form generic call-site dispatch (slice 2 of the
                 // method-resolution CR — see `phase-4-interpreter.md` item 8).
                 // The complement to type-prefixed `T.method()` dispatch via
@@ -8956,12 +9108,9 @@ impl<'a> TypeChecker<'a> {
                 // Multiple matching bounds → AmbiguousAssocFn (UFCS hint);
                 // zero matches → NoMethodFound; exactly one → dispatch.
                 //
-                // `Self` receivers are intentionally excluded — `self.method()`
-                // in a trait default body or impl method has its own
-                // resolution path (the trait being defined provides the
-                // candidate methods, not just supertrait bounds). Wiring
-                // that correctly is its own slice; for now the silent
-                // pre-existing fallthrough is preserved for `Self`.
+                // `Self` is handled in the arm above (slice 3.5) — it
+                // routes to `dispatch_self_receiver_method` which consults
+                // the enclosing trait being defined, not just bounds.
                 return self.dispatch_typeparam_receiver_method(name, method, args, span);
             }
             _ => {

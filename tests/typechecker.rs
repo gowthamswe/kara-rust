@@ -4975,6 +4975,66 @@ fn test_receiver_form_ambiguity_single_trait_no_diagnostic() {
     );
 }
 
+// ── Method resolution: Self-receiver dispatch ───────────────────
+//
+// Slice 3.5 of the method-resolution CR (see phase-4-interpreter.md
+// item 8). `self.method()` inside a trait default body resolves
+// through the enclosing trait's own methods + supertrait closure.
+// Closes the explicit `name == "Self"` exclusion that slice 2 left
+// in place — `self.unknown_method()` now errors loudly via
+// `NoMethodFound` instead of silently falling through to
+// `Type::Error`.
+
+#[test]
+fn test_self_receiver_resolves_trait_own_method() {
+    // Trait `Counter` defines `helper(ref self) -> i64` and a default
+    // `default_method(ref self) -> i64 { self.helper() + 1 }`. The
+    // default body's `self.helper()` resolves through the enclosing
+    // trait's own method.
+    typecheck_ok(
+        "trait Counter {\n\
+             fn helper(ref self) -> i64;\n\
+             fn default_method(ref self) -> i64 { self.helper() + 1 }\n\
+         }",
+    );
+}
+
+#[test]
+fn test_self_receiver_resolves_supertrait_method() {
+    // Trait `B: A` where `A` declares `from_supertrait(ref self) -> i64`.
+    // `B`'s default body calls `self.from_supertrait()` and resolves
+    // through the supertrait closure.
+    typecheck_ok(
+        "trait A { fn from_supertrait(ref self) -> i64; }\n\
+         trait B: A {\n\
+             fn use_super(ref self) -> i64 { self.from_supertrait() + 2 }\n\
+         }",
+    );
+}
+
+#[test]
+fn test_self_receiver_unknown_method_errors() {
+    // `self.does_not_exist()` in a trait default body emits
+    // `NoMethodFound` — regression test pinning the closed
+    // silent-fallthrough hole.
+    let errors = typecheck_errors(
+        "trait Counter {\n\
+             fn helper(ref self) -> i64;\n\
+             fn default_method(ref self) -> i64 { self.does_not_exist() }\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NoMethodFound)),
+        "expected NoMethodFound for `self.does_not_exist()` in trait default body, got: {:?}",
+        errors
+            .iter()
+            .map(|e| (&e.kind, &e.message))
+            .collect::<Vec<_>>()
+    );
+}
+
 // ── Public-signature visibility (CR-18) ─────────────────────────
 //
 // A `pub fn` / pub method / pub struct field / pub enum variant payload /

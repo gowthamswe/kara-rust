@@ -179,7 +179,7 @@ queue: slice 3.5 depends on slice 3 (closed, commit `eefe7b7`). One
 new dependency: A11 depends on A9 (REPL cell-tracking infrastructure).
 All other slices are independent.
 
-- [ ] **Slice 3.5 — Self-receiver dispatch (method-resolution item 8 follow-up).** `self.method()` inside a trait default body resolves through the enclosing trait's own methods + supertrait closure (currently silent fallthrough). Closes the `name != "Self"` exclusion slice 2 left in place. Five pre-existing tests get a real resolution path; new negative test pins the closed silent-fallthrough hole. Plan: `phase-4-interpreter.md` item 8 § "Slice 3.5 plan". Source: slice 2 deferred item.
+- [x] **Slice 3.5 — Self-receiver dispatch (method-resolution item 8 follow-up).** ✓ Landed 2026-05-07. `self.method()` inside a trait default body resolves through the enclosing trait's own methods + supertrait closure; the `name != "Self"` exclusion slice 2 left in place is closed. Five pre-existing tests now exercise the real resolution path; new negative test pins the closed silent-fallthrough hole. Close-out: `phase-4-interpreter.md` item 8.
 
 - [ ] **Slice get_unchecked — `Slice[T].get_unchecked(i)` and `get_unchecked_mut(i)` unsafe escape hatch.** Two `unsafe fn`s on `Slice[T]` returning `ref T` / `mut ref T`, lowered to direct GEP without the bounds-check + panic-block prelude. Mirrors Rust's `<[T]>::get_unchecked` shape; safety contract is caller-guaranteed `i < self.len()`. ~3-4 typechecker tests + 2 codegen tests under `--features llvm`. Plan: `phase-7-codegen.md` § "`Slice[T].get_unchecked(i)` and `Slice[T].get_unchecked_mut(i)` escape hatch" (slice plan section). Source: phase 4–8 survey bucket A4.
 
@@ -198,3 +198,26 @@ All other slices are independent.
 - [ ] **Slice From[VarError] → IoError — `impl From[VarError] for IoError`.** Standard I/O Phase 8 follow-up; needed for `?`-propagation from `env.var(...) -> Result[String, VarError]` into functions returning `Result[T, IoError]`. Single trait-impl addition in baked stdlib. Variant mapping: `VarError.NotPresent → IoError.NotFound`; `VarError.NotUnicode → IoError.InvalidUtf8`. Plan: `phase-8-stdlib-floor.md` § "`impl From[VarError] for IoError`" (slice plan section). Source: 2026-05-07 deeper triage, factored from Standard I/O `[x]` parent.
 
 - [ ] **Slice `?` JSON trace mode — runtime JSON / JSONL output for compiled binaries.** Add `KARAC_ERROR_TRACE_FORMAT=json|jsonl|text` env-var-driven format selector to the runtime's atexit error-trace printer; default `text` preserves existing behavior. JSON shape matches the interpreter's existing trace format. Runtime-only change in `runtime/src/lib.rs`. Plan: `phase-8-stdlib-floor.md` § "`?` codegen follow-up: `error_return_trace`..." → "Slice plan (drafted 2026-05-07) — JSON / JSONL trace output mode". Source: 2026-05-07 deeper triage, the open follow-up of the parent `[~]` item.
+
+---
+
+## Timing log (overnight run, 2026-05-07)
+
+Run started: **2026-05-07 21:41:40 PDT**.
+
+Per-slice durations recorded as each lands. Subagent wall-clock is the implementation phase; main verification is folded in (read diff, run tests, fmt/clippy spot-check).
+
+| # | Slice | Started | Landed | Duration | Commit |
+|---|---|---|---|---|---|
+| 1 | 3.5 — Self-receiver dispatch | 2026-05-07 21:41 | 2026-05-07 21:53 | _—_ | _pending fill_ |
+| 2 | get_unchecked | _—_ | _—_ | _—_ | _—_ |
+| 3 | binary-size phase 1 | _—_ | _—_ | _—_ | _—_ |
+| 4 | perf note (shared struct mut) | _—_ | _—_ | _—_ | _—_ |
+| 5 | REPL UAM diagnostic | _—_ | _—_ | _—_ | _—_ |
+| 6 | REPL auto-clone | _—_ | _—_ | _—_ | _—_ |
+| 7 | atomic-RC | _—_ | _—_ | _—_ | _—_ |
+| 8 | env.set | _—_ | _—_ | _—_ | _—_ |
+| 9 | From[VarError] → IoError | _—_ | _—_ | _—_ | _—_ |
+| 10 | `?` JSON trace mode | _—_ | _—_ | _—_ | _—_ |
+
+Total elapsed: _pending overall completion_.
