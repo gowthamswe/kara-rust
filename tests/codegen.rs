@@ -7083,6 +7083,55 @@ fn main() {
     }
 
     #[test]
+    fn test_with_provider_e2e_nested_same_resource_innermost_wins() {
+        // LIFO push/pop semantics. Outer push binds resource R to a
+        // provider whose `get()` returns 1; inner push rebinds R to
+        // a provider whose `get()` returns 2. Inside the inner scope,
+        // R.get() must walk to the inner frame (head) and return 2;
+        // after the inner scope pops, R.get() in the outer scope must
+        // return 1 again. This test pins the runtime stack walk
+        // (`karac_provider_lookup` returning the *first* matching frame
+        // at innermost-first order) end to end through codegen.
+        let src = "pub trait Reader { fn get(ref self) -> i64; }\n\
+            pub struct Data { x: i64 }\n\
+            impl Reader for Data { fn get(ref self) -> i64 { self.x } }\n\
+            pub effect resource D: Reader;\n\
+            fn main() {\n\
+              let outer = Data { x: 1 };\n\
+              let inner = Data { x: 2 };\n\
+              with_provider[D](outer, || {\n\
+                println(D.get());\n\
+                with_provider[D](inner, || {\n\
+                  println(D.get());\n\
+                });\n\
+                println(D.get());\n\
+              });\n\
+            }";
+        let Some(out) = run_program(src) else {
+            eprintln!("skipping nested with_provider e2e: runtime/linker unavailable");
+            return;
+        };
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected 3 println outputs (outer, inner, outer-restored); got: {:?}",
+            lines
+        );
+        assert_eq!(lines[0].trim(), "1", "outer scope: D.get should return 1");
+        assert_eq!(
+            lines[1].trim(),
+            "2",
+            "inner scope: D.get should return 2 (innermost wins)"
+        );
+        assert_eq!(
+            lines[2].trim(),
+            "1",
+            "after inner pop: D.get should return 1 again (outer restored)"
+        );
+    }
+
+    #[test]
     fn test_with_provider_e2e_mut_ref_self_mutation_visible_after_pop() {
         // Full Theme 6 round-trip: push → R.method() → pop, where the
         // method writes through `mut ref self` to the provider's storage.
