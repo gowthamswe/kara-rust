@@ -2,13 +2,16 @@
 //
 // This is where the effect resource model is most directly exercised.
 //
-// GAP-N (continued): Resource method dispatch syntax.
-//   `Db.query_table(ref table)` inside a `with reads(Db)` function is the
-//   assumed syntax for calling the current provider.  Whether the compiler
-//   desugars this to `<current_db_provider>.query_table(ref table)` implicitly,
-//   or whether explicit syntax like `Db.get().query_table(ref table)` is
-//   required, is not specified in the design doc.  The code below uses the
-//   implicit dispatch form from the spec's canonical example.
+// GAP-N (continued): Resource method dispatch — codegen-only gap.
+//   `Db.query_table(ref table)` inside a `with reads(Db)` function is
+//   the spec'd syntax (`docs/design.md § Provider-Rooted Resources` —
+//   "Resource call desugaring": implicit dispatch through the active
+//   `Arc<dyn DbProvider>` in the per-task provider stack). Interpreter
+//   implements it (`src/interpreter.rs::eval_resource_method`); codegen
+//   does not yet emit the vtable + per-task-stack ABI, so binaries
+//   silently no-op these calls. Tracked at
+//   `docs/implementation_checklist/phase-8-stdlib-floor.md` § Provider
+//   Implementations as the slice-6 GAP-N follow-up.
 //
 // GAP-S: Parallel reads on the same resource.
 //   `reads(Db) + reads(Db) = safe` by the conflict table, so two independent

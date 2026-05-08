@@ -14,18 +14,19 @@
 // pool.
 //
 // Why not call `MetricsA.record(WORK)` here? In v1 the
-// `with_provider[R](instance, || { ... })` mechanism in db_pipeline
-// has GAP-N (resource-method dispatch syntax under-specified) — the
-// codegen does not yet wire the trait-method call inside a provider
-// scope to the concrete impl, so a `MetricsA.record(...)` call is a
-// no-op at runtime. To keep the wall-clock benchmark meaningful we
-// inline the busy-compute kernel directly into each driver. The
-// effect resources `MetricsA / B / C` remain declared (in
-// resources.kara) and the driver functions remain effect-annotated
-// `writes(MetricsA / B / C)` — that is what the auto-par analyzer
-// keys off, and it is unaffected by the provider GAP. Once GAP-N
-// closes, the `record_*` bodies can swap to `MetricsA.record(WORK)`
-// without touching the surrounding shape.
+// `with_provider[R](instance, || { ... })` mechanism is fully spec'd
+// (`docs/design.md § Provider-Rooted Resources`) and runs correctly
+// in the interpreter, but `karac build` does not yet emit the
+// vtable + per-task-stack ABI for the spec'd dispatch — so a
+// `MetricsA.record(...)` call is a no-op at runtime. To keep the
+// wall-clock benchmark meaningful we inline the busy-compute kernel
+// directly into each driver. The effect resources `MetricsA / B / C`
+// remain declared (in resources.kara) and the driver functions
+// remain effect-annotated `writes(MetricsA / B / C)` — that is what
+// the auto-par analyzer keys off, unaffected by the codegen gap.
+// Once the codegen wiring lands (phase-8-stdlib-floor.md § Provider
+// Implementations § GAP-N follow-up), the `record_*` bodies swap to
+// `MetricsA.record(WORK)` with no surrounding-shape change.
 //
 // Demo-shape gap: the canonical Parallax demo (fan-out + join) is *not*
 // what this workload models. Joining results from parallel branches
