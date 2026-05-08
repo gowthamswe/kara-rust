@@ -773,6 +773,187 @@ pub unsafe extern "C" fn karac_runtime_list_par_blocks_into(out: *mut KaracVec) 
     };
 }
 
+// ── Provider stack (`with_provider[R]` trait-method dispatch) ──────────────
+//
+// Per-task linked list of `(resource_id, provider_data, vtable)` cells that
+// `R.method(args)` dispatch walks innermost-first. Mirrors the interpreter's
+// `eval_resource_method` semantics (src/interpreter.rs:7146) and the
+// `design.md § Provider-Rooted Resources` ("Resource call desugaring",
+// "Runtime mechanics", "with_provider and parameterized resources")
+// paragraphs.
+//
+// **TLS-backed head pointer.** The slice plan recommended carrying the head
+// pointer in `KaracFrame` to avoid `thread_local!` overhead, but root tasks
+// (no par-block) have no `KaracFrame` — `karac_par_run` is the only site
+// that allocates one. A thread-local works uniformly for root and spawned
+// tasks; the per-`R.method()` cost is one TLS read, well within the cost
+// model `design.md` already names ("thin Arc deref + one vtable
+// indirection"). Cross-task inheritance (par-block branches): the env-struct
+// emitted by codegen carries a `provider_stack_head` snapshot from the
+// calling thread; each worker calls `karac_provider_set_stack_head` from
+// the branch fn prologue to seed its TLS.
+//
+// **Frame ownership.** `ProviderFrame` storage is alloca'd by codegen at
+// each `with_provider[R](p, ||body)` site; `karac_provider_push` populates
+// the frame in-place and links it as the new head. `karac_provider_pop`
+// unlinks the head (without deallocating — codegen owns the alloca). This
+// matches the structured-concurrency invariant: every push has a matching
+// pop on the same thread, balanced across normal and unwind paths.
+
+/// FFI-safe handle to a trait vtable. Opaque from the runtime's
+/// perspective — the runtime walks `vtable_ptr` only as far as following
+/// the indirection; codegen generates the vtable layout (array of fn
+/// pointers in trait-method-declaration order) and emits the indirect
+/// call inline.
+#[repr(C)]
+pub struct VTable {
+    _private: [u8; 0],
+}
+
+/// One entry in the per-task provider stack. Codegen alloca's storage for
+/// these at each `with_provider[R](...)` site; `karac_provider_push`
+/// populates them in-place.
+///
+/// `prev` chains to the previous head (innermost-first lookup); `null` for
+/// the bottom frame. `resource_id` is the codegen-assigned u32 for the
+/// resource trait `R`. `provider_data_ptr` is an opaque pointer to the
+/// provider value's payload (codegen knows the layout); `vtable_ptr` is
+/// the static vtable for `Provider's-impl-of-R::Provider`.
+#[repr(C)]
+pub struct ProviderFrame {
+    pub prev: *const ProviderFrame,
+    pub resource_id: u32,
+    pub provider_data_ptr: *const u8,
+    pub vtable_ptr: *const VTable,
+}
+
+// SAFETY: ProviderFrame stores raw pointers but the per-thread invariant
+// (push/pop balanced on the same thread, frame storage alloca'd in the
+// caller's stack frame) means cross-thread sharing never happens through
+// `PROVIDER_STACK_HEAD` directly. The env-struct snapshot mechanism
+// (`karac_provider_set_stack_head`) is the only cross-thread transfer and
+// it copies the head pointer at branch entry — not a shared cell.
+unsafe impl Send for ProviderFrame {}
+unsafe impl Sync for ProviderFrame {}
+
+// Per-thread current-head pointer. `Cell` over `*const ProviderFrame` —
+// see the slice-4 `CURRENT_FRAME` comment block for the TLS-during-atexit
+// rationale; this surface is read only inside live Kāra code, never from
+// `atexit`.
+thread_local! {
+    static PROVIDER_STACK_HEAD: Cell<*const ProviderFrame> = const { Cell::new(ptr::null()) };
+}
+
+/// FFI return type for `karac_provider_lookup`. Two-pointer struct so the
+/// caller can branch on `data.is_null()` for the "no binding" panic path
+/// without needing a separate boolean. `#[repr(C)]` pins the layout.
+#[repr(C)]
+pub struct ProviderLookupResult {
+    pub data: *const u8,
+    pub vtable: *const VTable,
+}
+
+/// Push `frame` onto the per-task provider stack. Caller (codegen) supplies
+/// `frame` storage (typically an alloca'd `ProviderFrame`) so the runtime
+/// doesn't allocate. Populates `frame` in-place with `prev = current_head,
+/// resource_id, provider_data, vtable`, then sets the per-task head pointer
+/// to `frame`.
+///
+/// # Safety
+///
+/// `frame` must point to writable `ProviderFrame` storage that outlives
+/// the matching `karac_provider_pop()` call. Codegen alloca's the storage
+/// inside the same function frame as the `with_provider` body, so this is
+/// satisfied by construction. `provider_data` and `vtable` must remain
+/// valid for the duration of the push/pop window (provider value alive,
+/// vtable is a static global).
+#[no_mangle]
+pub unsafe extern "C" fn karac_provider_push(
+    frame: *mut ProviderFrame,
+    resource_id: u32,
+    provider_data: *const u8,
+    vtable: *const VTable,
+) {
+    let prev = PROVIDER_STACK_HEAD.with(|c| c.get());
+    *frame = ProviderFrame {
+        prev,
+        resource_id,
+        provider_data_ptr: provider_data,
+        vtable_ptr: vtable,
+    };
+    PROVIDER_STACK_HEAD.with(|c| c.set(frame));
+}
+
+/// Pop the current head frame from the per-task provider stack, reverting
+/// the head pointer to the `prev` link. The frame's storage is owned by
+/// the caller (codegen alloca) — the runtime only updates the head pointer.
+/// No-op if the stack is already empty (defensive against double-pop on
+/// unwind paths, though codegen should never emit that shape).
+#[no_mangle]
+pub extern "C" fn karac_provider_pop() {
+    PROVIDER_STACK_HEAD.with(|c| {
+        let head = c.get();
+        if !head.is_null() {
+            // SAFETY: head is a valid ProviderFrame (alive until matching
+            // pop, per the push contract); reading `.prev` is safe.
+            let prev = unsafe { (*head).prev };
+            c.set(prev);
+        }
+    });
+}
+
+/// Walk the per-task provider stack innermost-first, returning the first
+/// frame whose `resource_id` matches the requested ID. Returns
+/// `(null, null)` on miss; codegen emits the structured-panic call inline
+/// per `design.md:7084-7095` ("Resource call: no provider bound...").
+#[no_mangle]
+pub extern "C" fn karac_provider_lookup(resource_id: u32) -> ProviderLookupResult {
+    let mut cursor = PROVIDER_STACK_HEAD.with(|c| c.get());
+    while !cursor.is_null() {
+        // SAFETY: cursor was either the live head pointer or a `prev` link
+        // from a live frame; both are valid for the duration of the lookup
+        // because frames don't deallocate until matching pops on the same
+        // thread.
+        let frame = unsafe { &*cursor };
+        if frame.resource_id == resource_id {
+            return ProviderLookupResult {
+                data: frame.provider_data_ptr,
+                vtable: frame.vtable_ptr,
+            };
+        }
+        cursor = frame.prev;
+    }
+    ProviderLookupResult {
+        data: ptr::null(),
+        vtable: ptr::null(),
+    }
+}
+
+/// Set the per-task provider stack head to `head`. Used by par-block worker
+/// branches at branch-fn prologue to inherit the parent thread's stack.
+/// Codegen captures `karac_provider_get_stack_head()` into the env-struct
+/// at par-block entry, then each worker calls this with the captured value
+/// before executing the branch body.
+///
+/// # Safety
+///
+/// `head` must point to a `ProviderFrame` whose lifetime spans the entire
+/// par-block (it's the parent's frame, which lives until `karac_par_run`
+/// returns, which lives until all branches join — so the lifetime is
+/// satisfied by `thread::scope`'s join guarantee).
+#[no_mangle]
+pub unsafe extern "C" fn karac_provider_set_stack_head(head: *const ProviderFrame) {
+    PROVIDER_STACK_HEAD.with(|c| c.set(head));
+}
+
+/// Snapshot the current per-task provider stack head. Used by codegen at
+/// par-block entry to copy into the env-struct so each spawned worker can
+/// seed its TLS via `karac_provider_set_stack_head`.
+#[no_mangle]
+pub extern "C" fn karac_provider_get_stack_head() -> *const ProviderFrame {
+    PROVIDER_STACK_HEAD.with(|c| c.get())
+}
+
 // ── Error return trace ─────────────────────────────────────────────────────
 //
 // Mirrors the interpreter's `error_trace` (src/interpreter.rs:592). On each
@@ -1682,5 +1863,135 @@ mod tests {
             karac_runtime_list_par_blocks_into(std::ptr::null_mut());
         }
         // No assertion — the test passes by not crashing.
+    }
+
+    // ── Provider stack tests (Theme 6 sub-step 1) ──────────────────────────
+
+    /// `karac_provider_lookup` returns null + null when the per-task stack
+    /// is empty — codegen branches on this for the structured-panic call.
+    #[test]
+    fn test_provider_lookup_returns_null_on_empty_stack() {
+        // Defensive: any earlier test on this thread might have left the
+        // stack non-empty. Pop until empty before asserting.
+        while !PROVIDER_STACK_HEAD.with(|c| c.get()).is_null() {
+            karac_provider_pop();
+        }
+        let result = karac_provider_lookup(42);
+        assert!(result.data.is_null());
+        assert!(result.vtable.is_null());
+    }
+
+    /// `push` / `lookup` / `pop` round-trip on a single frame: lookup
+    /// finds the just-pushed frame; pop unlinks it; subsequent lookup
+    /// misses.
+    #[test]
+    fn test_provider_push_lookup_pop_roundtrip() {
+        while !PROVIDER_STACK_HEAD.with(|c| c.get()).is_null() {
+            karac_provider_pop();
+        }
+        let mut frame = ProviderFrame {
+            prev: std::ptr::null(),
+            resource_id: 0,
+            provider_data_ptr: std::ptr::null(),
+            vtable_ptr: std::ptr::null(),
+        };
+        let data: u64 = 0xCAFE_BABE;
+        unsafe {
+            karac_provider_push(
+                &mut frame as *mut ProviderFrame,
+                7,
+                &data as *const u64 as *const u8,
+                std::ptr::null::<VTable>(),
+            );
+        }
+        let hit = karac_provider_lookup(7);
+        assert!(!hit.data.is_null());
+        assert_eq!(hit.data as *const u64, &data as *const u64);
+
+        karac_provider_pop();
+        let miss = karac_provider_lookup(7);
+        assert!(miss.data.is_null());
+    }
+
+    /// Nested pushes: lookup returns the innermost (most-recently-pushed)
+    /// binding. Pop unwinds to the outer binding.
+    #[test]
+    fn test_provider_stack_innermost_wins() {
+        while !PROVIDER_STACK_HEAD.with(|c| c.get()).is_null() {
+            karac_provider_pop();
+        }
+        let outer_data: u64 = 100;
+        let inner_data: u64 = 200;
+        let mut outer = ProviderFrame {
+            prev: std::ptr::null(),
+            resource_id: 0,
+            provider_data_ptr: std::ptr::null(),
+            vtable_ptr: std::ptr::null(),
+        };
+        let mut inner = ProviderFrame {
+            prev: std::ptr::null(),
+            resource_id: 0,
+            provider_data_ptr: std::ptr::null(),
+            vtable_ptr: std::ptr::null(),
+        };
+        unsafe {
+            karac_provider_push(
+                &mut outer,
+                3,
+                &outer_data as *const u64 as *const u8,
+                std::ptr::null::<VTable>(),
+            );
+            karac_provider_push(
+                &mut inner,
+                3,
+                &inner_data as *const u64 as *const u8,
+                std::ptr::null::<VTable>(),
+            );
+        }
+        let hit = karac_provider_lookup(3);
+        assert_eq!(hit.data as *const u64, &inner_data as *const u64);
+
+        karac_provider_pop();
+        let outer_hit = karac_provider_lookup(3);
+        assert_eq!(outer_hit.data as *const u64, &outer_data as *const u64);
+
+        karac_provider_pop();
+        let miss = karac_provider_lookup(3);
+        assert!(miss.data.is_null());
+    }
+
+    /// `set_stack_head` + `get_stack_head` round-trip the per-task head
+    /// pointer — used by par-block worker branches to inherit the parent
+    /// thread's stack.
+    #[test]
+    fn test_provider_set_and_get_stack_head() {
+        while !PROVIDER_STACK_HEAD.with(|c| c.get()).is_null() {
+            karac_provider_pop();
+        }
+        assert!(karac_provider_get_stack_head().is_null());
+
+        let mut frame = ProviderFrame {
+            prev: std::ptr::null(),
+            resource_id: 0,
+            provider_data_ptr: std::ptr::null(),
+            vtable_ptr: std::ptr::null(),
+        };
+        unsafe {
+            karac_provider_push(&mut frame, 1, std::ptr::null(), std::ptr::null::<VTable>());
+        }
+        let head = karac_provider_get_stack_head();
+        assert!(!head.is_null());
+        assert_eq!(head, &frame as *const ProviderFrame);
+
+        unsafe {
+            karac_provider_set_stack_head(std::ptr::null());
+        }
+        assert!(karac_provider_get_stack_head().is_null());
+
+        // Restore for cleanup
+        unsafe {
+            karac_provider_set_stack_head(head);
+        }
+        karac_provider_pop();
     }
 }
