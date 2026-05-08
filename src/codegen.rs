@@ -3385,15 +3385,32 @@ impl<'ctx> Codegen<'ctx> {
                     }
                 }
                 // Track the declared type name so field/variant lookups work on this param.
-                if let TypeKind::Path(path) = &param.ty.kind {
+                // Both owned (`Type`) and ref-wrapped (`ref Type` / `mut ref Type`)
+                // paths feed `var_type_names` with the inner struct/enum name —
+                // `field_index_for` needs it to find the field index regardless of
+                // whether the param is value-typed or pointer-typed.
+                let path_for_type_name = match &param.ty.kind {
+                    TypeKind::Path(p) => Some(p),
+                    TypeKind::Ref(inner) | TypeKind::MutRef(inner) => match &inner.kind {
+                        TypeKind::Path(p) => Some(p),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(path) = path_for_type_name {
                     if let Some(type_name) = path.segments.first() {
                         self.var_type_names
                             .insert(param_name.clone(), type_name.clone());
-                        // rc_inc for shared-type parameters (caller keeps its reference).
-                        if let Some(info) = self.shared_types.get(type_name.as_str()).cloned() {
-                            let ptr = param_val.into_pointer_value();
-                            self.emit_refcount_inc(&param_name, info.heap_type, ptr);
-                            self.track_rc_var(&param_name, ptr, info.heap_type);
+                        // rc_inc for shared-type parameters (caller keeps its
+                        // reference). Only fires for owned Path params — a
+                        // shared-typed `ref T` doesn't take ownership, so no
+                        // refcount bump.
+                        if matches!(&param.ty.kind, TypeKind::Path(_)) {
+                            if let Some(info) = self.shared_types.get(type_name.as_str()).cloned() {
+                                let ptr = param_val.into_pointer_value();
+                                self.emit_refcount_inc(&param_name, info.heap_type, ptr);
+                                self.track_rc_var(&param_name, ptr, info.heap_type);
+                            }
                         }
                     }
                 }
@@ -5404,8 +5421,35 @@ impl<'ctx> Codegen<'ctx> {
         if let Some(receiver_type) = self.inferred_receiver_type(object) {
             let qualified = format!("{}.{}", receiver_type, method);
             if let Some(fn_val) = self.module.get_function(&qualified) {
-                let obj_val = self.compile_expr(object)?;
-                let mut compiled_args: Vec<BasicMetadataValueEnum<'ctx>> = vec![obj_val.into()];
+                // Inspect the resolved fn's first param to decide the receiver
+                // calling convention: pointer-typed (ref self / mut ref self)
+                // means pass the address of the receiver's storage; struct-
+                // typed (owned self) means pass the value. Mismatch silently
+                // miscompiles, which is exactly what shipped before this slice.
+                let first_param_is_ptr = fn_val
+                    .get_type()
+                    .get_param_types()
+                    .first()
+                    .map(|t| matches!(t, BasicMetadataTypeEnum::PointerType(_)))
+                    .unwrap_or(false);
+                let receiver_arg: BasicMetadataValueEnum<'ctx> = if first_param_is_ptr {
+                    if let ExprKind::Identifier(var_name) = &object.kind {
+                        if let Some(ptr) = self.get_data_ptr(var_name) {
+                            ptr.into()
+                        } else {
+                            self.compile_expr(object)?.into()
+                        }
+                    } else {
+                        // Non-identifier receiver into a ref-self method:
+                        // unsupported in v1 (would require materializing a
+                        // temporary alloca). Fall through to compile_expr;
+                        // mismatched ABI may surface at link time.
+                        self.compile_expr(object)?.into()
+                    }
+                } else {
+                    self.compile_expr(object)?.into()
+                };
+                let mut compiled_args: Vec<BasicMetadataValueEnum<'ctx>> = vec![receiver_arg];
                 for a in args {
                     compiled_args.push(self.compile_expr(&a.value)?.into());
                 }
@@ -10426,9 +10470,18 @@ impl<'ctx> Codegen<'ctx> {
         field: &str,
         new_val: BasicValueEnum<'ctx>,
     ) -> Result<(), String> {
-        if let ExprKind::Identifier(var_name) = &object.kind {
+        // `self.field = …` parses as `FieldAccess { object: SelfValue, … }`,
+        // and `self` is bound as a regular local named "self" — same lookup
+        // path as a plain Identifier. Treat both shapes uniformly so
+        // ref-self method bodies can mutate through the receiver.
+        let var_name_owned: Option<String> = match &object.kind {
+            ExprKind::Identifier(n) => Some(n.clone()),
+            ExprKind::SelfValue => Some("self".to_string()),
+            _ => None,
+        };
+        if let Some(var_name) = var_name_owned.as_deref() {
             // Shared type: store directly into the heap object via GEP.
-            if let Some(type_name) = self.var_type_names.get(var_name.as_str()).cloned() {
+            if let Some(type_name) = self.var_type_names.get(var_name).cloned() {
                 if let Some(info) = self.shared_types.get(&type_name).cloned() {
                     if !info.is_enum {
                         if let Some(slot) = self.variables.get(var_name).copied() {
@@ -10457,6 +10510,33 @@ impl<'ctx> Codegen<'ctx> {
                             }
                         }
                         return Ok(());
+                    }
+                }
+            }
+
+            // Ref / mut-ref struct param: write through the pointer so the
+            // caller's storage observes the update. The owned-param path
+            // below would mutate a local copy of the struct value, so the
+            // caller never sees the change — the `mut ref self` mutation
+            // bug fixed in this slice. `get_data_ptr` returns the alloca
+            // for owned bindings and the dereferenced pointer for ref
+            // params, so we use it uniformly when GEP'ing into a struct.
+            if let Some(&inner_ty) = self.ref_params.get(var_name) {
+                if let BasicTypeEnum::StructType(struct_ty) = inner_ty {
+                    if let Some(idx) = self.field_index_for(object, field) {
+                        if let Some(ptr) = self.get_data_ptr(var_name) {
+                            let field_ptr = self
+                                .builder
+                                .build_struct_gep(
+                                    struct_ty,
+                                    ptr,
+                                    idx,
+                                    &format!("ref_{}_ptr", field),
+                                )
+                                .unwrap();
+                            self.builder.build_store(field_ptr, new_val).unwrap();
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -14393,23 +14473,35 @@ fn method_self_is_value(method: &Function) -> bool {
 /// Build a synthetic `Function` node for an impl-block method so the
 /// existing `declare_function` / `compile_function` machinery can emit it
 /// as an LLVM function named `Type.method`. If the method has a receiver,
-/// prepend a `self` parameter with the impl target type so the body's
-/// `self` reference resolves as a normal local.
+/// prepend a `self` parameter whose type mirrors the source self mode:
+/// `self` → `Type` (owned), `ref self` → `ref Type`, `mut ref self` →
+/// `mut ref Type`. The existing ref-param plumbing in `compile_function`
+/// (`ref_params`, `get_data_ptr`, `load_variable` deref) handles each
+/// case from there; ref-self mutations write back to the caller's
+/// storage via the pointer-typed self param.
 fn make_impl_method_function(type_name: &str, method: &Function) -> Function {
     let mut f = method.clone();
     f.name = format!("{}.{}", type_name, method.name);
-    if method.self_param.is_some() {
+    if let Some(self_kind) = method.self_param.as_ref() {
         let span = method.span.clone();
-        // v1: owned `self` only. `ref self` / `mut ref self` would wrap the
-        // base type in `TypeKind::Ref`/`MutRef` here — deferred because the
-        // current call sites (Eq/Ord, constructors) all use owned receivers.
-        let ty = TypeExpr {
+        let base = TypeExpr {
             kind: TypeKind::Path(PathExpr {
                 segments: vec![type_name.to_string()],
                 generic_args: None,
                 span: span.clone(),
             }),
             span: span.clone(),
+        };
+        let ty = match self_kind {
+            SelfParam::Owned => base,
+            SelfParam::Ref => TypeExpr {
+                kind: TypeKind::Ref(Box::new(base)),
+                span: span.clone(),
+            },
+            SelfParam::MutRef => TypeExpr {
+                kind: TypeKind::MutRef(Box::new(base)),
+                span: span.clone(),
+            },
         };
         let self_param = Param {
             span: span.clone(),

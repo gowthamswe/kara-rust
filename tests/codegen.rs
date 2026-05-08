@@ -6700,6 +6700,68 @@ fn main() {
         }
     }
 
+    // ── Ref-self / mut-ref-self method codegen ───────────────────────────
+    //
+    // Prerequisite for Theme 6's `R.method(...)` dispatch: impl methods
+    // declared with `ref self` / `mut ref self` must compile to functions
+    // that take a pointer-to-Self as the receiver, and the call site must
+    // pass the receiver's address rather than its loaded value. Before
+    // this slice, `make_impl_method_function` rewrote every `ref self` /
+    // `mut ref self` to value-typed `self`, so mutations through the
+    // receiver were lost on a copy.
+
+    #[test]
+    fn test_mut_ref_self_method_mutation_persists_through_caller() {
+        let captured = run_program_capturing(
+            "struct Counter { n: i64 }\n\
+             impl Counter { fn bump(mut ref self) { self.n = self.n + 1; } }\n\
+             fn main() { let mut c = Counter { n: 42 }; c.bump(); c.bump(); println(c.n); }",
+        );
+        if let Some(c) = captured {
+            assert!(
+                c.stdout.lines().any(|l| l.trim() == "44"),
+                "expected 44 (42 + 1 + 1), got: {:?}",
+                c.stdout
+            );
+        }
+    }
+
+    #[test]
+    fn test_ref_self_method_reads_through_pointer() {
+        let captured = run_program_capturing(
+            "struct Pair { x: i64, y: i64 }\n\
+             impl Pair { fn read_y(ref self) -> i64 { self.y } }\n\
+             fn main() { let p = Pair { x: 7, y: 99 }; println(p.read_y()); }",
+        );
+        if let Some(c) = captured {
+            assert!(
+                c.stdout.lines().any(|l| l.trim() == "99"),
+                "expected 99 (Pair.y), got: {:?}",
+                c.stdout
+            );
+        }
+    }
+
+    #[test]
+    fn test_mut_ref_free_function_param_mutation_persists() {
+        // Cross-check that the same fix path applies to non-method
+        // mut-ref params on free functions — the call site decides
+        // the calling convention by inspecting the resolved fn's
+        // first param type.
+        let captured = run_program_capturing(
+            "struct Counter { n: i64 }\n\
+             fn bump(c: mut ref Counter) { c.n = c.n + 1; }\n\
+             fn main() { let mut c = Counter { n: 42 }; bump(mut c); bump(mut c); println(c.n); }",
+        );
+        if let Some(c) = captured {
+            assert!(
+                c.stdout.lines().any(|l| l.trim() == "44"),
+                "expected 44 (42 + 1 + 1), got: {:?}",
+                c.stdout
+            );
+        }
+    }
+
     // ── Theme 6: provider vtable emission (sub-step 2) ────────────────────
     //
     // Structural tests pinning that codegen emits a static `@VT_<U>_<T>`
