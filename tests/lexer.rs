@@ -1066,10 +1066,7 @@ fn test_c_string_literal_interior_nul_escape_zero_rejected() {
     let tokens = tokens_only(r#"c"a\0b""#);
     match &tokens[0] {
         Token::Error(msg) => {
-            assert!(
-                msg.contains("E_INTERIOR_NUL_IN_C_STRING"),
-                "got: {msg}"
-            );
+            assert!(msg.contains("E_INTERIOR_NUL_IN_C_STRING"), "got: {msg}");
         }
         other => panic!("expected Error token, got {other:?}"),
     }
@@ -1080,10 +1077,7 @@ fn test_c_string_literal_interior_nul_hex_escape_rejected() {
     let tokens = tokens_only(r#"c"a\x00b""#);
     match &tokens[0] {
         Token::Error(msg) => {
-            assert!(
-                msg.contains("E_INTERIOR_NUL_IN_C_STRING"),
-                "got: {msg}"
-            );
+            assert!(msg.contains("E_INTERIOR_NUL_IN_C_STRING"), "got: {msg}");
         }
         other => panic!("expected Error token, got {other:?}"),
     }
@@ -1094,10 +1088,7 @@ fn test_c_string_literal_interior_nul_unicode_escape_rejected() {
     let tokens = tokens_only(r#"c"a\u{0}b""#);
     match &tokens[0] {
         Token::Error(msg) => {
-            assert!(
-                msg.contains("E_INTERIOR_NUL_IN_C_STRING"),
-                "got: {msg}"
-            );
+            assert!(msg.contains("E_INTERIOR_NUL_IN_C_STRING"), "got: {msg}");
         }
         other => panic!("expected Error token, got {other:?}"),
     }
@@ -1132,8 +1123,8 @@ fn test_v60_reserved_for_future_use_keywords() {
     // Per design.md § Reserved-for-Future-Use Keywords (v60 item 9). Each must
     // be rejected at the lexer level so they cannot be used as identifiers.
     for keyword in [
-        "gen", "become", "do", "final", "override", "priv", "typeof", "virtual", "async",
-        "await", "comptime", "pure", "box",
+        "gen", "become", "do", "final", "override", "priv", "typeof", "virtual", "async", "await",
+        "comptime", "pure", "box",
     ] {
         let tokens = tokens_only(keyword);
         assert_eq!(

@@ -78,7 +78,9 @@ struct Matrix {
 
 pub enum ExhaustiveResult {
     Exhaustive,
-    NonExhaustive { witness: String },
+    NonExhaustive {
+        witness: String,
+    },
     /// Scrutinee type is not yet handled by Maranget; the caller must skip
     /// the check (matches the pre-Maranget early-return behaviour).
     Skipped,
@@ -110,11 +112,7 @@ pub fn is_pattern_irrefutable(pat: &Pattern, ty: &Type, env: &TypeEnv) -> Option
 /// pattern of an earlier unguarded arm is still unreachable) but never
 /// contribute to coverage themselves — the guard might fail at runtime,
 /// so a following arm with the same pattern can still be reached.
-pub fn unreachable_arms(
-    scrutinee_type: &Type,
-    arms: &[MatchArm],
-    env: &TypeEnv,
-) -> Vec<usize> {
+pub fn unreachable_arms(scrutinee_type: &Type, arms: &[MatchArm], env: &TypeEnv) -> Vec<usize> {
     if !is_handled_scrutinee(scrutinee_type) {
         return Vec::new();
     }
@@ -327,18 +325,23 @@ fn lower_struct_fields(
 ) -> Vec<Pat> {
     field_decls
         .iter()
-        .map(|(fname, fty)| match pattern_fields.iter().find(|f| &f.name == fname) {
-            Some(fp) => match &fp.pattern {
-                Some(p) => lower_pattern(p, fty, env),
+        .map(
+            |(fname, fty)| match pattern_fields.iter().find(|f| &f.name == fname) {
+                Some(fp) => match &fp.pattern {
+                    Some(p) => lower_pattern(p, fty, env),
+                    None => Pat::Wildcard,
+                },
                 None => Pat::Wildcard,
             },
-            None => Pat::Wildcard,
-        })
+        )
         .collect()
 }
 
 fn variant_payload_types(parent_ty: &Type, variant_name: &str, env: &TypeEnv) -> Vec<Type> {
-    if let Type::Named { name: enum_name, .. } = parent_ty {
+    if let Type::Named {
+        name: enum_name, ..
+    } = parent_ty
+    {
         if let Some(info) = env.enums.get(enum_name) {
             if let Some((_, vinfo)) = info.variants.iter().find(|(v, _)| v == variant_name) {
                 return match vinfo {
@@ -458,7 +461,10 @@ fn specialize(matrix: &Matrix, ctor: &PatCtor, arity: usize) -> Matrix {
                 new_pats.extend_from_slice(tail);
                 out.rows.push(Row { pats: new_pats });
             }
-            Pat::Ctor { ctor: row_ctor, args } if row_ctor == ctor => {
+            Pat::Ctor {
+                ctor: row_ctor,
+                args,
+            } if row_ctor == ctor => {
                 let mut new_pats = args.clone();
                 new_pats.extend_from_slice(tail);
                 out.rows.push(Row { pats: new_pats });
@@ -542,7 +548,10 @@ fn ctor_field_types(ctor: &PatCtor, parent_ty: &Type, env: &TypeEnv) -> Vec<Type
     match ctor {
         PatCtor::Bool(_) | PatCtor::Lit(_) => vec![],
         PatCtor::Variant(name) => {
-            if let Type::Named { name: enum_name, .. } = parent_ty {
+            if let Type::Named {
+                name: enum_name, ..
+            } = parent_ty
+            {
                 if let Some(info) = env.enums.get(enum_name) {
                     if let Some((_, vinfo)) = info.variants.iter().find(|(v, _)| v == name) {
                         return match vinfo {
@@ -598,7 +607,10 @@ fn render_variant(name: &str, args: &[Pat], ty: &Type, env: &TypeEnv) -> String 
     if args.is_empty() {
         return name.to_string();
     }
-    if let Type::Named { name: enum_name, .. } = ty {
+    if let Type::Named {
+        name: enum_name, ..
+    } = ty
+    {
         if let Some(info) = env.enums.get(enum_name) {
             if let Some((_, vinfo)) = info.variants.iter().find(|(v, _)| v == name) {
                 match vinfo {

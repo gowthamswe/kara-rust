@@ -1549,7 +1549,11 @@ fn test_compiler_builtin_permitted_with_stdlib_source_flag() {
          #[compiler_builtin]\nenum Option[T] { Some(T), None }\n\
          #[compiler_builtin]\ntrait Display { fn fmt(ref self) -> String; }",
     );
-    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
     let result = Resolver::new(&parsed.program)
         .with_stdlib_source(true)
         .resolve();
@@ -1581,7 +1585,11 @@ fn test_compiler_builtin_rejection_does_not_block_definition() {
         "#[compiler_builtin]\nfn dbg[T](v: T) -> T { v }\n\
          fn use_it() { let _ = dbg(1); }",
     );
-    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
     let errs = resolve(&parsed.program).errors;
     let undef: Vec<_> = errs
         .iter()
@@ -1608,7 +1616,11 @@ fn test_compiler_builtin_rejection_does_not_block_definition() {
 
 fn flip_stdlib_origin_on_first_item(prog: &mut karac::ast::Program) {
     use karac::ast::Item;
-    match prog.items.first_mut().expect("program has at least one item") {
+    match prog
+        .items
+        .first_mut()
+        .expect("program has at least one item")
+    {
         Item::Function(f) => f.stdlib_origin = true,
         Item::StructDef(s) => s.stdlib_origin = true,
         Item::EnumDef(e) => e.stdlib_origin = true,
@@ -1619,7 +1631,11 @@ fn flip_stdlib_origin_on_first_item(prog: &mut karac::ast::Program) {
 
 fn assert_per_item_origin_bypasses_gate(source: &str) {
     let parsed = parse(source);
-    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
     let mut program = parsed.program;
     flip_stdlib_origin_on_first_item(&mut program);
     // is_stdlib_source defaults to false — per-item tag is the only thing
@@ -1649,9 +1665,7 @@ fn test_compiler_builtin_per_item_origin_bypasses_gate_on_struct() {
 
 #[test]
 fn test_compiler_builtin_per_item_origin_bypasses_gate_on_enum() {
-    assert_per_item_origin_bypasses_gate(
-        "#[compiler_builtin]\nenum Option[T] { Some(T), None }",
-    );
+    assert_per_item_origin_bypasses_gate("#[compiler_builtin]\nenum Option[T] { Some(T), None }");
 }
 
 #[test]
@@ -1671,7 +1685,11 @@ fn test_compiler_builtin_per_item_tag_is_per_item_not_global() {
         "#[compiler_builtin]\nfn baked[T](v: T) -> T { v }\n\
          #[compiler_builtin]\nfn user_attempt[T](v: T) -> T { v }",
     );
-    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
     let mut program = parsed.program;
     flip_stdlib_origin_on_first_item(&mut program);
     let result = Resolver::new(&program).resolve();
@@ -1731,7 +1749,11 @@ fn test_compiler_builtin_permitted_on_impl_method_with_stdlib_source_flag() {
              fn bar(self) -> i64 { 0 }\n\
          }",
     );
-    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
     let result = Resolver::new(&parsed.program)
         .with_stdlib_source(true)
         .resolve();
@@ -1752,7 +1774,7 @@ fn test_compiler_builtin_per_method_origin_bypasses_gate_on_impl_method() {
     // resolver picks it up: even without the session-wide flag, a method
     // tagged `stdlib_origin = true` is allowed to carry `#[compiler_builtin]`,
     // while an untagged sibling in the same block is still rejected.
-    use karac::ast::{Item, ImplItem};
+    use karac::ast::{ImplItem, Item};
     let parsed = parse(
         "struct Foo { }\n\
          impl Foo {\n\
@@ -1762,12 +1784,22 @@ fn test_compiler_builtin_per_method_origin_bypasses_gate_on_impl_method() {
              fn user_attempt(self) -> i64 { 0 }\n\
          }",
     );
-    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
     let mut program = parsed.program;
     let imp = program
         .items
         .iter_mut()
-        .find_map(|i| if let Item::ImplBlock(b) = i { Some(b) } else { None })
+        .find_map(|i| {
+            if let Item::ImplBlock(b) = i {
+                Some(b)
+            } else {
+                None
+            }
+        })
         .expect("program has an impl block");
     let baked_method = imp
         .items

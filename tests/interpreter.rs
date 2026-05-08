@@ -7674,7 +7674,10 @@ fn test_dbg_terminal_no_par_omits_task_prefix() {
     assert_eq!(dbg.len(), 1, "expected one dbg line, got {:?}", dbg);
     let line = &dbg[0];
     assert_eq!(line, "[test.kara:2] 7 = 7\n");
-    assert!(!line.contains("task:"), "outside par {{}} should not include task tag");
+    assert!(
+        !line.contains("task:"),
+        "outside par {{}} should not include task tag"
+    );
 }
 
 #[test]

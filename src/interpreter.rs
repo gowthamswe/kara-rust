@@ -745,13 +745,21 @@ impl Value {
                     parts.push(format!("{}: {}", k, v.debug_fmt()));
                 }
                 for (k, weak) in &inner.weak_immutable_fields {
-                    parts.push(format!("{}: {}", k, upgrade_weak_to_option(weak).debug_fmt()));
+                    parts.push(format!(
+                        "{}: {}",
+                        k,
+                        upgrade_weak_to_option(weak).debug_fmt()
+                    ));
                 }
                 for (k, slot) in &inner.weak_mut_fields {
                     let weak = slot.try_read().expect(
                         "shared struct weak field write-locked during debug_fmt — unreachable in single-task interpreter",
                     );
-                    parts.push(format!("{}: {}", k, upgrade_weak_to_option(&weak).debug_fmt()));
+                    parts.push(format!(
+                        "{}: {}",
+                        k,
+                        upgrade_weak_to_option(&weak).debug_fmt()
+                    ));
                 }
                 format!("{} {{ {} }}", inner.name, parts.join(", "))
             }
@@ -2052,7 +2060,10 @@ impl<'a> Interpreter<'a> {
                 continue;
             };
             if skip_compiler_builtin
-                && method.attributes.iter().any(|a| a.name == "compiler_builtin")
+                && method
+                    .attributes
+                    .iter()
+                    .any(|a| a.name == "compiler_builtin")
             {
                 continue;
             }
@@ -3103,10 +3114,13 @@ impl<'a> Interpreter<'a> {
                     let output = branch_interp.captured_output.unwrap_or_default();
                     let dbg_lines = branch_interp.captured_dbg.unwrap_or_default();
 
-                    results_ref
-                        .lock()
-                        .unwrap()
-                        .push((i, defined_vars, output, dbg_lines, cf_result));
+                    results_ref.lock().unwrap().push((
+                        i,
+                        defined_vars,
+                        output,
+                        dbg_lines,
+                        cf_result,
+                    ));
                 });
             }
         });
@@ -3285,9 +3299,7 @@ impl<'a> Interpreter<'a> {
         let mut i = 0;
         while i < cleanup.len() {
             let should_fire = match &cleanup[i] {
-                CleanupAction::Drop { name } => {
-                    last_use.get(name).copied() == Some(stmt_idx)
-                }
+                CleanupAction::Drop { name } => last_use.get(name).copied() == Some(stmt_idx),
                 CleanupAction::Defer(_) => false,
             };
             if should_fire {
@@ -7659,12 +7671,7 @@ impl<'a> Interpreter<'a> {
             "println" => ("Stdout", "println"),
             _ => ("Stdout", "print"),
         };
-        self.dispatch_resource_method_with_values(
-            resource,
-            method,
-            vec![Value::String(val)],
-            span,
-        )
+        self.dispatch_resource_method_with_values(resource, method, vec![Value::String(val)], span)
     }
 
     /// Write to stdout, honoring `captured_output` when the test harness
@@ -7750,10 +7757,7 @@ impl<'a> Interpreter<'a> {
                     "[task:{} {}:{}] {} = {}\n",
                     tid, file, span.line, expr_text, value_str
                 ),
-                None => format!(
-                    "[{}:{}] {} = {}\n",
-                    file, span.line, expr_text, value_str
-                ),
+                None => format!("[{}:{}] {} = {}\n", file, span.line, expr_text, value_str),
             },
             DbgOutputMode::Json => {
                 let task_id = match self.current_task_id {

@@ -197,38 +197,86 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
     ("result.kara", include_str!("../runtime/stdlib/result.kara")),
     ("vec.kara", include_str!("../runtime/stdlib/vec.kara")),
     ("map.kara", include_str!("../runtime/stdlib/map.kara")),
-    ("sorted_set.kara", include_str!("../runtime/stdlib/sorted_set.kara")),
-    ("channel.kara", include_str!("../runtime/stdlib/channel.kara")),
+    (
+        "sorted_set.kara",
+        include_str!("../runtime/stdlib/sorted_set.kara"),
+    ),
+    (
+        "channel.kara",
+        include_str!("../runtime/stdlib/channel.kara"),
+    ),
     ("sender.kara", include_str!("../runtime/stdlib/sender.kara")),
-    ("receiver.kara", include_str!("../runtime/stdlib/receiver.kara")),
+    (
+        "receiver.kara",
+        include_str!("../runtime/stdlib/receiver.kara"),
+    ),
     ("set.kara", include_str!("../runtime/stdlib/set.kara")),
-    ("peekable.kara", include_str!("../runtime/stdlib/peekable.kara")),
+    (
+        "peekable.kara",
+        include_str!("../runtime/stdlib/peekable.kara"),
+    ),
     ("atomic.kara", include_str!("../runtime/stdlib/atomic.kara")),
     ("f32.kara", include_str!("../runtime/stdlib/f32.kara")),
     ("f64.kara", include_str!("../runtime/stdlib/f64.kara")),
     ("stats.kara", include_str!("../runtime/stdlib/stats.kara")),
     ("regex.kara", include_str!("../runtime/stdlib/regex.kara")),
     ("http.kara", include_str!("../runtime/stdlib/http.kara")),
-    ("encoding.kara", include_str!("../runtime/stdlib/encoding.kara")),
-    ("ordering.kara", include_str!("../runtime/stdlib/ordering.kara")),
-    ("memory_ordering.kara", include_str!("../runtime/stdlib/memory_ordering.kara")),
+    (
+        "encoding.kara",
+        include_str!("../runtime/stdlib/encoding.kara"),
+    ),
+    (
+        "ordering.kara",
+        include_str!("../runtime/stdlib/ordering.kara"),
+    ),
+    (
+        "memory_ordering.kara",
+        include_str!("../runtime/stdlib/memory_ordering.kara"),
+    ),
     ("entry.kara", include_str!("../runtime/stdlib/entry.kara")),
-    ("io_error.kara", include_str!("../runtime/stdlib/io_error.kara")),
-    ("var_error.kara", include_str!("../runtime/stdlib/var_error.kara")),
+    (
+        "io_error.kara",
+        include_str!("../runtime/stdlib/io_error.kara"),
+    ),
+    (
+        "var_error.kara",
+        include_str!("../runtime/stdlib/var_error.kara"),
+    ),
     ("index.kara", include_str!("../runtime/stdlib/index.kara")),
     ("from.kara", include_str!("../runtime/stdlib/from.kara")),
     ("into.kara", include_str!("../runtime/stdlib/into.kara")),
-    ("try_from.kara", include_str!("../runtime/stdlib/try_from.kara")),
-    ("try_into.kara", include_str!("../runtime/stdlib/try_into.kara")),
-    ("iterator.kara", include_str!("../runtime/stdlib/iterator.kara")),
-    ("into_iterator.kara", include_str!("../runtime/stdlib/into_iterator.kara")),
+    (
+        "try_from.kara",
+        include_str!("../runtime/stdlib/try_from.kara"),
+    ),
+    (
+        "try_into.kara",
+        include_str!("../runtime/stdlib/try_into.kara"),
+    ),
+    (
+        "iterator.kara",
+        include_str!("../runtime/stdlib/iterator.kara"),
+    ),
+    (
+        "into_iterator.kara",
+        include_str!("../runtime/stdlib/into_iterator.kara"),
+    ),
     ("not.kara", include_str!("../runtime/stdlib/not.kara")),
-    ("partial_eq.kara", include_str!("../runtime/stdlib/partial_eq.kara")),
+    (
+        "partial_eq.kara",
+        include_str!("../runtime/stdlib/partial_eq.kara"),
+    ),
     ("eq.kara", include_str!("../runtime/stdlib/eq.kara")),
-    ("partial_ord.kara", include_str!("../runtime/stdlib/partial_ord.kara")),
+    (
+        "partial_ord.kara",
+        include_str!("../runtime/stdlib/partial_ord.kara"),
+    ),
     ("ord.kara", include_str!("../runtime/stdlib/ord.kara")),
     ("hash.kara", include_str!("../runtime/stdlib/hash.kara")),
-    ("display.kara", include_str!("../runtime/stdlib/display.kara")),
+    (
+        "display.kara",
+        include_str!("../runtime/stdlib/display.kara"),
+    ),
     ("debug.kara", include_str!("../runtime/stdlib/debug.kara")),
     ("add.kara", include_str!("../runtime/stdlib/add.kara")),
     ("sub.kara", include_str!("../runtime/stdlib/sub.kara")),
@@ -508,7 +556,10 @@ mod tests {
                 }
             }
         }
-        panic!("expected enum `{}` in stdlib program at index {}", name, idx);
+        panic!(
+            "expected enum `{}` in stdlib program at index {}",
+            name, idx
+        );
     }
 
     #[test]
@@ -714,8 +765,7 @@ mod tests {
         // should be the real `Item::EnumDef` parsed from
         // `runtime/stdlib/option.kara`.
         let items = synthetic_prelude_items();
-        let opt = find_prelude_item(&items, "Option")
-            .expect("synthetic prelude exposes Option");
+        let opt = find_prelude_item(&items, "Option").expect("synthetic prelude exposes Option");
         assert!(
             matches!(opt, Item::EnumDef(_)),
             "Option should be spliced as EnumDef (baked), got {:?}",
@@ -729,14 +779,15 @@ mod tests {
         // multi-file `STDLIB_SOURCES` path resolves Result through
         // `baked_item_for` rather than falling back to the stub.
         let items = synthetic_prelude_items();
-        let res = find_prelude_item(&items, "Result")
-            .expect("synthetic prelude exposes Result");
+        let res = find_prelude_item(&items, "Result").expect("synthetic prelude exposes Result");
         assert!(
             matches!(res, Item::EnumDef(_)),
             "Result should be spliced as EnumDef (baked), got {:?}",
             res
         );
-        let Item::EnumDef(e) = res else { unreachable!() };
+        let Item::EnumDef(e) = res else {
+            unreachable!()
+        };
         assert!(
             e.span.line > 0,
             "baked Result should carry a real source span"
@@ -767,7 +818,11 @@ mod tests {
             .as_ref()
             .expect("baked Vec should declare a generic param list");
         assert_eq!(
-            params.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            params
+                .params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["T"],
         );
     }
@@ -779,10 +834,13 @@ mod tests {
         // through the synthetic prelude module at all. After 5a it is a
         // real `Item::TraitDef` from `runtime/stdlib/partial_eq.kara`.
         let items = synthetic_prelude_items();
-        let pe = find_prelude_item(&items, "PartialEq")
-            .expect("synthetic prelude exposes PartialEq");
+        let pe =
+            find_prelude_item(&items, "PartialEq").expect("synthetic prelude exposes PartialEq");
         let Item::TraitDef(t) = pe else {
-            panic!("PartialEq should be spliced as TraitDef (baked), got {:?}", pe);
+            panic!(
+                "PartialEq should be spliced as TraitDef (baked), got {:?}",
+                pe
+            );
         };
         assert!(
             t.span.line > 0,
@@ -885,8 +943,7 @@ mod tests {
         // schedule explicitly defers, so its stub status holds across
         // slice-6.1's mechanical migrations.
         let items = synthetic_prelude_items();
-        let slice_item = find_prelude_item(&items, "Slice")
-            .expect("Slice is still a prelude name");
+        let slice_item = find_prelude_item(&items, "Slice").expect("Slice is still a prelude name");
         match slice_item {
             Item::StructDef(s) => {
                 assert_eq!(
@@ -967,7 +1024,10 @@ mod tests {
                     )
                 });
             assert!(
-                method.attributes.iter().any(|a| a.name == "compiler_builtin"),
+                method
+                    .attributes
+                    .iter()
+                    .any(|a| a.name == "compiler_builtin"),
                 "{}.{} should carry #[compiler_builtin]",
                 target_type,
                 name
@@ -980,7 +1040,9 @@ mod tests {
         assert_inherent_impl_compiler_builtin(
             "stats.kara",
             "Stats",
-            &["sum", "prod", "mean", "variance", "stddev", "median", "min", "max"],
+            &[
+                "sum", "prod", "mean", "variance", "stddev", "median", "min", "max",
+            ],
         );
     }
 

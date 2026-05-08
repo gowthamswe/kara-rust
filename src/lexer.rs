@@ -731,8 +731,7 @@ impl<'a> Lexer<'a> {
             self.advance();
         }
         let hex = std::str::from_utf8(&digits).expect("ASCII hex digits");
-        u8::from_str_radix(hex, 16)
-            .map_err(|_| "\\xHH escape: hex digit parse failed".to_string())
+        u8::from_str_radix(hex, 16).map_err(|_| "\\xHH escape: hex digit parse failed".to_string())
     }
 
     fn string(&mut self) -> SpannedToken {

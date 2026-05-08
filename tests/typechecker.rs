@@ -3232,7 +3232,8 @@ fn empty_map_literal_without_annotation_emits_focused_diagnostic() {
 fn empty_array_literal_without_annotation_emits_focused_diagnostic() {
     let errors = typecheck_errors("fn main() { let a = Array[]; }");
     let any_match = errors.iter().any(|e| {
-        e.message.contains("E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION")
+        e.message
+            .contains("E_EMPTY_PREFIX_LITERAL_NEEDS_ANNOTATION")
             && e.message.contains("empty `Array[]` literal")
             && e.message.contains("Array[T, 0]")
     });
@@ -3259,9 +3260,7 @@ fn empty_array_literal_with_annotation_keeps_passing() {
 
 #[test]
 fn empty_vec_literal_at_typed_call_arg_keeps_passing() {
-    typecheck_ok(
-        "fn take(v: Vec[i64]) -> i64 { 0 } fn main() { let _ = take(Vec[]); }",
-    );
+    typecheck_ok("fn take(v: Vec[i64]) -> i64 { 0 } fn main() { let _ = take(Vec[]); }");
 }
 
 #[test]
@@ -3347,8 +3346,7 @@ fn impl_marker_trait_with_method_rejected() {
     assert!(
         errors
             .iter()
-            .any(|e| e.message.contains("E_MARKER_IMPL_HAS_METHOD")
-                && e.message.contains("Pod")),
+            .any(|e| e.message.contains("E_MARKER_IMPL_HAS_METHOD") && e.message.contains("Pod")),
         "expected E_MARKER_IMPL_HAS_METHOD, got: {errors:?}"
     );
 }
@@ -3400,9 +3398,7 @@ fn cast_char_as_i32_accepted() {
 fn cast_int_as_char_rejected() {
     let errors = typecheck_errors("fn main() { let _ = 65u32 as char; }");
     assert!(
-        errors
-            .iter()
-            .any(|e| e.message.contains("E_INT_AS_CHAR")),
+        errors.iter().any(|e| e.message.contains("E_INT_AS_CHAR")),
         "expected E_INT_AS_CHAR, got: {errors:?}"
     );
 }
@@ -3411,9 +3407,7 @@ fn cast_int_as_char_rejected() {
 fn cast_int_as_bool_rejected() {
     let errors = typecheck_errors("fn main() { let _ = 1i32 as bool; }");
     assert!(
-        errors
-            .iter()
-            .any(|e| e.message.contains("E_INT_AS_BOOL")),
+        errors.iter().any(|e| e.message.contains("E_INT_AS_BOOL")),
         "expected E_INT_AS_BOOL, got: {errors:?}"
     );
 }
@@ -3422,9 +3416,7 @@ fn cast_int_as_bool_rejected() {
 fn cast_float_as_bool_rejected() {
     let errors = typecheck_errors("fn main() { let _ = 1.0f64 as bool; }");
     assert!(
-        errors
-            .iter()
-            .any(|e| e.message.contains("E_FLOAT_AS_BOOL")),
+        errors.iter().any(|e| e.message.contains("E_FLOAT_AS_BOOL")),
         "expected E_FLOAT_AS_BOOL, got: {errors:?}"
     );
 }
@@ -3501,7 +3493,6 @@ fn refutable_let_with_literal_pattern_rejected() {
     );
 }
 
-
 #[test]
 fn match_with_full_range_pattern_set_typechecks() {
     // Five-form range pattern coverage: `..lo`, `lo..hi`, `lo..=hi`,
@@ -3556,30 +3547,22 @@ fn try_block_emits_v1_stub_diagnostic() {
 
 #[test]
 fn fstring_accepts_vec_of_display_type() {
-    typecheck_ok(
-        "fn main() { let v: Vec[i64] = Vec[]; let s = f\"{v}\"; }",
-    );
+    typecheck_ok("fn main() { let v: Vec[i64] = Vec[]; let s = f\"{v}\"; }");
 }
 
 #[test]
 fn fstring_accepts_nested_vec_of_display_type() {
-    typecheck_ok(
-        "fn main() { let v: Vec[Vec[String]] = Vec[]; let s = f\"{v}\"; }",
-    );
+    typecheck_ok("fn main() { let v: Vec[Vec[String]] = Vec[]; let s = f\"{v}\"; }");
 }
 
 #[test]
 fn fstring_accepts_map_of_display_types() {
-    typecheck_ok(
-        "fn main() { let m: Map[String, Vec[i32]] = Map[]; let s = f\"{m}\"; }",
-    );
+    typecheck_ok("fn main() { let m: Map[String, Vec[i32]] = Map[]; let s = f\"{m}\"; }");
 }
 
 #[test]
 fn fstring_accepts_set_of_display_type() {
-    typecheck_ok(
-        "fn main() { let s: Set[i64] = Set[]; let _ = f\"{s}\"; }",
-    );
+    typecheck_ok("fn main() { let s: Set[i64] = Set[]; let _ = f\"{s}\"; }");
 }
 
 #[test]
@@ -4548,13 +4531,14 @@ fn test_method_resolution_through_ref_returns_real_type() {
          fn read(r: ref S) { want_string(r.get()); }",
     );
     assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch
+            && e.message.contains("expected 'String'")
+            && e.message.contains("found 'i64'")),
+        "expected TypeMismatch for String/i64 from r.get() through ref, got: {:?}",
         errors
             .iter()
-            .any(|e| e.kind == TypeErrorKind::TypeMismatch
-                && e.message.contains("expected 'String'")
-                && e.message.contains("found 'i64'")),
-        "expected TypeMismatch for String/i64 from r.get() through ref, got: {:?}",
-        errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+            .map(|e| (&e.kind, &e.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -4567,13 +4551,14 @@ fn test_method_resolution_through_mut_ref_returns_real_type() {
          fn read(r: mut ref S) { want_string(r.get()); }",
     );
     assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch
+            && e.message.contains("expected 'String'")
+            && e.message.contains("found 'i64'")),
+        "expected TypeMismatch for String/i64 from r.get() through mut ref, got: {:?}",
         errors
             .iter()
-            .any(|e| e.kind == TypeErrorKind::TypeMismatch
-                && e.message.contains("expected 'String'")
-                && e.message.contains("found 'i64'")),
-        "expected TypeMismatch for String/i64 from r.get() through mut ref, got: {:?}",
-        errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+            .map(|e| (&e.kind, &e.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -4694,9 +4679,7 @@ fn test_method_resolution_no_suggestion_when_nothing_close() {
 #[test]
 fn test_method_resolution_iterator_typo_suggestion() {
     // `iter.colect()` → suggests `collect`
-    let errors = typecheck_errors(
-        "fn main() { let v = [1, 2, 3]; v.iter().colect(); }",
-    );
+    let errors = typecheck_errors("fn main() { let v = [1, 2, 3]; v.iter().colect(); }");
     let msg = errors
         .iter()
         .find(|e| e.kind == TypeErrorKind::NoMethodFound)
@@ -4728,9 +4711,7 @@ fn test_method_resolution_map_typo_suggestion() {
 #[test]
 fn test_method_resolution_slice_typo_suggestion() {
     // `s.firts()` → suggests `first`
-    let errors = typecheck_errors(
-        "fn main() { let v = [1, 2, 3]; v.as_slice().firts(); }",
-    );
+    let errors = typecheck_errors("fn main() { let v = [1, 2, 3]; v.as_slice().firts(); }");
     let msg = errors
         .iter()
         .find(|e| e.kind == TypeErrorKind::NoMethodFound)
@@ -4748,9 +4729,7 @@ fn test_method_resolution_stdlib_silent_for_runtime_only() {
     // match to `sorted` / `sorted_by`). Preserves the permissive fall-through
     // for runtime-only methods like `len` that aren't yet typechecker-known.
     // `typecheck_ok` asserts there are no errors at all.
-    typecheck_ok(
-        "fn main() { let s = \"hi\"; s.completely_unrelated(); }",
-    );
+    typecheck_ok("fn main() { let s = \"hi\"; s.completely_unrelated(); }");
 }
 
 // ── Method resolution: conditional impl filtering ───────────────
@@ -4790,9 +4769,14 @@ fn test_conditional_impl_unsatisfied_drops_silently() {
          fn main() { let b: Bar[NotOrd] = Bar { x: NotOrd { x: 0 } }; b.method(); }",
     );
     assert!(
-        errors.iter().any(|e| matches!(e.kind, TypeErrorKind::NoMethodFound)),
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NoMethodFound)),
         "expected NoMethodFound for conditional impl that fails to discharge, got: {:?}",
-        errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+        errors
+            .iter()
+            .map(|e| (&e.kind, &e.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -4853,15 +4837,16 @@ fn test_receiver_form_typeparam_no_bound_no_method() {
     // `T` has no bounds, so `x.method()` finds no candidate trait.
     // Errors with NoMethodFound rather than the pre-slice-2 silent
     // fallthrough to Type::Error.
-    let errors = typecheck_errors(
-        "fn use_anything[T](x: T) -> i64 { x.access() }",
-    );
+    let errors = typecheck_errors("fn use_anything[T](x: T) -> i64 { x.access() }");
     assert!(
         errors
             .iter()
             .any(|e| matches!(e.kind, TypeErrorKind::NoMethodFound)),
         "expected NoMethodFound for no-bound TypeParam receiver, got: {:?}",
-        errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+        errors
+            .iter()
+            .map(|e| (&e.kind, &e.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -4879,7 +4864,10 @@ fn test_receiver_form_typeparam_multi_bound_ambiguity() {
             .iter()
             .any(|e| matches!(e.kind, TypeErrorKind::AmbiguousAssocFn)),
         "expected AmbiguousAssocFn for multi-bound receiver, got: {:?}",
-        errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+        errors
+            .iter()
+            .map(|e| (&e.kind, &e.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -8860,23 +8848,30 @@ fn test_subsume_function_identity_unchanged() {
 
 fn typecheck_stdlib_source(source: &str) -> TypeCheckResult {
     let parsed = parse(source);
-    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
     let resolved = karac::resolver::Resolver::new(&parsed.program)
         .with_stdlib_source(true)
         .resolve();
     assert!(
         resolved.errors.is_empty(),
         "resolve errors: {:?}",
-        resolved.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        resolved
+            .errors
+            .iter()
+            .map(|e| &e.message)
+            .collect::<Vec<_>>()
     );
     typecheck(&parsed.program, &resolved)
 }
 
 #[test]
 fn test_compiler_builtin_registers_signature_and_marks_intrinsic() {
-    let result = typecheck_stdlib_source(
-        "#[compiler_builtin]\nfn id_intrinsic[T](v: T) -> T { v }",
-    );
+    let result =
+        typecheck_stdlib_source("#[compiler_builtin]\nfn id_intrinsic[T](v: T) -> T { v }");
     assert!(result.errors.is_empty(), "type errors: {:?}", result.errors);
     assert!(
         result.compiler_builtins.contains("id_intrinsic"),
@@ -8891,9 +8886,8 @@ fn test_compiler_builtin_body_is_not_type_checked() {
     // Without slice 2's body-skip, this would surface as a TypeMismatch.
     // With it, the body is treated as a placeholder that Rust dispatch
     // replaces, so the (deliberately wrong) body passes silently.
-    let result = typecheck_stdlib_source(
-        "#[compiler_builtin]\nfn id_intrinsic[T](v: T) -> T { 42 }",
-    );
+    let result =
+        typecheck_stdlib_source("#[compiler_builtin]\nfn id_intrinsic[T](v: T) -> T { 42 }");
     assert!(
         result.errors.is_empty(),
         "expected no errors (body should be skipped), got: {:?}",
@@ -8927,14 +8921,22 @@ fn test_compiler_builtin_signature_rejects_mismatched_caller_return() {
         "#[compiler_builtin]\nfn id_intrinsic[T](v: T) -> T { v }\n\
          fn use_it() -> bool { id_intrinsic(42) }",
     );
-    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
     let resolved = karac::resolver::Resolver::new(&parsed.program)
         .with_stdlib_source(true)
         .resolve();
     assert!(
         resolved.errors.is_empty(),
         "resolve errors: {:?}",
-        resolved.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        resolved
+            .errors
+            .iter()
+            .map(|e| &e.message)
+            .collect::<Vec<_>>()
     );
     let result = typecheck(&parsed.program, &resolved);
     assert!(
@@ -8943,7 +8945,11 @@ fn test_compiler_builtin_signature_rejects_mismatched_caller_return() {
             .iter()
             .any(|e| e.kind == TypeErrorKind::TypeMismatch),
         "expected TypeMismatch on bool/i64, got: {:?}",
-        result.errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| (&e.kind, &e.message))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -9185,7 +9191,10 @@ fn baked_vec_registers_correct_struct_shape() {
         .get("Vec")
         .expect("Vec must be registered in struct_info from baked source");
     assert_eq!(info.generic_params, vec!["T".to_string()]);
-    assert!(info.fields.is_empty(), "Vec[T] is opaque (no public fields)");
+    assert!(
+        info.fields.is_empty(),
+        "Vec[T] is opaque (no public fields)"
+    );
     assert!(
         info.derived_traits.is_empty(),
         "Vec carries no structural derives at the type level (matches the legacy hardcoded path)"
@@ -9327,9 +9336,7 @@ fn baked_display_resolvable_as_trait_bound() {
     // bound position rather than at impl head. If the slice-5f swap
     // dropped Display from `env.traits`, this would fail with a
     // missing-trait diagnostic at the bound check.
-    typecheck_ok(
-        "fn show[T: Display](v: T) -> String { v.to_string() }",
-    );
+    typecheck_ok("fn show[T: Display](v: T) -> String { v.to_string() }");
 }
 
 #[test]
@@ -9428,9 +9435,17 @@ fn baked_eq_user_impl_without_partial_eq_companion_fails() {
         "struct Tag { value: i64 }\n\
          impl Eq for Tag {}",
     );
-    assert!(parsed.errors.is_empty(), "parse errors: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
     let resolved = resolve(&parsed.program);
-    assert!(resolved.errors.is_empty(), "resolve errors: {:?}", resolved.errors);
+    assert!(
+        resolved.errors.is_empty(),
+        "resolve errors: {:?}",
+        resolved.errors
+    );
     let typed = typecheck(&parsed.program, &resolved);
     assert!(
         typed
@@ -9438,8 +9453,10 @@ fn baked_eq_user_impl_without_partial_eq_companion_fails() {
             .iter()
             .any(|e| e.kind == TypeErrorKind::MissingSupertrait),
         "expected MissingSupertrait, got: {:?}",
-        typed.errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+        typed
+            .errors
+            .iter()
+            .map(|e| (&e.kind, &e.message))
+            .collect::<Vec<_>>()
     );
 }
-
-

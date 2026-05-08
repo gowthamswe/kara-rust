@@ -229,9 +229,9 @@ impl Parser {
                 }
             }
             Token::Trait => self.parse_trait_or_alias(attributes, is_pub, is_private),
-            Token::Marker => Some(Item::MarkerTrait(self.parse_marker_trait(
-                attributes, is_pub, is_private,
-            )?)),
+            Token::Marker => Some(Item::MarkerTrait(
+                self.parse_marker_trait(attributes, is_pub, is_private)?,
+            )),
             Token::Impl => Some(Item::ImplBlock(self.parse_impl_block(attributes)?)),
             Token::Effect => self.parse_effect_decl(is_pub, false, false),
             Token::Stable => {
@@ -534,9 +534,7 @@ impl Parser {
         };
 
         let (code, kind_label) = match self.fn_context_stack.last() {
-            Some(FnContext::TraitMethod) => {
-                ("E_TRAIT_METHOD_ANONYMOUS_PARAM", "trait method")
-            }
+            Some(FnContext::TraitMethod) => ("E_TRAIT_METHOD_ANONYMOUS_PARAM", "trait method"),
             // Default to the free-function diagnostic when the context
             // stack is empty (defensive — every signature site should
             // have pushed before reaching `parse_param`).
@@ -1061,18 +1059,12 @@ impl Parser {
         })
     }
 
-
     fn parse_assoc_type_decl(&mut self) -> Option<AssocTypeDecl> {
         let start = self.current_span();
         self.expect(&Token::Type)?;
         let name = self.expect_identifier()?;
         let name_span = self.span_from(&start);
-        self.check_ident_class(
-            &name,
-            IdentClass::Type,
-            "associated type",
-            name_span,
-        );
+        self.check_ident_class(&name, IdentClass::Type, "associated type", name_span);
         let mut bounds = Vec::new();
         if self.eat(&Token::Colon) {
             loop {
@@ -4398,9 +4390,7 @@ impl Parser {
         // never form struct literals, so the `{` here belongs to whatever
         // wraps this expression (a match scrutinee's arm list, a loop's
         // body, etc.).
-        if starts_upper(&name)
-            && self.check(&Token::LeftBrace)
-            && self.looks_like_struct_literal()
+        if starts_upper(&name) && self.check(&Token::LeftBrace) && self.looks_like_struct_literal()
         {
             return self.parse_struct_literal_body(vec![name], &start);
         }

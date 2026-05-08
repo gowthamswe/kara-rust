@@ -792,19 +792,13 @@ fn unify_types(a: &Type, b: &Type, substitutions: &mut HashMap<TypeVarId, Type>)
             .iter()
             .zip(bs.iter())
             .all(|(x, y)| unify_types(x, y, substitutions)),
-        (
-            Type::Named {
-                name: an,
-                args: aa,
-            },
-            Type::Named {
-                name: bn,
-                args: bb,
-            },
-        ) if an == bn && aa.len() == bb.len() => aa
-            .iter()
-            .zip(bb.iter())
-            .all(|(x, y)| unify_types(x, y, substitutions)),
+        (Type::Named { name: an, args: aa }, Type::Named { name: bn, args: bb })
+            if an == bn && aa.len() == bb.len() =>
+        {
+            aa.iter()
+                .zip(bb.iter())
+                .all(|(x, y)| unify_types(x, y, substitutions))
+        }
         (Type::Ref(x), Type::Ref(y))
         | (Type::MutRef(x), Type::MutRef(y))
         | (Type::Weak(x), Type::Weak(y)) => unify_types(x, y, substitutions),
@@ -2281,9 +2275,7 @@ impl<'a> TypeChecker<'a> {
         known_methods: &[&str],
         span: &Span,
     ) {
-        if let Some(suggestion) =
-            crate::edit_distance::suggest_similar(method, known_methods)
-        {
+        if let Some(suggestion) = crate::edit_distance::suggest_similar(method, known_methods) {
             self.type_error(
                 format!(
                     "no method '{}' on type '{}', did you mean '{}'?",
@@ -4660,9 +4652,11 @@ impl<'a> TypeChecker<'a> {
     /// where-clause / dyn). Bound substitution lands in P1.
     fn is_trait_alias(&self, trait_name: &str) -> bool {
         self.env.trait_aliases.contains(trait_name)
-            || self.program.items.iter().any(
-                |item| matches!(item, Item::TraitAlias(t) if t.name == trait_name),
-            )
+            || self
+                .program
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::TraitAlias(t) if t.name == trait_name))
     }
 
     /// Bound list of a declared trait alias for inclusion in the v1 stub
@@ -5709,12 +5703,10 @@ impl<'a> TypeChecker<'a> {
             // for a marker trait must be empty. Per design.md § Marker
             // Traits.
             if self.env.marker_traits.contains(&trait_name) {
-                let has_items = imp.items.iter().any(|item| {
-                    matches!(
-                        item,
-                        ImplItem::Method(_) | ImplItem::AssocType(_)
-                    )
-                });
+                let has_items = imp
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, ImplItem::Method(_) | ImplItem::AssocType(_)));
                 if has_items {
                     self.type_error(
                         format!(
@@ -5847,11 +5839,7 @@ impl<'a> TypeChecker<'a> {
         if matches!(inferred, Type::Error) {
             return;
         }
-        let in_scope: HashSet<&str> = self
-            .enclosing_bounds
-            .keys()
-            .map(|s| s.as_str())
-            .collect();
+        let in_scope: HashSet<&str> = self.enclosing_bounds.keys().map(|s| s.as_str()).collect();
         if let Some(name) = find_unbound_type_param(inferred, &in_scope) {
             self.type_error(
                 format!(
@@ -6295,7 +6283,10 @@ impl<'a> TypeChecker<'a> {
         if self.local_scope.lookup(name).is_some()
             || self.env.functions.contains_key(name)
             || self.env.constants.contains_key(name)
-            || matches!(name, "todo" | "unreachable" | "println" | "print" | "eprintln" | "panic")
+            || matches!(
+                name,
+                "todo" | "unreachable" | "println" | "print" | "eprintln" | "panic"
+            )
         {
             return None;
         }
@@ -6465,11 +6456,7 @@ impl<'a> TypeChecker<'a> {
         // pushdown seeing concrete (i.e. solved) slot types when
         // available.
         let (sub_params, sub_ret, name_to_id, id_to_name) =
-            instantiate_signature_with_fresh_vars(
-                params,
-                return_type,
-                &mut self.env.next_type_var,
-            );
+            instantiate_signature_with_fresh_vars(params, return_type, &mut self.env.next_type_var);
 
         let mut arg_tys: Vec<Option<Type>> = Vec::with_capacity(args.len());
         for arg in args {
@@ -8285,7 +8272,10 @@ impl<'a> TypeChecker<'a> {
         if self.local_scope.lookup(name).is_some()
             || self.env.functions.contains_key(name)
             || self.env.constants.contains_key(name)
-            || matches!(name, "todo" | "unreachable" | "println" | "print" | "eprintln" | "panic")
+            || matches!(
+                name,
+                "todo" | "unreachable" | "println" | "print" | "eprintln" | "panic"
+            )
         {
             return false;
         }
@@ -9102,8 +9092,7 @@ impl<'a> TypeChecker<'a> {
                     && !crate::prelude::PRELUDE_TYPES.contains(&type_name.as_str());
                 if is_user_defined {
                     let candidates = self.env.collect_method_names(&type_name);
-                    let candidate_refs: Vec<&str> =
-                        candidates.iter().map(String::as_str).collect();
+                    let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
                     let mut msg = format!("no method '{}' on type '{}'", method, type_name);
                     if let Some(suggestion) =
                         crate::edit_distance::suggest_similar(method, &candidate_refs)
@@ -9150,13 +9139,7 @@ impl<'a> TypeChecker<'a> {
             // Flip to always-error once enumeration catches up to the
             // interpreter's String surface — design.md § Method Resolution
             // Step 7.
-            _ => self.handle_unknown_method(
-                "String",
-                method,
-                &["sorted", "sorted_by"],
-                args,
-                span,
-            ),
+            _ => self.handle_unknown_method("String", method, &["sorted", "sorted_by"], args, span),
         }
     }
 
@@ -9323,9 +9306,21 @@ impl<'a> TypeChecker<'a> {
                 "Slice",
                 method,
                 &[
-                    "binary_search", "chunks", "contains", "fill", "first",
-                    "get", "is_empty", "last", "len", "reverse", "sort",
-                    "sort_by", "split_at", "swap", "windows",
+                    "binary_search",
+                    "chunks",
+                    "contains",
+                    "fill",
+                    "first",
+                    "get",
+                    "is_empty",
+                    "last",
+                    "len",
+                    "reverse",
+                    "sort",
+                    "sort_by",
+                    "split_at",
+                    "swap",
+                    "windows",
                 ],
                 args,
                 span,
@@ -9526,9 +9521,19 @@ impl<'a> TypeChecker<'a> {
                 "Map",
                 method,
                 &[
-                    "clear", "contains_key", "entries", "entry", "get",
-                    "get_or", "insert", "is_empty", "keys", "len", "merge",
-                    "remove", "values",
+                    "clear",
+                    "contains_key",
+                    "entries",
+                    "entry",
+                    "get",
+                    "get_or",
+                    "insert",
+                    "is_empty",
+                    "keys",
+                    "len",
+                    "merge",
+                    "remove",
+                    "values",
                 ],
                 args,
                 span,
@@ -9734,8 +9739,16 @@ impl<'a> TypeChecker<'a> {
                 "SortedSet",
                 method,
                 &[
-                    "contains", "difference", "insert", "intersection",
-                    "is_empty", "len", "max", "min", "remove", "union",
+                    "contains",
+                    "difference",
+                    "insert",
+                    "intersection",
+                    "is_empty",
+                    "len",
+                    "max",
+                    "min",
+                    "remove",
+                    "union",
                 ],
                 args,
                 span,
@@ -9825,8 +9838,14 @@ impl<'a> TypeChecker<'a> {
                 "Set",
                 method,
                 &[
-                    "contains", "difference", "insert", "intersection",
-                    "is_empty", "len", "remove", "union",
+                    "contains",
+                    "difference",
+                    "insert",
+                    "intersection",
+                    "is_empty",
+                    "len",
+                    "remove",
+                    "union",
                 ],
                 args,
                 span,
@@ -10511,11 +10530,31 @@ impl<'a> TypeChecker<'a> {
                 "Iterator",
                 method,
                 &[
-                    "all", "any", "chain", "chunk_by", "chunks", "collect",
-                    "count", "cycle", "enumerate", "filter", "flat_map",
-                    "fold", "inspect", "map", "next", "peek", "peekable",
-                    "scan", "skip", "skip_while", "step_by", "take",
-                    "take_while", "windows", "zip",
+                    "all",
+                    "any",
+                    "chain",
+                    "chunk_by",
+                    "chunks",
+                    "collect",
+                    "count",
+                    "cycle",
+                    "enumerate",
+                    "filter",
+                    "flat_map",
+                    "fold",
+                    "inspect",
+                    "map",
+                    "next",
+                    "peek",
+                    "peekable",
+                    "scan",
+                    "skip",
+                    "skip_while",
+                    "step_by",
+                    "take",
+                    "take_while",
+                    "windows",
+                    "zip",
                 ],
                 args,
                 span,
@@ -10639,13 +10678,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 result_response
             }
-            _ => self.handle_unknown_method(
-                "Client",
-                method,
-                &["get", "post"],
-                args,
-                span,
-            ),
+            _ => self.handle_unknown_method("Client", method, &["get", "post"], args, span),
         }
     }
 
@@ -10709,13 +10742,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Str
             }
-            _ => self.handle_unknown_method(
-                "HttpError",
-                method,
-                &["message"],
-                args,
-                span,
-            ),
+            _ => self.handle_unknown_method("HttpError", method, &["message"], args, span),
         }
     }
 
@@ -10758,13 +10785,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     sender_elem
                 }
-                _ => self.handle_unknown_method(
-                    "Sender",
-                    method,
-                    &["clone", "send"],
-                    args,
-                    span,
-                ),
+                _ => self.handle_unknown_method("Sender", method, &["clone", "send"], args, span),
             }
         } else {
             // Receiver

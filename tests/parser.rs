@@ -965,9 +965,7 @@ fn test_trait_alias_empty_bound_list_rejected() {
         "expected error for empty trait-alias bound list"
     );
     assert!(
-        errors[0]
-            .message
-            .contains("at least one trait bound"),
+        errors[0].message.contains("at least one trait bound"),
         "got: {:?}",
         errors[0].message
     );
@@ -4739,9 +4737,8 @@ fn test_ident_class_assoc_type_pascal_ok() {
 
 #[test]
 fn test_ident_class_layout_name_must_be_value_class() {
-    let (_, errors) = parse_with_errors(
-        "struct Entity { id: i64 } layout MyEntities: Vec[Entity] { id }",
-    );
+    let (_, errors) =
+        parse_with_errors("struct Entity { id: i64 } layout MyEntities: Vec[Entity] { id }");
     assert!(
         !errors.is_empty(),
         "expected naming error for PascalCase layout name"
@@ -5279,8 +5276,7 @@ fn anon_param_in_free_fn_emits_focused_diagnostic() {
 
 #[test]
 fn anon_param_in_trait_method_emits_focused_diagnostic() {
-    let (_prog, errors) =
-        parse_with_errors("trait V { fn visit(ref self, Node); }");
+    let (_prog, errors) = parse_with_errors("trait V { fn visit(ref self, Node); }");
     assert_one_error_containing(
         &errors,
         &[
@@ -5297,8 +5293,7 @@ fn anon_param_recovers_so_remaining_params_keep_parsing() {
     // After the focused diagnostic fires on the second param, the third
     // param's name+colon shape is still recognized — we get one error
     // for the anonymous param, not a cascade.
-    let (_prog, errors) =
-        parse_with_errors("fn f(a: i32, Node, c: bool) { }");
+    let (_prog, errors) = parse_with_errors("fn f(a: i32, Node, c: bool) { }");
     assert_eq!(
         errors.len(),
         1,
