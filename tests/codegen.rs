@@ -6699,4 +6699,71 @@ fn main() {
             );
         }
     }
+
+    // ── Theme 6: provider vtable emission (sub-step 2) ────────────────────
+    //
+    // Structural tests pinning that codegen emits a static `@VT_<U>_<T>`
+    // global per `impl T for U` where `T` is bound to some `effect resource
+    // R: T`. The fully-wired dispatch (sub-steps 3+4 — `with_provider[R]`
+    // lowering + `R.method(...)` indirect call) is out of scope for this
+    // commit; these tests verify the foundation only.
+
+    #[test]
+    fn test_provider_vtable_emitted_for_provider_trait_impl() {
+        let ir = ir_for(
+            "pub trait Recorder { fn record(value: i64); }\n\
+             pub struct Counter { n: i64 }\n\
+             impl Recorder for Counter { fn record(value: i64) { } }\n\
+             pub effect resource Metric: Recorder;\n\
+             fn main() { }",
+        );
+        assert!(
+            ir.contains("@VT_Counter_Recorder"),
+            "expected vtable global @VT_Counter_Recorder; IR: {}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_provider_vtable_skipped_for_non_provider_trait_impl() {
+        // No `effect resource` declaration → the trait isn't a provider
+        // trait → no vtable emitted, even though `impl Foo for Bar`
+        // exists.
+        let ir = ir_for(
+            "pub trait Foo { fn f(value: i64); }\n\
+             pub struct Bar { n: i64 }\n\
+             impl Foo for Bar { fn f(value: i64) { } }\n\
+             fn main() { }",
+        );
+        assert!(
+            !ir.contains("@VT_Bar_Foo"),
+            "expected no vtable global for non-provider trait; IR: {}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_provider_vtable_one_per_impl_target() {
+        // Two impls of the same provider trait on different target types
+        // produce two distinct vtables.
+        let ir = ir_for(
+            "pub trait Recorder { fn record(value: i64); }\n\
+             pub struct CounterA { n: i64 }\n\
+             pub struct CounterB { n: i64 }\n\
+             impl Recorder for CounterA { fn record(value: i64) { } }\n\
+             impl Recorder for CounterB { fn record(value: i64) { } }\n\
+             pub effect resource Metric: Recorder;\n\
+             fn main() { }",
+        );
+        assert!(
+            ir.contains("@VT_CounterA_Recorder"),
+            "expected @VT_CounterA_Recorder; IR: {}",
+            ir
+        );
+        assert!(
+            ir.contains("@VT_CounterB_Recorder"),
+            "expected @VT_CounterB_Recorder; IR: {}",
+            ir
+        );
+    }
 }

@@ -16,7 +16,7 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, StructType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, IntValue, PointerValue,
 };
 use inkwell::{
     AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate, OptimizationLevel,
@@ -687,6 +687,51 @@ struct Codegen<'ctx> {
     /// `phase-8-stdlib-floor.md` § "Auto-Concurrency Codegen —
     /// Parallax-lite Workload".
     auto_par_disabled: bool,
+    // ── Theme 6: `with_provider[R]` trait-method dispatch ──────────
+    /// Resource name → stable u32 ID assigned at codegen init from the
+    /// declaration order of `Item::EffectResource` items. The same
+    /// integer flows through to runtime calls (`karac_provider_push`,
+    /// `karac_provider_lookup`); the runtime is name-agnostic.
+    provider_resource_ids: HashMap<String, u32>,
+    /// Resource name → trait name for resources declared as
+    /// `effect resource R: T`. Used to (1) drive vtable emission for
+    /// the impls of `T` and (2) resolve method indices at `R.method(...)`
+    /// call sites.
+    provider_resource_traits: HashMap<String, String>,
+    /// Trait name → ordered method-name list (source-declaration order
+    /// from the `trait T { ... }` block). Vtables for `impl T for U`
+    /// store fn ptrs in this same order; method dispatch resolves the
+    /// vtable index by `position()` against this list.
+    provider_trait_methods: HashMap<String, Vec<String>>,
+    /// (impl-target type name, trait name) → emitted vtable global.
+    /// Populated after impl method declarations run in `compile_program`.
+    provider_vtables: HashMap<(String, String), GlobalValue<'ctx>>,
+    /// Runtime extern: `karac_provider_push(frame_ptr, resource_id, data_ptr, vtable_ptr)`.
+    /// Consumed by `with_provider[R]` lowering (sub-step 3).
+    #[allow(dead_code)]
+    karac_provider_push_fn: FunctionValue<'ctx>,
+    /// Runtime extern: `karac_provider_pop()`. Consumed by `with_provider[R]`
+    /// lowering (sub-step 3) for the matching pop on body exit.
+    #[allow(dead_code)]
+    karac_provider_pop_fn: FunctionValue<'ctx>,
+    /// Runtime extern: `karac_provider_lookup(resource_id) -> ProviderLookupResult`.
+    /// Consumed by `R.method(...)` dispatch (sub-step 4) to find the
+    /// active provider's data pointer and vtable.
+    #[allow(dead_code)]
+    karac_provider_lookup_fn: FunctionValue<'ctx>,
+    /// LLVM struct type for `ProviderFrame { prev, resource_id, data, vtable }`
+    /// — `#[repr(C)]` matches `runtime/src/lib.rs::ProviderFrame`. Consumed
+    /// at `with_provider[R]` lowering sites for the alloca'd frame storage
+    /// (sub-step 3); declared here so the type is established alongside
+    /// the runtime extern declarations.
+    #[allow(dead_code)]
+    provider_frame_ty: StructType<'ctx>,
+    /// LLVM struct type for `ProviderLookupResult { data, vtable }` —
+    /// matches the runtime's `#[repr(C)]` shape. Consumed at
+    /// `R.method(...)` dispatch sites (sub-step 4) to extract the two
+    /// pointer fields from `karac_provider_lookup`'s return.
+    #[allow(dead_code)]
+    provider_lookup_result_ty: StructType<'ctx>,
     // ── Map runtime ───────────────────────────────────────────────
     /// Per-variable Map key LLVM type (variable name → K LLVM type).
     map_key_types: HashMap<String, BasicTypeEnum<'ctx>>,
@@ -846,6 +891,57 @@ impl<'ctx> Codegen<'ctx> {
         );
         let karac_par_run_fn =
             module.add_function("karac_par_run", karac_par_run_type, Some(Linkage::External));
+
+        // ── Theme 6: provider stack ABI ──────────────────────────────────
+        //
+        // Mirrors `runtime/src/lib.rs::ProviderFrame` and
+        // `ProviderLookupResult` `#[repr(C)]` layouts. `ProviderFrame` is
+        // alloca'd at each `with_provider[R](...)` site; the runtime only
+        // updates head pointers, so the storage shape needs to match the
+        // runtime's reads but isn't owned by the runtime.
+        let provider_frame_ty = context.struct_type(
+            &[
+                ptr_type.into(), // prev: *const ProviderFrame
+                i32_type.into(), // resource_id: u32
+                ptr_type.into(), // provider_data_ptr: *const u8
+                ptr_type.into(), // vtable_ptr: *const VTable
+            ],
+            false,
+        );
+        let provider_lookup_result_ty = context.struct_type(
+            &[
+                ptr_type.into(), // data: *const u8
+                ptr_type.into(), // vtable: *const VTable
+            ],
+            false,
+        );
+        let karac_provider_push_type = context.void_type().fn_type(
+            &[
+                ptr_type.into(), // frame: *mut ProviderFrame
+                i32_type.into(), // resource_id: u32
+                ptr_type.into(), // provider_data: *const u8
+                ptr_type.into(), // vtable: *const VTable
+            ],
+            false,
+        );
+        let karac_provider_push_fn = module.add_function(
+            "karac_provider_push",
+            karac_provider_push_type,
+            Some(Linkage::External),
+        );
+        let karac_provider_pop_type = context.void_type().fn_type(&[], false);
+        let karac_provider_pop_fn = module.add_function(
+            "karac_provider_pop",
+            karac_provider_pop_type,
+            Some(Linkage::External),
+        );
+        let karac_provider_lookup_type =
+            provider_lookup_result_ty.fn_type(&[i32_type.into()], false);
+        let karac_provider_lookup_fn = module.add_function(
+            "karac_provider_lookup",
+            karac_provider_lookup_type,
+            Some(Linkage::External),
+        );
 
         // ── Debugger Contract slice 5: `std.runtime` introspection ──
         //
@@ -1070,6 +1166,15 @@ impl<'ctx> Codegen<'ctx> {
             spawn_sites: Vec::new(),
             runtime_debug_metadata_enabled: read_runtime_debug_metadata_env(),
             auto_par_disabled: !read_auto_par_env(),
+            provider_resource_ids: HashMap::new(),
+            provider_resource_traits: HashMap::new(),
+            provider_trait_methods: HashMap::new(),
+            provider_vtables: HashMap::new(),
+            karac_provider_push_fn,
+            karac_provider_pop_fn,
+            karac_provider_lookup_fn,
+            provider_frame_ty,
+            provider_lookup_result_ty,
             map_key_types: HashMap::new(),
             map_val_types: HashMap::new(),
             map_key_type_names: HashMap::new(),
@@ -2754,6 +2859,38 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
+        // Theme 6: assign stable u32 IDs to `effect resource R[: T]`
+        // declarations + capture each provider trait's method-declaration
+        // order. The IDs flow through to `karac_provider_push` /
+        // `karac_provider_lookup` calls; method order pins the vtable
+        // layout. Must precede impl-method declaration so vtable emission
+        // (after impl declarations) can read these tables.
+        let mut next_resource_id: u32 = 0;
+        for item in &program.items {
+            if let Item::EffectResource(decl) = item {
+                self.provider_resource_ids
+                    .insert(decl.name.clone(), next_resource_id);
+                next_resource_id += 1;
+                if let Some(trait_name) = &decl.provider_trait {
+                    self.provider_resource_traits
+                        .insert(decl.name.clone(), trait_name.clone());
+                }
+            }
+        }
+        for item in &program.items {
+            if let Item::TraitDef(t) = item {
+                let methods: Vec<String> = t
+                    .items
+                    .iter()
+                    .filter_map(|ti| match ti {
+                        TraitItem::Method(m) => Some(m.name.clone()),
+                        TraitItem::AssocType(_) => None,
+                    })
+                    .collect();
+                self.provider_trait_methods.insert(t.name.clone(), methods);
+            }
+        }
+
         // First pass: register generic functions for on-demand monomorphization;
         // declare concrete (non-generic) functions for forward-call support.
         for item in &program.items {
@@ -2852,12 +2989,83 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
+        // Theme 6: emit static vtables for impls of provider traits.
+        // Runs after impl methods are declared (they're referenced by the
+        // vtable entries) and before `emit_llvm_used` so any `#[used]`
+        // attributes on the vtable globals would still apply (no v1
+        // attributes attach to vtable globals today).
+        self.emit_provider_vtables(program);
+
         self.emit_llvm_used();
         self.emit_spawn_sites_metadata();
 
         self.module
             .verify()
             .map_err(|e| format!("Module verification failed: {}", e))
+    }
+
+    /// Emit a static vtable global per `impl T for U` where `T` was
+    /// declared as a provider trait via some `effect resource R: T`.
+    /// The vtable is an array of fn pointers in trait-method-declaration
+    /// order; method dispatch at `R.method(...)` indexes into this array
+    /// using the method's position in `provider_trait_methods[T]`.
+    /// Symbol name: `@VT_<U>_<T>`. Stored in `provider_vtables` keyed by
+    /// `(U, T)` for `with_provider[R]` lookup.
+    fn emit_provider_vtables(&mut self, program: &Program) {
+        // Gather the set of provider trait names from the resource decls
+        // walked earlier. Inherent impls (no trait) don't need vtables —
+        // they're called directly by name.
+        let provider_traits: HashSet<String> =
+            self.provider_resource_traits.values().cloned().collect();
+        if provider_traits.is_empty() {
+            return;
+        }
+
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        for item in &program.items {
+            let Item::ImplBlock(imp) = item else { continue };
+            let Some(trait_path) = &imp.trait_name else {
+                continue;
+            };
+            let Some(trait_name) = trait_path.segments.last().cloned() else {
+                continue;
+            };
+            if !provider_traits.contains(&trait_name) {
+                continue;
+            }
+            let Some(target_name) = impl_target_name(&imp.target_type) else {
+                continue;
+            };
+            let Some(method_order) = self.provider_trait_methods.get(&trait_name).cloned() else {
+                continue;
+            };
+
+            // Look up each method's compiled fn-ptr. Methods declared on
+            // the impl but absent from the trait (extras) are ignored —
+            // the vtable matches the trait's view. Trait methods missing
+            // from the impl emit a null fn-ptr; calling such a vtable
+            // slot would null-deref at runtime, but the typechecker
+            // rejects partial impls so this case shouldn't reach codegen.
+            let mut entries: Vec<inkwell::values::PointerValue<'ctx>> = Vec::new();
+            for method_name in &method_order {
+                let symbol = format!("{}.{}", target_name, method_name);
+                let entry = match self.module.get_function(&symbol) {
+                    Some(f) => f.as_global_value().as_pointer_value(),
+                    None => ptr_type.const_null(),
+                };
+                entries.push(entry);
+            }
+
+            let vtable_array_ty = ptr_type.array_type(entries.len() as u32);
+            let vtable_init = ptr_type.const_array(&entries);
+            let vt_name = format!("VT_{}_{}", target_name, trait_name);
+            let vt_global = self.module.add_global(vtable_array_ty, None, &vt_name);
+            vt_global.set_initializer(&vtable_init);
+            vt_global.set_linkage(Linkage::Internal);
+            vt_global.set_constant(true);
+            self.provider_vtables
+                .insert((target_name, trait_name), vt_global);
+        }
     }
 
     /// Materialize the special `@llvm.used` global from `used_symbols`.
