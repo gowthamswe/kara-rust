@@ -215,7 +215,7 @@ Per-slice durations recorded as each lands. Subagent wall-clock is the implement
 | 4 | perf note (shared struct mut) | 2026-05-08 00:01 | 2026-05-08 00:12 | 11 min | `4f1efe1` |
 | 5 | REPL UAM diagnostic | 2026-05-08 00:19 | 2026-05-08 00:37 | 18 min | `a684ca1` |
 | 6 | REPL auto-clone | 2026-05-08 00:40 | 2026-05-08 00:59 | 19 min | `3f20d72` |
-| 7 | atomic-RC | 2026-05-08 01:01 | 2026-05-08 01:18 | 17 min | _pending_ |
+| 7 | atomic-RC | 2026-05-08 01:01 | 2026-05-08 01:18 | 17 min | `791ea64` |
 | 8 | env.set | _—_ | _—_ | _—_ | _—_ |
 | 9 | From[VarError] → IoError | _—_ | _—_ | _—_ | _—_ |
 | 10 | `?` JSON trace mode | _—_ | _—_ | _—_ | _—_ |
