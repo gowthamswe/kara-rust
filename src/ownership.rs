@@ -4232,8 +4232,18 @@ fn type_expr_head(te: &TypeExpr) -> Option<String> {
 fn owned_type_name(ty: &Type) -> Option<String> {
     match ty {
         Type::Named { name, .. } => Some(name.clone()),
+        // Shared structs participate in the cycle graph the same way Named
+        // does — `shared struct A { b: B }` still creates an A → B edge.
+        // The shared-vs-mixed cycle classification happens downstream in
+        // `dfs_cycle` via `is_shared_type`.
+        Type::Shared(name) => Some(name.clone()),
         // ref, mut ref, weak fields don't create ownership edges
         Type::Ref(_) | Type::MutRef(_) | Type::Weak(_) => None,
+        // Rc/Arc wrappers behave like the legacy `Type::Named { name: "Rc", … }`
+        // form did — the wrapper name has no entry in the user-type graph,
+        // so the edge is effectively absent. (Cycle detection via the inner
+        // type is out of scope for sub-item 2's behavior-preserving refactor.)
+        Type::Rc(_) | Type::Arc(_) => None,
         // Primitives, tuples, arrays, etc. don't create type graph edges
         _ => None,
     }
@@ -4243,6 +4253,7 @@ fn owned_type_name(ty: &Type) -> Option<String> {
 fn type_name(ty: &Type) -> Option<String> {
     match ty {
         Type::Named { name, .. } => Some(name.clone()),
+        Type::Shared(name) => Some(name.clone()),
         Type::Ref(inner) | Type::MutRef(inner) | Type::Weak(inner) => type_name(inner),
         _ => None,
     }

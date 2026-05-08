@@ -2987,6 +2987,24 @@ impl<'a> TypeChecker<'a> {
             }
             // Named type (struct/enum/import)
             let args = self.lower_generic_args(&path.generic_args, generic_scope);
+            // Intercept stdlib Rc[T] / Arc[T] wrappers — sub-item 2 of the
+            // Type::Shared/Rc/Arc representation work. Single-arg form
+            // only; zero/multi-arg keeps flowing through Type::Named so
+            // the existing arity diagnostics still fire from there.
+            if name == "Rc" && args.len() == 1 {
+                return Type::Rc(Box::new(args.into_iter().next().unwrap()));
+            }
+            if name == "Arc" && args.len() == 1 {
+                return Type::Arc(Box::new(args.into_iter().next().unwrap()));
+            }
+            // Intercept shared structs — bare struct name `S` lowers to
+            // Type::Shared(S) when `S` was declared as `shared struct S`.
+            // Non-shared structs continue through Type::Named.
+            if let Some(info) = self.env.structs.get(name) {
+                if info.is_shared {
+                    return Type::Shared(name.clone());
+                }
+            }
             Type::Named {
                 name: name.clone(),
                 args,
@@ -12408,6 +12426,79 @@ mod once_function_carrier_tests {
         };
         assert!(!types_compatible(&shared_s, &legacy_s));
         assert!(!types_compatible(&legacy_s, &shared_s));
+    }
+
+    // ── lower_path_type produces Rc / Arc / Shared variants (sub-item 2) ──
+
+    fn build_typechecker(src: &str) -> TypeChecker<'static> {
+        // Leak the parsed/resolved data so the TypeChecker borrow is 'static
+        // for the duration of the test — fine; the lifetime ends with the
+        // test process.
+        let parsed: &'static _ = Box::leak(Box::new(crate::parse(src)));
+        let resolved: &'static _ = Box::leak(Box::new(crate::resolve(&parsed.program)));
+        let mut tc = TypeChecker::new(&parsed.program, resolved);
+        tc.build_type_env();
+        tc
+    }
+
+    fn path_with_args(name: &str, args: Vec<crate::ast::TypeExpr>) -> crate::ast::PathExpr {
+        use crate::ast::GenericArg;
+        crate::ast::PathExpr {
+            segments: vec![name.to_string()],
+            generic_args: if args.is_empty() {
+                None
+            } else {
+                Some(args.into_iter().map(GenericArg::Type).collect())
+            },
+            span: Span::default(),
+        }
+    }
+
+    fn type_path(name: &str) -> crate::ast::TypeExpr {
+        crate::ast::TypeExpr {
+            kind: crate::ast::TypeKind::Path(path_with_args(name, vec![])),
+            span: Span::default(),
+        }
+    }
+
+    #[test]
+    fn test_lower_rc_path_type_produces_rc_variant() {
+        let tc = build_typechecker("");
+        let path = path_with_args("Rc", vec![type_path("i64")]);
+        let lowered = tc.lower_path_type(&path, &[]);
+        assert_eq!(lowered, Type::Rc(Box::new(Type::Int(IntSize::I64))));
+    }
+
+    #[test]
+    fn test_lower_arc_path_type_produces_arc_variant() {
+        let tc = build_typechecker("");
+        let path = path_with_args("Arc", vec![type_path("String")]);
+        let lowered = tc.lower_path_type(&path, &[]);
+        assert_eq!(lowered, Type::Arc(Box::new(Type::Str)));
+    }
+
+    #[test]
+    fn test_lower_shared_struct_path_type_produces_shared_variant() {
+        let tc = build_typechecker("shared struct S { val: i64 }");
+        let path = path_with_args("S", vec![]);
+        let lowered = tc.lower_path_type(&path, &[]);
+        assert_eq!(lowered, Type::Shared("S".to_string()));
+    }
+
+    #[test]
+    fn test_lower_nonshared_struct_path_type_stays_named() {
+        // Cross-check: the shared-struct intercept must not fire for plain
+        // structs — sub-item 2's behavior-preserving promise hinges on this.
+        let tc = build_typechecker("struct P { val: i64 }");
+        let path = path_with_args("P", vec![]);
+        let lowered = tc.lower_path_type(&path, &[]);
+        assert_eq!(
+            lowered,
+            Type::Named {
+                name: "P".to_string(),
+                args: vec![],
+            }
+        );
     }
 }
 
