@@ -157,9 +157,36 @@ The items below land from the v62 brainstorm on interpreter perf and binary size
 
 - [ ] **Phase 1 binary-size optimization: `strip -x` + `panic = "abort"` in runtime release profile.** P0 v1. Single PR. Two changes: (1) add `strip -x <output>` after the `cc` invocation in `link_executable` (`src/codegen.rs` ~line 121) — verified -18% on a representative binary (1.4 MB → 1.18 MB); (2) set `panic = "abort"` in `runtime/Cargo.toml`'s `[profile.release]` — drops `__eh_frame` + `__unwind_info` (~114 KB on a representative binary). Ship `panic = "abort"` unconditionally for v1 — `catch_panic` (currently P1 deferred) lands its own build-profile gate (kernel/embedded → abort, default → unwind) when it ships, not pre-built here. Combined estimated effect: 1.4 MB → ~900 KB.
 
+  *Slice plan (drafted 2026-05-07).* Combined slice covering both Phase 1 binary-size optimization (this entry) and the pre-flight runtime symbol sweep (entry below at ~line 162) since they're paired by design — the sweep is a 5-min audit that documents keep-list symbols, and `panic = "abort"` benefits from the same review pass. Combined slice keeps both build-config changes in one commit.
+
+  *Sub-steps.*
+  - **(a)** Symbol sweep (the prep audit). Grep `runtime/src/` for `#[used]`, `#[link_section]`, `#[ctor]`, `#[dtor]`, `#[no_mangle]`, and `extern "C"` declarations. Document findings (or absence) in a new `runtime/SYMBOL_KEEP_LIST.md`. Runtime is 726 LOC across 2 files — expected output is short (likely just the FFI bridge entry points).
+  - **(b)** `strip -x` post-link command. In `src/codegen.rs`'s `link_executable` (~line 121), invoke `strip -x <output>` on the produced binary after the `cc` link step. Use `Command::new` matching the existing `cc` invocation. Skip on Windows (no native `strip` equivalent in toolchain at v1) — gate with `#[cfg(unix)]` or a runtime platform check.
+  - **(c)** `panic = "abort"` in runtime release profile. Add `panic = "abort"` to `runtime/Cargo.toml`'s `[profile.release]`. Re-run `cargo build -p karac-runtime --release` to refresh `target/release/libkarac_runtime.a` (CLAUDE.md flags this as a one-time-setup step).
+  - **(d)** Smoke-verify post-strip binary. Pick an existing `--features llvm` E2E test (e.g., `tests/codegen.rs::test_basic_program` or similar); confirm exit code + observable behavior unchanged after the strip + abort config lands.
+
+  *Tests.*
+  - No new unit tests — this is build-config + post-link tooling.
+  - **Smoke verification** as part of slice acceptance: existing E2E test passes under the strip + abort config when `--features llvm` is enabled.
+  - **Size-delta measurement** in the close-out: report binary size for one representative E2E binary, before vs after, to confirm the expected delta lands (-18% from strip + ~114 KB from abort).
+
+  *Files expected to change.* `runtime/SYMBOL_KEEP_LIST.md` (new file capturing sweep output); `src/codegen.rs` (~10 lines for post-link `strip` command); `runtime/Cargo.toml` (1 line for `panic = "abort"`); this doc (close-out for both entries with measured size delta).
+
+  *Out of scope.*
+  - Phase 2 LTO/DCE flags (entry at line 160) — explicit follow-up; the symbol sweep here is its prerequisite.
+  - Per-target rustc flags (`-ffunction-sections` Linux equivalents) — Phase 2 territory.
+  - `catch_panic` infrastructure — P1 deferred per the entry text; lands its own build-profile gate later.
+
+  *Hard-stop triggers.*
+  - The symbol sweep finds `#[ctor]` / `#[dtor]` / `#[link_section]` attributes that DCE would later strip incorrectly — Phase 2 concern, but if Phase 1's `panic = "abort"` interacts with one (e.g., a panic-handler `#[link_section]`), halt and discuss.
+  - `panic = "abort"` breaks something in the existing test suite (e.g., a panic-recovery test that relied on unwind being available). The entry says "Ship `panic = "abort"` unconditionally for v1" but a real failure surfaces a design call.
+  - Stripped binary fails the smoke-verification step — strip semantics differ across BSD/GNU strip; if `-x` doesn't behave on the target platform, halt and document.
+
 - [ ] **Phase 2 binary-size optimization: cross-archive LTO + DCE flags.** P0 v1. Add `-Wl,-dead_strip` (macOS) / `-Wl,--gc-sections` (Linux) to the `cc` link invocation; set `lto = "thin"` in `runtime/Cargo.toml`'s `[profile.release]`. Linux ELF additionally needs the runtime crate compiled with `-ffunction-sections -fdata-sections` (`RUSTFLAGS=-C link-arg=...` per-target, or per-target rustc config) for granular DCE. macOS Mach-O has subsections-via-symbols always-on so explicit `-ffunction-sections` is a no-op there. Estimated effect on top of Phase 1: ~700 KB Linux, ~850 KB macOS. Pre-flight: see entry below.
 
 - [ ] **Pre-flight runtime symbol sweep (gates Phase 2 LTO/DCE).** Grep `runtime/src/` for `#[used]`, `#[link_section]`, `#[ctor]`, `#[dtor]`, `#[no_mangle]`, and `extern "C"` declarations before enabling LTO. Document any findings in the Phase 2 PR's checklist as a keep-list — symbols DCE would strip incorrectly otherwise. The runtime is 726 LOC across 2 files; this is a 5-minute task, not a design question. Phase 2 PR's checklist: (1) sweep done, (2) flagged symbols documented as keep-list, (3) LTO enabled, (4) E2E tests pass, (5) measured size delta reported.
+
+  *Bundled into Phase 1 binary-size slice.* See entry above (`Phase 1 binary-size optimization`) — the symbol sweep is sub-step (a) of that slice's plan, since the audit pairs naturally with the build-config changes.
 
 - [ ] **Monomorphized collections — runtime restructure.** P1 (post-v1, P0 design-property). Replace today's type-erased C runtime (`runtime/src/map.rs` and any future erased collections) with monomorphizable Kāra/Rust source compiled per user crate. `Map[K, V]`, `Set[T]`, `Vec[T]`, future `BTreeMap[K, V]` emit one specialized implementation per concrete type tuple — direct hash/eq calls, full inlining, no function-pointer indirection, no byte-blob storage. Existing codegen infrastructure (`generic_fns`, `generated_monos`, `mangle_mono_name`, `type_subst` in `src/codegen.rs:338–345`, `12723–12788`, `12931–12970`) extends naturally to runtime collections. `libkarac_runtime.a` shrinks to non-monomorphizable primitives (panic infra, allocator interface, FFI bridges, OS bindings). Empirical justification: indirection microbench 2026-05-06 confirmed 24.9% erasure tax on i64 hash_map (75% of total Karac-vs-std gap); monomorphization moves Map ops from 1.32× → ~1.07× of std::HashMap. Sequencing: (a) close trait-bounds-at-codegen enforcement (entry below — P0 prerequisite), (b) restructure runtime as monomorphizable source, (c) extend codegen to invoke runtime-collection methods through `compile_generic_call`. Estimated effort 4–8 weeks focused. See `design.md § Generics and Monomorphization Strategy`. Bench artifact for re-running the indirection microbench at implementation-start: `bench/indirection_cost/` (standalone Cargo project).
 
@@ -168,5 +195,31 @@ The items below land from the v62 brainstorm on interpreter perf and binary size
 - [ ] **Bounds-check elision: LLVM-friendly emission.** P0 v1. Rework bounds-check codegen to emit the check in a form LLVM's range-analysis passes (SCEV, GVN) can prove redundant when the index is provably in-bounds from surrounding loop structure. Concrete shape: `cmp + branch` against the slice's `len`, with the panic block marked `cold` (so it's hoisted out of the hot path) and `llvm.assume` annotations communicating the success-path range to LLVM where appropriate. Constant-index accesses (`xs[3]` where `3 < xs.len()` is statically known) skip the runtime check at codegen time. Validation: re-run sieve / brute_force / coin_change benchmarks after the change — gaps should close to <1.3× of Rust. Estimated effort 2–4 weeks. See `design.md § Bounds-Check Elision and the get_unchecked Escape Hatch`. Foundational rationale: per the O2 → O3 finding (the bench bump produces 0% delta because bounds checks block autovec prerequisite analyses), this is the prerequisite for any LLVM loop optimization to fire on Karac IR.
 
 - [ ] **`Slice[T].get_unchecked(i)` and `Slice[T].get_unchecked_mut(i)` escape hatch.** P0 v1. ~1 day. `unsafe fn`s on `Slice[T]` returning `ref T` / `mut ref T`, mirroring Rust's `<[T]>::get_unchecked` shape. Safety contract: caller must guarantee `i < self.len()`. Used at call sites via `unsafe { xs.get_unchecked(i) }`; the `unsafe` block at the call site documents the rationale per the `undocumented_unsafe` lint. See `design.md § Bounds-Check Elision and the get_unchecked Escape Hatch` for the example and rationale.
+
+  *Slice plan (drafted 2026-05-07).* Two `unsafe fn`s on `Slice[T]`, registered in `infer_slice_method`, codegen-lowered to direct GEP without the bounds-check + panic-block prelude. Mirrors existing safe `Slice.get(i: usize) -> Option[ref T]` shape but skips the runtime check — that's the whole point per design.md § Bounds-Check Elision.
+
+  *Sub-steps.*
+  - **(a)** Typechecker — extend `infer_slice_method` arm in `src/typechecker.rs` to recognize `get_unchecked(i: usize) -> ref T` (receiver `ref Slice[T]`) and `get_unchecked_mut(i: usize) -> mut ref T` (receiver `mut ref Slice[T]`). Mark them `unsafe fn` so calling them outside an `unsafe { }` block fires the existing unsafe-required diagnostic.
+  - **(b)** Codegen (gated on `--features llvm`) — add the methods to `Slice` method dispatch in `src/codegen.rs`. Emit a single `getelementptr` returning the element pointer; no bounds-check prelude, no panic block. Out-of-bounds index → UB (matches Rust semantics).
+  - **(c)** Verify the safe-form `Slice.get(i: usize) -> Option[ref T]` continues to pre-empt unchecked dispatch when `unsafe` is absent (i.e., bare `xs.get_unchecked(0)` errors before reaching codegen).
+
+  *Tests* (3-4 typechecker + 2 codegen `#[cfg(feature = "llvm")]`, under section `// ── Slice: get_unchecked / get_unchecked_mut ──`):
+  - `test_slice_get_unchecked_returns_ref` — typecheck `unsafe { xs.get_unchecked(0) }` returns `ref T` against `xs: ref Slice[i32]`.
+  - `test_slice_get_unchecked_mut_returns_mut_ref` — same for the mut variant against `xs: mut Slice[i32]`.
+  - `test_slice_get_unchecked_outside_unsafe_block_errors` — bare `xs.get_unchecked(0)` errors with the existing unsafe-required diagnostic.
+  - `test_slice_get_unchecked_mut_on_immutable_slice_errors` — `unsafe { xs.get_unchecked_mut(0) }` against `xs: ref Slice[i32]` errors with the existing receiver-mismatch diagnostic.
+  - Codegen: `test_get_unchecked_reads_element` — runtime read; `test_get_unchecked_mut_writes_element` — runtime mutation through returned mut ref.
+
+  *Files expected to change.* `src/typechecker.rs` (~30 lines in `infer_slice_method`); `src/codegen.rs` (~40 lines in Slice dispatch, `--features llvm`); `tests/typechecker.rs` (3-4 new tests); `tests/codegen.rs` (2 new tests when `--features llvm`); this doc (close-out).
+
+  *Out of scope.*
+  - Range-form `xs.get_unchecked(0..3)` returning a sub-`Slice` — spec only mentions index form.
+  - `Vec[T]` / `Array[T, N]` `get_unchecked` variants — spec names `Slice[T]` only; pattern-extends trivially later.
+  - Bounds-check elision for safe `xs[i]` access (item at line 168) — separate, larger LLVM-friendly emission slice.
+
+  *Hard-stop triggers.*
+  - `unsafe { }` block enforcement isn't in place to require `unsafe` on the new methods (i.e., the requirement fires globally rather than only outside `unsafe { }` blocks).
+  - `infer_slice_method` doesn't have a clean extension point for `unsafe fn` registration — would need refactoring rather than additive change.
+  - Codegen's bounds-check emission for `Slice.get` is too entangled with the safe-access path to cleanly diverge for `get_unchecked`.
 
 - [ ] **`--target-cpu=native` flag for `karac build`.** P1 (post-v1), gated on the BCE LLVM-friendly emission entry above landing. Optional flag flipping the LLVM target machine from `"generic"` to host CPU. Unlocks NEON/AVX/etc. for autovectorization. Default stays generic so binaries remain portable. Pre-blocked by BCE: per the O2 → O3 finding, vectorization currently can't fire on Karac IR — `--target-cpu=native` provides zero benefit until BCE lets autovec engage. Cheap addition once BCE lands.

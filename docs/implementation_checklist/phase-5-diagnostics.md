@@ -154,7 +154,58 @@ First-class interactive surface. **v0 → v1 transition:** the MVP REPL shipped 
 
 - [ ] **Notebook-aware use-after-move diagnostic.** When the REPL detects a use-after-move spanning cells, render a hint naming the consuming cell and suggesting `.clone()` at the call site — not an auto-clone insertion. Strictness identical to `.kara` files; only the diagnostic presentation differs. See `design.md § Interactive Evaluation Model > Ownership Across Cells`.
 
+  *Slice plan (drafted 2026-05-07).* Enrich the existing `UseAfterMove` diagnostic when fired in REPL context to name the cell that consumed the binding and suggest `.clone()` at the consume site. Strictness identical to `.kara` files (the ownership-checker still rejects); only diagnostic presentation differs.
+
+  *Sub-steps.*
+  - **(a)** Cell-span tracking on `Session`. Today `Session.cell_history: Vec<String>` (`src/repl.rs:142`) records cell text but doesn't track byte ranges within the synthetic-program source that map back to cell indices. Add a parallel `Session.cell_byte_ranges: Vec<Range<usize>>` (or equivalent) that records, for each evaluated cell, the byte range of that cell's contribution to the assembled synthetic-program source. Populate at cell-evaluation time in `evaluate_cell` / `evaluate_cell_captured`.
+  - **(b)** Span-to-cell lookup helper. New `Session::cell_for_span(span: Span) -> Option<usize>` returns the cell index containing the byte range of `span`.
+  - **(c)** Diagnostic enrichment. In the REPL diagnostic-rendering path (the function that takes the ownership-checker's structured errors and renders them for stdout), after the baseline `UseAfterMove` rendering, add a notebook-aware tail: *"consumed by cell N (`<cell preview>`); add `.clone()` at the consume site to keep the original binding usable in later cells"*. Only fires when the consume span resolves to a different cell than the use span — same-cell UAM uses the existing rendering unchanged.
+
+  *Tests* (3-4 new in `tests/repl.rs`, under section `// ── Notebook-aware use-after-move diagnostic ──`):
+  - `test_cross_cell_uam_names_consuming_cell` — cell 1 declares `let s = String::from("x");`, cell 2 calls `consume(s)`, cell 3 references `s`; the diagnostic on cell 3's submission names cell 2 as the consumer.
+  - `test_cross_cell_uam_suggests_clone` — same setup; the diagnostic includes `add `.clone()` at the consume site` in the help line.
+  - `test_same_cell_uam_uses_baseline_diagnostic` — UAM within a single cell continues to use the existing diagnostic without the cell-naming tail.
+  - `test_cross_cell_uam_strictness_unchanged` — the diagnostic enrichment doesn't change rejection behavior; the program still errors and doesn't compile.
+
+  *Files expected to change.* `src/repl.rs` (`cell_byte_ranges` field on `Session`, `cell_for_span` helper, diagnostic-rendering enrichment — ~80-120 lines); `tests/repl.rs` (3-4 new tests); this doc (close-out).
+
+  *Out of scope.*
+  - Auto-clone insertion — that's the next slice (`--auto-clone` opt-in mode), which depends on this slice's cell-tracking infrastructure.
+  - Cross-cell provider-scope diagnostics — separate slice (entry at line 161 mentions notebook-aware hint shape mirrored from this one).
+  - REPL-aware enrichment for diagnostics other than UAM (e.g., borrow conflicts, double-move) — each is its own slice.
+
+  *Hard-stop triggers.*
+  - The synthetic-program source assembly model in `evaluate_cell` doesn't preserve cell boundaries cleanly (e.g., cells get merged, or `persistent_lets` replay obscures the cell-of-origin for a binding) — cell-tracking design needs more thought.
+  - The ownership-checker's `UseAfterMove` error doesn't carry enough span fidelity to distinguish consume site from use site — that's a deeper structural fix, not slice-scoped.
+
 - [ ] **`--auto-clone` opt-in mode.** `karac repl --auto-clone` flag (and `%set auto-clone on` magic once the kernel lands) enables 2B-style ergonomics: `.clone()` inserted at the consume site when the binding is referenced in a later cell; emits `perf[auto-clone-in-repl]` note. Never silent. Inserted clones appear verbatim in session export.
+
+  *Slice plan (drafted 2026-05-07).* `karac repl --auto-clone` flag that auto-inserts `.clone()` at the consume site when the binding is referenced cross-cell. Builds on the previous slice's cell-tracking infrastructure (`Notebook-aware use-after-move diagnostic`). Never silent — emits `perf[auto-clone-in-repl]` note on every insertion. Inserted clones become part of the persisted cell source (so they appear in `:save` exports unchanged).
+
+  *Sub-steps.*
+  - **(a)** CLI flag wiring. `karac repl --auto-clone` flag in the repl binary entry point. Stored as `Session.auto_clone: bool` (defaults `false`). The `%set auto-clone on` magic mentioned in the entry is deferred to the kernel-magic slice — flag-only for v1.
+  - **(b)** Pre-eval rewrite. When `auto_clone` is on, before compiling cell N, run a short pass: for each binding `x` referenced in cell N that was consumed in cell M < N (use the previous slice's `cell_for_span` to determine consume cell), rewrite cell M's source to insert `.clone()` at the consume call site. The rewrite goes into `cell_history[M]` and the assembled synthetic-program source for the next compilation.
+  - **(c)** Perf-note emission. Each insertion emits `perf[auto-clone-in-repl]` with the consume-site location and the binding name, surfaced through the existing `perf-report` channel. Always shown to the user — never silent (entry text spec).
+  - **(d)** Session export fidelity. `:save session.kara` already writes `cell_history` verbatim; since we rewrite into `cell_history`, the inserted clones survive export with no additional handling. Verify in tests.
+
+  *Tests* (3-4 new in `tests/repl.rs`, under section `// ── --auto-clone REPL mode ──`):
+  - `test_auto_clone_inserts_clone_at_consume_site` — with flag on, cell 1 declares `let s = String::from("x");`, cell 2 calls `consume(s)`, cell 3 references `s`; cell 2's `cell_history` entry now reads `consume(s.clone())` and cell 3 evaluates successfully.
+  - `test_auto_clone_emits_perf_note` — same setup; the `perf[auto-clone-in-repl]` note fires with the binding name.
+  - `test_auto_clone_off_keeps_uam_diagnostic` — without the flag, behavior matches the previous slice (cell-aware UAM diagnostic, no insertion).
+  - `test_auto_clone_export_preserves_inserted_clones` — `:save` output contains the rewritten `consume(s.clone())` form.
+
+  *Files expected to change.* `src/repl.rs` (`auto_clone` field, CLI flag wiring, pre-eval rewrite pass, perf-note emission — ~120-180 lines); `tests/repl.rs` (3-4 new tests); this doc (close-out).
+
+  *Out of scope.*
+  - `%set auto-clone on` Jupyter-magic form — gated on the kernel slice. Flag-only for v1.
+  - Auto-clone insertion in `.kara` files — explicitly REPL-only (REPL ergonomics, not language semantics).
+  - Auto-clone for non-`Clone` types — emits the existing bound-violation diagnostic; no special path.
+
+  *Hard-stop triggers.*
+  - Pre-eval source rewriting interacts badly with `persistent_lets` — the rewrite needs to apply to the right cell's source slice, not the assembled synthetic-program. If the indexing or byte-range tracking from the previous slice is insufficient, halt.
+  - The `perf-report` channel doesn't have a cell-aware emission path — would need its own design.
+
+  *Depends on.* The previous slice (`Notebook-aware use-after-move diagnostic`) — this slice's pre-eval rewrite uses that slice's `cell_for_span` lookup. Sequence the previous slice first.
 
 - [ ] **Session export — `.kara` fidelity.** `:save session.kara` writes the session's cell history as a single `.kara` file wrapping the history in `fn main() -> Result[Unit, Error]` with declared effects matching the session's accumulated effect set. Guarantee: the exported file compiles with `karac build` and produces identical observable behavior. If auto-clone was enabled, the inserted clones appear in the exported file unchanged.
 

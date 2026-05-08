@@ -11,8 +11,11 @@ cargo test --features llvm             # Run ALL tests including codegen E2E + m
 cargo test lexer                       # Run a single test file (e.g., tests/lexer.rs)
 cargo test -- test_name                # Run a single test by name
 cargo clippy --all --tests -- -D warnings  # Lint (must be clean before declaring work done)
-cargo fmt                              # Format
+cargo fmt --all                        # Format all files
+cargo fmt --all -- --check             # Verify formatted (must be clean before declaring work done — peer to clippy)
 ```
+
+**`cargo fmt --all -- --check` is a hard pre-commit gate, peer to clippy.** Both must clear before any commit lands. **First action of any new coding session or slice:** run `cargo fmt --all -- --check`. If it fails, fix with `cargo fmt --all` and land as a standalone `chore: cargo fmt cleanup` commit *before* starting feature work. Don't pull fmt drift into a feature commit; don't surgically revert drift to keep a commit scoped — both patterns push cleanup to CI and let drift accumulate in the meantime.
 
 **Codegen and memory-sanitizer tests are gated on `--features llvm`.** Plain `cargo test` will skip `tests/codegen.rs`, `tests/par_codegen.rs`, and `tests/memory_sanitizer.rs` entirely (the modules are `#[cfg(feature = "llvm")]`). Always use `--features llvm` when verifying codegen-related work; otherwise you will miss real regressions.
 
