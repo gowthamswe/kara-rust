@@ -181,7 +181,7 @@ All other slices are independent.
 
 - [x] **Slice 3.5 — Self-receiver dispatch (method-resolution item 8 follow-up).** ✓ Landed 2026-05-07. `self.method()` inside a trait default body resolves through the enclosing trait's own methods + supertrait closure; the `name != "Self"` exclusion slice 2 left in place is closed. Five pre-existing tests now exercise the real resolution path; new negative test pins the closed silent-fallthrough hole. Close-out: `phase-4-interpreter.md` item 8.
 
-- [ ] **Slice get_unchecked — `Slice[T].get_unchecked(i)` and `get_unchecked_mut(i)` unsafe escape hatch.** Two `unsafe fn`s on `Slice[T]` returning `ref T` / `mut ref T`, lowered to direct GEP without the bounds-check + panic-block prelude. Mirrors Rust's `<[T]>::get_unchecked` shape; safety contract is caller-guaranteed `i < self.len()`. ~3-4 typechecker tests + 2 codegen tests under `--features llvm`. Plan: `phase-7-codegen.md` § "`Slice[T].get_unchecked(i)` and `Slice[T].get_unchecked_mut(i)` escape hatch" (slice plan section). Source: phase 4–8 survey bucket A4.
+- [ ] **[BLOCKED]** **Slice get_unchecked — `Slice[T].get_unchecked(i)` and `get_unchecked_mut(i)` unsafe escape hatch.** Two `unsafe fn`s on `Slice[T]` returning `ref T` / `mut ref T`, lowered to direct GEP without the bounds-check + panic-block prelude. Mirrors Rust's `<[T]>::get_unchecked` shape; safety contract is caller-guaranteed `i < self.len()`. ~3-4 typechecker tests + 2 codegen tests under `--features llvm`. Plan: `phase-7-codegen.md` § "`Slice[T].get_unchecked(i)` and `Slice[T].get_unchecked_mut(i)` escape hatch" (slice plan section). Source: phase 4–8 survey bucket A4. **Blocked 2026-05-07** on missing unsafe-block enforcement infrastructure (`unsafe { }` is doc-lint only; no typechecker gating, no `unsafe fn` parser form). See close-out paragraph in plan section for predecessor unblock.
 
 - [ ] **Slice binary-size phase 1 + symbol sweep — `strip -x` post-link, `panic = "abort"` in runtime release profile, plus pre-flight runtime symbol audit.** Combined slice covering both Phase 1 binary-size optimization and the pre-flight symbol sweep. Expected size delta: 1.4 MB → ~900 KB on a representative E2E binary (-18% from strip, ~114 KB from `panic = "abort"`). Symbol sweep produces `runtime/SYMBOL_KEEP_LIST.md` documenting `#[used]` / `#[link_section]` / `#[ctor]` / `#[dtor]` / `#[no_mangle]` / `extern "C"` declarations in `runtime/src/`. Plan: `phase-7-codegen.md` § "Phase 1 binary-size optimization" (slice plan section). Source: phase 4–8 survey bucket A5+A6.
 
@@ -209,8 +209,8 @@ Per-slice durations recorded as each lands. Subagent wall-clock is the implement
 
 | # | Slice | Started | Landed | Duration | Commit |
 |---|---|---|---|---|---|
-| 1 | 3.5 — Self-receiver dispatch | 2026-05-07 21:41 | 2026-05-07 21:53 | _—_ | _pending fill_ |
-| 2 | get_unchecked | _—_ | _—_ | _—_ | _—_ |
+| 1 | 3.5 — Self-receiver dispatch | 2026-05-07 21:41 | 2026-05-07 21:53 | 12 min | `f7cad93` |
+| 2 | get_unchecked | 2026-05-07 22:00 | _—_ | ~10 min (investigation) | `BLOCKED` |
 | 3 | binary-size phase 1 | _—_ | _—_ | _—_ | _—_ |
 | 4 | perf note (shared struct mut) | _—_ | _—_ | _—_ | _—_ |
 | 5 | REPL UAM diagnostic | _—_ | _—_ | _—_ | _—_ |
