@@ -3181,11 +3181,25 @@ fn render_cost_summary_json(s: &crate::cost_summary::CostSummary, filename: &str
             )
         })
         .collect();
+    let perf_notes: Vec<String> = s
+        .perf_notes
+        .iter()
+        .map(|n| {
+            let site = span_to_json(&n.site, filename);
+            format!(
+                "{{\"code\":{},\"message\":{},\"site\":{{{}}}}}",
+                json_string(&n.code),
+                json_string(&n.message),
+                site,
+            )
+        })
+        .collect();
     format!(
-        "{{\"scope\":{},\"totals\":{},\"by_function\":[{}]}}",
+        "{{\"scope\":{},\"totals\":{},\"by_function\":[{}],\"perf_notes\":[{}]}}",
         json_string(&s.scope),
         totals,
         by_function.join(","),
+        perf_notes.join(","),
     )
 }
 

@@ -1931,6 +1931,11 @@ fn test_query_cost_summary_borrow_flags_count_shared_mut_fields() {
     // Two `mut` fields on a `shared struct`, plus one non-mut field, must
     // produce `borrow_flag_fields: 2` (only `mut` fields cost a flag).
     // The category is struct-attributable, so `by_function` stays empty.
+    // The same definition is the trigger for the Tier 2
+    // `perf[shared-struct-mut-field]` perf note: one entry per offending
+    // struct (not per field), with the field names enumerated in the
+    // message body so the migration target is visible without re-reading
+    // the source.
     let out = karac_bin()
         .args([
             "query",
@@ -1944,6 +1949,92 @@ fn test_query_cost_summary_borrow_flags_count_shared_mut_fields() {
     let json = stdout.trim();
     assert!(json.contains("\"borrow_flag_fields\":2"));
     assert!(json.contains("\"by_function\":[]"));
+    // Tier 2 perf note: exactly one entry, code stable, message names the
+    // struct and both `mut` fields, site points at the struct definition.
+    assert!(
+        json.contains("\"code\":\"perf[shared-struct-mut-field]\""),
+        "expected perf note code, got: {json}"
+    );
+    assert!(
+        json.contains("`shared struct Counter`"),
+        "expected struct name in perf note message, got: {json}"
+    );
+    assert!(
+        json.contains("`hits`") && json.contains("`misses`"),
+        "expected mut field names in perf note message, got: {json}"
+    );
+    // Exactly one note (one offending struct, one entry — not one per
+    // field). Counted by occurrences of the stable code.
+    let note_count = json.matches("perf[shared-struct-mut-field]").count();
+    assert_eq!(
+        note_count, 1,
+        "expected exactly one perf note for the offending struct, got {note_count}: {json}"
+    );
+}
+
+#[test]
+fn test_query_cost_summary_no_perf_note_for_shared_without_mut() {
+    // Negative-1: a `shared struct` with zero `mut` fields must NOT trigger
+    // the Tier 2 perf note. The migration hint is predictive of *future*
+    // concurrent-access cost, which depends on a `mut` field being present
+    // — without one the borrow-flag and `par struct` migration framing both
+    // collapse, so the note has nothing to predict.
+    let src = "shared struct ReadOnly {\n    a: i64,\n    b: i64,\n}\nfn main() {}\n";
+    let path = std::env::temp_dir().join(format!(
+        "karac-perfnote-shared-no-mut-{}-{}.kara",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    std::fs::write(&path, src).unwrap();
+    let out = karac_bin()
+        .args(["query", "cost-summary", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json = stdout.trim();
+    assert!(json.contains("\"borrow_flag_fields\":0"));
+    assert!(
+        json.contains("\"perf_notes\":[]"),
+        "expected empty perf_notes for shared struct without mut fields, got: {json}"
+    );
+}
+
+#[test]
+fn test_query_cost_summary_no_perf_note_for_plain_struct_with_mut() {
+    // Negative-2: a plain (non-`shared`) struct with `mut` fields must NOT
+    // trigger the Tier 2 perf note. The diagnostic is gated on
+    // `kind == Shared` because it predicts the cost of a future
+    // `shared struct` → `par struct` migration; a plain struct has no such
+    // future, and `mut` on a plain-struct field is a parser-level shape that
+    // doesn't pay a borrow-flag cost in the first place.
+    let src = "struct Plain {\n    mut x: i64,\n    mut y: i64,\n}\nfn main() {}\n";
+    let path = std::env::temp_dir().join(format!(
+        "karac-perfnote-plain-mut-{}-{}.kara",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    std::fs::write(&path, src).unwrap();
+    let out = karac_bin()
+        .args(["query", "cost-summary", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json = stdout.trim();
+    assert!(json.contains("\"borrow_flag_fields\":0"));
+    assert!(
+        json.contains("\"perf_notes\":[]"),
+        "expected empty perf_notes for plain struct with mut fields, got: {json}"
+    );
 }
 
 #[test]

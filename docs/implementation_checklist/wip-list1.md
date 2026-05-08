@@ -185,7 +185,7 @@ All other slices are independent.
 
 - [x] **Slice binary-size phase 1 + symbol sweep — `strip -x` post-link, `panic = "abort"` in runtime release profile, plus pre-flight runtime symbol audit.** ✓ Landed 2026-05-07. Combined slice covering both Phase 1 binary-size optimization and the pre-flight symbol sweep. `panic = "abort"` lives at workspace-root `[profile.release]` (cargo refuses per-package `panic`); `strip -x` runs after `cc` link inside `link_executable_impl` (gated `cfg!(unix)`, skipped on sanitizer builds to keep ASAN stack-trace symbolication legible); `runtime/SYMBOL_KEEP_LIST.md` documents 19 `#[no_mangle]` runtime exports + 1 libc import + 1 private callback + confirms zero `#[used]/#[link_section]/#[ctor]/#[dtor]` (so no Phase 2 DCE keep-list machinery beyond what the audit captures). Measured deltas on this macOS environment: runtime archive -48 KB (panic=abort), example E2E binaries +32 B each (Mach-O strip header rewrite exceeds savings on these tiny ld64-already-pruned binaries — slice plan called this out as the "pick one of the example .kara programs" smoke verification). Close-out: `phase-7-codegen.md` § "Phase 1 binary-size optimization".
 
-- [ ] **Slice perf note — `shared struct` with mut fields (Tier 2 `--perf-report`).** Definition-site walker over `StructDef` items in the typechecker; when `kind == Shared` and at least one field carries `mut`, emits `perf[shared-struct-mut-field]` into the perf-report aggregator. Off by default (Tier 2, predictive). Plan: `phase-7-codegen.md` § "Definition-site perf note: `shared struct` with mut fields" (entry has implementation paragraph; subagent drafts the test + close-out detail). Source: phase 4–8 survey bucket A12.
+- [x] **Slice perf note — `shared struct` with mut fields (Tier 2 `--perf-report`).** ✓ Landed 2026-05-08. Definition-site walker over `StructDef` items emits `perf[shared-struct-mut-field]` into the perf-report aggregator (`src/cost_summary.rs`) when `kind == Shared` and at least one field carries `mut`; one note per offending struct (not per field) with field names enumerated in the message body. New `PerfNote` type + `perf_notes: Vec<PerfNote>` on `CostSummary`; surfaced today through `karac query cost-summary`'s JSON envelope (`"perf_notes":[...]`), ready for the future `karac build --perf-report` UX without further data-shape work. Off by default (Tier 2, predictive). Three tests in `tests/cli.rs` cover positive (shared+mut → note) and both negatives (shared/no-mut → no note; plain/+mut → no note). Close-out: `phase-7-codegen.md` § "Definition-site perf note: `shared struct` with mut fields".
 
 - [ ] **Slice REPL UAM diagnostic — Notebook-aware use-after-move.** Enrich the existing `UseAfterMove` diagnostic in REPL context to name the cell that consumed the binding and suggest `.clone()` at the consume site. Adds `Session.cell_byte_ranges` cell-tracking infrastructure (foundation for the next slice). Strictness identical to `.kara` files; only diagnostic presentation differs. Plan: `phase-5-diagnostics.md` § "Notebook-aware use-after-move diagnostic" (slice plan section). Source: phase 4–8 survey bucket A9.
 
@@ -211,8 +211,8 @@ Per-slice durations recorded as each lands. Subagent wall-clock is the implement
 |---|---|---|---|---|---|
 | 1 | 3.5 — Self-receiver dispatch | 2026-05-07 21:41 | 2026-05-07 21:53 | 12 min | `f7cad93` |
 | 2 | get_unchecked | 2026-05-07 22:00 | _—_ | ~10 min (investigation) | `BLOCKED` |
-| 3 | binary-size phase 1 | 2026-05-07 23:45 | 2026-05-07 23:55 | 10 min | _pending fill_ |
-| 4 | perf note (shared struct mut) | _—_ | _—_ | _—_ | _—_ |
+| 3 | binary-size phase 1 | 2026-05-07 23:45 | 2026-05-07 23:55 | 10 min | `0731fd2` |
+| 4 | perf note (shared struct mut) | 2026-05-08 00:01 | 2026-05-08 00:12 | 11 min | _pending fill_ |
 | 5 | REPL UAM diagnostic | _—_ | _—_ | _—_ | _—_ |
 | 6 | REPL auto-clone | _—_ | _—_ | _—_ | _—_ |
 | 7 | atomic-RC | _—_ | _—_ | _—_ | _—_ |

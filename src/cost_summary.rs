@@ -13,6 +13,14 @@
 //! reported as `0` until parameterized resources and the REPL `--auto-clone`
 //! flag respectively land — the schema reserves the keys so post-v1 wiring
 //! is purely additive.
+//!
+//! Tier 2 perf notes (definition-site, predictive — surfaced only when the
+//! caller opts in via the perf-report channel) ride alongside the totals as
+//! a `perf_notes` array. Each entry carries a stable `code`, the prose
+//! `message` from design.md, the offending struct name, the bare-`mut`
+//! field names, and the definition-site `Span`. Today's wired diagnostic
+//! is `perf[shared-struct-mut-field]`; new notes plug into the same vector
+//! without further schema work.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +35,24 @@ pub struct CostSummary {
     pub totals: CostTotals,
     /// Per-function rows, sorted by function key for stable output.
     pub by_function: Vec<FunctionCostRow>,
+    /// Tier 2 perf notes harvested at definition time. Off-by-default in the
+    /// surface that consumes this aggregator (the perf-report channel); the
+    /// data is collected unconditionally so the channel is purely additive.
+    pub perf_notes: Vec<PerfNote>,
+}
+
+/// A definition-site Tier 2 perf note. Predictive — fires before any cost is
+/// paid (no RC inserted, no atomic emitted), so the surface that renders this
+/// must gate on the user's perf-report opt-in. See design.md § Performance
+/// Diagnostics for the three-tier taxonomy.
+#[derive(Debug, Clone)]
+pub struct PerfNote {
+    /// Stable diagnostic code (e.g. `perf[shared-struct-mut-field]`).
+    pub code: String,
+    /// Human-readable message body, suitable for display alongside the code.
+    pub message: String,
+    /// Site of the offending definition.
+    pub site: Span,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,11 +181,27 @@ pub fn build(scope: &str, program: &Program, ownership: &OwnershipCheckResult) -
 
     // 3. Borrow-flag fields — totals-only sum over every `shared struct`'s
     //    `mut` fields (struct-attributable, not function-attributable).
+    //    Same walk doubles as the definition-site source for the Tier 2
+    //    `perf[shared-struct-mut-field]` perf note: one note per offending
+    //    struct (not per field), with the field names enumerated in the
+    //    message body so the user sees the migration target without
+    //    re-reading the source. The note is collected unconditionally; the
+    //    perf-report channel decides whether to render it.
     let mut borrow_flag_total = 0usize;
+    let mut perf_notes: Vec<PerfNote> = Vec::new();
     for item in &program.items {
         if let Item::StructDef(s) = item {
             if s.is_shared {
-                borrow_flag_total += s.fields.iter().filter(|f| f.is_mut).count();
+                let mut_fields: Vec<&str> = s
+                    .fields
+                    .iter()
+                    .filter(|f| f.is_mut)
+                    .map(|f| f.name.as_str())
+                    .collect();
+                borrow_flag_total += mut_fields.len();
+                if !mut_fields.is_empty() {
+                    perf_notes.push(shared_struct_mut_field_note(&s.name, &mut_fields, &s.span));
+                }
             }
         }
     }
@@ -183,6 +225,29 @@ pub fn build(scope: &str, program: &Program, ownership: &OwnershipCheckResult) -
             auto_clone_insertions: 0,
         },
         by_function,
+        perf_notes,
+    }
+}
+
+/// Build the canonical message body for a `perf[shared-struct-mut-field]`
+/// note. Mirrors the prose in design.md § Compiler-assisted migration from
+/// `shared struct` to `par struct` (and § Performance Diagnostics).
+fn shared_struct_mut_field_note(name: &str, mut_fields: &[&str], span: &Span) -> PerfNote {
+    let field_list = mut_fields
+        .iter()
+        .map(|f| format!("`{f}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = format!(
+        "`shared struct {name}` has mut field{plural} ({field_list}); if a future caller \
+         needs concurrent access, the migration to `par struct` is structural — consider \
+         defining as `par struct` from the start.",
+        plural = if mut_fields.len() == 1 { "" } else { "s" },
+    );
+    PerfNote {
+        code: "perf[shared-struct-mut-field]".to_string(),
+        message,
+        site: span.clone(),
     }
 }
 
