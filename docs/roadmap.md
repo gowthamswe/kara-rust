@@ -26,8 +26,7 @@ Development plan for the `karac` compiler, aligned with [design.md](docs/design.
   - [Phase 7.1: Core Code Generation](#phase-71-core-code-generation--complete) — COMPLETE
   - [Phase 7.2: Compiled Stdlib Types + Layout Codegen](#phase-72-compiled-stdlib-types--layout-codegen--complete) — COMPLETE
 - [Phase 8: Standard Library — Floor](#phase-8-standard-library--floor)
-- [Interactive Development: REPL + Browser Playground (P0, v1) + Jupyter Kernel (P1, v1.1)](#interactive-development-repl--browser-playground-p0--jupyter-kernel-p1-delivery)
-- [Package Manager v1.1: Build & Dependency Tooling](#package-manager-v11-build--dependency-tooling)
+- [Phase 8.5: V1 Ship Readiness](#phase-85-v1-ship-readiness) — parallel track (Interactive Development, Build & Dependency Tooling, Discovery)
 - [Phase 9: Gradual Verification Enforcement](#phase-9-gradual-verification-enforcement)
 - [Phase 10: Additional Compilation Targets](#phase-10-additional-compilation-targets)
 - [Phase 11: Standard Library — Long-Tail](#phase-11-standard-library--long-tail)
@@ -524,9 +523,19 @@ Parallax-lite is a stripped-down precursor to Demo 1 (Parallax — Auto-Concurre
 
 ---
 
-## Interactive Development: REPL + Browser Playground (P0) + Jupyter Kernel (P1 delivery)
+## Phase 8.5: V1 Ship Readiness
 
-**Goal:** First-class interactive surface that positions Kāra as a notebook-friendly systems language. Delivery is split into two tiers — the `karac repl` binary and a browser playground ship in v1 (the frictionless first-try path that drives adoption); the Jupyter kernel ships in v1.1 alongside a stable stdlib (so first-run notebook users don't hit "function not found" on common types). Runs as a parallel track to Phase 8; does not block phase progression. Semantics are specified in [`docs/design.md § Interactive Evaluation Model`](design.md#interactive-evaluation-model). Execution backend: always-JIT via LLJIT (per Core Strategy #2) — the same code path users get from `karac build`, just compiled lazily per function on first call.
+**Goal.** Everything v1 needs to ship credibly beyond the demo-feature surface in Phase 8 — packaging / build tooling, the interactive surfaces that drive adoption, and a discovery bucket for items that emerge during demo build. **P1 priority within v1**: comes back to once Phase 8 demo features are built; lands before v1 ships at the end of Phase 11.
+
+**Why a separate phase, not a Phase 8 parallel track.** Phase 8 is "build the language surface that makes the demos work." Phase 8.5 is "everything else v1 needs to ship credibly." The split keeps Phase 8 demo-driven and gives v1-but-not-demo-blocking work a coherent filing cabinet — particularly important for items that surface during demo build and need somewhere clean to land. Half-numbered phase signals the bucket isn't yet committed to a permanent shape; will graduate to a numbered Phase 9 (renumbering downstream) if/when the contents stabilize.
+
+**Why v1, not v1.1.** Profile knobs (kernel / embedded / deterministic) are a differentiator pillar (`demo_ideas.md` § Demo planning, pillar 4) — they need a real config surface. `kara-version` MSRV is a credibility table-stake. Reproducible-builds CI backs the `design.md` reproducibility pitch. Path / git deps are needed for self-hosting (Phase 12). None of this can ship as "parsed-but-ignored" without the half-ship being the broken signal. Resolver / registry / cache *implementation infrastructure* could have deferred to v1.1; pulled into v1-P1 on 2026-05-08 to avoid the cliff between "model exists" and "model works at adoption scale."
+
+**Sequencing.** Runs as a parallel track that does not block Phase 9 / 10 / 11 progression. Items here are addressed once their gating demo work clears or in dedicated pre-ship windows. Discovery items (Track 3) are added as they surface during Phase 8–11 work — see Track 3 prose for filing protocol.
+
+### Track 1: Interactive Development — REPL + Browser Playground (P0) + Jupyter Kernel (P1 delivery)
+
+**Goal:** First-class interactive surface that positions Kāra as a notebook-friendly systems language. Delivery is split into two tiers — the `karac repl` binary and a browser playground ship in v1 (the frictionless first-try path that drives adoption); the Jupyter kernel ships in v1.1 alongside a stable stdlib (so first-run notebook users don't hit "function not found" on common types). Semantics are specified in [`docs/design.md § Interactive Evaluation Model`](design.md#interactive-evaluation-model). Execution backend: always-JIT via LLJIT (per Core Strategy #2) — the same code path users get from `karac build`, just compiled lazily per function on first call.
 
 **Why P0.** The execution-model-parity story (REPL cells run on the same LLJIT path as `karac build` produces, not on a parallel interpreter) gives Kāra a differentiator that neither Rust nor Java can match cheaply:
 
@@ -536,25 +545,25 @@ Parallax-lite is a stripped-down precursor to Demo 1 (Parallax — Auto-Concurre
 
 **Why the split.** Adoption is the dominant concern for a new language, not dev effort. The mental barrier to trying a systems language ("cargo new, edit TOML, fight IDE, *then* learn ownership") is what sends Python-origin users away. The REPL binary and browser playground remove that barrier at v1. The Jupyter kernel — while strategically important for data-science audiences and shareable notebook content — depends on a stable stdlib for a good first impression, and ships with v1.1 when that's in place.
 
-### Tier 1: REPL binary + browser playground (P0, ships in v1)
+#### Tier 1: REPL binary + browser playground (P0, ships in v1)
 - [ ] `karac repl` subcommand — line-based REPL over the LLJIT execution backend; multi-line continuation; persistent session bindings; `:help`, `:quit`, `:type`, `:effects`, `:save <file.kara>`, `:provide R = expr` / `:end-provide R` meta-commands. Cell semantics per `design.md § Interactive Evaluation Model > Cell Scope`; cross-cell provider scoping per `design.md § Cross-Cell Providers`. Lazy compilation: each defined function is compiled on first call, cached for subsequent calls — published cold-start latency is the v1 perf headline alongside binary size and steady-state perf.
 - [ ] Notebook-aware rendering of use-after-move diagnostics when consume and use straddle cells — strict semantics, softened presentation (names the consuming cell, suggests `.clone()` at call site).
 - [ ] `--auto-clone` opt-in flag for users who prefer Python-like ergonomics — inserts `.clone()` at consume sites, emits `perf[auto-clone-in-repl]` note. Never silent.
 - [ ] Session export (`:save session.kara`) that produces a `.kara` file compiling identically to the session. `:provide`/`:end-provide` pairs compile to `with_provider[R](expr, || { /* cells */ })` blocks in the saved file.
 - [ ] Browser playground (`play.kara-lang.org` or equivalent) — zero-install entry point. Server-side `karac repl` behind a WebSocket shim, or WASM-compiled interpreter in the browser (decide during implementation). Minimum UX: editor, run button, output pane, share-by-URL.
 
-### Tier 2: Jupyter kernel MVP (P0 priority, P1 delivery — ships in v1.1)
+#### Tier 2: Jupyter kernel MVP (P0 priority, P1 delivery — ships in v1.1)
 - [ ] `jupyter_client` protocol compliance — ZMQ shell/iopub/stdin/control channels, cell execution, stderr diagnostics with **clickable source spans in JupyterLab**, Ctrl+C cooperative interrupt, tab completion over session + prelude.
 - [ ] `pip install karac-kernel` packaging — Python launcher + kernelspec registration; precompiled `karac` binaries per platform.
 - [ ] `%magic` surface (MVP): `%effects`, `%ownership`, `%explain <name>`, `%set auto-clone on|off`, `%provide R = expr` / `%end-provide R` (parity with REPL meta-commands — same compilation path). Per-cell effect footer rendered automatically on every execution. **This is where the language differentiators become visible in the notebook.** `%rc` is deferred to post-MVP — RC-fallback analysis is still settling and its introspection surface is not yet stable.
 
-### Tier 3: Rich interactive (stretch, post-MVP)
+#### Tier 3: Rich interactive (stretch, post-MVP)
 - [ ] Rich `text/html` display for structs and collections; `image/png` for any plotting primitive.
 - [ ] Effect-conflict timeline — sidebar showing per-cell effect sets and cross-cell dependency arrows.
 - [ ] `%rc` magic — RC-fallback decision list with trigger reasoning, once the underlying analysis surface stabilizes.
 - [ ] Widget protocol (IPython-widgets equivalent) — probably v2+.
 
-### Tier 4: Book coverage (P0 prose, v1)
+#### Tier 4: Book coverage (P0 prose, v1)
 - [ ] **"Getting Started, Part 2: Two Surfaces"** — dedicated chapter positioned right after "Getting Started / Installation." `.kara` file and `karac repl` shown side by side on the same binary-search example; teaches session model, cell scope, ownership across cells, `:effects` / `:save` meta-commands. Browser playground gets a sidebar callout. Ownership is taught honestly from day one — Q2's softened diagnostic means no retraction later. v1 surfaces only (no notebook content yet). When the Jupyter kernel ships in v1.1, either extend this chapter to a third surface or add a standalone "Notebooks" chapter.
 
 **Done when (v1):** `karac repl` gives a first-run Python user a productive session in under 5 minutes. Browser playground loads in under 2 seconds with no install. A user can save a REPL session to a `.kara` file that compiles and runs identically.
@@ -563,11 +572,11 @@ Parallax-lite is a stripped-down precursor to Demo 1 (Parallax — Auto-Concurre
 
 ---
 
-## Package Manager v1.1: Build & Dependency Tooling
+### Track 2: Build & Dependency Tooling
 
-**Goal:** Flip `[dependencies]` from parsed-but-ignored (v1 posture) to load-bearing. Runs as a parallel track alongside Phase 8 / Phase 11; does not block phase progression. Detailed implementation entries under [`implementation_checklist/phase-5-diagnostics.md § 5.5`](implementation_checklist/phase-5-diagnostics.md#55-package-manager-v11).
+**Goal:** Flip `[dependencies]` from parsed-but-ignored (v1 posture) to load-bearing. Formerly tracked as v1.1; pulled into v1-P1 on 2026-05-08 — see Phase 8.5 framing above for the rationale. Detailed implementation entries under [`implementation_checklist/phase-5-diagnostics.md § 5.5`](implementation_checklist/phase-5-diagnostics.md#55-package-manager-v11).
 
-### Tier 1: Resolver + lockfile (lands first; everything else builds on it)
+#### Tier 1: Resolver + lockfile (lands first; everything else builds on it)
 
 - [ ] **PubGrub-style resolver** — conservative semver, latest compatible by default, lockfile pins, full constraint-chain conflict diagnostics.
 - [ ] **`kara.lock`** — package name, exact version, source URL (proxy mirror or git URL), BLAKE3 content hash, dependency tree. Single lockfile across targets. Bin-yes / lib-no commitment.
@@ -575,7 +584,7 @@ Parallax-lite is a stripped-down precursor to Demo 1 (Parallax — Auto-Concurre
 - [ ] **Build artifact cache** — global `~/.kara/cache/` keyed on `(compiler-version, package-version, edition, profile, target-triple)`. Per-project `dist/` already exists.
 - [ ] **`[package].kara-version` MSRV constraint** — enforced by resolver; mismatch is a structured diagnostic with the constraint chain.
 
-### Tier 2: CLI surface + cross-cutting
+#### Tier 2: CLI surface + cross-cutting
 
 - [ ] **`karac update` / `karac update <pkg>`** — bare form bumps everything within semver-compatible range; surgical form bumps one package.
 - [ ] **`karac install <bin-spec>`** — install a binary from path / git / proxy reference into `~/.kara/bin/`.
@@ -585,23 +594,37 @@ Parallax-lite is a stripped-down precursor to Demo 1 (Parallax — Auto-Concurre
 - [ ] **`[dev-dependencies]` excluded from non-test builds** — wiring in the existing test/non-test split.
 - [ ] **`karac-toolchain.toml` reader** — `version` (required), `targets` (optional). Channels / components / install profiles deferred. Read by `karac` and by the eventual `karaup` toolchain manager.
 
-### Tier 3: Interactive parity
+#### Tier 3: Interactive parity
 
 - [ ] **`:dep` REPL meta-command** — adds a package to the session's in-memory manifest. State in-memory only; symmetric with `:provide`. Jupyter parity via the existing kernel meta-command channel.
 - [ ] **`karac run <script>` script-dir manifest discovery** — walk upward from the script's own directory (not cwd). `--manifest` / `--no-manifest` overrides.
 
-### Reproducibility CI
+#### Reproducibility CI
 
 - [ ] **Build-twice-and-hash CI for the compiler itself** — enforces the bit-exact reproducible-builds promise (see `design.md § Package System > Reproducibility guarantee`). Failure on diff is a compiler bug, not a user issue.
 
-**Out of scope for v1.1** (v1.5+ or v2 RFC):
+**Out of scope for v1-P1** (v1.5+ or v2 RFC):
 - `karac bench` (needs bench harness + statistical reporting).
 - `karac publish` (needs registry publish protocol; gated on adoption signals).
 - `karac audit` (needs vulnerability database with package-identity keys).
 - Per-package feature flags / `[features]` axis (v2 RFC slot — opens if "ship multiple packages" pattern becomes widely lamented; rejected in v1 to avoid Cargo's worst pain point).
 - Centralized registry (deferred indefinitely; git-URL identity + proxy stays canonical).
 
-**Done when (v1.1):** `karac build` in a project with non-trivial `[dependencies]` resolves through the proxy, writes `kara.lock`, caches compiled deps in `~/.kara/cache/`, and produces a bit-exact-reproducible artifact given a pinned `karac-toolchain.toml`. `karac repl` inside the project tree picks up project deps automatically; `:dep http = "1.2"` works in a session outside any project.
+**Done when (v1-P1):** `karac build` in a project with non-trivial `[dependencies]` resolves through the proxy, writes `kara.lock`, caches compiled deps in `~/.kara/cache/`, and produces a bit-exact-reproducible artifact given a pinned `karac-toolchain.toml`. `karac repl` inside the project tree picks up project deps automatically; `:dep http = "1.2"` works in a session outside any project.
+
+---
+
+### Track 3: Discovery — items added as found during demo build
+
+This subsection is intentionally empty at Phase 8.5's creation (2026-05-08). It accumulates items that surface during Phase 8 / 9 / 10 / 11 demo work and that are *v1 ship-blocking but not demo-blocking* — the kind of "we can't ship v1 without this, but it doesn't gate the demo" item that is hard to predict in advance.
+
+**Filing protocol.** When adding an item: name it; record the demo-build date / context where it surfaced; explain why v1 needs it; note any sequencing constraints (prerequisite work, downstream demos that depend on it). Each entry should be terse — pointer to the durable design content in the relevant phase tracker rather than full design discussion inline.
+
+*(No items yet.)*
+
+---
+
+**Phase 8.5 done when:** v1 ships. The combined Track 1 v1 surface + Track 2 v1-P1 surface + reproducible-builds CI + any Track 3 items that accumulated during Phase 8–11 demo build are landed. Track 1's v1.1 follow-ups (Jupyter kernel) ship in their own window after v1.
 
 ---
 
@@ -966,6 +989,11 @@ Phase 7.2 (Compiled Stdlib Types + Layout Codegen)  ← Array[T,N], Vec[T], Stri
   ▼
 Phase 8 (Stdlib — Floor)        ← full method sets, traits, I/O, providers, std.json/time/path/error/mem/bytes/cmp/hash, auto-concurrency codegen
   │
+  ├──── Phase 8.5 (V1 Ship Readiness)  ← parallel track; runs alongside Phase 8–11.
+  │                                       Track 1: REPL + Browser Playground + Jupyter (Jupyter ships v1.1).
+  │                                       Track 2: Build & Dependency Tooling (formerly v1.1; pulled into v1-P1 2026-05-08).
+  │                                       Track 3: Discovery — items added as found during demo build.
+  │                                       Does not block Phase 9–11; lands before v1 ships at end of Phase 11.
   ▼
 Phase 9 (Verification)          ← refinement types, distinct types, contracts (parsing done in Phase 2; enforcement here)
   │
