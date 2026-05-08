@@ -125,14 +125,31 @@ pub unsafe extern "C" fn karac_par_run(branches: *const KaracBranch, count: usiz
 // branches in the MVP runtime discard their `Err` returns anyway, so they
 // never reach the trace surface.
 //
-// Output format: matches the interpreter's text mode (cli.rs:1651-1664):
+// Output format: defaults to the interpreter's text mode (cli.rs:1651-1664):
 //
 //     Error return trace:
 //       <file>:<line>:<col>
 //       ... (trace truncated, max 64 frames)         (only when truncated)
 //
-// The atexit registration is lazy — the first `karac_error_trace_push` call
-// arms it. Programs that never `?`-propagate pay zero atexit overhead.
+// At process exit the printer consults the `KARAC_ERROR_TRACE_FORMAT` env
+// var and dispatches to one of three emitters:
+//
+//   - `text`   (default, missing/unrecognized values fall back here): the
+//              stderr lines shown above. Backwards-compatible with the
+//              pre-env-var build.
+//   - `json`   single-document pretty-ish JSON on stderr matching the
+//              interpreter's `format_error_trace_json` shape: a bare array
+//              `[{"file":"…","line":N,"column":N},…]` when not truncated,
+//              or `{"frames":[…],"truncated":true}` when truncated.
+//   - `jsonl`  line-delimited JSON (NDJSON), one event per line:
+//              `{"type":"frame","file":"…","line":N,"column":N}` per frame
+//              and an optional trailing `{"type":"truncated","max":64}`
+//              line when the ring buffer dropped older frames.
+//
+// The env var is read once at atexit-time (after the printer wakes); the
+// runtime never observes mid-process changes — out of scope per the slice
+// plan. The atexit registration is lazy — the first `karac_error_trace_push`
+// call arms it. Programs that never `?`-propagate pay zero atexit overhead.
 
 const ERROR_TRACE_MAX_DEPTH: usize = 64;
 
@@ -231,6 +248,32 @@ fn register_trace_atexit_once() {
     });
 }
 
+/// Output format selected by the `KARAC_ERROR_TRACE_FORMAT` env var.
+/// `Text` is the default and preserves the pre-env-var behavior verbatim.
+#[derive(Clone, Copy)]
+enum TraceFormat {
+    Text,
+    Json,
+    Jsonl,
+}
+
+impl TraceFormat {
+    /// Parse the env var. Missing / empty / unrecognized values fall back
+    /// to `Text` (no diagnostic — keeping startup quiet matches the
+    /// "format-switching mid-process is out of scope" stance).
+    fn from_env() -> Self {
+        match std::env::var("KARAC_ERROR_TRACE_FORMAT")
+            .unwrap_or_default()
+            .as_str()
+        {
+            "json" => TraceFormat::Json,
+            "jsonl" => TraceFormat::Jsonl,
+            // Empty string, "text", or anything else → text.
+            _ => TraceFormat::Text,
+        }
+    }
+}
+
 extern "C" fn print_trace_at_exit() {
     // `lock()` may fail only if a prior holder panicked. In that case we
     // can still try to print via `into_inner` on the poisoned guard.
@@ -241,6 +284,14 @@ extern "C" fn print_trace_at_exit() {
     if state.frames.is_empty() {
         return;
     }
+    match TraceFormat::from_env() {
+        TraceFormat::Text => emit_text(&state),
+        TraceFormat::Json => emit_json(&state),
+        TraceFormat::Jsonl => emit_jsonl(&state),
+    }
+}
+
+fn emit_text(state: &ErrorTraceState) {
     eprintln!("Error return trace:");
     for f in &state.frames {
         let file_part = if f.file.is_empty() {
@@ -256,4 +307,116 @@ extern "C" fn print_trace_at_exit() {
             ERROR_TRACE_MAX_DEPTH
         );
     }
+}
+
+/// Single-document JSON matching the interpreter's
+/// `cli.rs::format_error_trace_json` shape verbatim:
+///
+/// - Not truncated: bare array `[{"file":"…","line":N,"column":N},…]`.
+/// - Truncated:     `{"frames":[…],"truncated":true}`.
+///
+/// Emitted on stderr (peer to text mode — keeps the program's stdout
+/// clean for downstream pipelines).
+fn emit_json(state: &ErrorTraceState) {
+    let mut frames = String::new();
+    for (i, f) in state.frames.iter().enumerate() {
+        if i > 0 {
+            frames.push(',');
+        }
+        write_frame_object(&mut frames, f);
+    }
+    if state.truncated {
+        eprintln!("{{\"frames\":[{}],\"truncated\":true}}", frames);
+    } else {
+        eprintln!("[{}]", frames);
+    }
+}
+
+/// Line-delimited JSON (NDJSON): one event per line, each line a
+/// self-contained JSON object. Frames carry `"type":"frame"`; a trailing
+/// `{"type":"truncated","max":N}` line is emitted only when the ring
+/// buffer dropped older entries. The shape matches the interpreter's
+/// JSONL channel idiom (`emit_jsonl_event` in `cli.rs`).
+fn emit_jsonl(state: &ErrorTraceState) {
+    for f in &state.frames {
+        let mut line = String::from("{\"type\":\"frame\",");
+        write_frame_fields(&mut line, f);
+        line.push('}');
+        eprintln!("{}", line);
+    }
+    if state.truncated {
+        eprintln!(
+            "{{\"type\":\"truncated\",\"max\":{}}}",
+            ERROR_TRACE_MAX_DEPTH
+        );
+    }
+}
+
+/// Append a `{"file":…,"line":N,"column":N}` object literal to `out`.
+fn write_frame_object(out: &mut String, f: &ErrorTraceFrame) {
+    out.push('{');
+    write_frame_fields(out, f);
+    out.push('}');
+}
+
+/// Append the bare `"file":…,"line":N,"column":N` field set (no braces)
+/// so callers can splice extra fields like `"type":"frame"` alongside.
+fn write_frame_fields(out: &mut String, f: &ErrorTraceFrame) {
+    out.push_str("\"file\":");
+    write_json_string(out, &f.file);
+    out.push_str(",\"line\":");
+    push_u32(out, f.line);
+    out.push_str(",\"column\":");
+    push_u32(out, f.col);
+}
+
+/// Hand-written JSON string escape — the runtime intentionally avoids a
+/// `serde_json` dependency (zero-heavy-deps policy; runtime is no_std-
+/// adjacent). Escapes match the interpreter's `cli.rs::json_string`:
+/// `"`, `\`, `\n`, `\r`, `\t`, and any other control byte (`< 0x20`)
+/// goes through `\u00XX`. Everything else passes through untouched —
+/// including non-ASCII, since the source filename arrives as UTF-8 from
+/// `karac_error_trace_push` and the output stream is byte-transparent.
+fn write_json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                // `\u00XX` for the remaining control bytes (BS, FF, etc.).
+                let bytes = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    hex_nibble(((c as u32) >> 4) as u8),
+                    hex_nibble((c as u32) as u8),
+                ];
+                // SAFETY: every byte produced above is ASCII (`\\`, `u`,
+                // `0`, and two lowercase hex digits) so the slice is
+                // valid UTF-8.
+                out.push_str(std::str::from_utf8(&bytes).unwrap());
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn hex_nibble(b: u8) -> u8 {
+    let n = b & 0x0F;
+    if n < 10 {
+        b'0' + n
+    } else {
+        b'a' + (n - 10)
+    }
+}
+
+fn push_u32(out: &mut String, n: u32) {
+    use std::fmt::Write;
+    let _ = write!(out, "{}", n);
 }

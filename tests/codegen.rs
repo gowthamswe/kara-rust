@@ -3378,6 +3378,250 @@ fn main() {
         }
     }
 
+    // ── ? error_return_trace KARAC_ERROR_TRACE_FORMAT env-var dispatch ───────
+    //
+    // The runtime's atexit printer reads `KARAC_ERROR_TRACE_FORMAT` and
+    // dispatches between three emitters:
+    //   - text   (default; missing/unrecognized values fall back here)
+    //   - json   (single-document — bare array, or `{frames,truncated}`
+    //            when the ring buffer dropped older entries)
+    //   - jsonl  (line-delimited JSON; one event per line)
+    // The JSON shape mirrors the interpreter's `format_error_trace_json`
+    // verbatim. These tests exercise the full compile → link → run path
+    // with the env var threaded into the child process.
+
+    fn run_program_capturing_with_env(
+        src: &str,
+        filename: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> Option<CapturedRun> {
+        use karac::codegen::{compile_to_object_with_options, link_executable};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let mut parsed = karac::parse(src);
+        if !parsed.errors.is_empty() {
+            let mut msg = String::from("test source failed to parse:\n");
+            for e in &parsed.errors {
+                msg.push_str(&format!("  {:?}\n", e));
+            }
+            panic!("{}", msg);
+        }
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let obj_path = format!("/tmp/karac_e2e_envtrace_{}_{}.o", std::process::id(), id);
+        let exe_path = format!("/tmp/karac_e2e_envtrace_{}_{}", std::process::id(), id);
+
+        if let Err(e) = compile_to_object_with_options(&parsed.program, &obj_path, None, filename) {
+            panic!("codegen failed for test program: {}", e);
+        }
+        link_executable(&obj_path, &exe_path).ok()?;
+
+        let mut cmd = std::process::Command::new(&exe_path);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().ok()?;
+
+        let _ = std::fs::remove_file(&obj_path);
+        let _ = std::fs::remove_file(&exe_path);
+
+        Some(CapturedRun {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
+
+    /// Source common to all three format-dispatch tests: a single `?`
+    /// site so the trace has exactly one frame, threaded through a
+    /// source filename so each frame carries `<file>:<line>:<col>` —
+    /// gives the JSON / JSONL emitters something non-empty to escape
+    /// (and keeps the JSON shape assertion easy to read).
+    const TRACE_FORMAT_SRC: &str = r#"
+fn boom() -> Result[i64, i64] { Err(7_i64) }
+fn caller() -> Result[i64, i64] {
+    let _ = boom()?;
+    Ok(0_i64)
+}
+fn main() {
+    match caller() {
+        Ok(_) => println(0_i64),
+        Err(e) => println(e),
+    }
+}
+"#;
+
+    #[test]
+    fn test_error_trace_text_format_default() {
+        // No env var → existing text format. Regression pin: this is
+        // identical to what `test_e2e_question_trace_includes_source_filename_when_threaded`
+        // exercises, but explicitly asserts the absence of any JSON
+        // markers so a future default flip would surface here.
+        let captured =
+            run_program_capturing_with_env(TRACE_FORMAT_SRC, Some("trace_fmt_default.kara"), &[]);
+        if let Some(c) = captured {
+            assert_eq!(c.stdout.trim(), "7");
+            assert!(
+                c.stderr.contains("Error return trace:"),
+                "expected text-mode header; got {:?}",
+                c.stderr
+            );
+            assert!(
+                c.stderr.contains("trace_fmt_default.kara:"),
+                "expected file:line:col frame; got {:?}",
+                c.stderr
+            );
+            // No JSON markers — `[`, `]`, or `{` appearing on their own
+            // would indicate a stray JSON emitter wired in by mistake.
+            // (We can't blanket-ban `{` because user stdout is separate;
+            // we're checking stderr.)
+            assert!(
+                !c.stderr.contains("\"file\":"),
+                "text mode should not emit JSON keys; got {:?}",
+                c.stderr
+            );
+        }
+    }
+
+    #[test]
+    fn test_error_trace_json_format() {
+        // KARAC_ERROR_TRACE_FORMAT=json → single-document JSON on
+        // stderr matching the interpreter's `format_error_trace_json`
+        // shape: a bare array of frame objects when not truncated.
+        // Each frame object has the keys `file`, `line`, `column`.
+        let captured = run_program_capturing_with_env(
+            TRACE_FORMAT_SRC,
+            Some("trace_fmt_json.kara"),
+            &[("KARAC_ERROR_TRACE_FORMAT", "json")],
+        );
+        if let Some(c) = captured {
+            assert_eq!(c.stdout.trim(), "7");
+            // No text-mode header.
+            assert!(
+                !c.stderr.contains("Error return trace:"),
+                "json mode should not emit the text header; got {:?}",
+                c.stderr
+            );
+            // Locate the JSON document — the printer emits a single
+            // line on stderr matching the array shape.
+            let json_line = c
+                .stderr
+                .lines()
+                .find(|l| l.starts_with('[') && l.ends_with(']'))
+                .unwrap_or_else(|| {
+                    panic!("expected a JSON array line on stderr; got {:?}", c.stderr)
+                });
+            // Shape assertions — interpreter's format verbatim:
+            //   `[{"file":"…","line":N,"column":N}]`
+            assert!(
+                json_line.contains("\"file\":"),
+                "missing `file` key: {}",
+                json_line
+            );
+            assert!(
+                json_line.contains("\"line\":"),
+                "missing `line` key: {}",
+                json_line
+            );
+            assert!(
+                json_line.contains("\"column\":"),
+                "missing `column` key: {}",
+                json_line
+            );
+            assert!(
+                json_line.contains("trace_fmt_json.kara"),
+                "filename not threaded into JSON frame: {}",
+                json_line
+            );
+            // One `?` site → one frame → exactly one `{…}` object.
+            let open_braces = json_line.matches('{').count();
+            assert_eq!(
+                open_braces, 1,
+                "expected exactly 1 frame object; got {} ({})",
+                open_braces, json_line
+            );
+        }
+    }
+
+    #[test]
+    fn test_error_trace_jsonl_format() {
+        // KARAC_ERROR_TRACE_FORMAT=jsonl → line-delimited JSON. One
+        // event per line, each line a self-contained JSON object with
+        // a `type` discriminator. Frames carry `"type":"frame"`; the
+        // truncation marker (not exercised here — only one frame) would
+        // be a separate `{"type":"truncated","max":N}` line.
+        let captured = run_program_capturing_with_env(
+            TRACE_FORMAT_SRC,
+            Some("trace_fmt_jsonl.kara"),
+            &[("KARAC_ERROR_TRACE_FORMAT", "jsonl")],
+        );
+        if let Some(c) = captured {
+            assert_eq!(c.stdout.trim(), "7");
+            // No text-mode header, no JSON-array bracket.
+            assert!(
+                !c.stderr.contains("Error return trace:"),
+                "jsonl mode should not emit the text header; got {:?}",
+                c.stderr
+            );
+            // Each non-empty stderr line must be a JSON object — i.e.
+            // start with `{` and end with `}` — and contain the
+            // `type` key.
+            let trace_lines: Vec<&str> = c.stderr.lines().filter(|l| !l.is_empty()).collect();
+            assert!(
+                !trace_lines.is_empty(),
+                "expected at least one JSONL line; got {:?}",
+                c.stderr
+            );
+            for line in &trace_lines {
+                assert!(
+                    line.starts_with('{') && line.ends_with('}'),
+                    "JSONL line must be a JSON object literal; got `{}`",
+                    line
+                );
+                assert!(
+                    line.contains("\"type\":"),
+                    "JSONL line missing `type` discriminator; got `{}`",
+                    line
+                );
+            }
+            // One `?` site → exactly one frame line, no truncated marker.
+            let frame_lines: Vec<&&str> = trace_lines
+                .iter()
+                .filter(|l| l.contains("\"type\":\"frame\""))
+                .collect();
+            assert_eq!(
+                frame_lines.len(),
+                1,
+                "expected exactly 1 frame event; got {:?}",
+                trace_lines
+            );
+            let frame = frame_lines[0];
+            assert!(
+                frame.contains("\"file\":"),
+                "frame missing `file`: {}",
+                frame
+            );
+            assert!(
+                frame.contains("\"line\":"),
+                "frame missing `line`: {}",
+                frame
+            );
+            assert!(
+                frame.contains("\"column\":"),
+                "frame missing `column`: {}",
+                frame
+            );
+            assert!(
+                frame.contains("trace_fmt_jsonl.kara"),
+                "filename not threaded into JSONL frame: {}",
+                frame
+            );
+        }
+    }
+
     // ── Linker control attributes ────────────────────────────────────────────
 
     #[test]
