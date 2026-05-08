@@ -162,6 +162,8 @@ wip-list1 is a single docs commit; do not bundle with implementation.
 
 - [x] **Slice 2 — Auto-par codegen MVP (the Parallax punchline).** Consume the slice-1 `parallel_groups_for_current_fn` getter at function-body scope: emit `karac_par_run` for compiler-inferred non-trivial parallel groups outside explicit `par {}` blocks. The "write sequential code, the compiler parallelizes it" promise becomes true in compiled output, not just the interpreter. Plan source: [`phase-7-codegen.md`](phase-7-codegen.md) § "Par codegen: auto-parallelization of non-`par` regions" → "Slice plan (drafted 2026-05-08) — slice 2: auto-par codegen MVP". Promoted from staging 2026-05-08. Landed 2026-05-08 (commit 8bc3bab).
 
+- [x] **Slice 3 — Debugger Contract: SpawnSiteId metadata table emission.** First piece of the four-part Debugger Contract. Mint a stable per-binary `SpawnSiteId: u32` per `par {}` block (explicit + inferred both flow through `emit_par_run`'s new `record_spawn_site` site) and emit three module-scope external-linkage globals — `KARAC_SPAWN_SITES`, `KARAC_SPAWN_SITES_LEN`, `KARAC_SPAWN_SITES_ENABLED` — slice 5's `std.runtime::list_par_blocks()` / `has_debug_metadata()` will read directly. Default-on for dev; `KARAC_RUNTIME_DEBUG_METADATA=0` flips the gate off (globals still emit, but `LEN = 0`, `ENABLED = false`, array `[0 x …]`). Plan source: [`phase-8-stdlib-floor.md`](phase-8-stdlib-floor.md) § "Auto-Concurrency Codegen — Debugger Contract" → "Debugger Contract slice 3 — SpawnSiteId metadata table emission". Promoted from staging 2026-05-08. Landed 2026-05-08 (commit SLICE3_HASH_PLACEHOLDER).
+
 Slices 3–6 of the Phase 8 auto-concurrency slate remain in
 [`wip-staging.md`](wip-staging.md) under "needs plan drafting" state;
 they graduate here as their plans land in their phase trackers. Slice
@@ -178,3 +180,4 @@ retrofits the `par_counter` ID-mint inside `emit_par_run` to a
 |---|---|---|---|---|---|
 | 1 | Plumbing: `ConcurrencyAnalysis` into `Codegen` | 2026-05-08 | 2026-05-08 | ~30 min | c0e72fc |
 | 2 | Auto-par codegen MVP (Parallax punchline) | 2026-05-08 | 2026-05-08 | ~45 min | 8bc3bab |
+| 3 | Debugger Contract: SpawnSiteId metadata table | 2026-05-08 | 2026-05-08 | ~60 min | SLICE3_HASH_PLACEHOLDER |

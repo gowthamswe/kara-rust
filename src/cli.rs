@@ -2261,6 +2261,7 @@ fn cmd_build(filename: &str, output: OutputMode) {
             pipeline.ownership.as_ref(),
             pipeline.concurrency.as_ref(),
             Some(filename),
+            Some(&source),
         ) {
             eprintln!("error: codegen failed: {e}");
             process::exit(1);
@@ -3586,7 +3587,7 @@ fn cmd_fix(filename: &str, dry_run: bool) {
             let original = source
                 .get(edit.offset..edit.offset.saturating_add(edit.length))
                 .unwrap_or("<?>");
-            let (line, col) = byte_offset_to_line_col(&source, edit.offset);
+            let (line, col) = crate::byte_offset_to_line_col(&source, edit.offset);
             println!(
                 "  {filename}:{line}:{col}: `{}` → `{}`",
                 original, edit.replacement
@@ -3617,25 +3618,10 @@ fn cmd_fix(filename: &str, dry_run: bool) {
     println!("applied {} fix(es) to {filename}", deduped.len());
 }
 
-/// Convert a byte offset into the source string into a (line, column)
-/// pair suitable for diagnostic display. 1-indexed for both axes,
-/// matching the rest of `karac`'s diagnostic output.
-fn byte_offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
-    let mut line = 1usize;
-    let mut col = 1usize;
-    for (i, ch) in source.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
+// `byte_offset_to_line_col` was promoted to `crate::byte_offset_to_line_col`
+// in `src/lib.rs` so codegen's debugger-contract metadata emission can reuse
+// it. The cli still calls it from `apply_fixes` below; the rename is a single
+// crate-path tweak with no behavior change.
 
 // ── Tests ────────────────────────────────────────────────────────
 

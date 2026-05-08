@@ -35,26 +35,33 @@ pub fn compile_to_ir(
     ownership: Option<&OwnershipCheckResult>,
     concurrency: Option<&ConcurrencyAnalysis>,
 ) -> Result<String, String> {
-    compile_to_ir_with_options(program, ownership, concurrency, None)
+    compile_to_ir_with_options(program, ownership, concurrency, None, None)
 }
 
-/// Like [`compile_to_ir`] but accepts an optional source-filename string used
-/// when emitting `karac_error_trace_push(...)` calls at `?` failure sites.
-/// When `Some`, codegen materializes the filename as a deduped global string
-/// and passes its `(ptr, len)` to the runtime so error-return traces print as
-/// `<file>:<line>:<col>` (matching the interpreter's format) instead of the
-/// MVP fallback `<line>:<col>`. `None` preserves the prior behavior.
+/// Like [`compile_to_ir`] but accepts optional source-filename and source-text
+/// strings used by side features:
+///   - `source_filename` is materialized as a deduped global string and
+///     passed to `karac_error_trace_push(...)` at `?` failure sites so
+///     error-return traces print as `<file>:<line>:<col>`. `None` preserves
+///     the MVP fallback `<line>:<col>` output.
+///   - `source_text` is consumed by the SpawnSiteId metadata table emission
+///     (Debugger Contract slice 3) to resolve `par {}` byte offsets to
+///     `(line, col)` for the `KARAC_SPAWN_SITES` global. `None` records
+///     `(0, 0)` for each site — the table still emits, just without
+///     source-position fidelity.
 pub fn compile_to_ir_with_options(
     program: &Program,
     ownership: Option<&OwnershipCheckResult>,
     concurrency: Option<&ConcurrencyAnalysis>,
     source_filename: Option<&str>,
+    source_text: Option<&str>,
 ) -> Result<String, String> {
     let context = Context::create();
     let mut cg = Codegen::new(&context, "karac_module");
     cg.load_rc_fallback(ownership);
     cg.load_concurrency_analysis(concurrency);
     cg.set_source_filename(source_filename);
+    cg.set_source_text(source_text);
     cg.compile_program(program)?;
     Ok(cg.module.print_to_string().to_string())
 }
@@ -66,23 +73,26 @@ pub fn compile_to_object(
     ownership: Option<&OwnershipCheckResult>,
     concurrency: Option<&ConcurrencyAnalysis>,
 ) -> Result<(), String> {
-    compile_to_object_with_options(program, output_path, ownership, concurrency, None)
+    compile_to_object_with_options(program, output_path, ownership, concurrency, None, None)
 }
 
-/// Like [`compile_to_object`] but accepts an optional source-filename string;
-/// see [`compile_to_ir_with_options`] for the rationale.
+/// Like [`compile_to_object`] but accepts optional source-filename and
+/// source-text strings; see [`compile_to_ir_with_options`] for the
+/// rationale and how each is consumed.
 pub fn compile_to_object_with_options(
     program: &Program,
     output_path: &str,
     ownership: Option<&OwnershipCheckResult>,
     concurrency: Option<&ConcurrencyAnalysis>,
     source_filename: Option<&str>,
+    source_text: Option<&str>,
 ) -> Result<(), String> {
     let context = Context::create();
     let mut cg = Codegen::new(&context, "karac_module");
     cg.load_rc_fallback(ownership);
     cg.load_concurrency_analysis(concurrency);
     cg.set_source_filename(source_filename);
+    cg.set_source_text(source_text);
     cg.compile_program(program)?;
 
     let target_machine = create_target_machine()?;
@@ -240,6 +250,20 @@ fn create_target_machine() -> Result<TargetMachine, String> {
         .ok_or_else(|| "Failed to create target machine".to_string())
 }
 
+/// Read the `KARAC_RUNTIME_DEBUG_METADATA` env var to decide whether
+/// `KARAC_SPAWN_SITES` (and friends) emit populated. Slice 3 of the
+/// Debugger Contract; see `Codegen::runtime_debug_metadata_enabled` for
+/// the field doc and `phase-8-stdlib-floor.md` § "Auto-Concurrency
+/// Codegen — Debugger Contract slice 3" for the spec.
+///
+/// - `Ok("0")` → `false` (gate explicitly off).
+/// - `Ok(_)`   → `true` (any other value, including empty).
+/// - `Err(_)`  → `true` (dev default; profile-aware defaults land in
+///   Phase 8.5 Track 2).
+fn read_runtime_debug_metadata_env() -> bool {
+    !matches!(std::env::var("KARAC_RUNTIME_DEBUG_METADATA"), Ok(v) if v == "0")
+}
+
 // ── Variable slot: pointer + LLVM type for typed loads ─────────
 
 #[derive(Clone, Copy)]
@@ -365,6 +389,60 @@ struct LoopFrame<'ctx> {
     result_slot: Option<PointerValue<'ctx>>,
 }
 
+// ── Spawn-site metadata (Debugger Contract slice 3) ────────────
+
+/// One row of the `KARAC_SPAWN_SITES` metadata table.
+///
+/// A `SpawnSiteId` (the `id` field) is minted per `par {}` block during
+/// codegen — both explicit `par {}` blocks (`compile_par_block`) and
+/// compiler-inferred parallel groups (`compile_function_body`'s auto-par
+/// dispatch) flow through `emit_par_run`, which calls
+/// `Codegen::record_spawn_site` to push a record into `Codegen::spawn_sites`.
+/// The collected records are emitted as a module-scope global at the
+/// end of compilation by `emit_spawn_sites_metadata`.
+///
+/// See `design.md § AI-First Compiler Interface > Debugger Contract` for
+/// the four-part contract this is the foundation of:
+///
+/// - slice 3 (this entry) — produces `KARAC_SPAWN_SITES` + `_LEN` + `_ENABLED`.
+/// - slice 4 — references these IDs in worker-frame metadata
+///   (parent-frame ref + await-chain pointer).
+/// - slice 5 — exposes the table to Kāra-callable code via
+///   `std.runtime::list_par_blocks()` / `has_debug_metadata()`, reading
+///   `KARAC_SPAWN_SITES` + `_LEN` + `_ENABLED` directly through external
+///   linkage.
+/// - the still-future `std.panic` crash report
+///   (`design.md § Crash Report Format`) reads them for the
+///   `parallel_context` field.
+struct SpawnSiteRecord {
+    /// Stable per-binary `SpawnSiteId`. Equal to the `par_counter` value
+    /// at the time the record was minted; the same value is used to name
+    /// the par-branch functions (`__par_branch_<id>_<i>`).
+    id: u32,
+    /// Source filename. Empty when `Codegen::source_filename` was not
+    /// threaded in (most tests, ad-hoc IR dumps).
+    file: String,
+    /// 1-indexed line of the par-block keyword (or first stmt of an
+    /// inferred group), per `crate::byte_offset_to_line_col`.
+    line: u32,
+    /// 1-indexed column of the par-block keyword (or first stmt of an
+    /// inferred group), per `crate::byte_offset_to_line_col`.
+    col: u32,
+    /// Static branch count (number of stmts in the block at codegen
+    /// time). `None` would indicate "unknown"; v1's runtime spawns one
+    /// OS thread per branch (`karac_par_run` in `runtime/src/lib.rs`),
+    /// so the count is statically the stmt count and the field is
+    /// always `Some(stmts.len() as u32)` today. Recorded as `Option`
+    /// to lock the field shape now — when work-stealing or
+    /// thread-pool-bounded execution lands (Phase 6.2 / 6.3), the
+    /// static count loses meaning and slice 4 / 5's introspection
+    /// surface will need to choose between "branches in source" (this
+    /// field) and a separate dynamic "currently active workers"
+    /// surface from the runtime. Defer the decision; the field name
+    /// captures the static-source intent.
+    worker_count: Option<u32>,
+}
+
 // ── Codegen ────────────────────────────────────────────────────
 
 struct Codegen<'ctx> {
@@ -481,6 +559,15 @@ struct Codegen<'ctx> {
     /// an unused global to programs with no `?` propagation. Cleared on each
     /// `compile_program` entry alongside the other side-tables.
     source_filename_global: Option<(PointerValue<'ctx>, u64)>,
+    /// Source text threaded in from the CLI (`compile_to_object_with_options`
+    /// / `compile_to_ir_with_options` via `set_source_text`). When `Some`,
+    /// `record_spawn_site` resolves each `par {}` block's byte offset to
+    /// `(line, col)` via `crate::byte_offset_to_line_col`. When `None`,
+    /// recorded entries fall back to `(0, 0)` — the metadata table still
+    /// emits, just without source-position fidelity (most tests and ad-hoc
+    /// IR dumps don't supply source text, and the `(line, col)` fields are
+    /// strictly for the slice 5 / debugger surface).
+    source_text: Option<String>,
     /// Symbols carrying `#[used]` collected during declaration. After the
     /// program is fully lowered, `emit_llvm_used` materializes them into the
     /// special `@llvm.used` appending-linkage global so the linker preserves
@@ -522,11 +609,41 @@ struct Codegen<'ctx> {
     current_fn_name: String,
     // ── Par block runtime ─────────────────────────────────────────
     /// Monotonic counter used to generate unique par-branch function names.
+    /// Also serves as the `SpawnSiteId` for each `par {}` block — the value
+    /// at the time `emit_par_run` records a spawn site is the ID written
+    /// into the `KARAC_SPAWN_SITES` metadata table (slice 3 of the
+    /// Debugger Contract; see `SpawnSiteRecord`).
     par_counter: u32,
     /// Runtime struct `KaracBranch { ptr func, ptr ctx }` — shared across par blocks.
     karac_branch_ty: StructType<'ctx>,
     /// Runtime entry point `void karac_par_run(const KaracBranch*, usize)`.
     karac_par_run_fn: FunctionValue<'ctx>,
+    // ── Debugger contract: SpawnSiteId metadata (slice 3) ─────────
+    /// One entry per `par {}` block (explicit or inferred). Populated by
+    /// `record_spawn_site`; emitted as the `KARAC_SPAWN_SITES` global by
+    /// `emit_spawn_sites_metadata` at the end of compilation. The order
+    /// matches `SpawnSiteId` order (entry 0 → ID 0, entry 1 → ID 1, …).
+    spawn_sites: Vec<SpawnSiteRecord>,
+    /// Whether `KARAC_SPAWN_SITES` and friends emit populated. Driven by
+    /// the `KARAC_RUNTIME_DEBUG_METADATA` env var read at `Codegen::new`
+    /// time:
+    ///
+    /// - `Ok("0")` → false (gate explicitly off).
+    /// - `Ok(_)`   → true.
+    /// - `Err(_)`  → true (dev default).
+    ///
+    /// Slice 3 ships dev-default-on with env-var override only; profile-
+    /// aware defaults (release / embedded / `isr` → off) and the TOML
+    /// config home for the knob land in Phase 8.5 Track 2 (Build &
+    /// Dependency Tooling). When the gate is off, all three globals
+    /// (`KARAC_SPAWN_SITES`, `_LEN`, `_ENABLED`) still emit so slice 5's
+    /// runtime API can read through the same symbols regardless of build
+    /// mode and degrade cleanly — `_LEN` is zero, the array has zero
+    /// entries, and `_ENABLED` is false. ID minting is unaffected so
+    /// `__par_branch_<id>_<i>` symbol names stay stable across the
+    /// gate-on / gate-off boundary. See `phase-8-stdlib-floor.md`
+    /// § Auto-Concurrency Codegen — Debugger Contract slice 3.
+    runtime_debug_metadata_enabled: bool,
     // ── Map runtime ───────────────────────────────────────────────
     /// Per-variable Map key LLVM type (variable name → K LLVM type).
     map_key_types: HashMap<String, BasicTypeEnum<'ctx>>,
@@ -857,6 +974,7 @@ impl<'ctx> Codegen<'ctx> {
             pattern_binding_types: HashMap::new(),
             source_filename: None,
             source_filename_global: None,
+            source_text: None,
             used_symbols: Vec::new(),
             branch_cancel_ptr: None,
             rc_fallback_fns: HashMap::new(),
@@ -867,6 +985,8 @@ impl<'ctx> Codegen<'ctx> {
             par_counter: 0,
             karac_branch_ty,
             karac_par_run_fn,
+            spawn_sites: Vec::new(),
+            runtime_debug_metadata_enabled: read_runtime_debug_metadata_env(),
             map_key_types: HashMap::new(),
             map_val_types: HashMap::new(),
             map_key_type_names: HashMap::new(),
@@ -924,6 +1044,46 @@ impl<'ctx> Codegen<'ctx> {
     /// `?` failure sites. See the field doc on `source_filename`.
     fn set_source_filename(&mut self, filename: Option<&str>) {
         self.source_filename = filename.map(|s| s.to_string());
+    }
+
+    /// Set the source text used by `record_spawn_site` to resolve byte
+    /// offsets to `(line, col)` for the `KARAC_SPAWN_SITES` metadata
+    /// table (Debugger Contract slice 3). Mirrors `set_source_filename`.
+    fn set_source_text(&mut self, text: Option<&str>) {
+        self.source_text = text.map(|s| s.to_string());
+    }
+
+    /// Mint a fresh `SpawnSiteId` and record a `SpawnSiteRecord` for the
+    /// par block at `span` with `worker_count` static branches. Returns
+    /// the assigned ID. The ID is the value of `par_counter` at entry —
+    /// using a single counter for both par-branch function naming and
+    /// SpawnSiteId minting keeps `__par_branch_<id>_<i>` and the metadata
+    /// table in lockstep.
+    ///
+    /// Recording happens unconditionally (regardless of
+    /// `runtime_debug_metadata_enabled`) so the IDs are stable across
+    /// the gate-on / gate-off boundary; the gate decides only whether
+    /// the emitted globals are populated. See `Codegen::spawn_sites` and
+    /// the slice 3 plan in `phase-8-stdlib-floor.md`.
+    fn record_spawn_site(&mut self, span: &Span, worker_count: Option<u32>) -> u32 {
+        let id = self.par_counter;
+        self.par_counter += 1;
+        let (line, col) = match self.source_text.as_deref() {
+            Some(src) => {
+                let (l, c) = crate::byte_offset_to_line_col(src, span.offset);
+                (l as u32, c as u32)
+            }
+            None => (span.line as u32, span.column as u32),
+        };
+        let file = self.source_filename.clone().unwrap_or_default();
+        self.spawn_sites.push(SpawnSiteRecord {
+            id,
+            file,
+            line,
+            col,
+            worker_count,
+        });
+        id
     }
 
     fn is_rc_fallback_binding(&self, name: &str) -> bool {
@@ -2583,6 +2743,7 @@ impl<'ctx> Codegen<'ctx> {
         }
 
         self.emit_llvm_used();
+        self.emit_spawn_sites_metadata();
 
         self.module
             .verify()
@@ -2610,6 +2771,145 @@ impl<'ctx> Codegen<'ctx> {
         global.set_initializer(&init);
         global.set_linkage(inkwell::module::Linkage::Appending);
         global.set_section(Some("llvm.metadata"));
+    }
+
+    /// Emit the three module-scope globals that make up the SpawnSiteId
+    /// metadata table — the foundation of the four-piece Debugger
+    /// Contract specified in `design.md § AI-First Compiler Interface
+    /// > Debugger Contract`. Slice 3 of the contract; consumed by
+    /// slices 4 + 5 and the `std.panic` crash report's
+    /// `parallel_context` field.
+    ///
+    /// Globals (external linkage; names are exact — runtime APIs and
+    /// any external debugger tooling key on them verbatim):
+    ///
+    /// - `KARAC_SPAWN_SITES_ENABLED: i1` — `true` iff
+    ///   `runtime_debug_metadata_enabled`. `std.runtime`'s
+    ///   `has_debug_metadata()` (slice 5) reads this.
+    /// - `KARAC_SPAWN_SITES_LEN: i32` — 0 when the gate is off,
+    ///   `spawn_sites.len()` otherwise.
+    /// - `KARAC_SPAWN_SITES: [N x SpawnSiteEntry]` where
+    ///   `SpawnSiteEntry = { i32 id, ptr file_cstr, i32 line,
+    ///   i32 col, i32 worker_count, i32 reserved }`.
+    ///   The trailing `reserved` field is intentionally future-additive
+    ///   (per `design.md § Debugger Contract > Stability`); it lets
+    ///   future fields land within a major version without breaking
+    ///   ABI. When the gate is off, `N == 0`.
+    ///
+    /// Per-filename `i8`-array globals are deduped by file path so a
+    /// program with many `par {}` blocks in the same file emits only
+    /// one filename string.
+    fn emit_spawn_sites_metadata(&mut self) {
+        let i32_ty = self.context.i32_type();
+        let i8_ty = self.context.i8_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let bool_ty = self.context.bool_type();
+
+        // Entry struct layout: { i32 id, ptr file_cstr, i32 line,
+        //                        i32 col, i32 worker_count, i32 reserved }
+        let entry_ty = self.context.struct_type(
+            &[
+                i32_ty.into(),
+                ptr_ty.into(),
+                i32_ty.into(),
+                i32_ty.into(),
+                i32_ty.into(),
+                i32_ty.into(),
+            ],
+            false,
+        );
+
+        // Decide what the table contains. When the gate is off, emit
+        // an empty array and a length of zero; the runtime API in
+        // slice 5 reads through the same symbols regardless and
+        // degrades cleanly (`list_par_blocks() == []`,
+        // `has_debug_metadata() == false`).
+        let emit_entries = self.runtime_debug_metadata_enabled;
+        let len_value = if emit_entries {
+            self.spawn_sites.len() as u32
+        } else {
+            0
+        };
+
+        // Build the per-filename `i8`-array globals (one per distinct
+        // file path) and remember each as a pointer-to-first-byte.
+        let mut file_globals: HashMap<String, PointerValue<'ctx>> = HashMap::new();
+        if emit_entries {
+            for record in &self.spawn_sites {
+                if file_globals.contains_key(&record.file) {
+                    continue;
+                }
+                // Null-terminated; use `const_string(.., true)` to
+                // append the trailing NUL automatically.
+                let cstr = self.context.const_string(record.file.as_bytes(), true);
+                let arr_ty = i8_ty.array_type(cstr.get_type().len());
+                let g = self.module.add_global(
+                    arr_ty,
+                    None,
+                    &format!("karac.spawn_site_file.{}", file_globals.len()),
+                );
+                g.set_initializer(&cstr);
+                g.set_linkage(Linkage::Private);
+                g.set_constant(true);
+                file_globals.insert(record.file.clone(), g.as_pointer_value());
+            }
+        }
+
+        // Construct the array initializer.
+        let entries_init: Vec<_> = if emit_entries {
+            self.spawn_sites
+                .iter()
+                .map(|r| {
+                    let file_ptr = file_globals
+                        .get(&r.file)
+                        .copied()
+                        .unwrap_or_else(|| ptr_ty.const_null());
+                    let id_v = i32_ty.const_int(r.id as u64, false);
+                    let line_v = i32_ty.const_int(r.line as u64, false);
+                    let col_v = i32_ty.const_int(r.col as u64, false);
+                    let wc_v =
+                        i32_ty.const_int(r.worker_count.map(|w| w as u64).unwrap_or(0), false);
+                    let reserved_v = i32_ty.const_zero();
+                    entry_ty.const_named_struct(&[
+                        id_v.into(),
+                        file_ptr.into(),
+                        line_v.into(),
+                        col_v.into(),
+                        wc_v.into(),
+                        reserved_v.into(),
+                    ])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let arr_ty = entry_ty.array_type(entries_init.len() as u32);
+        let arr_global = self.module.add_global(arr_ty, None, "KARAC_SPAWN_SITES");
+        arr_global.set_initializer(&entry_ty.const_array(&entries_init));
+        arr_global.set_linkage(Linkage::External);
+        arr_global.set_constant(true);
+
+        let len_global = self
+            .module
+            .add_global(i32_ty, None, "KARAC_SPAWN_SITES_LEN");
+        len_global.set_initializer(&i32_ty.const_int(len_value as u64, false));
+        len_global.set_linkage(Linkage::External);
+        len_global.set_constant(true);
+
+        let enabled_global = self
+            .module
+            .add_global(bool_ty, None, "KARAC_SPAWN_SITES_ENABLED");
+        enabled_global.set_initializer(&bool_ty.const_int(
+            if self.runtime_debug_metadata_enabled {
+                1
+            } else {
+                0
+            },
+            false,
+        ));
+        enabled_global.set_linkage(Linkage::External);
+        enabled_global.set_constant(true);
     }
 
     /// Apply `#[link_section("name")]`, `#[no_mangle]`, and `#[used]` to
@@ -2977,7 +3277,14 @@ impl<'ctx> Codegen<'ctx> {
                     .iter()
                     .map(|&s| body.stmts[s].clone())
                     .collect();
-                self.emit_par_run(&group_stmts, &body.span)?;
+                // Slice 3 (sub-step d.1): pass a per-group span so the
+                // SpawnSiteRecord pinned by `emit_par_run`'s call to
+                // `record_spawn_site` carries the location of the first
+                // grouped stmt — the conceptual fire-point of the
+                // inferred `par_run` — rather than the whole function-
+                // body span (slice 2's MVP).
+                let group_span = body.stmts[group.statement_indices[0]].span.clone();
+                self.emit_par_run(&group_stmts, &group_span)?;
                 let max_idx = group.statement_indices.iter().copied().max().unwrap_or(i);
                 i = max_idx + 1;
             } else if covered.contains(&i) {
@@ -12375,8 +12682,16 @@ impl<'ctx> Codegen<'ctx> {
         }
 
         // 4. Generate one branch function per statement.
-        let par_id = self.par_counter;
-        self.par_counter += 1;
+        //    Mint the SpawnSiteId via `record_spawn_site` (Debugger
+        //    Contract slice 3): the helper bumps `par_counter`, returns
+        //    the assigned ID, and pushes a metadata record carrying the
+        //    par-block's `(file, line, col)` and static branch count for
+        //    `KARAC_SPAWN_SITES` to emit at the end of compilation.
+        //    Both call sites of `emit_par_run` (explicit `par {}` via
+        //    `compile_par_block`, inferred groups via
+        //    `compile_function_body`) flow through this single
+        //    recording site.
+        let par_id = self.record_spawn_site(span, Some(stmts.len() as u32));
         let mut branch_fn_ptrs: Vec<PointerValue<'ctx>> = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
             let fn_ptr = self.emit_par_branch_fn(

@@ -43,6 +43,31 @@ use crate::resolver::{ResolveResult, Resolver};
 use crate::token::SpannedToken;
 use crate::typechecker::{TypeCheckResult, TypeChecker};
 
+/// Convert a byte offset into the source string into a (line, column)
+/// pair suitable for diagnostic display. 1-indexed for both axes,
+/// matching the rest of `karac`'s diagnostic output.
+///
+/// Originally lived in `cli.rs`; promoted here so codegen's debugger-
+/// contract metadata emission (Phase 8 § Auto-Concurrency Codegen —
+/// Debugger Contract slice 3) can record `(line, col)` for each `par {}`
+/// site without depending on cli-private state.
+pub fn byte_offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for (i, ch) in source.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 /// Tokenize source code into a vector of spanned tokens.
 pub fn tokenize(source: &str) -> Vec<SpannedToken> {
     let mut lexer = Lexer::new(source);

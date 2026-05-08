@@ -458,7 +458,7 @@ fn main() {
         karac::lower(&mut parsed.program, &typed);
         let effects = karac::effectcheck(&parsed.program);
         let analysis = karac::concurrency_analyze(&parsed.program, &effects);
-        compile_to_ir_with_options(&parsed.program, None, Some(&analysis), None)
+        compile_to_ir_with_options(&parsed.program, None, Some(&analysis), None, None)
             .expect("codegen failed")
     }
 

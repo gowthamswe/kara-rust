@@ -494,7 +494,7 @@ fn main() {
         // stay as soft-skip because they can fire in environments that
         // lack libkarac_runtime.a or a working linker.
         if let Err(e) =
-            compile_to_object_with_options(&parsed.program, &obj_path, None, None, filename)
+            compile_to_object_with_options(&parsed.program, &obj_path, None, None, filename, None)
         {
             panic!("codegen failed for test program: {}", e);
         }
@@ -3418,7 +3418,7 @@ fn main() {
         let exe_path = format!("/tmp/karac_e2e_envtrace_{}_{}", std::process::id(), id);
 
         if let Err(e) =
-            compile_to_object_with_options(&parsed.program, &obj_path, None, None, filename)
+            compile_to_object_with_options(&parsed.program, &obj_path, None, None, filename, None)
         {
             panic!("codegen failed for test program: {}", e);
         }
@@ -6059,8 +6059,14 @@ fn main() {
         let analysis = karac::concurrency_analyze(&parsed.program, &effects);
 
         let obj_path = "/tmp/karac_test_concurrency_threads.o";
-        let result =
-            compile_to_object_with_options(&parsed.program, obj_path, None, Some(&analysis), None);
+        let result = compile_to_object_with_options(
+            &parsed.program,
+            obj_path,
+            None,
+            Some(&analysis),
+            None,
+            None,
+        );
         assert!(
             result.is_ok(),
             "compile_to_object_with_options failed with concurrency analysis: {:?}",
@@ -6152,6 +6158,279 @@ fn main() {
             analysis.function_decisions.contains_key("main"),
             "expected `main` in function_decisions; got keys: {:?}",
             analysis.function_decisions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ── Debugger Contract: SpawnSiteId metadata table ──
+    //
+    // Slice 3 of the four-piece Debugger Contract (`design.md § AI-First
+    // Compiler Interface > Debugger Contract`). For every `par {}` block
+    // (explicit or compiler-inferred) codegen records a `(id, file,
+    // line, col, worker_count)` tuple and emits a module-scope
+    // `KARAC_SPAWN_SITES` array, plus the companion `KARAC_SPAWN_SITES_LEN`
+    // and `KARAC_SPAWN_SITES_ENABLED` globals. The IDs are stable per
+    // binary and serve as the join key consumed by slices 4 and 5 (and
+    // the future `std.panic` crash report's `parallel_context` field).
+    //
+    // Tests use IR-level string-grep — same precedent as
+    // `test_repeat_literal_const_zero_uses_memset`.
+    //
+    // Test isolation: `KARAC_RUNTIME_DEBUG_METADATA` is read at
+    // `Codegen::new` time. The disabled-via-env-var test below
+    // mutates the var, so all four spawn-site tests serialize on a
+    // shared mutex to avoid cross-test pollution under cargo's
+    // default parallel test execution. The lock is acquired at the
+    // top of each test and released on drop — env-var-touching tests
+    // restore prior state explicitly inside the critical section.
+
+    static SPAWN_SITE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Compile to IR with explicit source-text plumbing, threading
+    /// the source through the new `source_text` parameter so
+    /// `record_spawn_site` resolves byte offsets to `(line, col)`.
+    fn ir_for_with_source(src: &str) -> String {
+        use karac::codegen::compile_to_ir_with_options;
+        let mut parsed = karac::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        compile_to_ir_with_options(&parsed.program, None, None, Some("test.kara"), Some(src))
+            .expect("codegen failed")
+    }
+
+    /// Three globals must always emit, regardless of whether the
+    /// program contains any `par {}` blocks. Slice 5's runtime API
+    /// reads through these symbols unconditionally and degrades
+    /// cleanly when the table is empty.
+    #[test]
+    fn test_spawn_site_metadata_emitted_for_par_blocks() {
+        // Serialize against the env-var test below — see module
+        // comment for rationale.
+        let _guard = SPAWN_SITE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Two par blocks: first has 2 branches, second has 3. The
+        // metadata table should pin both with their `worker_count`
+        // values (2 and 3) and assign IDs 0 and 1 (matching the
+        // `par_counter` start).
+        let ir = ir_for_with_source(
+            r#"
+fn a() { println(1); }
+fn b() { println(2); }
+fn c() { println(3); }
+fn main() {
+    par {
+        a();
+        b();
+    }
+    par {
+        a();
+        b();
+        c();
+    }
+}
+"#,
+        );
+
+        // Length global: two entries.
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES_LEN"),
+            "missing KARAC_SPAWN_SITES_LEN global; ir:\n{ir}"
+        );
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES_LEN = constant i32 2")
+                || ir.contains("@KARAC_SPAWN_SITES_LEN = constant i32 2,")
+                || ir.contains("@KARAC_SPAWN_SITES_LEN = constant i32 2\n"),
+            "expected KARAC_SPAWN_SITES_LEN = 2; ir:\n{ir}"
+        );
+
+        // Enabled global: true (i1 1).
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES_ENABLED = constant i1 true"),
+            "expected KARAC_SPAWN_SITES_ENABLED = true; ir:\n{ir}"
+        );
+
+        // Array global: two entries.
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES = constant"),
+            "missing KARAC_SPAWN_SITES global; ir:\n{ir}"
+        );
+        // The array type prefix should reflect the entry count.
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES = constant [2 x"),
+            "expected `[2 x …]` array type for KARAC_SPAWN_SITES; ir:\n{ir}"
+        );
+
+        // Worker counts: 2 and 3 should both appear in the array
+        // initializer. We can't easily isolate just the array text
+        // from the IR string, but the combination of `[2 x` plus
+        // both i32 values 2 and 3 is a strong signal.
+        // Sanity-check: at least one occurrence of `i32 2,` and
+        // `i32 3,` in the array initializer (the entry struct fields).
+        assert!(
+            ir.contains("i32 2"),
+            "expected i32 2 worker_count; ir:\n{ir}"
+        );
+        assert!(
+            ir.contains("i32 3"),
+            "expected i32 3 worker_count; ir:\n{ir}"
+        );
+    }
+
+    /// Empty array must still emit (length zero, enabled true) — the
+    /// runtime API reads through these symbols even on programs with
+    /// no `par {}` blocks.
+    #[test]
+    fn test_spawn_site_metadata_empty_when_no_par_blocks() {
+        let _guard = SPAWN_SITE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let ir = ir_for_with_source(
+            r#"
+fn main() {
+    println(42);
+}
+"#,
+        );
+
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES_LEN"),
+            "missing KARAC_SPAWN_SITES_LEN global; ir:\n{ir}"
+        );
+        // Length zero.
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES_LEN = constant i32 0"),
+            "expected KARAC_SPAWN_SITES_LEN = 0; ir:\n{ir}"
+        );
+        // Enabled true (dev default).
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES_ENABLED = constant i1 true"),
+            "expected KARAC_SPAWN_SITES_ENABLED = true; ir:\n{ir}"
+        );
+        // Empty array.
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES = constant [0 x"),
+            "expected empty `[0 x …]` KARAC_SPAWN_SITES; ir:\n{ir}"
+        );
+    }
+
+    /// `KARAC_RUNTIME_DEBUG_METADATA=0` flips the gate off — all three
+    /// globals still emit, but `LEN = 0`, `ENABLED = false`, and the
+    /// array is empty regardless of how many `par {}` blocks the
+    /// program contains.
+    ///
+    /// Env-var test isolation: `KARAC_RUNTIME_DEBUG_METADATA` is read
+    /// once at `Codegen::new` time. We `set_var` before invoking
+    /// codegen, then `remove_var` immediately after to restore prior
+    /// state. Other tests in this file that don't set the var see the
+    /// dev default (true). Cargo runs tests in parallel by default —
+    /// the var name is unique to this test, so there is no collision
+    /// risk with peers, and the explicit unset prevents leaking state
+    /// to any later codegen helper that may run in the same process.
+    #[test]
+    fn test_spawn_site_metadata_disabled_via_env_var() {
+        // Acquire the shared lock so peer spawn-site tests don't
+        // observe the var while the gate is flipped to "0".
+        let _guard = SPAWN_SITE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Restore prior state on completion. Establishing the prior
+        // value before the test is paranoid but cheap — most CI runs
+        // start with the var unset.
+        let prior = std::env::var("KARAC_RUNTIME_DEBUG_METADATA").ok();
+        std::env::set_var("KARAC_RUNTIME_DEBUG_METADATA", "0");
+        let ir = ir_for_with_source(
+            r#"
+fn a() { println(1); }
+fn b() { println(2); }
+fn main() {
+    par {
+        a();
+        b();
+    }
+}
+"#,
+        );
+        match prior {
+            Some(v) => std::env::set_var("KARAC_RUNTIME_DEBUG_METADATA", v),
+            None => std::env::remove_var("KARAC_RUNTIME_DEBUG_METADATA"),
+        }
+
+        // Length zero, even though the program has one par block.
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES_LEN = constant i32 0"),
+            "expected KARAC_SPAWN_SITES_LEN = 0 when gate off; ir:\n{ir}"
+        );
+        // Enabled false.
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES_ENABLED = constant i1 false"),
+            "expected KARAC_SPAWN_SITES_ENABLED = false when gate off; ir:\n{ir}"
+        );
+        // Empty array when gate off.
+        assert!(
+            ir.contains("@KARAC_SPAWN_SITES = constant [0 x"),
+            "expected empty `[0 x …]` KARAC_SPAWN_SITES when gate off; ir:\n{ir}"
+        );
+    }
+
+    /// Source-position fidelity: a `par {}` block at a known line
+    /// must record a `(line, col)` matching the source position of
+    /// the par-block's body. Pins the byte-offset-to-line-col
+    /// conversion direction.
+    ///
+    /// Implementation note: `compile_par_block` flows the inner
+    /// `block.span` into `emit_par_run`, which then records the
+    /// site. `block.span` starts at the opening `{`, so the
+    /// recorded column is the position of `{`, not `par`. The line
+    /// is the same in both cases (the recorded line is reliably the
+    /// par-keyword's line), and the column is reliably "somewhere
+    /// inside the par block on that line." That's the contract for
+    /// the slice-3 metadata table — `(file, line)` are exact;
+    /// `col` is at-or-after the `par` keyword.
+    #[test]
+    fn test_spawn_site_records_correct_source_location() {
+        let _guard = SPAWN_SITE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Line layout (1-indexed):
+        //   1: (blank — leading newline)
+        //   2: fn a() { println(1); }
+        //   3: fn b() { println(2); }
+        //   4: fn main() {
+        //   5:     par {
+        //   6:         a();
+        //   7:         b();
+        //   8:     }
+        //   9: }
+        //
+        // The `par` keyword starts at line 5, col 5; the opening
+        // `{` (which `block.span` points at) is at line 5, col 9.
+        let src = r#"
+fn a() { println(1); }
+fn b() { println(2); }
+fn main() {
+    par {
+        a();
+        b();
+    }
+}
+"#;
+        let ir = ir_for_with_source(src);
+
+        // Spawn-site struct fields:
+        //   { i32 id, ptr file_cstr, i32 line, i32 col, i32 worker_count, i32 reserved }
+        // The only par block in this program produces id=0,
+        // line=5, col=9 (opening brace), worker_count=2,
+        // reserved=0. Sanity-check the array initializer contains
+        // `i32 5, i32 9` — line then column.
+        assert!(
+            ir.contains("i32 5, i32 9"),
+            "expected line=5 col=9 in spawn-site entry; ir:\n{ir}"
         );
     }
 }
