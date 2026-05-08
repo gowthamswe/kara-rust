@@ -40,6 +40,26 @@ pub enum Type {
         args: Vec<Type>,
     },
 
+    /// A `shared struct S { ... }` value type — RC-tracked struct with
+    /// reference semantics. Carries the struct name only; shared structs
+    /// are non-generic at v1 (no `shared struct S[T]`) per design.md
+    /// § Part 5: Shared Types. Distinct from `Type::Named { name: "S" }`
+    /// so consumers can match shared-ness off the type directly without
+    /// consulting `StructDef.is_shared` in the item table.
+    Shared(String),
+
+    /// `Rc[T]` — explicit reference-counted wrapper, single-task only.
+    /// Not assignable to `Arc[T]`; the `Rc → Arc` migration story is
+    /// manual (per design.md § RC integration). The auto-promotion in
+    /// `OwnershipChecker::promote_rc_to_arc` rewrites the value site,
+    /// not the type, so the typechecker compat rule and the
+    /// ownership-checker's promotion are orthogonal.
+    Rc(Box<Type>),
+
+    /// `Arc[T]` — atomically-reference-counted wrapper, cross-task safe.
+    /// Not assignable to `Rc[T]`; see `Type::Rc` for the migration note.
+    Arc(Box<Type>),
+
     Function {
         params: Vec<Type>,
         return_type: Box<Type>,
@@ -277,6 +297,7 @@ fn type_is_fully_concrete(ty: &Type) -> bool {
         Type::Array { element, .. } => type_is_fully_concrete(element),
         Type::Slice { element, .. } => type_is_fully_concrete(element),
         Type::Ref(inner) | Type::MutRef(inner) | Type::Weak(inner) => type_is_fully_concrete(inner),
+        Type::Rc(inner) | Type::Arc(inner) => type_is_fully_concrete(inner),
         Type::Pointer { inner, .. } => type_is_fully_concrete(inner),
         Type::Function {
             params,
@@ -294,6 +315,7 @@ fn type_is_fully_concrete(ty: &Type) -> bool {
         | Type::Str
         | Type::Unit
         | Type::Never
+        | Type::Shared(_)
         | Type::Error => true,
     }
 }
@@ -342,6 +364,9 @@ pub fn type_display(ty: &Type) -> String {
             let inner: Vec<String> = args.iter().map(type_display).collect();
             format!("{}<{}>", name, inner.join(", "))
         }
+        Type::Shared(name) => name.clone(),
+        Type::Rc(inner) => format!("Rc[{}]", type_display(inner)),
+        Type::Arc(inner) => format!("Arc[{}]", type_display(inner)),
         Type::Function {
             params,
             return_type,
@@ -1207,6 +1232,15 @@ fn types_compatible(a: &Type, b: &Type) -> bool {
                     .all(|(a, b)| types_compatible(a, b))
                 && types_compatible(a_r, b_r)
         }
+        (Type::Shared(a_name), Type::Shared(b_name)) => a_name == b_name,
+        (Type::Rc(a_inner), Type::Rc(b_inner)) => types_compatible(a_inner, b_inner),
+        (Type::Arc(a_inner), Type::Arc(b_inner)) => types_compatible(a_inner, b_inner),
+        // No (Rc, Arc) / (Arc, Rc) cross arms: `Rc[T]` is not assignable
+        // to `Arc[T]` and vice versa per design.md § RC integration. The
+        // value-site auto-promotion in `OwnershipChecker::promote_rc_to_arc`
+        // is the only path that crosses the boundary, and it rewrites the
+        // value's representation, not the type — so type-level compat
+        // stays strict.
         _ => false,
     }
 }
@@ -2517,6 +2551,19 @@ impl<'a> TypeChecker<'a> {
                     true
                 }
             }
+            Type::Rc(inner) | Type::Arc(inner) => self.type_supports_partial_eq(inner),
+            Type::Shared(name) => {
+                if self.env.has_impl("Eq", name, &[]) {
+                    return true;
+                }
+                if let Some(info) = self.env.structs.get(name) {
+                    info.derived_traits.contains("Eq") || info.derived_traits.contains("PartialEq")
+                } else if let Some(info) = self.env.enums.get(name) {
+                    info.derived_traits.contains("Eq") || info.derived_traits.contains("PartialEq")
+                } else {
+                    true
+                }
+            }
             Type::TypeParam(_) | Type::TypeVar(_) | Type::AssocProjection { .. } | Type::Error => {
                 true
             }
@@ -2551,6 +2598,16 @@ impl<'a> TypeChecker<'a> {
                     true
                 }
             }
+            Type::Rc(inner) | Type::Arc(inner) => self.type_supports_eq(inner),
+            Type::Shared(name) => {
+                if let Some(info) = self.env.structs.get(name) {
+                    info.derived_traits.contains("Eq")
+                } else if let Some(info) = self.env.enums.get(name) {
+                    info.derived_traits.contains("Eq")
+                } else {
+                    true
+                }
+            }
             Type::TypeParam(_) | Type::TypeVar(_) | Type::AssocProjection { .. } | Type::Error => {
                 true
             }
@@ -2581,6 +2638,16 @@ impl<'a> TypeChecker<'a> {
                     true
                 }
             }
+            Type::Rc(inner) | Type::Arc(inner) => self.type_supports_hash(inner),
+            Type::Shared(name) => {
+                if let Some(info) = self.env.structs.get(name) {
+                    info.derived_traits.contains("Hash")
+                } else if let Some(info) = self.env.enums.get(name) {
+                    info.derived_traits.contains("Hash")
+                } else {
+                    true
+                }
+            }
             Type::TypeParam(_) | Type::TypeVar(_) | Type::AssocProjection { .. } | Type::Error => {
                 true
             }
@@ -2602,6 +2669,16 @@ impl<'a> TypeChecker<'a> {
             Type::Slice { element, .. } => self.type_supports_ord(element),
             Type::Ref(inner) | Type::MutRef(inner) => self.type_supports_ord(inner),
             Type::Named { name, .. } => {
+                if let Some(info) = self.env.structs.get(name) {
+                    info.derived_traits.contains("Ord")
+                } else if let Some(info) = self.env.enums.get(name) {
+                    info.derived_traits.contains("Ord")
+                } else {
+                    true
+                }
+            }
+            Type::Rc(inner) | Type::Arc(inner) => self.type_supports_ord(inner),
+            Type::Shared(name) => {
                 if let Some(info) = self.env.structs.get(name) {
                     info.derived_traits.contains("Ord")
                 } else if let Some(info) = self.env.enums.get(name) {
@@ -2658,6 +2735,19 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             },
+            Type::Rc(inner) | Type::Arc(inner) => self.type_supports_display(inner),
+            Type::Shared(name) => {
+                if self.env.has_impl("Display", name, &[]) {
+                    return true;
+                }
+                if let Some(info) = self.env.structs.get(name) {
+                    info.derived_traits.contains("Display")
+                } else if let Some(info) = self.env.enums.get(name) {
+                    info.derived_traits.contains("Display")
+                } else {
+                    true
+                }
+            }
             Type::TypeParam(_) | Type::TypeVar(_) | Type::AssocProjection { .. } | Type::Error => {
                 true
             }
@@ -2684,6 +2774,18 @@ impl<'a> TypeChecker<'a> {
             Type::Slice { element, .. } => self.type_supports_partial_ord(element),
             Type::Ref(inner) | Type::MutRef(inner) => self.type_supports_partial_ord(inner),
             Type::Named { name, .. } => {
+                if let Some(info) = self.env.structs.get(name) {
+                    info.derived_traits.contains("PartialOrd")
+                        || info.derived_traits.contains("Ord")
+                } else if let Some(info) = self.env.enums.get(name) {
+                    info.derived_traits.contains("PartialOrd")
+                        || info.derived_traits.contains("Ord")
+                } else {
+                    true
+                }
+            }
+            Type::Rc(inner) | Type::Arc(inner) => self.type_supports_partial_ord(inner),
+            Type::Shared(name) => {
                 if let Some(info) = self.env.structs.get(name) {
                     info.derived_traits.contains("PartialOrd")
                         || info.derived_traits.contains("Ord")
@@ -12256,6 +12358,56 @@ mod once_function_carrier_tests {
 
         let no_param = once_fn_i32_to_i32();
         assert!(!contains_type_param(&no_param));
+    }
+
+    // ── Type::Shared / Type::Rc / Type::Arc variants ──
+
+    #[test]
+    fn test_type_display_shared_rc_arc_variants() {
+        let shared = Type::Shared("S".to_string());
+        assert_eq!(type_display(&shared), "S");
+
+        let rc_i64 = Type::Rc(Box::new(Type::Int(IntSize::I64)));
+        assert_eq!(type_display(&rc_i64), "Rc[i64]");
+
+        let arc_str = Type::Arc(Box::new(Type::Str));
+        assert_eq!(type_display(&arc_str), "Arc[String]");
+    }
+
+    #[test]
+    fn test_types_compatible_rc_not_assignable_to_arc() {
+        let rc_i64 = Type::Rc(Box::new(Type::Int(IntSize::I64)));
+        let arc_i64 = Type::Arc(Box::new(Type::Int(IntSize::I64)));
+        assert!(!types_compatible(&rc_i64, &arc_i64));
+        assert!(!types_compatible(&arc_i64, &rc_i64));
+
+        // The legacy structural form `Type::Named { name: "Rc", … }` is
+        // a different type now — variants are distinct, even though
+        // sub-item 2 hasn't yet migrated callers to construct them.
+        let legacy_rc = Type::Named {
+            name: "Rc".to_string(),
+            args: vec![Type::Int(IntSize::I64)],
+        };
+        assert!(!types_compatible(&rc_i64, &legacy_rc));
+        assert!(!types_compatible(&legacy_rc, &rc_i64));
+    }
+
+    #[test]
+    fn test_types_compatible_shared_struct_name_match() {
+        let shared_s = Type::Shared("S".to_string());
+        let shared_s2 = Type::Shared("S".to_string());
+        assert!(types_compatible(&shared_s, &shared_s2));
+
+        let shared_t = Type::Shared("T".to_string());
+        assert!(!types_compatible(&shared_s, &shared_t));
+
+        // Distinct from the legacy `Type::Named { name: "S", args: [] }`.
+        let legacy_s = Type::Named {
+            name: "S".to_string(),
+            args: vec![],
+        };
+        assert!(!types_compatible(&shared_s, &legacy_s));
+        assert!(!types_compatible(&legacy_s, &shared_s));
     }
 }
 
