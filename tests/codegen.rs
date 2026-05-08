@@ -6922,4 +6922,131 @@ fn main() {
             ir
         );
     }
+
+    // ── Theme 6: R.method(args) dispatch (sub-step 4) ────────────────────
+    //
+    // Structural tests pinning the `karac_provider_lookup` + extractvalue
+    // + GEP + indirect-call sequence emitted at each `R.method(...)`
+    // call site where R is a known provider resource. Pairs with the
+    // sub-step 3 push/pop tests above; together they verify the full
+    // `with_provider[R](p, || R.method())` shape compiles to the
+    // expected runtime-stack-walk lowering.
+
+    #[test]
+    fn test_provider_dispatch_emits_lookup_and_indirect_call() {
+        let ir = ir_for(
+            "pub trait Recorder { fn record(mut ref self, value: i64); }\n\
+             pub struct Counter { n: i64 }\n\
+             impl Recorder for Counter { fn record(mut ref self, value: i64) { self.n = value; } }\n\
+             pub effect resource Metric: Recorder;\n\
+             fn run() {\n\
+               let p = Counter { n: 0 };\n\
+               with_provider[Metric](p, || { Metric.record(42) });\n\
+             }",
+        );
+        assert!(
+            ir.contains("call %ProviderLookupResult @karac_provider_lookup")
+                || ir.contains("call { ptr, ptr } @karac_provider_lookup"),
+            "expected karac_provider_lookup call; IR: {}",
+            ir
+        );
+        // The dispatch loads the fn ptr from the vtable (`load ptr` on
+        // `wp.fn`) and indirect-calls. Inkwell's load instruction names
+        // come from the third arg to build_load.
+        assert!(
+            ir.contains("wp.fn"),
+            "expected vtable fn pointer load named `wp.fn`; IR: {}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_provider_dispatch_resource_id_matches_declaration_order() {
+        // Resource IDs assigned in source-declaration order. The
+        // dispatch's lookup call carries the same i32 as the push call
+        // at the surrounding with_provider site — verifies the two
+        // halves of the ABI agree.
+        let ir = ir_for(
+            "pub trait Recorder { fn record(mut ref self, value: i64); }\n\
+             pub struct Counter { n: i64 }\n\
+             impl Recorder for Counter { fn record(mut ref self, value: i64) { self.n = value; } }\n\
+             pub effect resource A: Recorder;\n\
+             pub effect resource B: Recorder;\n\
+             pub effect resource C: Recorder;\n\
+             fn run() {\n\
+               let p = Counter { n: 0 };\n\
+               with_provider[C](p, || { C.record(0) });\n\
+             }",
+        );
+        // Both calls — push and lookup — should reference i32 2 (C is third).
+        let push_lines: Vec<&str> = ir
+            .lines()
+            .filter(|l| l.contains("karac_provider_push"))
+            .collect();
+        let lookup_lines: Vec<&str> = ir
+            .lines()
+            .filter(|l| l.contains("karac_provider_lookup"))
+            .collect();
+        assert!(
+            push_lines.iter().any(|l| l.contains("i32 2")),
+            "expected push with i32 2 (C is third resource); push lines: {:?}",
+            push_lines
+        );
+        assert!(
+            lookup_lines.iter().any(|l| l.contains("i32 2")),
+            "expected lookup with i32 2 (C is third resource); lookup lines: {:?}",
+            lookup_lines
+        );
+    }
+
+    #[test]
+    fn test_with_provider_e2e_mut_ref_self_mutation_visible_after_pop() {
+        // Full Theme 6 round-trip: push → R.method() → pop, where the
+        // method writes through `mut ref self` to the provider's storage.
+        // After the with_provider scope ends, the provider variable
+        // reflects the mutation — proving the data pointer that flowed
+        // through karac_provider_push survived round-trip back into
+        // karac_provider_lookup and the indirect call wrote through it.
+        let src = "pub trait Recorder { fn record(mut ref self, value: i64); }\n\
+            pub struct Counter { n: i64 }\n\
+            impl Recorder for Counter { fn record(mut ref self, value: i64) { self.n = value; } }\n\
+            pub effect resource Metric: Recorder;\n\
+            fn main() {\n\
+              let mut p = Counter { n: 0 };\n\
+              with_provider[Metric](p, || { Metric.record(99); });\n\
+              println(p.n);\n\
+            }";
+        let Some(out) = run_program(src) else {
+            eprintln!("skipping with_provider e2e: runtime/linker unavailable");
+            return;
+        };
+        assert_eq!(
+            out.trim(),
+            "99",
+            "expected p.n == 99 after with_provider mutated through mut ref self"
+        );
+    }
+
+    #[test]
+    fn test_provider_dispatch_skipped_for_non_resource_path() {
+        // `Vec::new()` style 2-segment paths must continue routing to
+        // compile_assoc_call, not the provider dispatch. No call to
+        // karac_provider_lookup should appear for non-provider calls
+        // (the extern's `declare` is always emitted at codegen init,
+        // so we filter for `call ... @karac_provider_lookup` lines
+        // specifically rather than the bare symbol).
+        let ir = ir_for(
+            "fn main() {\n\
+               let v: Vec[i64] = Vec.new();\n\
+             }",
+        );
+        let has_call = ir
+            .lines()
+            .any(|l| l.contains("call") && l.contains("@karac_provider_lookup"));
+        assert!(
+            !has_call,
+            "non-resource Vec.new must not emit a call to karac_provider_lookup; IR: {}",
+            ir
+        );
+    }
 }

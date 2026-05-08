@@ -715,7 +715,6 @@ struct Codegen<'ctx> {
     /// Runtime extern: `karac_provider_lookup(resource_id) -> ProviderLookupResult`.
     /// Consumed by `R.method(...)` dispatch (sub-step 4) to find the
     /// active provider's data pointer and vtable.
-    #[allow(dead_code)]
     karac_provider_lookup_fn: FunctionValue<'ctx>,
     /// LLVM struct type for `ProviderFrame { prev, resource_id, data, vtable }`
     /// — `#[repr(C)]` matches `runtime/src/lib.rs::ProviderFrame`. Consumed
@@ -724,9 +723,13 @@ struct Codegen<'ctx> {
     /// the runtime extern declarations.
     provider_frame_ty: StructType<'ctx>,
     /// LLVM struct type for `ProviderLookupResult { data, vtable }` —
-    /// matches the runtime's `#[repr(C)]` shape. Consumed at
-    /// `R.method(...)` dispatch sites (sub-step 4) to extract the two
-    /// pointer fields from `karac_provider_lookup`'s return.
+    /// matches the runtime's `#[repr(C)]` shape. Used once at codegen
+    /// init to type the `karac_provider_lookup` extern's return; after
+    /// that the call's return type carries the shape implicitly so
+    /// extractvalue at sub-step 4 dispatch sites doesn't need to look
+    /// it up here. Field retained as ABI documentation for future
+    /// readers and as the canonical anchor if `ProviderLookupResult`'s
+    /// shape ever changes.
     #[allow(dead_code)]
     provider_lookup_result_ty: StructType<'ctx>,
     // ── Map runtime ───────────────────────────────────────────────
@@ -3276,6 +3279,171 @@ impl<'ctx> Codegen<'ctx> {
             ));
         }
         self.compile_expr(body)
+    }
+
+    /// Theme 6 sub-step 4: lower `R.method(args)` dispatch when `R` is an
+    /// `effect resource R: T`. Returns `Some(value)` when dispatch fires;
+    /// `None` when `name` isn't a known provider resource, in which case
+    /// the caller falls through to `compile_assoc_call` (so non-resource
+    /// `Type.method(...)` shapes — `Vec::new`, primitive ops, user
+    /// `Type.method` — keep working unchanged).
+    ///
+    /// IR shape:
+    /// ```text
+    ///   %res = call %ProviderLookupResult @karac_provider_lookup(<id>)
+    ///   %data = extractvalue %ProviderLookupResult %res, 0
+    ///   %vt = extractvalue %ProviderLookupResult %res, 1
+    ///   %fn_slot = getelementptr [N x ptr], ptr %vt, i64 0, i64 <method_idx>
+    ///   %fn = load ptr, ptr %fn_slot
+    ///   <ret> = call <FnTy> %fn(%data, <user_args>...)
+    /// ```
+    ///
+    /// Method index comes from the trait's source-declaration order.
+    /// The indirect-call FunctionType is borrowed from any concrete
+    /// `<U>.<method>` symbol we already declared during impl-method
+    /// declaration: every provider impl of the same trait method shares
+    /// the same lowered LLVM signature (`*const Self` first arg lowers
+    /// to `ptr`, primitives lower the same way regardless of `U`), so
+    /// any one will do.
+    ///
+    /// v1 restriction: no scope-empty / null-vtable runtime check —
+    /// the typechecker's effect-checker enforces `R` is in scope at
+    /// every call site. A bug there or a programmatic misuse would
+    /// crash via null-deref of the vtable load below; tightening this
+    /// to a structured panic is a sub-step 6+ task.
+    fn try_compile_provider_dispatch(
+        &mut self,
+        name: &str,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        let Some(&resource_id) = self.provider_resource_ids.get(name) else {
+            return Ok(None);
+        };
+        let Some(trait_name) = self.provider_resource_traits.get(name).cloned() else {
+            // `effect resource R;` (no `: T`) — no dispatch possible.
+            // Fall through to the regular assoc-call path so an
+            // upstream typechecker error or a future R-as-ID use stays
+            // observable.
+            return Ok(None);
+        };
+
+        let method_order = self
+            .provider_trait_methods
+            .get(&trait_name)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "R.method dispatch: provider trait '{}' has no recorded method order \
+                     (vtable emission and dispatch out of sync — codegen bug)",
+                    trait_name
+                )
+            })?;
+        let method_idx = method_order
+            .iter()
+            .position(|m| m == method)
+            .ok_or_else(|| {
+                format!(
+                "R.method dispatch: '{}' is not a method of provider trait '{}' for resource '{}'",
+                method, trait_name, name
+            )
+            })?;
+
+        // Borrow the FunctionType from any impl of this trait method.
+        // All impls of the same trait share the same lowered signature.
+        let fn_type = self
+            .provider_method_fn_type(&trait_name, method)
+            .ok_or_else(|| {
+                format!(
+                    "R.method dispatch: no impl found for `{}::{}` — at least one \
+                     `impl {} for U` must exist to populate the vtable",
+                    trait_name, method, trait_name
+                )
+            })?;
+
+        let i32_t = self.context.i32_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let id_v = i32_t.const_int(resource_id as u64, false);
+
+        // 1. karac_provider_lookup(resource_id) → { data, vtable }.
+        let lookup_call = self
+            .builder
+            .build_call(self.karac_provider_lookup_fn, &[id_v.into()], "wp.lookup")
+            .unwrap();
+        let lookup_sv = lookup_call
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_struct_value();
+        let data_ptr = self
+            .builder
+            .build_extract_value(lookup_sv, 0, "wp.lookup.data")
+            .unwrap()
+            .into_pointer_value();
+        let vtable_ptr = self
+            .builder
+            .build_extract_value(lookup_sv, 1, "wp.lookup.vt")
+            .unwrap()
+            .into_pointer_value();
+
+        // 2. GEP into the vtable for method_idx, load the fn pointer.
+        //    Vtable layout is `[N x ptr]` per `emit_provider_vtables`,
+        //    so the slot offset is just `method_idx` in pointer units.
+        //    Use a flat offset GEP to avoid recomputing the array size.
+        let idx_v = i32_t.const_int(method_idx as u64, false);
+        let fn_slot = unsafe {
+            self.builder
+                .build_gep(ptr_ty, vtable_ptr, &[idx_v], "wp.fn.slot")
+                .unwrap()
+        };
+        let fn_ptr = self
+            .builder
+            .build_load(ptr_ty, fn_slot, "wp.fn")
+            .unwrap()
+            .into_pointer_value();
+
+        // 3. Build call args: data_ptr first, then user args.
+        let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> =
+            vec![BasicMetadataValueEnum::from(data_ptr)];
+        for a in args {
+            let v = self.compile_expr(&a.value)?;
+            call_args.push(BasicMetadataValueEnum::from(v));
+        }
+
+        // 4. Indirect call through the loaded fn pointer.
+        let call = self
+            .builder
+            .build_indirect_call(fn_type, fn_ptr, &call_args, "wp.call")
+            .unwrap();
+        let basic = call.try_as_basic_value();
+        if basic.is_instruction() {
+            // void-returning method — fill the expression slot with
+            // const-0 i64, mirroring how the user-impl-method dispatch
+            // path handles unit-returning method calls.
+            Ok(Some(self.context.i64_type().const_int(0, false).into()))
+        } else {
+            Ok(Some(basic.unwrap_basic()))
+        }
+    }
+
+    /// Find the LLVM `FunctionType` for a provider trait method by
+    /// looking up any concrete `<U>.<method>` symbol whose `(U, T)` pair
+    /// is registered in `provider_vtables`. Returns `None` when no impl
+    /// has been declared yet (which would mean the vtable couldn't have
+    /// been emitted either — handled as a dispatch error by the caller).
+    fn provider_method_fn_type(
+        &self,
+        trait_name: &str,
+        method: &str,
+    ) -> Option<inkwell::types::FunctionType<'ctx>> {
+        for ((target, t), _) in &self.provider_vtables {
+            if t == trait_name {
+                let qualified = format!("{}.{}", target, method);
+                if let Some(f) = self.module.get_function(&qualified) {
+                    return Some(f.get_type());
+                }
+            }
+        }
+        None
     }
 
     /// Materialize the special `@llvm.used` global from `used_symbols`.
@@ -11542,9 +11710,19 @@ impl<'ctx> Codegen<'ctx> {
             return self.compile_with_provider(&resource, provider_expr, closure_expr);
         }
 
-        // Associated function calls: Vec::new(), etc.
+        // Associated function calls: Vec::new(), etc. Theme 6 sub-step 4
+        // intercepts `R.method(args)` where R is an `effect resource R: T`
+        // before assoc-call dispatch: those go through the runtime stack
+        // via `karac_provider_lookup` + indirect vtable call. Any other
+        // 2-segment path (Vec::new, T.from, primitive ops, user
+        // `Type.method`, …) falls through to `compile_assoc_call`.
         if let ExprKind::Path { segments, .. } = &callee.kind {
             if segments.len() == 2 {
+                if let Some(value) =
+                    self.try_compile_provider_dispatch(&segments[0], &segments[1], args)?
+                {
+                    return Ok(value);
+                }
                 return self.compile_assoc_call(&segments[0], &segments[1], args);
             }
         }
