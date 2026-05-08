@@ -533,7 +533,7 @@
 
     *Hard-stop triggers.* If the overlap check turns out to require generic substitution / unification beyond concrete-args vector equality, pause and re-discuss. If `register_stdlib_impls`'s primitive-operator dispatch breaks under the new key shape (the Type::Int(I32) → "i32" path in `impl_table_key`), pause and re-discuss.
 
-    *What landed (typechecker mechanism, 2026-05-08, commit `49726fa`).*
+    *What landed (typechecker mechanism, 2026-05-08, commit `2b867a4`).*
     - **`ImplInfo.target_args: Vec<Type>`** sibling field. Empty = generic-on-name (status quo for every existing impl); non-empty = specialized to a concrete instantiation. `env_add_impl` lowers the target type-expression through `lower_type_expr` (so aliases canonicalize at registration time) and stores `target_args` only when the lowered args are *fully concrete* — any `TypeParam` / `TypeVar` / `AssocProjection` recursively present collapses target_args to empty. Helper `type_is_fully_concrete` is the recursion driver.
     - **`impl_args_match(stored, call_site)`** — match rule helper. `stored.is_empty()` → wildcard match (generic impl applies to any instantiation); otherwise both name AND args must vector-equal.
     - **`impl_table_key(ty) -> (String, Vec<Type>)`** — extends to return the args alongside the head name. `Type::Named { name, args }` arm clones `args`; primitives + ref/mut-ref stripping unchanged.
