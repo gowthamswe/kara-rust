@@ -2292,16 +2292,41 @@ impl<'ctx> Codegen<'ctx> {
         // current use sites — Eq/Ord/constructors — take `self` or no
         // receiver). Generic methods are deferred along with generic-fn
         // monomorphization.
-        for item in &program.items {
-            if let Item::ImplBlock(imp) = item {
-                if let Some(type_name) = impl_target_name(&imp.target_type) {
-                    for impl_item in &imp.items {
-                        if let ImplItem::Method(method) = impl_item {
-                            if method.generic_params.is_some() {
-                                continue;
+        //
+        // Duplicate impls (e.g. `impl PartialEq for Point { fn eq(ref self,
+        // ref Point) }` and `impl Eq for Point { fn eq(self, Point) }` —
+        // both legal in Kāra because `Eq` is a non-marker compat shim per
+        // `runtime/stdlib/eq.kara`) collide on the LLVM symbol
+        // `@Type.method`. We pick the value-self variant when there's a
+        // choice: the lowering pass at `lowering.rs:543` dispatches `==`
+        // via the `Eq` trait and emits `Type.eq(a, b)` with value-typed
+        // arguments, so the function signature must accept values. A
+        // ref-self body wouldn't compile correctly today anyway (deferred
+        // — see comment above and `var_type_names` not being populated for
+        // ref-typed params in `compile_function`). Two-pass iteration:
+        // value-self impls first, then ref-self impls of the same method
+        // are skipped as duplicates.
+        let mut declared_impl_methods: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for value_self_pass in [true, false] {
+            for item in &program.items {
+                if let Item::ImplBlock(imp) = item {
+                    if let Some(type_name) = impl_target_name(&imp.target_type) {
+                        for impl_item in &imp.items {
+                            if let ImplItem::Method(method) = impl_item {
+                                if method.generic_params.is_some() {
+                                    continue;
+                                }
+                                if method_self_is_value(method) != value_self_pass {
+                                    continue;
+                                }
+                                let qualified = format!("{}.{}", type_name, method.name);
+                                if !declared_impl_methods.insert(qualified) {
+                                    continue;
+                                }
+                                let synth = make_impl_method_function(&type_name, method);
+                                self.declare_function(&synth)?;
                             }
-                            let synth = make_impl_method_function(&type_name, method);
-                            self.declare_function(&synth)?;
                         }
                     }
                 }
@@ -2317,17 +2342,30 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
-        // Compile user impl-block method bodies.
-        for item in &program.items {
-            if let Item::ImplBlock(imp) = item {
-                if let Some(type_name) = impl_target_name(&imp.target_type) {
-                    for impl_item in &imp.items {
-                        if let ImplItem::Method(method) = impl_item {
-                            if method.generic_params.is_some() {
-                                continue;
+        // Compile user impl-block method bodies. Mirror the declaration
+        // pass's value-self-first ordering so the body that gets compiled
+        // is the same one whose signature was declared.
+        let mut compiled_impl_methods: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for value_self_pass in [true, false] {
+            for item in &program.items {
+                if let Item::ImplBlock(imp) = item {
+                    if let Some(type_name) = impl_target_name(&imp.target_type) {
+                        for impl_item in &imp.items {
+                            if let ImplItem::Method(method) = impl_item {
+                                if method.generic_params.is_some() {
+                                    continue;
+                                }
+                                if method_self_is_value(method) != value_self_pass {
+                                    continue;
+                                }
+                                let qualified = format!("{}.{}", type_name, method.name);
+                                if !compiled_impl_methods.insert(qualified) {
+                                    continue;
+                                }
+                                let synth = make_impl_method_function(&type_name, method);
+                                self.compile_function(&synth)?;
                             }
-                            let synth = make_impl_method_function(&type_name, method);
-                            self.compile_function(&synth)?;
                         }
                     }
                 }
@@ -13134,6 +13172,23 @@ fn impl_target_name(target: &TypeExpr) -> Option<String> {
         TypeKind::Path(p) => p.segments.last().cloned(),
         _ => None,
     }
+}
+
+/// `true` when the method has no `ref T` / `mut ref T` parameters, so its
+/// signature matches what the operator-lowering pass emits — every binop
+/// rewrite at `lowering.rs` passes operands by value through
+/// `Path(Type, method)(a, b)`. Used to break ties between duplicate impls
+/// of the same method (e.g. `impl PartialEq for Point { fn eq(ref self,
+/// ref Point) }` and `impl Eq for Point { fn eq(self, Point) }`): the
+/// value-form impl is the one whose function signature lines up with
+/// what the call site actually passes. `make_impl_method_function`
+/// already synthesizes `self` as value-typed regardless of the source
+/// `ref self`, so this check focuses on the non-self params.
+fn method_self_is_value(method: &Function) -> bool {
+    !method
+        .params
+        .iter()
+        .any(|p| matches!(&p.ty.kind, TypeKind::Ref(_) | TypeKind::MutRef(_)))
 }
 
 /// Build a synthetic `Function` node for an impl-block method so the
