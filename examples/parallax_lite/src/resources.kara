@@ -1,0 +1,65 @@
+// resources.kara — MetricsRecorder trait, three distinct effect resources,
+// and the InMemoryMetrics provider impl that backs all three.
+//
+// The slice 6 workload's load-bearing shape is three *distinct* effect
+// resources (`MetricsA`, `MetricsB`, `MetricsC`) all bound to the same
+// `MetricsRecorder` trait. The auto-par analyzer treats them as disjoint
+// (no conflict edges between `writes(MetricsA)` and `writes(MetricsB)`),
+// so the three top-level call statements in `process_request` group into
+// a single parallel_group and dispatch through `karac_par_run`.
+//
+// `InMemoryMetrics` does CPU-bound busy-compute in `record(..)` rather
+// than I/O — the runtime doesn't expose `sleep` primitives today, and
+// auto-par's lowering is effect-driven (it doesn't care about the
+// underlying op's latency profile, only its declared resource set).
+
+pub trait MetricsRecorder {
+    fn record(mut ref self, value: i64);
+}
+
+// Three distinct effect resources, all trait-bound to MetricsRecorder.
+// Disjointness across these is what makes the three writes(R_i) calls
+// in process_request() eligible for auto-par grouping.
+pub effect resource MetricsA: MetricsRecorder;
+pub effect resource MetricsB: MetricsRecorder;
+pub effect resource MetricsC: MetricsRecorder;
+
+// In-memory provider — the one impl that backs all three resources.
+// `count` is the running tally of `record` calls; `accumulator` is a
+// modular running sum over the busy-compute kernel. Both are observable
+// side-effects so dead-code elimination cannot strip the loop body.
+pub struct InMemoryMetrics {
+    count: i64,
+    accumulator: i64,
+}
+
+impl InMemoryMetrics {
+    pub fn new() -> InMemoryMetrics {
+        InMemoryMetrics { count: 0, accumulator: 0 }
+    }
+}
+
+impl MetricsRecorder for InMemoryMetrics {
+    // CPU-bound busy-compute kernel. Loops `value` iterations of an
+    // additive accumulator. Three notes:
+    //   - The kernel uses only `+` (no `%`/`/`) — see
+    //     `workload.kara`'s comment on the same: the `__builtin_div_rem`
+    //     builtin carries inferred `panics`, and `panics + panics`
+    //     self-conflicts in the analyzer, blocking the auto-par group
+    //     in `process_request`. Plain addition stays panics-free.
+    //   - Overflow is outside the effect system's scope (effectchecker
+    //     `:380`) — sum `0+1+...+value` for `value≤50M` is ≈1.25e15,
+    //     well under `i64::MAX` ≈9.2e18, so the kernel is overflow-safe.
+    //   - `accumulator` is published to a struct field so the optimizer
+    //     cannot constant-fold the loop body away.
+    fn record(mut ref self, value: i64) {
+        let mut sum: i64 = 0;
+        let mut i: i64 = 0;
+        while i < value {
+            sum = sum + i;
+            i = i + 1;
+        }
+        self.accumulator = self.accumulator + sum;
+        self.count = self.count + 1;
+    }
+}

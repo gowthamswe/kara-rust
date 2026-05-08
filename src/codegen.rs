@@ -264,6 +264,27 @@ fn read_runtime_debug_metadata_env() -> bool {
     !matches!(std::env::var("KARAC_RUNTIME_DEBUG_METADATA"), Ok(v) if v == "0")
 }
 
+/// Read the `KARAC_AUTO_PAR` env var to decide whether
+/// `compile_function_body` dispatches non-trivial parallel groups to
+/// `emit_par_run` (auto-par codegen) or falls back to plain sequential
+/// `compile_block`. Slice 6 of the Auto-Concurrency Codegen track;
+/// mirrors slice 3's `read_runtime_debug_metadata_env` shape exactly.
+/// See `phase-8-stdlib-floor.md` § "Auto-Concurrency Codegen —
+/// Parallax-lite Workload" for the spec.
+///
+/// - `Ok("0")` → `false` (gate explicitly off — sequential codegen).
+/// - `Ok(_)`   → `true` (any other value, including empty).
+/// - `Err(_)`  → `true` (dev default — auto-par on by default; the
+///   user-facing `--sequential` CLI flag is a Phase 8.5 Track 2
+///   deliverable when the profile system ships).
+///
+/// Returns `true` iff auto-par dispatch is enabled. The
+/// `Codegen::auto_par_disabled` field is `!return_value` so the
+/// compile-time check reads naturally as `if self.auto_par_disabled`.
+fn read_auto_par_env() -> bool {
+    !matches!(std::env::var("KARAC_AUTO_PAR"), Ok(v) if v == "0")
+}
+
 // ── Variable slot: pointer + LLVM type for typed loads ─────────
 
 #[derive(Clone, Copy)]
@@ -644,6 +665,19 @@ struct Codegen<'ctx> {
     /// gate-on / gate-off boundary. See `phase-8-stdlib-floor.md`
     /// § Auto-Concurrency Codegen — Debugger Contract slice 3.
     runtime_debug_metadata_enabled: bool,
+    /// Slice 6 (Parallax-lite workload) — when true,
+    /// `compile_function_body` skips its parallel-group dispatch path
+    /// entirely and falls through to plain sequential `compile_block`,
+    /// disabling auto-par codegen. Read once from the `KARAC_AUTO_PAR`
+    /// env var at `Codegen` construction (see `read_auto_par_env`); the
+    /// default is `false` (auto-par on). Used to support side-by-side
+    /// wall-clock benchmarking of auto-par vs sequential codegen on the
+    /// same workload without changing source. The user-facing
+    /// `--sequential` CLI flag is a Phase 8.5 Track 2 deliverable; in
+    /// v1, `KARAC_AUTO_PAR=0` is the only way to flip the gate. See
+    /// `phase-8-stdlib-floor.md` § "Auto-Concurrency Codegen —
+    /// Parallax-lite Workload".
+    auto_par_disabled: bool,
     // ── Map runtime ───────────────────────────────────────────────
     /// Per-variable Map key LLVM type (variable name → K LLVM type).
     map_key_types: HashMap<String, BasicTypeEnum<'ctx>>,
@@ -991,6 +1025,7 @@ impl<'ctx> Codegen<'ctx> {
             karac_par_run_fn,
             spawn_sites: Vec::new(),
             runtime_debug_metadata_enabled: read_runtime_debug_metadata_env(),
+            auto_par_disabled: !read_auto_par_env(),
             map_key_types: HashMap::new(),
             map_val_types: HashMap::new(),
             map_key_type_names: HashMap::new(),
@@ -3213,6 +3248,17 @@ impl<'ctx> Codegen<'ctx> {
         &mut self,
         body: &Block,
     ) -> Result<Option<BasicValueEnum<'ctx>>, String> {
+        // Slice 6 (Parallax-lite workload): `KARAC_AUTO_PAR=0` flips
+        // `auto_par_disabled` on, short-circuiting all parallel-group
+        // dispatch back to plain sequential `compile_block`. This is
+        // the gate for side-by-side wall-clock benchmarking of auto-par
+        // vs sequential codegen on the same workload. The default
+        // (auto-par on) is unchanged — gate-on programs continue to
+        // hit the parallel-group dispatch path below.
+        if self.auto_par_disabled {
+            return self.compile_block(body);
+        }
+
         // Snapshot the analysis up front to release the borrow on `self`
         // before the loop calls `&mut self` methods (`compile_stmt`,
         // `emit_par_run`). The clone is cheap — `ParallelGroup` holds a

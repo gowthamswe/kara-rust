@@ -1,0 +1,24 @@
+// main.kara — Parallax-lite entry point.
+//
+// Note (deviation from plan): a faithful `with_provider[MetricsA]`
+// nesting (mirroring `db_pipeline/src/main.kara`) is documented as the
+// preferred entry shape, but in v1 the provider-rooted dispatch path
+// (`db_pipeline::db.kara` GAP-N) has not yet been wired through codegen
+// — a `MetricsA.record(...)` call inside a `with_provider` scope is a
+// no-op at runtime. Auto-par lowering is unaffected (it keys off the
+// `writes(R_i)` effect annotations, not provider availability), so the
+// codegen tests pin auto-par behavior directly without the provider
+// dance. The entry-point falls back to calling `process_request()`
+// directly, which is sufficient for the wall-clock benchmark — each
+// `record_*` driver in workload.kara does its own busy-compute kernel
+// inline. Once GAP-N closes, this main can grow back the canonical
+// nested-`with_provider` shape (the providers, trait, and three
+// distinct effect resources are already declared in resources.kara and
+// are picked up by the analyzer).
+
+import workload.process_request;
+
+fn main() {
+    process_request();
+    println("done");
+}

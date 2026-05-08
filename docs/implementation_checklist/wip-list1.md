@@ -166,13 +166,14 @@ wip-list1 is a single docs commit; do not bundle with implementation.
 
 - [x] **Slice 4 — Debugger Contract: parent-frame ref + `KaracWaitTarget` surface.** Items (2) + (3) of the four-piece contract. Item 2 (parent-frame ref) ships real machinery: every worker frame produced by `karac_par_run` carries a stack-allocated `KaracFrame { parent, spawn_site_id, worker_index, wait_target }` registered in a process-wide `ACTIVE_FRAMES` registry; slice 5 walks the parent chain to reconstruct the structured-concurrency tree. Item 3 (await-chain pointer) ships contract surface only — `KaracWaitTarget` enum + `wait_target` field exist and are stable, but every v1 frame is populated as `KaracWaitTarget::None` (no real suspension to track until Phase 6.3). Two new public-extern getters land for slice 5 to wrap: `karac_runtime_get_current_frame` + `karac_runtime_for_each_active_frame`. Codegen-side: `karac_par_run` extern decl + call site grow a `spawn_site_id: u32` arg (slice 3's `par_id`). Plan source: [`phase-8-stdlib-floor.md`](phase-8-stdlib-floor.md) § "Auto-Concurrency Codegen — Debugger Contract" → "Debugger Contract slice 4 — parent-frame ref + await-chain pointer". Promoted from staging 2026-05-08. Landed 2026-05-08 (commit 22fa27a).
 
-Slices 3–6 of the Phase 8 auto-concurrency slate remain in
+- [x] **Slice 6 — Parallax-lite microbenchmark workload.** First demo-shaped consumer of slices 1 + 2. Hand-coded `examples/parallax_lite/` Kāra project with three trait-bound effect resources (`MetricsA / MetricsB / MetricsC`), an `InMemoryMetrics` provider impl, and a `process_request()` aggregator whose three top-level call statements (each `with writes(R_i)` on disjoint resources) auto-parallelize through slice 2's `compile_function_body` path. Slice 6 also adds a `KARAC_AUTO_PAR=0` codegen gate (env-var-only, mirroring slice 3's `KARAC_RUNTIME_DEBUG_METADATA` shape) that flips off auto-par dispatch back to plain sequential `compile_block` — enabling side-by-side wall-clock benchmarking on the same source. Test surface: 4 mandatory IR-shape / concurrency / cost-summary / clean-compile tests + 2 `#[ignore]`-gated env-var + wall-clock tests. Locally observed ~2.81x speedup on three CPU-bound branches (well above the relaxed 1.3x assertion threshold). Plan source: [`phase-8-stdlib-floor.md`](phase-8-stdlib-floor.md) § "Auto-Concurrency Codegen — Parallax-lite Workload" → "Debugger Contract slice 6 — Parallax-lite microbenchmark workload". Promoted from staging 2026-05-08. Landed 2026-05-08 (commit __SLICE6_HASH__).
+
+Slice 5 of the Phase 8 auto-concurrency slate remains in
 [`wip-staging.md`](wip-staging.md) under "needs plan drafting" state;
-they graduate here as their plans land in their phase trackers. Slice
-3 (SpawnSiteId metadata table for the debugger contract) is the
-natural next plan-draft now that slice 2 has shipped, since slice 3
-retrofits the `par_counter` ID-mint inside `emit_par_run` to a
-`record_spawn_site` call once that lands.
+it graduates here as its plan lands in its phase tracker. Slice 5
+(`std.runtime` introspection APIs — `list_par_blocks` /
+`list_tasks` / `has_debug_metadata`) is the natural next plan-draft
+once slice 4's runtime surface has bedded down.
 
 ---
 
@@ -184,3 +185,4 @@ retrofits the `par_counter` ID-mint inside `emit_par_run` to a
 | 2 | Auto-par codegen MVP (Parallax punchline) | 2026-05-08 | 2026-05-08 | ~45 min | 8bc3bab |
 | 3 | Debugger Contract: SpawnSiteId metadata table | 2026-05-08 | 2026-05-08 | ~60 min | c6d8b44 |
 | 4 | Debugger Contract: parent-frame ref + `KaracWaitTarget` surface | 2026-05-08 | 2026-05-08 | ~75 min | 22fa27a |
+| 6 | Parallax-lite microbenchmark workload + `KARAC_AUTO_PAR` gate | 2026-05-08 | 2026-05-08 | ~90 min | __SLICE6_HASH__ |

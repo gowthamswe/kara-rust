@@ -1,0 +1,106 @@
+// workload.kara — Three driver functions and the `process_request`
+// aggregator whose body is the slice's load-bearing code.
+//
+// `process_request` has exactly three top-level call statements with no
+// `let` bindings. Slice 2's auto-par codegen picks this shape up because:
+//   1. The analyzer (concurrency.rs) sees three disjoint `writes(R_i)`
+//      effects (no conflict edges → groupable).
+//   2. The granularity heuristic classifies the group non-trivial (the
+//      `writes` effects are non-empty).
+//   3. The `group_defines_binding_used_outside` gate doesn't fire (no
+//      bindings are introduced).
+// `compile_function_body` therefore emits a single `karac_par_run` call
+// that fans out the three `record_*` calls across the runtime's worker
+// pool.
+//
+// Why not call `MetricsA.record(WORK)` here? In v1 the
+// `with_provider[R](instance, || { ... })` mechanism in db_pipeline
+// has GAP-N (resource-method dispatch syntax under-specified) — the
+// codegen does not yet wire the trait-method call inside a provider
+// scope to the concrete impl, so a `MetricsA.record(...)` call is a
+// no-op at runtime. To keep the wall-clock benchmark meaningful we
+// inline the busy-compute kernel directly into each driver. The
+// effect resources `MetricsA / B / C` remain declared (in
+// resources.kara) and the driver functions remain effect-annotated
+// `writes(MetricsA / B / C)` — that is what the auto-par analyzer
+// keys off, and it is unaffected by the provider GAP. Once GAP-N
+// closes, the `record_*` bodies can swap to `MetricsA.record(WORK)`
+// without touching the surrounding shape.
+//
+// Demo-shape gap: the canonical Parallax demo (fan-out + join) is *not*
+// what this workload models. Joining results from parallel branches
+// requires per-branch return slots in `karac_par_run`'s ABI — the
+// open `phase-7-codegen.md:182` "Par codegen: return values" entry.
+// Slice 6 ships effect-only fan-out as the v1 measurement workload.
+
+import resources.{MetricsA, MetricsB, MetricsC};
+
+// Per-iteration loop count for the busy-compute kernel is hardcoded
+// inline as `50000000` in each driver. ~50M iterations is enough to
+// dominate thread-spawn / RC-fallback overhead on the auto-par
+// branch on a typical laptop, so the wall-clock benchmark sees
+// signal. Hardcoded rather than `pub const WORK: i64 = ...` because
+// v1 codegen does not yet emit module-level `const` decls (referencing
+// a top-level `const` from a function body raises `Undefined
+// variable` in the compiler today). Once that lands the literal can
+// hoist out.
+
+// Busy-compute kernel inlined into each driver. The running sum is
+// published via a printout so the optimizer cannot strip the loop
+// body. Each driver carries a distinct `writes(R_i)` effect on
+// disjoint resources — the analyzer's groupability key.
+//
+// The kernel uses only `+` (no `%`/`/`) intentionally: the
+// `__builtin_div_rem` builtin carries an inferred `panics` effect
+// (div-by-zero), and `panics + panics` is a self-conflict in the
+// concurrency analyzer (correctly modeling that concurrent panic
+// aggregation is undefined). Using `%` for modular reduction would
+// cause the three drivers to inherit `panics` and refuse to group,
+// short-circuiting the whole demo. `i64` overflow is *outside* the
+// effect system's scope per `effectchecker.rs:380` — overflow traps
+// are runtime concerns, not effect-system concerns. The sum
+// `0+1+...+50M` ≈ 1.25e15 fits in `i64::MAX` (≈9.2e18) with three
+// orders of magnitude of headroom, so the loop is overflow-safe.
+
+fn record_a() with writes(MetricsA) {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 50000000 {
+        sum = sum + i;
+        i = i + 1;
+    }
+    println(sum);
+}
+
+fn record_b() with writes(MetricsB) {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 50000000 {
+        sum = sum + i;
+        i = i + 1;
+    }
+    println(sum);
+}
+
+fn record_c() with writes(MetricsC) {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 50000000 {
+        sum = sum + i;
+        i = i + 1;
+    }
+    println(sum);
+}
+
+// The aggregator. Three top-level call statements, no return value.
+// This is *exactly* the shape slice 2's `compile_function_body`
+// dispatches through `emit_par_run`. All three `record_*` calls run
+// concurrently when `KARAC_AUTO_PAR != 0` (default); with
+// `KARAC_AUTO_PAR=0` the slice 6 codegen gate falls back to plain
+// sequential `compile_block`, providing the side-by-side benchmark
+// baseline.
+pub fn process_request() with writes(MetricsA) writes(MetricsB) writes(MetricsC) {
+    record_a();
+    record_b();
+    record_c();
+}
