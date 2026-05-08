@@ -218,6 +218,6 @@ Per-slice durations recorded as each lands. Subagent wall-clock is the implement
 | 7 | atomic-RC | 2026-05-08 01:01 | 2026-05-08 01:18 | 17 min | `791ea64` |
 | 8 | env.set | 2026-05-08 01:21 | 2026-05-08 01:34 | 13 min | `4f41905` |
 | 9 | From[VarError] → IoError | 2026-05-08 01:36 | 2026-05-08 01:48 | 12 min | `3bc449e` |
-| 10 | `?` JSON trace mode | 2026-05-08 01:50 | 2026-05-08 01:56 | 6 min | _pending_ |
+| 10 | `?` JSON trace mode | 2026-05-08 01:50 | 2026-05-08 01:56 | 6 min | `42c0e8d` |
 
 Total elapsed: 4h 15m (2026-05-07 21:41 → 2026-05-08 01:56).
