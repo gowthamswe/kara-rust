@@ -1,22 +1,27 @@
 // runtime/stdlib/io.kara
 //
-// I/O resource method signatures lifted from `register_compiler_intrinsic_env`
-// into baked stdlib source. Each I/O primitive (`Stdin`, `Stdout`, `Stderr`,
-// `FileSystem`, `Env`) is also registered as a `SymbolKind::EffectResource` via
-// `PRELUDE_EFFECT_RESOURCES`; the empty struct here exists purely so
-// `impl <Resource> { ... }` has a target type for `env_add_impl` to register
-// methods against. Authoring the signatures here lets the I/O surface grow
-// in source instead of in three hand-coded sites per method.
+// Ambient effect-resource method signatures lifted from
+// `register_compiler_intrinsic_env` into baked stdlib source. Despite the
+// filename, the file's scope is every entry in `PRELUDE_EFFECT_RESOURCES`:
+// I/O primitives (`Stdin`, `Stdout`, `Stderr`, `FileSystem`), the
+// nondeterminism resources (`Clock`, `RandomSource`), and `Env`. Each one
+// is registered as a `SymbolKind::EffectResource` via the prelude; the
+// empty struct here exists purely so `impl <Resource> { ... }` has a target
+// type for `env_add_impl` to register methods against. Authoring the
+// signatures here lets the surface grow in source instead of in three
+// hand-coded sites per method.
 //
 // Method bodies are placeholder `#[compiler_builtin]` stubs: real dispatch
 // fires in `eval_resource_method` → `dispatch_builtin_resource_method_with_values`
 // (interpreter), which routes through the provider stack so
 // `with_provider[Stdin](Fake {}, || ...)` interception keeps working.
 //
-// Slice 1 baked Stdin only. Slice 2 extends to Stdout / Stderr / FileSystem
-// / Env. The lowercase module-path forms `env.args()` / `env.var(name)` stay
-// as manual `env.functions` entries in `register_compiler_intrinsic_env` —
-// they alias the capitalized `Env.args()` / `Env.var(name)` paths but the
+// Slice 1 baked Stdin; slice 2 extended to Stdout / Stderr / FileSystem /
+// Env; slice 3 added Clock / RandomSource for symmetry (no behavior change —
+// they had no manual typechecker registration before). The lowercase
+// module-path forms `env.args()` / `env.var(name)` stay as manual
+// `env.functions` entries in `register_compiler_intrinsic_env` — they
+// alias the capitalized `Env.args()` / `Env.var(name)` paths but the
 // lowercase form has no syntactic representation as an impl method.
 
 struct Stdin { }
@@ -73,4 +78,18 @@ impl Env {
 
     #[compiler_builtin]
     fn var(name: String) -> Result[String, VarError] { Err(VarError.NotPresent) }
+}
+
+struct Clock { }
+
+impl Clock {
+    #[compiler_builtin]
+    fn now() -> i64 { 0 }
+}
+
+struct RandomSource { }
+
+impl RandomSource {
+    #[compiler_builtin]
+    fn next_u64() -> u64 { 0 }
 }

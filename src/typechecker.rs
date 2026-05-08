@@ -2878,18 +2878,19 @@ impl<'a> TypeChecker<'a> {
     /// - The `Range*` family of typechecker-internal iteration types.
     ///   Constructed from `a..b` syntax; never user-referenced as
     ///   `Range[T]`, so a baked struct adds no value.
-    /// - I/O resource method signatures still authored here:
-    ///   `Stdout.flush`, `Stderr.flush`, `FileSystem.read_to_string`,
-    ///   `FileSystem.write`, `Env.args`, `Env.var`. The companion-struct
-    ///   migration (`struct Stdin {} impl Stdin { ... }` in baked source)
-    ///   moved `Stdin.read_line` / `Stdin.read_to_string` into
-    ///   `runtime/stdlib/io.kara` as the slice-1 proof-of-concept; the
+    /// - Module-path free-function aliases (`env.args`, `env.var`,
+    ///   `process.exit`). These cannot be expressed as `impl Env { fn args() }`
+    ///   blocks because the lowercase identifier (`env`) doesn't name a
+    ///   type; they're a syntactically distinct surface that aliases the
+    ///   capitalized `Env.args` / `Env.var` (which now live in baked source).
+    ///   The full ambient effect-resource surface — Stdin, Stdout, Stderr,
+    ///   FileSystem, Env, Clock, RandomSource — has migrated to
+    ///   `runtime/stdlib/io.kara` via the companion-struct pattern; the
     ///   `EffectResource` symbol kind and the baked struct coexist because
-    ///   baked source bypasses the resolver — `Stdin` stays as a
-    ///   `SymbolKind::EffectResource` for `with_provider[Stdin]` purposes
-    ///   while `env.structs` / `env.impls` carries the type+method shape
-    ///   for `infer_path_type` lookups. Slice 2 extends the same pattern to
-    ///   the remaining I/O surface.
+    ///   baked source bypasses the resolver, so each resource stays a
+    ///   `SymbolKind::EffectResource` for `with_provider[R]` purposes while
+    ///   `env.structs` / `env.impls` carries the type+method shape for
+    ///   `infer_path_type` lookups.
     /// - The primitive operator impl table via [`Self::register_stdlib_impls`]
     ///   (`impl Add for i32`, `impl Eq for u8`, the numeric widening
     ///   `From` impls, …). Documented as permanently programmatic — a
@@ -7164,8 +7165,13 @@ impl<'a> TypeChecker<'a> {
                 }
             }
 
-            // Check for ambient resource methods registered as "TypeName.method"
-            // in the function table (e.g. "Stdin.read_line", "FileSystem.write").
+            // Module-path free functions registered as "module.fn" in the
+            // function table — `process.exit`, `env.args`, `env.var`. The
+            // ambient effect-resource methods (`Stdin.read_line`,
+            // `FileSystem.write`, …) used to land here too, but the slice-1
+            // through slice-3 migration moved every `Type.method` entry into
+            // `env.impls` via baked source, so this fallback now only serves
+            // module-path free functions.
             let dotted = format!("{}.{}", type_name, member);
             if let Some(sig) = self.env.functions.get(&dotted) {
                 return Type::Function {
