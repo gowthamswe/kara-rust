@@ -4830,6 +4830,70 @@ fn test_conditional_impl_two_impls_only_one_bound_satisfied() {
     );
 }
 
+// ── Method resolution: receiver-form generic call-site dispatch ─
+//
+// Slice 2 of the method-resolution CR (see phase-4-interpreter.md
+// item 8). `t.method(args)` where `t: T` and `T: SomeTrait`
+// declares `method` should dispatch through the bound trait's
+// method, mirroring what `T.method(args)` already does for the
+// type-prefixed form.
+
+#[test]
+fn test_receiver_form_typeparam_single_bound_dispatches() {
+    // `T: Reader` declares `access` — `x.access()` resolves through
+    // the Reader trait's method signature.
+    typecheck_ok(
+        "trait Reader { fn access(ref self) -> i64; }\n\
+         fn use_reader[T: Reader](x: T) -> i64 { x.access() }",
+    );
+}
+
+#[test]
+fn test_receiver_form_typeparam_no_bound_no_method() {
+    // `T` has no bounds, so `x.method()` finds no candidate trait.
+    // Errors with NoMethodFound rather than the pre-slice-2 silent
+    // fallthrough to Type::Error.
+    let errors = typecheck_errors(
+        "fn use_anything[T](x: T) -> i64 { x.access() }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NoMethodFound)),
+        "expected NoMethodFound for no-bound TypeParam receiver, got: {:?}",
+        errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_receiver_form_typeparam_multi_bound_ambiguity() {
+    // Both Reader and Writer declare `access`. `x.access()` is ambiguous
+    // — emit AmbiguousAssocFn pointing at UFCS.
+    let errors = typecheck_errors(
+        "trait Reader { fn access(ref self) -> i64; }\n\
+         trait Writer { fn access(ref self) -> i64; }\n\
+         fn use_both[T: Reader + Writer](x: T) -> i64 { x.access() }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::AmbiguousAssocFn)),
+        "expected AmbiguousAssocFn for multi-bound receiver, got: {:?}",
+        errors.iter().map(|e| (&e.kind, &e.message)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_receiver_form_typeparam_multi_bound_disambiguates_by_method() {
+    // Reader declares `read`, Writer declares `write`. `x.read()`
+    // unambiguously resolves to Reader (only one bound declares it).
+    typecheck_ok(
+        "trait Reader { fn read(ref self) -> i64; }\n\
+         trait Writer { fn write(ref self) -> i64; }\n\
+         fn use_both[T: Reader + Writer](x: T) -> i64 { x.read() }",
+    );
+}
+
 // ── Public-signature visibility (CR-18) ─────────────────────────
 //
 // A `pub fn` / pub method / pub struct field / pub enum variant payload /

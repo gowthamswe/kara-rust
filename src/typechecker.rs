@@ -8265,6 +8265,9 @@ impl<'a> TypeChecker<'a> {
         trait_name: &str,
         method_name: &str,
     ) -> Option<&'p crate::ast::TraitMethod> {
+        // User program first (so user-defined traits with the same name
+        // shadow stdlib if such a case ever arises — though stdlib trait
+        // names are reserved per design.md).
         for item in &self.program.items {
             if let Item::TraitDef(t) = item {
                 if t.name == trait_name {
@@ -8272,6 +8275,29 @@ impl<'a> TypeChecker<'a> {
                         if let TraitItem::Method(m) = ti {
                             if m.name == method_name {
                                 return Some(m);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Baked stdlib (`STDLIB_PROGRAMS`): trait declarations like
+        // `Display`, `Iterator`, `Ord`, etc. live here. Walking the
+        // baked surface lets `T: Display`-bounded type params resolve
+        // their `.to_string()` etc. without requiring user redeclaration.
+        // Slice 2 of the method-resolution CR — the receiver-form
+        // dispatch path needs this for `T: Display` to find Display's
+        // `to_string` method, and the same fix benefits the existing
+        // type-prefixed dispatch.
+        for (_, program) in crate::prelude::STDLIB_PROGRAMS.iter() {
+            for item in &program.items {
+                if let Item::TraitDef(t) = item {
+                    if t.name == trait_name {
+                        for ti in &t.items {
+                            if let TraitItem::Method(m) = ti {
+                                if m.name == method_name {
+                                    return Some(m);
+                                }
                             }
                         }
                     }
@@ -8292,6 +8318,93 @@ impl<'a> TypeChecker<'a> {
     /// plus `Type::Error`. Exactly one match → lower the trait method's
     /// signature with `Self → Type::TypeParam(type_name)` substitution and
     /// validate args.
+    /// Receiver-form complement to [`Self::try_dispatch_typeparam_assoc_fn`].
+    /// Slice 2 of the method-resolution CR (see `phase-4-interpreter.md` item
+    /// 8). Called from `infer_method_call`'s receiver-type match when the
+    /// receiver is `Type::TypeParam(name)`. Looks up `name`'s bounds in
+    /// `enclosing_bounds` (populated by `collect_param_bounds`), finds bound
+    /// traits that declare a *method* (with `self_param`) of the requested
+    /// name, and dispatches.
+    ///
+    /// Branch on candidate count:
+    /// - zero → emit `NoMethodFound` diagnostic, return `Type::Error`.
+    /// - one → dispatch via `dispatch_trait_assoc_fn` (which substitutes
+    ///   `Self → Type::TypeParam(name)` in the method's signature). The
+    ///   trait method's `params` already excludes `self_param` per the
+    ///   AST shape, so `args.len()` matches `method.params.len()` — no
+    ///   off-by-one for the implicit receiver.
+    /// - more → emit `AmbiguousAssocFn` (E0233) listing each candidate
+    ///   trait with a UFCS-disambiguation hint.
+    ///
+    /// Self-mode compatibility (calling a `mut ref self` method on a `ref`
+    /// receiver) is the param-binding layer's concern, not this dispatcher's.
+    fn dispatch_typeparam_receiver_method(
+        &mut self,
+        type_param_name: &str,
+        method: &str,
+        args: &[CallArg],
+        span: &Span,
+    ) -> Type {
+        let bounds = match self.enclosing_bounds.get(type_param_name) {
+            Some(b) => b.clone(),
+            None => Vec::new(),
+        };
+        let candidates: Vec<(String, crate::ast::TraitMethod)> = bounds
+            .iter()
+            .filter_map(|b| b.path.last().cloned())
+            .filter_map(|trait_name| {
+                let m = self.find_trait_method(&trait_name, method)?;
+                // Only methods (with self_param) are receiver-form
+                // candidates. Associated functions (no self_param) reach
+                // the dispatch only through type-prefixed `T.method()`.
+                m.self_param.as_ref()?;
+                Some((trait_name, m.clone()))
+            })
+            .collect();
+
+        match candidates.len() {
+            0 => {
+                for arg in args {
+                    self.infer_expr(&arg.value);
+                }
+                self.type_error(
+                    format!(
+                        "no method '{}' on type parameter '{}'; \
+                         add a trait bound declaring it (e.g. `{}: SomeTrait`)",
+                        method, type_param_name, type_param_name,
+                    ),
+                    span.clone(),
+                    TypeErrorKind::NoMethodFound,
+                );
+                Type::Error
+            }
+            1 => {
+                let (_trait_name, trait_method) = candidates.into_iter().next().unwrap();
+                self.dispatch_trait_assoc_fn(type_param_name, &trait_method, args, span)
+            }
+            _ => {
+                let trait_list = candidates
+                    .iter()
+                    .map(|(t, _)| format!("`{}`", t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                for arg in args {
+                    self.infer_expr(&arg.value);
+                }
+                self.type_error(
+                    format!(
+                        "ambiguous method '{}' on type parameter '{}': declared by {}. \
+                         Use UFCS `Trait.{}(receiver, ...)` to disambiguate.",
+                        method, type_param_name, trait_list, method,
+                    ),
+                    span.clone(),
+                    TypeErrorKind::AmbiguousAssocFn,
+                );
+                Type::Error
+            }
+        }
+    }
+
     fn try_dispatch_typeparam_assoc_fn(
         &mut self,
         type_name: &str,
@@ -8787,6 +8900,26 @@ impl<'a> TypeChecker<'a> {
         };
         let (type_name, type_args) = match receiver_for_lookup {
             Type::Named { name, args } => (name.clone(), args.clone()),
+            Type::TypeParam(name) if name != "Self" => {
+                // Receiver-form generic call-site dispatch (slice 2 of the
+                // method-resolution CR — see `phase-4-interpreter.md` item 8).
+                // The complement to type-prefixed `T.method()` dispatch via
+                // `try_dispatch_typeparam_assoc_fn` (`infer_call`): for
+                // `t.method(args)` where `t: T` and `T: SomeTrait` declares
+                // `method`, look up T's bounds in `enclosing_bounds`, find
+                // the trait declaring `method`, and lower the trait method's
+                // signature with `Self → Type::TypeParam(T)` substitution.
+                // Multiple matching bounds → AmbiguousAssocFn (UFCS hint);
+                // zero matches → NoMethodFound; exactly one → dispatch.
+                //
+                // `Self` receivers are intentionally excluded — `self.method()`
+                // in a trait default body or impl method has its own
+                // resolution path (the trait being defined provides the
+                // candidate methods, not just supertrait bounds). Wiring
+                // that correctly is its own slice; for now the silent
+                // pre-existing fallthrough is preserved for `Self`.
+                return self.dispatch_typeparam_receiver_method(name, method, args, span);
+            }
             _ => {
                 // For non-named types, just type-check args and return Error
                 for arg in args {
