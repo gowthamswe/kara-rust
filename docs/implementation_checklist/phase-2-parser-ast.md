@@ -32,11 +32,139 @@
 
 - [ ] **Path expression with generic args — concrete-type UFCS support.** Discovered 2026-05-07 during method-resolution slice-2 grounding (see `phase-4-interpreter.md` item 5). `Vec[i64].new()` currently parses as `MethodCall { object: PrefixCollectionLiteral { type_name: "Vec", items: [Identifier("i64")] }, method: "new", args: [] }` — i.e., `Vec[i64]` is treated as a one-element collection literal containing the identifier `i64`. The intended parse for concrete-type UFCS (per `design.md:226` example `Vec[i32].default()`) is a path-with-generic-args expression form, e.g. `MethodCall { object: PathExpr { segments: ["Vec"], generic_args: Some([i64]) }, method: "new", ... }` or similar. Today's `ExprKind::Path` is bare `Vec<String>` with no generic-args slot, so even if the parser disambiguated, the AST couldn't carry the args.
 
-  Two-prong CR:
-  1. **AST shape.** Either extend `ExprKind::Path` with an optional `generic_args: Option<Vec<TypeExpr>>` field, or introduce a new `ExprKind::TypedPath { segments, generic_args }` variant alongside the bare `Path`. Knock-on: every walker call-site has to handle the new field/variant; some currently destructure `ExprKind::Path(segments)` and would need updating.
-  2. **Context-aware parsing.** When the parser sees `TypeName[...]` (uppercase first segment, generic-args-shaped contents), it currently produces a `PrefixCollectionLiteral` expression. The disambiguation rule: when the `[...]` is immediately followed by `.method(`, prefer the path-with-generic-args interpretation over the collection-literal one. Lookahead at parse time; no name resolution required (the case-class disambiguation per `design.md:374` is purely syntactic).
+  **Design lock (2026-05-08): option (a) — extend `ExprKind::Path`.**
+  Sized via a grep pass that found 59 `ExprKind::Path` sites across 15
+  source files (~4 construction, ~15 wildcard, ~40 destructure).
+  Rejected option (b) (new `TypedPath` variant) on coverage-risk
+  grounds: ~15 wildcard leaf-detection sites would silently fall
+  through under (b), forcing per-site judgment about whether each
+  should treat `TypedPath` as `Path`. Option (a) gets compile-time
+  coverage for free at the cost of ~40 mechanical destructure-pattern
+  updates. Long-term maintenance also favors (a) — concrete-type UFCS
+  + `impl Option[Ordering]` will make path-with-generic-args a
+  recurring shape, not exotic.
 
-  Once both prongs land, the typechecker side is a small extension to the existing `resolve_path_type` impl-walk (slice 1 of method-resolution wired the bound-discharge engine but intentionally skipped this site because it had no receiver args at the call site — a path-with-generic-args expression provides exactly those args).
+  Two-prong CR (now locked):
+  1. **AST shape.** Extend `ExprKind::Path(Vec<String>)` to
+     `ExprKind::Path { segments: Vec<String>, generic_args: Option<Vec<TypeExpr>> }`
+     in `src/ast.rs`. Construction sites populate `generic_args: None`
+     by default; the parser populates `Some(...)` only at the
+     disambiguation site below.
+  2. **Context-aware parsing.** When the parser sees `TypeName[...]`
+     (uppercase first segment, generic-args-shaped contents),
+     currently produces a `PrefixCollectionLiteral` expression. The
+     disambiguation rule: when the `[...]` is immediately followed by
+     `.method(`, prefer the path-with-generic-args interpretation over
+     the collection-literal one. Lookahead at parse time; no name
+     resolution required (the case-class disambiguation per
+     `design.md:374` is purely syntactic).
 
-  Unblocks `phase-4-interpreter.md` § "TypeChecker: implement full method resolution algorithm" item 5 (concrete-type UFCS) and `phase-4-interpreter.md` § "Follow-ups" `impl Option[Ordering]` item (whose user-facing call form is `Option[Ordering].partial_cmp_by(...)` per design.md). Not blocking for slice 2 of the method-resolution CR (which scopes to receiver-form via item 8 only).
+  Once both prongs land, the typechecker side is a small extension to
+  the existing `resolve_path_type` impl-walk (slice 1 of
+  method-resolution wired the bound-discharge engine but intentionally
+  skipped this site because it had no receiver args at the call site
+  — a path-with-generic-args expression provides exactly those args).
+
+  Unblocks [`phase-4-interpreter.md` § "TypeChecker: implement full
+  method resolution algorithm" sub-item 5B](phase-4-interpreter.md)
+  (concrete-type UFCS) and the
+  [`impl Option[Ordering]`](phase-4-interpreter.md#impl-option-ordering-deferred)
+  follow-up (whose user-facing call form is
+  `Option[Ordering].partial_cmp_by(...)` per design.md). Not blocking
+  for slice 2 of the method-resolution CR (which scopes to
+  receiver-form via item 8 only).
+
+  **Slice plan (drafted 2026-05-08).** Two slices; Slice A is pure
+  refactor with zero behavioral change, Slice B lands the feature.
+
+  - [ ] **Slice A — AST extension + mechanical fixup.** Pure
+    refactoring; zero behavioral change.
+    - *Goal.* `ExprKind::Path` carries
+      `generic_args: Option<Vec<TypeExpr>>` (always `None` after this
+      slice — populated by Slice B's parser rule). Every destructure
+      site updated to the new pattern syntax.
+    - *Sub-steps.* (1) Change `ExprKind::Path(Vec<String>)` to
+      `ExprKind::Path { segments: Vec<String>, generic_args: Option<Vec<TypeExpr>> }`
+      in `src/ast.rs`. (2) Compile-driven fixup across all 59 sites:
+      ~4 construction sites populate `generic_args: None`; ~40
+      destructure sites change `Path(segments)` → `Path { segments, .. }`;
+      ~15 wildcards stay as-is. (3) Verify zero behavioral change:
+      `cargo test`, `cargo test --features llvm`,
+      `cargo clippy --all --tests -- -D warnings`,
+      `cargo fmt --all -- --check` all clean.
+    - *Tests.* No new tests in this slice — coverage comes from the
+      existing test suite passing unchanged (~2293 non-LLVM, ~2495
+      LLVM with `KARAC_SKIP_ASAN_TESTS=1`).
+    - *Files touched (15).* `src/ast.rs`, `src/concurrency.rs`,
+      `src/effectchecker.rs`, `src/unsafe_lint.rs`, `src/lowering.rs`,
+      `src/cost_summary.rs`, `src/cfg.rs`, `src/use_classifier.rs`,
+      `src/formatter.rs`, `src/ownership.rs`, `src/ffi_lint.rs`,
+      `src/logical_lint.rs`, `src/provider_escape.rs`, `src/codegen.rs`,
+      `src/resolver.rs`, `src/parser.rs` (construction sites only —
+      no disambiguation rule yet), `src/interpreter.rs`, `src/cli.rs`,
+      `src/typechecker.rs`. (Counting `src/ast.rs` separately; `src/parser.rs`
+      counts construction-only.)
+    - *Out of scope.* Parser disambiguation rule (Slice B).
+      Typechecker propagation of `generic_args` (Slice B). Construction
+      of `Some(...)` `generic_args` (Slice B).
+    - *Stop triggers.* Test breakage that doesn't fix mechanically by
+      adding `..` to a destructure pattern. Suggests a site uses
+      `segments` content in a way that breaks under struct-shape —
+      investigate before proceeding (likely indicates a site needs
+      option (b)-style parallel handling, which would invalidate the
+      design lock).
+
+  - [ ] **Slice B — Parser disambiguation + typechecker tail.**
+    Behavioral change; lands concrete-type UFCS as a working surface.
+    - *Goal.* `Vec[i64].new()` parses to `MethodCall { object: Path { segments: ["Vec"], generic_args: Some([i64]) }, method: "new", … }`
+      and typechecks through the bound-discharge engine. Sub-item 5B
+      under [`phase-4-interpreter.md` § method resolution](phase-4-interpreter.md)
+      flips `[→]` → `[x]`.
+    - *Sub-steps.* (1) **Parser disambiguation rule** in
+      `src/parser.rs`: when a `TypeName[...]` (uppercase first
+      segment, generic-args-shaped contents) is immediately followed
+      by `.method(`, prefer the path-with-generic-args interpretation
+      over `PrefixCollectionLiteral`. Pure syntactic lookahead; no
+      name resolution. Balanced-bracket scanning handles nested
+      generics like `Vec[Map[K, V]].new()`. (2) **Typechecker tail**
+      (= sub-item 5B): extend `resolve_path_type` impl-walk in
+      `src/typechecker.rs` to consume the populated `generic_args`
+      and route through `find_method_with_args` +
+      `impl_bounds_discharge` (slice 1 of method-resolution wired
+      this engine but skipped this site for lack of receiver args —
+      now provided by the parser).
+    - *Tests.* (a) **Parser positives:** `Vec[i64].new()`,
+      `HashMap[String, i32].default()`, `Self[T].method()`,
+      `Vec[Map[K, V]].new()` (nested generics), `Vec[i64].new().push(1)`
+      (chained method calls). (b) **Parser negatives — regression
+      guards:** `[1]`, `[var]`, `[expr.field]`, `[some_call()]` still
+      parse as collection literals. (c) **End-to-end typecheck:**
+      `Vec[i64].new()` typechecks against `impl Vec[T]` and dispatches
+      correctly. (d) **Bound-discharge:** trait-bounded UFCS
+      (`Vec[i64].method_requiring_T_Display()`) discharges if i32
+      impls Display, rejects if not. (e) **5B graduation:** flip
+      `phase-4-interpreter.md` sub-item 5B from `[→]` to `[x]`.
+    - *Files touched.* `src/parser.rs`, `src/typechecker.rs`,
+      `tests/parser.rs`, `tests/typechecker.rs`,
+      `docs/implementation_checklist/phase-4-interpreter.md` (5B
+      checkbox flip).
+    - *Out of scope.* Sub-item 5C (inherent-vs-trait priority on UFCS
+      form) — separate slice once 5B lands. `Option[Ordering]`
+      impl-table specialization (Theme 4 of wip-list2 — different
+      concern: impl-table key shape, not parser).
+      `[Vec[i64]]` (collection literal containing a typed path —
+      would require recursive disambiguation, post-v1 polish).
+    - *Stop triggers.* Disambiguation breaks an existing test that
+      uses `[X]` shape in a position where path-with-generic-args is
+      wrong (would require refining the rule). Pre-existing case-class
+      disambiguation per design.md:374 conflicts with the new rule
+      (would require co-design). Bound-discharge engine doesn't
+      handle the new `target_args` shape (would require typechecker
+      engine extension, larger than 5B).
+
+  Once both slices land, **closes:**
+  - `phase-2-parser-ast.md:33` parent (this entry).
+  - `phase-4-interpreter.md` § method resolution sub-item 5B (`[→]` → `[x]`).
+  - The parent item 5 (`[~]`) graduates to `[x]` once 5C also lands
+    (still open after this CR).
 
