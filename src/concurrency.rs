@@ -17,14 +17,14 @@ use std::collections::{HashMap, HashSet};
 // ── Result Types ───────────────────────────────────────────────
 
 /// The full result of concurrency analysis across all functions.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConcurrencyAnalysis {
     /// Per-function parallelization decisions.
     pub function_decisions: HashMap<String, FunctionConcurrency>,
 }
 
 /// Parallelization analysis for a single function.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FunctionConcurrency {
     /// Groups of statement indices that can run in parallel.
     pub parallel_groups: Vec<ParallelGroup>,
@@ -33,7 +33,7 @@ pub struct FunctionConcurrency {
 }
 
 /// A set of statements that can safely run in parallel.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParallelGroup {
     /// Indices of statements in this parallel group.
     pub statement_indices: Vec<usize>,

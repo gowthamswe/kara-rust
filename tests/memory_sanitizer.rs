@@ -75,7 +75,7 @@ mod memory_sanitizer_tests {
         let obj_path = format!("/tmp/karac_asan_{}_{}.o", std::process::id(), id);
         let exe_path = format!("/tmp/karac_asan_{}_{}", std::process::id(), id);
 
-        if let Err(e) = compile_to_object(&parsed.program, &obj_path, None) {
+        if let Err(e) = compile_to_object(&parsed.program, &obj_path, None, None) {
             eprintln!("[{label}] compile_to_object failed: {e}");
             return None;
         }
@@ -587,7 +587,7 @@ fn main() {
         let obj_path = format!("/tmp/karac_asan_ow_{}_{}.o", std::process::id(), id);
         let exe_path = format!("/tmp/karac_asan_ow_{}_{}", std::process::id(), id);
 
-        if let Err(e) = compile_to_object(&parsed.program, &obj_path, Some(&ownership)) {
+        if let Err(e) = compile_to_object(&parsed.program, &obj_path, Some(&ownership), None) {
             eprintln!("[{label}] compile_to_object failed: {e}");
             return None;
         }

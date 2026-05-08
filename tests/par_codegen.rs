@@ -50,7 +50,7 @@ mod par_codegen_tests {
             "parse errors: {:?}",
             parsed.errors
         );
-        compile_to_ir(&parsed.program, None).expect("codegen failed")
+        compile_to_ir(&parsed.program, None, None).expect("codegen failed")
     }
 
     /// Like `ir_for` but runs the full analysis pipeline first so the
@@ -98,7 +98,7 @@ mod par_codegen_tests {
                 .or_insert(eff);
         }
         parsed.program.callee_effectful = table;
-        compile_to_ir(&parsed.program, None).expect("codegen failed")
+        compile_to_ir(&parsed.program, None, None).expect("codegen failed")
     }
 
     /// Compile, link with the runtime, and run the program. Returns stdout
@@ -126,7 +126,7 @@ mod par_codegen_tests {
         let obj_path = format!("/tmp/karac_par_e2e_{}_{}.o", std::process::id(), id);
         let exe_path = format!("/tmp/karac_par_e2e_{}_{}", std::process::id(), id);
 
-        if let Err(e) = compile_to_object(&parsed.program, &obj_path, None) {
+        if let Err(e) = compile_to_object(&parsed.program, &obj_path, None, None) {
             panic!("codegen failed for test program: {}", e);
         }
         link_executable(&obj_path, &exe_path).ok()?;

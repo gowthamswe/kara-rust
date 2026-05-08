@@ -23,6 +23,7 @@ use inkwell::{
 };
 
 use crate::ast::*;
+use crate::concurrency::{ConcurrencyAnalysis, FunctionConcurrency};
 use crate::ownership::OwnershipCheckResult;
 use crate::token::{FloatSuffix, IntSuffix};
 
@@ -32,8 +33,9 @@ use crate::token::{FloatSuffix, IntSuffix};
 pub fn compile_to_ir(
     program: &Program,
     ownership: Option<&OwnershipCheckResult>,
+    concurrency: Option<&ConcurrencyAnalysis>,
 ) -> Result<String, String> {
-    compile_to_ir_with_options(program, ownership, None)
+    compile_to_ir_with_options(program, ownership, concurrency, None)
 }
 
 /// Like [`compile_to_ir`] but accepts an optional source-filename string used
@@ -45,11 +47,13 @@ pub fn compile_to_ir(
 pub fn compile_to_ir_with_options(
     program: &Program,
     ownership: Option<&OwnershipCheckResult>,
+    concurrency: Option<&ConcurrencyAnalysis>,
     source_filename: Option<&str>,
 ) -> Result<String, String> {
     let context = Context::create();
     let mut cg = Codegen::new(&context, "karac_module");
     cg.load_rc_fallback(ownership);
+    cg.load_concurrency_analysis(concurrency);
     cg.set_source_filename(source_filename);
     cg.compile_program(program)?;
     Ok(cg.module.print_to_string().to_string())
@@ -60,8 +64,9 @@ pub fn compile_to_object(
     program: &Program,
     output_path: &str,
     ownership: Option<&OwnershipCheckResult>,
+    concurrency: Option<&ConcurrencyAnalysis>,
 ) -> Result<(), String> {
-    compile_to_object_with_options(program, output_path, ownership, None)
+    compile_to_object_with_options(program, output_path, ownership, concurrency, None)
 }
 
 /// Like [`compile_to_object`] but accepts an optional source-filename string;
@@ -70,11 +75,13 @@ pub fn compile_to_object_with_options(
     program: &Program,
     output_path: &str,
     ownership: Option<&OwnershipCheckResult>,
+    concurrency: Option<&ConcurrencyAnalysis>,
     source_filename: Option<&str>,
 ) -> Result<(), String> {
     let context = Context::create();
     let mut cg = Codegen::new(&context, "karac_module");
     cg.load_rc_fallback(ownership);
+    cg.load_concurrency_analysis(concurrency);
     cg.set_source_filename(source_filename);
     cg.compile_program(program)?;
 
@@ -505,6 +512,12 @@ struct Codegen<'ctx> {
     /// Heap struct type for each active RC-fallback binding in the current function.
     /// Cleared at each `compile_function` call. Key: binding name.
     rc_fallback_heap_types: HashMap<String, StructType<'ctx>>,
+    /// Per-function parallelization decisions populated from `ConcurrencyAnalysis`.
+    /// Function name → `FunctionConcurrency` (parallel groups + total stmt count).
+    /// Threaded in by `load_concurrency_analysis`; consumed in slice 2 by the
+    /// auto-par lowering path that emits `karac_par_run` for inferred groups
+    /// outside explicit `par {}` blocks. Empty when no analysis was supplied.
+    concurrency_decisions: HashMap<String, FunctionConcurrency>,
     /// Name of the function currently being compiled (for rc_fallback_fns lookup).
     current_fn_name: String,
     // ── Par block runtime ─────────────────────────────────────────
@@ -849,6 +862,7 @@ impl<'ctx> Codegen<'ctx> {
             rc_fallback_fns: HashMap::new(),
             arc_fallback_fns: HashMap::new(),
             rc_fallback_heap_types: HashMap::new(),
+            concurrency_decisions: HashMap::new(),
             current_fn_name: String::new(),
             par_counter: 0,
             karac_branch_ty,
@@ -925,6 +939,37 @@ impl<'ctx> Codegen<'ctx> {
         self.arc_fallback_fns
             .get(&self.current_fn_name)
             .is_some_and(|set| set.contains(name))
+    }
+
+    /// Populate concurrency-analysis data from a `ConcurrencyAnalysis` result.
+    ///
+    /// Mirrors `load_rc_fallback`: walks `analysis.function_decisions` and
+    /// clones each entry into `concurrency_decisions`. The plumbing is
+    /// behavior-neutral — slice 2 will consume the loaded decisions to emit
+    /// `karac_par_run` for compiler-inferred parallel groups outside
+    /// explicit `par {}` blocks. `None` is a no-op (the existing `par`
+    /// codegen path stays in effect).
+    fn load_concurrency_analysis(&mut self, analysis: Option<&ConcurrencyAnalysis>) {
+        let Some(an) = analysis else { return };
+        for (fn_name, decision) in &an.function_decisions {
+            self.concurrency_decisions
+                .insert(fn_name.clone(), decision.clone());
+        }
+    }
+
+    /// Look up the parallelization decision for the function currently being
+    /// compiled. Returns `None` when no concurrency analysis was threaded in
+    /// (the legacy entry-point path) or when the current function isn't
+    /// keyed in the analysis (e.g. compiler-synthesized helpers). Slice 2's
+    /// consumer entry point — the body lowering path will dispatch on
+    /// `parallel_groups_for_current_fn().is_some()` to decide whether to
+    /// emit `karac_par_run` for non-`par` parallel groups.
+    #[allow(dead_code)] // slice 1 plumbing; consumed by slice 2 auto-par lowering
+    fn parallel_groups_for_current_fn(&self) -> Option<&FunctionConcurrency> {
+        if self.concurrency_decisions.is_empty() {
+            return None;
+        }
+        self.concurrency_decisions.get(&self.current_fn_name)
     }
 
     // ── Type resolution ───────────────────────────────────────────

@@ -2253,6 +2253,7 @@ fn cmd_build(filename: &str, output: OutputMode) {
             &pipeline.parsed.program,
             &obj_path,
             pipeline.ownership.as_ref(),
+            pipeline.concurrency.as_ref(),
             Some(filename),
         ) {
             eprintln!("error: codegen failed: {e}");

@@ -22,7 +22,7 @@ mod codegen_tests {
         let resolved = karac::resolve(&parsed.program);
         let typed = karac::typecheck(&parsed.program, &resolved);
         karac::lower(&mut parsed.program, &typed);
-        compile_to_ir(&parsed.program, None).expect("codegen failed")
+        compile_to_ir(&parsed.program, None, None).expect("codegen failed")
     }
 
     // ── Basic arithmetic ─────────────────────────────────────────
@@ -432,7 +432,7 @@ fn main() {
         karac::lower(&mut parsed.program, &typed);
 
         let obj_path = "/tmp/karac_test_hello.o";
-        let result = compile_to_object(&parsed.program, obj_path, None);
+        let result = compile_to_object(&parsed.program, obj_path, None, None);
         assert!(result.is_ok(), "compile_to_object failed: {:?}", result);
         assert!(Path::new(obj_path).exists(), "object file should exist");
 
@@ -493,7 +493,9 @@ fn main() {
         // the test program) — surface them loudly. Link and exec failures
         // stay as soft-skip because they can fire in environments that
         // lack libkarac_runtime.a or a working linker.
-        if let Err(e) = compile_to_object_with_options(&parsed.program, &obj_path, None, filename) {
+        if let Err(e) =
+            compile_to_object_with_options(&parsed.program, &obj_path, None, None, filename)
+        {
             panic!("codegen failed for test program: {}", e);
         }
         link_executable(&obj_path, &exe_path).ok()?;
@@ -533,7 +535,7 @@ fn main() {
         let obj_path = format!("/tmp/karac_e2e_ow_{}_{}.o", std::process::id(), id);
         let exe_path = format!("/tmp/karac_e2e_ow_{}_{}", std::process::id(), id);
 
-        if let Err(e) = compile_to_object(&parsed.program, &obj_path, Some(&ownership)) {
+        if let Err(e) = compile_to_object(&parsed.program, &obj_path, Some(&ownership), None) {
             panic!("codegen failed for test program: {}", e);
         }
         link_executable(&obj_path, &exe_path).ok()?;
@@ -2680,7 +2682,7 @@ fn main() {
         let typed = karac::typecheck(&parsed.program, &resolved);
         karac::lower(&mut parsed.program, &typed);
         let ownership = karac::ownershipcheck(&parsed.program, &typed);
-        compile_to_ir(&parsed.program, Some(&ownership)).expect("codegen failed")
+        compile_to_ir(&parsed.program, Some(&ownership), None).expect("codegen failed")
     }
 
     #[test]
@@ -3415,7 +3417,9 @@ fn main() {
         let obj_path = format!("/tmp/karac_e2e_envtrace_{}_{}.o", std::process::id(), id);
         let exe_path = format!("/tmp/karac_e2e_envtrace_{}_{}", std::process::id(), id);
 
-        if let Err(e) = compile_to_object_with_options(&parsed.program, &obj_path, None, filename) {
+        if let Err(e) =
+            compile_to_object_with_options(&parsed.program, &obj_path, None, None, filename)
+        {
             panic!("codegen failed for test program: {}", e);
         }
         link_executable(&obj_path, &exe_path).ok()?;
@@ -6004,7 +6008,7 @@ fn main() {
         let resolved = karac::resolve(&parsed.program);
         let typed = karac::typecheck(&parsed.program, &resolved);
         karac::lower(&mut parsed.program, &typed);
-        let err = compile_to_ir(&parsed.program, None).expect_err(
+        let err = compile_to_ir(&parsed.program, None, None).expect_err(
             "expected codegen to Err on unsupported slice method; \
              the dispatcher silent-zero must not be re-introduced",
         );
@@ -6013,5 +6017,99 @@ fn main() {
             "expected diagnostic to name the missing slice method; got: {}",
             err
         );
+    }
+
+    // ── Concurrency analysis plumbing ──
+
+    /// Slice 1 wiring sanity-check: full pipeline through
+    /// `concurrency_analyze`, then a `compile_to_object_with_options` call
+    /// passing the analysis as `Some(&analysis)`. Asserts only that codegen
+    /// succeeds — IR-shape assertions for inferred-par lowering are slice 2's
+    /// job. The point here is to verify the new param accepts a real analysis
+    /// without regressing the existing legacy path.
+    #[test]
+    fn test_concurrency_analysis_threads_into_codegen() {
+        use karac::codegen::compile_to_object_with_options;
+        let src = r#"
+effect resource Net;
+effect resource Disk;
+effect resource Db;
+
+fn fetch_net() -> i64 reads(Net) { 1 }
+fn fetch_disk() -> i64 reads(Disk) { 2 }
+fn fetch_db() -> i64 reads(Db) { 3 }
+
+fn main() {
+    let a = fetch_net();
+    let b = fetch_disk();
+    let c = fetch_db();
+    println(a + b + c);
+}
+"#;
+        let mut parsed = karac::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        let effects = karac::effectcheck(&parsed.program);
+        let analysis = karac::concurrency_analyze(&parsed.program, &effects);
+
+        let obj_path = "/tmp/karac_test_concurrency_threads.o";
+        let result =
+            compile_to_object_with_options(&parsed.program, obj_path, None, Some(&analysis), None);
+        assert!(
+            result.is_ok(),
+            "compile_to_object_with_options failed with concurrency analysis: {:?}",
+            result
+        );
+        let _ = std::fs::remove_file(obj_path);
+    }
+
+    /// Regression pin for substep (e): the new `concurrency` param is
+    /// genuinely optional. Compiling the same program through
+    /// `compile_to_object` (the param-light wrapper) with `None` for both
+    /// ownership and concurrency must still succeed. Slice 1 promised no
+    /// behavior change — this is the regression guard.
+    #[test]
+    fn test_concurrency_analysis_none_compiles_unchanged() {
+        use karac::codegen::compile_to_object;
+        let src = r#"
+effect resource Net;
+effect resource Disk;
+effect resource Db;
+
+fn fetch_net() -> i64 reads(Net) { 1 }
+fn fetch_disk() -> i64 reads(Disk) { 2 }
+fn fetch_db() -> i64 reads(Db) { 3 }
+
+fn main() {
+    let a = fetch_net();
+    let b = fetch_disk();
+    let c = fetch_db();
+    println(a + b + c);
+}
+"#;
+        let mut parsed = karac::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+
+        let obj_path = "/tmp/karac_test_concurrency_none.o";
+        let result = compile_to_object(&parsed.program, obj_path, None, None);
+        assert!(
+            result.is_ok(),
+            "compile_to_object with None concurrency failed: {:?}",
+            result
+        );
+        let _ = std::fs::remove_file(obj_path);
     }
 }
