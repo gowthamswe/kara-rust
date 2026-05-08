@@ -18,7 +18,9 @@ use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionTy
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
 };
-use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
+use inkwell::{
+    AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate, OptimizationLevel,
+};
 
 use crate::ast::*;
 use crate::ownership::OwnershipCheckResult;
@@ -493,6 +495,13 @@ struct Codegen<'ctx> {
     /// Per-function RC-fallback binding names populated from `OwnershipCheckResult`.
     /// Function name → set of binding names that need heap-boxing + refcount.
     rc_fallback_fns: HashMap<String, HashSet<String>>,
+    /// Per-function Arc-promoted binding names — the subset of `rc_fallback_fns`
+    /// flagged by the ownership pass as crossing a `par {}` thread boundary.
+    /// Inc/dec on these bindings emits atomic LLVM operations (`atomicrmw add` /
+    /// `atomicrmw sub`, `SeqCst`); the rest stay on plain non-atomic load+arith+store.
+    /// Allocation site is unchanged — the heap layout `{ refcount: i64, payload: T }`
+    /// is identical for both flavors.
+    arc_fallback_fns: HashMap<String, HashSet<String>>,
     /// Heap struct type for each active RC-fallback binding in the current function.
     /// Cleared at each `compile_function` call. Key: binding name.
     rc_fallback_heap_types: HashMap<String, StructType<'ctx>>,
@@ -838,6 +847,7 @@ impl<'ctx> Codegen<'ctx> {
             used_symbols: Vec::new(),
             branch_cancel_ptr: None,
             rc_fallback_fns: HashMap::new(),
+            arc_fallback_fns: HashMap::new(),
             rc_fallback_heap_types: HashMap::new(),
             current_fn_name: String::new(),
             par_counter: 0,
@@ -873,11 +883,26 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Populate RC-fallback data from an ownership check result.
+    ///
+    /// Two side-tables land here:
+    /// * `rc_fallback_fns` — every binding the dataflow flagged for heap-boxing
+    ///   + refcount.
+    /// * `arc_fallback_fns` — the subset of those that also cross a `par {}`
+    ///   thread boundary (Phase 2 promotion). Codegen routes inc/dec on the
+    ///   subset to the atomic path (`atomicrmw add` / `atomicrmw sub`,
+    ///   `SeqCst`); the rest stay on plain non-atomic ops. Allocation is
+    ///   identical for both — the heap shape is `{ refcount: i64, payload: T }`
+    ///   regardless of flavor and the initial `refcount = 1` store happens
+    ///   before the value is shared.
     fn load_rc_fallback(&mut self, ownership: Option<&OwnershipCheckResult>) {
         let Some(ow) = ownership else { return };
         for (fn_name, rc_map) in &ow.rc_values {
             let names: HashSet<String> = rc_map.keys().cloned().collect();
             self.rc_fallback_fns.insert(fn_name.clone(), names);
+        }
+        for (fn_name, arc_set) in &ow.arc_values {
+            self.arc_fallback_fns
+                .insert(fn_name.clone(), arc_set.clone());
         }
     }
 
@@ -889,6 +914,15 @@ impl<'ctx> Codegen<'ctx> {
 
     fn is_rc_fallback_binding(&self, name: &str) -> bool {
         self.rc_fallback_fns
+            .get(&self.current_fn_name)
+            .is_some_and(|set| set.contains(name))
+    }
+
+    /// True iff `name` was promoted to Arc in the current function — i.e. it
+    /// lives in the `arc_values` subset for this function key. Inc/dec on
+    /// such bindings must use the atomic path.
+    fn is_arc_binding(&self, name: &str) -> bool {
+        self.arc_fallback_fns
             .get(&self.current_fn_name)
             .is_some_and(|set| set.contains(name))
     }
@@ -1581,6 +1615,94 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(done_bb);
     }
 
+    /// Atomic counterpart to `emit_rc_inc` for `arc_values`-promoted bindings.
+    /// `atomicrmw add refcount, 1, seq_cst`. Mirrors the non-atomic helper's
+    /// shape exactly — same `struct_gep` to land on the refcount field, same
+    /// `+1`-by-i64 — only the load+arith+store sequence changes to a single
+    /// `atomicrmw` op. Memory ordering is `SequentiallyConsistent` for v1
+    /// (correct, conservative); relaxation to `Monotonic`+`Acquire`/`Release`
+    /// per Rust's `Arc` is a future optimization tracked under "out of scope"
+    /// in the slice plan. The returned old value is discarded — increments do
+    /// not need to observe it (only decrements do, to detect transition to 0).
+    fn emit_arc_inc(&self, heap_type: StructType<'ctx>, ptr: PointerValue<'ctx>) {
+        let rc_ptr = self
+            .builder
+            .build_struct_gep(heap_type, ptr, 0, "arc_ptr")
+            .unwrap();
+        let one = self.context.i64_type().const_int(1, false);
+        self.builder
+            .build_atomicrmw(
+                AtomicRMWBinOp::Add,
+                rc_ptr,
+                one,
+                AtomicOrdering::SequentiallyConsistent,
+            )
+            .unwrap();
+    }
+
+    /// Atomic counterpart to `emit_rc_dec`. Uses `atomicrmw sub refcount, 1,
+    /// seq_cst`; the returned value is the *previous* refcount, so the
+    /// "drop-to-zero" check is `old == 1` (post-decrement value is 0). Same
+    /// branch shape as `emit_rc_dec`: a `free_bb` that calls `free(ptr)` and
+    /// a `done_bb` join.
+    fn emit_arc_dec(&self, heap_type: StructType<'ctx>, ptr: PointerValue<'ctx>) {
+        let rc_ptr = self
+            .builder
+            .build_struct_gep(heap_type, ptr, 0, "arc_ptr")
+            .unwrap();
+        let one = self.context.i64_type().const_int(1, false);
+        let old = self
+            .builder
+            .build_atomicrmw(
+                AtomicRMWBinOp::Sub,
+                rc_ptr,
+                one,
+                AtomicOrdering::SequentiallyConsistent,
+            )
+            .unwrap();
+
+        let is_last = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, old, one, "arc_is_last")
+            .unwrap();
+
+        let current_fn = self.current_fn.unwrap();
+        let free_bb = self.context.append_basic_block(current_fn, "arc_free");
+        let done_bb = self.context.append_basic_block(current_fn, "arc_done");
+
+        self.builder
+            .build_conditional_branch(is_last, free_bb, done_bb)
+            .unwrap();
+
+        self.builder.position_at_end(free_bb);
+        self.builder
+            .build_call(self.free_fn, &[ptr.into()], "")
+            .unwrap();
+        self.builder.build_unconditional_branch(done_bb).unwrap();
+
+        self.builder.position_at_end(done_bb);
+    }
+
+    /// Dispatch an inc on `name`'s refcount: atomic path when `name` is in
+    /// `arc_fallback_fns` for the current function, plain non-atomic otherwise.
+    fn emit_refcount_inc(&self, name: &str, heap_type: StructType<'ctx>, ptr: PointerValue<'ctx>) {
+        if self.is_arc_binding(name) {
+            self.emit_arc_inc(heap_type, ptr);
+        } else {
+            self.emit_rc_inc(heap_type, ptr);
+        }
+    }
+
+    /// Dispatch a dec on `name`'s refcount: atomic path when `name` is in
+    /// `arc_fallback_fns` for the current function, plain non-atomic otherwise.
+    fn emit_refcount_dec(&self, name: &str, heap_type: StructType<'ctx>, ptr: PointerValue<'ctx>) {
+        if self.is_arc_binding(name) {
+            self.emit_arc_dec(heap_type, ptr);
+        } else {
+            self.emit_rc_dec(heap_type, ptr);
+        }
+    }
+
     /// Track a shared-type variable for scope-exit rc_dec.
     fn track_rc_var(&mut self, name: &str, ptr: PointerValue<'ctx>, heap_type: StructType<'ctx>) {
         if let Some(frame) = self.scope_cleanup_actions.last_mut() {
@@ -1631,7 +1753,7 @@ impl<'ctx> Codegen<'ctx> {
                         } else {
                             *ptr
                         };
-                        self.emit_rc_dec(*heap_type, current_ptr);
+                        self.emit_refcount_dec(name, *heap_type, current_ptr);
                     }
                     CleanupAction::FreeVecBuffer { vec_alloca } => {
                         let cap_ptr = self
@@ -2608,7 +2730,7 @@ impl<'ctx> Codegen<'ctx> {
                         // rc_inc for shared-type parameters (caller keeps its reference).
                         if let Some(info) = self.shared_types.get(type_name.as_str()).cloned() {
                             let ptr = param_val.into_pointer_value();
-                            self.emit_rc_inc(info.heap_type, ptr);
+                            self.emit_refcount_inc(&param_name, info.heap_type, ptr);
                             self.track_rc_var(&param_name, ptr, info.heap_type);
                         }
                     }
@@ -2886,7 +3008,7 @@ impl<'ctx> Codegen<'ctx> {
                     if !is_fresh_construction {
                         // Copying a shared pointer — increment refcount.
                         let ptr = val.into_pointer_value();
-                        self.emit_rc_inc(info.heap_type, ptr);
+                        self.emit_refcount_inc(var_name, info.heap_type, ptr);
                     }
                     // Track for scope-exit cleanup.
                     let ptr = val.into_pointer_value();
@@ -2983,10 +3105,10 @@ impl<'ctx> Codegen<'ctx> {
                                     )
                                     .unwrap()
                                     .into_pointer_value();
-                                self.emit_rc_dec(info.heap_type, old_ptr);
+                                self.emit_refcount_dec(name, info.heap_type, old_ptr);
                                 // rc_inc new pointer
                                 let new_ptr = val.into_pointer_value();
-                                self.emit_rc_inc(info.heap_type, new_ptr);
+                                self.emit_refcount_inc(name, info.heap_type, new_ptr);
                                 self.builder.build_store(slot.ptr, val).unwrap();
                                 return Ok(());
                             }

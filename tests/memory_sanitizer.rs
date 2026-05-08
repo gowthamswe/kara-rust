@@ -561,6 +561,128 @@ fn main() {
         );
     }
 
+    /// Variant of `run_under_asan` that threads `OwnershipCheckResult` into
+    /// codegen. The plain `run_under_asan` passes `None`, which leaves the
+    /// `arc_fallback_fns` table empty — so atomic-RC inc/dec on
+    /// `arc_values`-promoted bindings would never fire from that harness.
+    /// The atomic-RC slice's race-detection check needs the full pipeline.
+    fn run_under_asan_with_ownership(
+        src: &str,
+        label: &str,
+    ) -> Option<(String, std::process::ExitStatus)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let mut parsed = karac::parse(src);
+        if !parsed.errors.is_empty() {
+            eprintln!("[{label}] parse errors: {:?}", parsed.errors);
+            return None;
+        }
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        let ownership = karac::ownershipcheck(&parsed.program, &typed);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let obj_path = format!("/tmp/karac_asan_ow_{}_{}.o", std::process::id(), id);
+        let exe_path = format!("/tmp/karac_asan_ow_{}_{}", std::process::id(), id);
+
+        if let Err(e) = compile_to_object(&parsed.program, &obj_path, Some(&ownership)) {
+            eprintln!("[{label}] compile_to_object failed: {e}");
+            return None;
+        }
+        if !Path::new(&obj_path).exists() {
+            eprintln!("[{label}] object file missing after compile_to_object");
+            return None;
+        }
+        if let Err(e) =
+            link_executable_with_sanitizer(&obj_path, &exe_path, &["-fsanitize=address"])
+        {
+            eprintln!("[{label}] link_executable_with_sanitizer failed: {e}");
+            let _ = std::fs::remove_file(&obj_path);
+            return None;
+        }
+
+        let asan_options = if cfg!(target_os = "macos") {
+            "abort_on_error=0:exitcode=23"
+        } else {
+            "detect_leaks=1:abort_on_error=0:exitcode=23"
+        };
+        let output = Command::new(&exe_path)
+            .env("ASAN_OPTIONS", asan_options)
+            .output();
+
+        let _ = std::fs::remove_file(&obj_path);
+        let _ = std::fs::remove_file(&exe_path);
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    eprintln!("[{label}] binary exited non-zero:\n{stderr}");
+                }
+                Some((stdout, out.status))
+            }
+            Err(e) => {
+                eprintln!("[{label}] failed to run binary: {e}");
+                None
+            }
+        }
+    }
+
+    fn assert_clean_asan_run_with_ownership(src: &str, label: &str) {
+        if !asan_available() {
+            eprintln!("[{label}] ASAN unavailable on this host — skipping");
+            return;
+        }
+        let Some((_stdout, status)) = run_under_asan_with_ownership(src, label) else {
+            eprintln!("[{label}] setup failed — skipping");
+            return;
+        };
+        assert!(
+            status.success(),
+            "[{label}] ASAN reported a memory error (exit code {:?}). \
+             Look for `data race`, `heap-use-after-free`, `double-free`, \
+             or `LeakSanitizer` in the stderr above.",
+            status.code()
+        );
+    }
+
+    // ── Atomic-RC across par {}: refcount race detection ─────────
+    // The `arc_values` subset of RC bindings crosses `par {}` thread
+    // boundaries. With non-atomic load+add+store the refcount races
+    // when both branches run concurrent inc/dec on the same heap block;
+    // with atomic-RC (`atomicrmw add` / `atomicrmw sub`, `SeqCst`) the
+    // increment is race-free. ASAN's standard run does not detect data
+    // races on its own, but it *will* catch the secondary symptoms:
+    // a UAF when the racing dec drops below zero and one branch tries
+    // to free a still-live heap block, or a double-free when both
+    // branches independently free. Pre-slice (substep 2 missing) this
+    // test would manifest one of those errors under load; with the
+    // atomic path it stays clean.
+
+    #[test]
+    fn asan_par_block_arc_promoted_no_double_free() {
+        assert_clean_asan_run_with_ownership(
+            r#"
+shared struct Counter { val: i64 }
+fn use_c(c: Counter) -> i64 { c.val }
+fn main() {
+    let cond: bool = false;
+    let c = Counter { val: 7 };
+    let d = c;
+    if cond { use_c(d); }
+    par {
+        println(use_c(d));
+        println(use_c(d));
+    }
+}
+"#,
+            "par_block_arc_promoted_no_double_free",
+        );
+    }
+
     #[test]
     fn asan_vec_clone_repeat_stresses_scope_cleanup() {
         // Clone in a fresh scope across multiple loop iterations —
