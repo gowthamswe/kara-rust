@@ -708,11 +708,9 @@ struct Codegen<'ctx> {
     provider_vtables: HashMap<(String, String), GlobalValue<'ctx>>,
     /// Runtime extern: `karac_provider_push(frame_ptr, resource_id, data_ptr, vtable_ptr)`.
     /// Consumed by `with_provider[R]` lowering (sub-step 3).
-    #[allow(dead_code)]
     karac_provider_push_fn: FunctionValue<'ctx>,
     /// Runtime extern: `karac_provider_pop()`. Consumed by `with_provider[R]`
     /// lowering (sub-step 3) for the matching pop on body exit.
-    #[allow(dead_code)]
     karac_provider_pop_fn: FunctionValue<'ctx>,
     /// Runtime extern: `karac_provider_lookup(resource_id) -> ProviderLookupResult`.
     /// Consumed by `R.method(...)` dispatch (sub-step 4) to find the
@@ -724,7 +722,6 @@ struct Codegen<'ctx> {
     /// at `with_provider[R]` lowering sites for the alloca'd frame storage
     /// (sub-step 3); declared here so the type is established alongside
     /// the runtime extern declarations.
-    #[allow(dead_code)]
     provider_frame_ty: StructType<'ctx>,
     /// LLVM struct type for `ProviderLookupResult { data, vtable }` —
     /// matches the runtime's `#[repr(C)]` shape. Consumed at
@@ -2950,6 +2947,16 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
+        // Theme 6: emit static vtables for impls of provider traits.
+        // Runs after impl methods are *declared* (their fn-ptrs become
+        // vtable entries) but BEFORE function bodies are compiled — body
+        // compilation may include `with_provider[R]` call sites that
+        // need the vtable global to already exist in `provider_vtables`
+        // for the lookup at sub-step 3 lowering time. Bodies don't need
+        // to be compiled yet because the vtable only references fn-ptr
+        // symbols which were established by `declare_function`.
+        self.emit_provider_vtables(program);
+
         // Second pass: compile concrete functions (generic ones are compiled lazily).
         for item in &program.items {
             if let Item::Function(f) = item {
@@ -2988,13 +2995,6 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
         }
-
-        // Theme 6: emit static vtables for impls of provider traits.
-        // Runs after impl methods are declared (they're referenced by the
-        // vtable entries) and before `emit_llvm_used` so any `#[used]`
-        // attributes on the vtable globals would still apply (no v1
-        // attributes attach to vtable globals today).
-        self.emit_provider_vtables(program);
 
         self.emit_llvm_used();
         self.emit_spawn_sites_metadata();
@@ -3066,6 +3066,216 @@ impl<'ctx> Codegen<'ctx> {
             self.provider_vtables
                 .insert((target_name, trait_name), vt_global);
         }
+    }
+
+    /// Theme 6 sub-step 3: lower `with_provider[R](provider, ||body)`.
+    ///
+    /// Generates:
+    /// ```text
+    ///   %frame = alloca ProviderFrame
+    ///   %data = <pointer to provider value>
+    ///   call void @karac_provider_push(%frame, <resource_id>, %data, @VT_<U>_<T>)
+    ///   <body>                                    ; inlined closure body
+    ///   call void @karac_provider_pop()
+    ///   ; result = body's value
+    /// ```
+    ///
+    /// The `ProviderFrame` is alloca'd on the entry block so each
+    /// `with_provider` call site has its own per-invocation slot — the
+    /// runtime only mutates head pointers, the storage is caller-owned.
+    /// Restrictions for v1: the closure argument must be an inline
+    /// `||body` literal (the canonical Parallax-lite shape); a named
+    /// closure-binding form would require routing through the indirect
+    /// closure-call path. The provider's impl-target type is inferred
+    /// from a small set of receiver-shape patterns (identifier whose
+    /// `var_type_names` is set, struct literal, shared-struct value);
+    /// other shapes return a codegen error.
+    fn compile_with_provider(
+        &mut self,
+        resource: &str,
+        provider_expr: &Expr,
+        closure_expr: &Expr,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        // 1. Resolve the resource ID and provider trait. Both must have
+        //    been populated by the early walk over `Item::EffectResource`
+        //    in `compile_program`; absence here means the resource
+        //    name is bogus or the resource has no provider trait
+        //    (`effect resource R;` without `: T`), which the typechecker
+        //    should already reject before codegen runs.
+        let resource_id = self
+            .provider_resource_ids
+            .get(resource)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "with_provider: unknown effect resource '{}' (no resource ID assigned)",
+                    resource
+                )
+            })?;
+        let trait_name = self
+            .provider_resource_traits
+            .get(resource)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "with_provider: resource '{}' has no provider trait — `with_provider` \
+                     requires `effect resource {}: T` for some trait T",
+                    resource, resource
+                )
+            })?;
+
+        // 2. Infer the provider's impl-target type and look up its vtable.
+        let provider_type_name = self
+            .infer_provider_type_name(provider_expr)
+            .ok_or_else(|| {
+                format!(
+                    "with_provider[{}]: cannot infer concrete provider type at codegen — \
+                 supported shapes are an identifier with a known struct type or a \
+                 struct literal",
+                    resource
+                )
+            })?;
+        let vt_global = self
+            .provider_vtables
+            .get(&(provider_type_name.clone(), trait_name.clone()))
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "with_provider[{}]: no vtable found for `impl {} for {}` — check that \
+                     the impl exists and `effect resource {}: {}` is declared at the top level",
+                    resource, trait_name, provider_type_name, resource, trait_name
+                )
+            })?;
+
+        // 3. Materialize a pointer to the provider's data. For shared
+        //    structs, the loaded variable value IS the heap pointer
+        //    (`{refcount, fields...}`); for value-type structs, take the
+        //    storage alloca, or alloca-and-store a fresh value when the
+        //    provider expression isn't a known identifier.
+        let data_ptr = self.compile_provider_data_ptr(provider_expr, &provider_type_name)?;
+
+        // 4. Alloca a `ProviderFrame` on the function entry block so the
+        //    storage outlives the push/pop pair without re-alloca'ing
+        //    on each loop iteration if a `with_provider` is in a loop.
+        let fn_val = self.current_fn.ok_or_else(|| {
+            "with_provider: no current function (called from top-level?)".to_string()
+        })?;
+        let frame_ptr = self.create_entry_alloca(fn_val, "wp.frame", self.provider_frame_ty.into());
+
+        // 5. Push: karac_provider_push(frame, resource_id, data, vtable_ptr).
+        let i32_t = self.context.i32_type();
+        let id_v = i32_t.const_int(resource_id as u64, false);
+        let vtable_ptr = vt_global.as_pointer_value();
+        self.builder
+            .build_call(
+                self.karac_provider_push_fn,
+                &[
+                    frame_ptr.into(),
+                    id_v.into(),
+                    data_ptr.into(),
+                    vtable_ptr.into(),
+                ],
+                "",
+            )
+            .unwrap();
+
+        // 6. Inline the closure body. Only inline `||body` is supported in
+        //    v1 — the body's free variables resolve against the outer
+        //    scope, exactly as the interpreter handles a `with_provider`
+        //    closure (see `Interpreter::eval_with_provider`).
+        let body_result = self.compile_with_provider_body(closure_expr, resource)?;
+
+        // 7. Pop: karac_provider_pop(). Matches the push; the runtime
+        //    asserts head==frame and walks back to `frame.prev`.
+        self.builder
+            .build_call(self.karac_provider_pop_fn, &[], "")
+            .unwrap();
+
+        Ok(body_result)
+    }
+
+    /// Determine the concrete impl-target type name of a provider
+    /// expression at codegen, used to look up the right `@VT_<U>_<T>`
+    /// vtable. Supports:
+    ///   - `ExprKind::Identifier(n)` whose `var_type_names[n]` is set
+    ///     (covers `let p = MyProvider { ... }; with_provider[R](p, ...)`);
+    ///   - `ExprKind::StructLit { name, ... }` for inline construction.
+    /// Other shapes (function-return values, field projections, etc.)
+    /// fall through and the caller emits a codegen error.
+    fn infer_provider_type_name(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Identifier(n) => self.var_type_names.get(n.as_str()).cloned(),
+            ExprKind::StructLiteral { path, .. } => path.last().cloned(),
+            _ => None,
+        }
+    }
+
+    /// Materialize a pointer to the provider value's data, suitable for
+    /// passing to `karac_provider_push` and reading back as `*const Self`
+    /// inside vtable methods.
+    ///
+    /// - **Shared struct provider:** the loaded value IS the heap pointer
+    ///   (`{refcount, fields...}`). Vtable methods for shared structs
+    ///   already know how to skip the refcount slot, so we pass the heap
+    ///   pointer directly.
+    /// - **Value-type struct provider, identifier receiver:** use the
+    ///   variable's alloca pointer via `get_data_ptr`. This is in-place
+    ///   (no copy), so mutations through `mut ref self` persist back to
+    ///   the binding — same semantics as a direct method call.
+    /// - **Value-type struct provider, struct-literal receiver (or
+    ///   anything else):** alloca a fresh slot, store the compiled value,
+    ///   and pass that. The lifetime of the alloca is the enclosing
+    ///   function frame, so the runtime stack can hold the pointer for
+    ///   the entire `with_provider` body without aliasing concerns.
+    fn compile_provider_data_ptr(
+        &mut self,
+        expr: &Expr,
+        type_name: &str,
+    ) -> Result<inkwell::values::PointerValue<'ctx>, String> {
+        if self.shared_types.contains_key(type_name) {
+            let v = self.compile_expr(expr)?;
+            let pv = v.into_pointer_value();
+            return Ok(pv);
+        }
+        if let ExprKind::Identifier(name) = &expr.kind {
+            if let Some(ptr) = self.get_data_ptr(name) {
+                return Ok(ptr);
+            }
+        }
+        let fn_val = self
+            .current_fn
+            .ok_or_else(|| "with_provider: no current function for provider alloca".to_string())?;
+        let v = self.compile_expr(expr)?;
+        let alloca = self.create_entry_alloca(fn_val, "wp.data", v.get_type());
+        self.builder.build_store(alloca, v).unwrap();
+        Ok(alloca)
+    }
+
+    /// Inline-compile the `with_provider` body closure. Only the
+    /// `||body` literal form is supported — non-zero-arg closures would
+    /// indicate a typechecker bug (the with_provider signature requires
+    /// `() -> R`), and named closure values would need the indirect
+    /// fat-pointer call path which v1 does not wire up here.
+    fn compile_with_provider_body(
+        &mut self,
+        closure_expr: &Expr,
+        resource: &str,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let ExprKind::Closure { params, body, .. } = &closure_expr.kind else {
+            return Err(format!(
+                "with_provider[{}]: closure argument must be an inline `||body` \
+                 literal (named closure bindings unsupported in v1)",
+                resource
+            ));
+        };
+        if !params.is_empty() {
+            return Err(format!(
+                "with_provider[{}]: closure must take zero arguments, got {}",
+                resource,
+                params.len()
+            ));
+        }
+        self.compile_expr(body)
     }
 
     /// Materialize the special `@llvm.used` global from `used_symbols`.
@@ -11320,6 +11530,18 @@ impl<'ctx> Codegen<'ctx> {
         };
         self.emit_branch_cancel_check("call", callee_key.as_deref());
 
+        // Theme 6 sub-step 3: `with_provider[R](provider, ||body)`.
+        // Recognize the call shape before the generic dispatch below — the
+        // callee is an `Index` expression which would otherwise fall through
+        // to the unknown-callee path and return const-0. The lowering pushes
+        // a `ProviderFrame` onto the runtime stack, runs the body, pops, and
+        // yields the body's value.
+        if let Some((resource, provider_expr, closure_expr)) =
+            match_with_provider_call(callee, args)
+        {
+            return self.compile_with_provider(&resource, provider_expr, closure_expr);
+        }
+
         // Associated function calls: Vec::new(), etc.
         if let ExprKind::Path { segments, .. } = &callee.kind {
             if segments.len() == 2 {
@@ -14451,6 +14673,37 @@ fn impl_target_name(target: &TypeExpr) -> Option<String> {
         TypeKind::Path(p) => p.segments.last().cloned(),
         _ => None,
     }
+}
+
+/// Recognize the `with_provider[R](provider, closure)` call shape at AST
+/// level. Mirror of `Interpreter::match_with_provider` and
+/// `provider_escape::match_with_provider`. Returns `(R, provider_expr,
+/// closure_expr)` when the callee is `Index(Ident("with_provider") |
+/// Path(["with_provider"]), R)` with exactly two unlabeled args, else `None`.
+fn match_with_provider_call<'e>(
+    callee: &'e Expr,
+    args: &'e [CallArg],
+) -> Option<(String, &'e Expr, &'e Expr)> {
+    let ExprKind::Index { object, index } = &callee.kind else {
+        return None;
+    };
+    let is_with_provider = match &object.kind {
+        ExprKind::Identifier(n) => n == "with_provider",
+        ExprKind::Path { segments, .. } => segments.as_slice() == ["with_provider"],
+        _ => false,
+    };
+    if !is_with_provider {
+        return None;
+    }
+    let resource = match &index.kind {
+        ExprKind::Identifier(n) => n.clone(),
+        ExprKind::Path { segments, .. } => segments.last().cloned()?,
+        _ => return None,
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    Some((resource, &args[0].value, &args[1].value))
 }
 
 /// `true` when the method has no `ref T` / `mut ref T` parameters, so its

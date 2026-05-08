@@ -6828,4 +6828,98 @@ fn main() {
             ir
         );
     }
+
+    // ── Theme 6: with_provider[R] lowering (sub-step 3) ──────────────────
+    //
+    // Structural tests pinning the alloca + push + body + pop sequence
+    // emitted at each `with_provider[R](provider, ||body)` call site. The
+    // body's value is whatever the closure expression evaluates to;
+    // dispatch through `R.method(...)` is sub-step 4.
+
+    #[test]
+    fn test_with_provider_emits_push_and_pop() {
+        let ir = ir_for(
+            "pub trait Recorder { fn record(value: i64); }\n\
+             pub struct Counter { n: i64 }\n\
+             impl Recorder for Counter { fn record(value: i64) { } }\n\
+             pub effect resource Metric: Recorder;\n\
+             fn main() {\n\
+               let p = Counter { n: 0 };\n\
+               with_provider[Metric](p, || { 42 });\n\
+             }",
+        );
+        assert!(
+            ir.contains("call void @karac_provider_push"),
+            "expected karac_provider_push call; IR: {}",
+            ir
+        );
+        assert!(
+            ir.contains("call void @karac_provider_pop"),
+            "expected karac_provider_pop call; IR: {}",
+            ir
+        );
+        assert!(
+            ir.contains("@VT_Counter_Recorder"),
+            "expected vtable reference @VT_Counter_Recorder in push args; IR: {}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_with_provider_resource_id_matches_declaration_order() {
+        // Resource IDs are assigned in source-declaration order from the
+        // top-level walk in compile_program. With three resources, the
+        // third (Disk) has ID 2; verify the push call carries i32 2.
+        let ir = ir_for(
+            "pub trait Recorder { fn record(value: i64); }\n\
+             pub struct Counter { n: i64 }\n\
+             impl Recorder for Counter { fn record(value: i64) { } }\n\
+             pub effect resource Net: Recorder;\n\
+             pub effect resource Mem: Recorder;\n\
+             pub effect resource Disk: Recorder;\n\
+             fn main() {\n\
+               let p = Counter { n: 0 };\n\
+               with_provider[Disk](p, || { 0 });\n\
+             }",
+        );
+        // The push call is `karac_provider_push(frame, id, data, vtable)`.
+        // Matcher: any line containing both `karac_provider_push` and
+        // `i32 2` confirms the third resource's ID flowed through.
+        let push_lines: Vec<&str> = ir
+            .lines()
+            .filter(|l| l.contains("karac_provider_push"))
+            .collect();
+        assert!(
+            push_lines.iter().any(|l| l.contains("i32 2")),
+            "expected push with i32 2 (resource Disk has declaration index 2); push lines: {:?}",
+            push_lines
+        );
+    }
+
+    #[test]
+    fn test_with_provider_returns_body_value() {
+        // The body's result becomes the with_provider expression's
+        // value. Smoke-test that an `i64` literal body lowers without
+        // error and the function returns a non-void path.
+        let ir = ir_for(
+            "pub trait Recorder { fn record(value: i64); }\n\
+             pub struct Counter { n: i64 }\n\
+             impl Recorder for Counter { fn record(value: i64) { } }\n\
+             pub effect resource Metric: Recorder;\n\
+             fn run() -> i64 {\n\
+               let p = Counter { n: 0 };\n\
+               with_provider[Metric](p, || { 7 })\n\
+             }",
+        );
+        assert!(
+            ir.contains("define i64 @run"),
+            "expected `run` returns i64; IR: {}",
+            ir
+        );
+        assert!(
+            ir.contains("call void @karac_provider_push"),
+            "expected push inside run; IR: {}",
+            ir
+        );
+    }
 }
