@@ -13,20 +13,14 @@
 // that fans out the three `record_*` calls across the runtime's worker
 // pool.
 //
-// Why not call `MetricsA.record(WORK)` here? In v1 the
-// `with_provider[R](instance, || { ... })` mechanism is fully spec'd
-// (`docs/design.md § Provider-Rooted Resources`) and runs correctly
-// in the interpreter, but `karac build` does not yet emit the
-// vtable + per-task-stack ABI for the spec'd dispatch — so a
-// `MetricsA.record(...)` call is a no-op at runtime. To keep the
-// wall-clock benchmark meaningful we inline the busy-compute kernel
-// directly into each driver. The effect resources `MetricsA / B / C`
-// remain declared (in resources.kara) and the driver functions
-// remain effect-annotated `writes(MetricsA / B / C)` — that is what
-// the auto-par analyzer keys off, unaffected by the codegen gap.
-// Once the codegen wiring lands (phase-8-stdlib-floor.md § Provider
-// Implementations § GAP-N follow-up), the `record_*` bodies swap to
-// `MetricsA.record(WORK)` with no surrounding-shape change.
+// Each driver dispatches its busy-compute kernel through the
+// provider-rooted `R.record(WORK)` call. The trait-method dispatch
+// is the canonical Kāra shape — auto-par grouping keys off the
+// declared `writes(R_i)` effects, and the actual work happens on the
+// bound provider's `record(...)` impl (see `resources.kara`'s
+// `InMemoryMetrics::record`). The codegen wiring landed as Theme 6
+// sub-steps 3+4+5 (`with_provider[R]` lowering, `R.method` indirect
+// dispatch, par-block provider-stack inheritance).
 //
 // Demo-shape gap: the canonical Parallax demo (fan-out + join) is *not*
 // what this workload models. Joining results from parallel branches
@@ -43,51 +37,29 @@ import resources.{MetricsA, MetricsB, MetricsC};
 // single source-of-truth without editing every driver.
 pub const WORK: i64 = 50000000;
 
-// Busy-compute kernel inlined into each driver. The running sum is
-// published via a printout so the optimizer cannot strip the loop
-// body. Each driver carries a distinct `writes(R_i)` effect on
-// disjoint resources — the analyzer's groupability key.
+// Each driver fires the busy-compute kernel via the provider-rooted
+// dispatch path `MetricsA.record(WORK)`. The kernel itself lives in
+// `resources.kara::InMemoryMetrics::record` — same additive-only
+// loop the inlined v0 form used (kept additive so the inferred
+// `panics` from `__builtin_div_rem` stays out and doesn't poison the
+// `process_request` parallel group).
 //
-// The kernel uses only `+` (no `%`/`/`) intentionally: the
-// `__builtin_div_rem` builtin carries an inferred `panics` effect
-// (div-by-zero), and `panics + panics` is a self-conflict in the
-// concurrency analyzer (correctly modeling that concurrent panic
-// aggregation is undefined). Using `%` for modular reduction would
-// cause the three drivers to inherit `panics` and refuse to group,
-// short-circuiting the whole demo. `i64` overflow is *outside* the
-// effect system's scope per `effectchecker.rs:380` — overflow traps
-// are runtime concerns, not effect-system concerns. The sum
-// `0+1+...+50M` ≈ 1.25e15 fits in `i64::MAX` (≈9.2e18) with three
-// orders of magnitude of headroom, so the loop is overflow-safe.
+// The driver functions stay effect-annotated `writes(R_i)` because
+// the auto-par analyzer's groupability key is the *declared* effect,
+// not the dispatch implementation. `R.record(WORK)` carries the
+// provider trait's `writes(R)` annotation through to the caller's
+// effect signature — see `resources.kara`'s trait declaration.
 
 fn record_a() with writes(MetricsA) {
-    let mut sum: i64 = 0;
-    let mut i: i64 = 0;
-    while i < WORK {
-        sum = sum + i;
-        i = i + 1;
-    }
-    println(sum);
+    MetricsA.record(WORK);
 }
 
 fn record_b() with writes(MetricsB) {
-    let mut sum: i64 = 0;
-    let mut i: i64 = 0;
-    while i < WORK {
-        sum = sum + i;
-        i = i + 1;
-    }
-    println(sum);
+    MetricsB.record(WORK);
 }
 
 fn record_c() with writes(MetricsC) {
-    let mut sum: i64 = 0;
-    let mut i: i64 = 0;
-    while i < WORK {
-        sum = sum + i;
-        i = i + 1;
-    }
-    println(sum);
+    MetricsC.record(WORK);
 }
 
 // The aggregator. Three top-level call statements, no return value.

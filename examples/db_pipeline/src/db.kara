@@ -4,25 +4,23 @@
 // It exercises: effect resources, provider-rooted injection, and trait-bound
 // effect declarations.
 //
-// GAP-N: Effect resource method call codegen.
-//   Spec is locked — `docs/design.md § Provider-Rooted Resources` covers
-//   it: `Db.method(args)` inside a `with reads(Db)` function desugars to
-//   a vtable call through the current task's top-of-stack `Arc<dyn
-//   DbProvider>` binding, with the per-task provider stack pushed by
-//   `with_provider[R](p, ||...)` and Arc-shared into spawned tasks. See
-//   the "Resource call desugaring" + "Runtime mechanics" + "with_provider
-//   and parameterized resources" paragraphs for the full rule.
-//   The interpreter already implements this (`src/interpreter.rs` ::
-//   `eval_resource_method`). The remaining gap is **codegen-only** —
-//   `karac build` does not yet emit the vtable + per-task-stack ABI the
-//   spec describes, so a `Db.query_table(...)` call inside a
-//   `with_provider[Db](...)` scope compiles + links but does not invoke
-//   the bound provider's impl method at runtime. Tracked as
-//   "with_provider[R] trait-method dispatch wiring" in
-//   `docs/implementation_checklist/phase-8-stdlib-floor.md` § Provider
-//   Implementations; pairs with `phase-7-codegen.md` "Par codegen:
-//   return values" for the canonical Parallax demo (`docs/demo_ideas.md
-//   § Demo 1`).
+// GAP-N (CLOSED): Effect resource method call codegen.
+//   Spec at `docs/design.md § Provider-Rooted Resources`: `Db.method(args)`
+//   inside a `with reads(Db)` function desugars to an indirect vtable call
+//   through the current task's top-of-stack provider binding, with the
+//   per-task provider stack pushed by `with_provider[R](p, ||...)` and
+//   inherited into spawned par-block branches.
+//   Closed by Theme 6 sub-steps 1-7 (commits `9eb73d6` through `7d0d462`):
+//   sub-step 1 ships the runtime ABI (ProviderFrame, push/pop/lookup
+//   externs, env-struct snapshot/seed for par-block inheritance);
+//   sub-steps 2-4 wire codegen (static `@VT_<U>_<T>` vtables, the
+//   `with_provider[R](p, ||body)` push/inline/pop lowering, the
+//   `R.method(args)` lookup + indirect-vtable-call dispatch); sub-step 5
+//   carries the parent thread's stack head into each spawned par-branch
+//   via the env-struct trailing pointer. The Parallax-lite example at
+//   `examples/parallax_lite/` exercises the full canonical shape — three
+//   nested `with_provider[MetricsA/B/C]` scopes wrapping an auto-par'd
+//   aggregator that fans out three `R.record(WORK)` dispatches.
 //
 // GAP-O: Parameterized resources for table-level granularity.
 //   `effect resource Db: DatabaseProvider` is a single resource covering the

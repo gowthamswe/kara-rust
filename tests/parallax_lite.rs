@@ -73,6 +73,24 @@ mod parallax_lite_tests {
         format!("{resources}\n{workload_no_import}\n")
     }
 
+    /// Concatenate resources + workload + main into a single source
+    /// string, dropping cross-module `import` lines. Used by the
+    /// canonical-shape e2e tests (sub-step 7 close-out) — main.kara is
+    /// where the nested `with_provider` setup lives, and we want to
+    /// exercise it through the same in-process pipeline that
+    /// `workload_source()` uses for the workload-only tests.
+    fn full_program_source() -> String {
+        let root = workspace_root();
+        let main_kara = std::fs::read_to_string(root.join("examples/parallax_lite/src/main.kara"))
+            .expect("main.kara missing");
+        let main_no_import: String = main_kara
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("import "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{}\n{}\n", workload_source(), main_no_import)
+    }
+
     /// Run the full pipeline on the workload source and produce the
     /// LLVM IR. Mirrors `tests/par_codegen.rs::ir_for_with_concurrency`
     /// but loads from disk and explicitly populates the auto-par path.
@@ -95,6 +113,77 @@ mod parallax_lite_tests {
         let analysis = karac::concurrency_analyze(&parsed.program, &effects);
         compile_to_ir_with_options(&parsed.program, None, Some(&analysis), None, None)
             .expect("workload codegen failed")
+    }
+
+    /// Theme 6 sub-step 7 close-out: the full canonical Parallax-lite
+    /// program (resources + workload + main, with main's nested
+    /// `with_provider[MetricsA/B/C]` shape) compiles cleanly through
+    /// every pipeline phase. This is the sub-step 6 "1 integration
+    /// test" mandate — it pins the spec'd entry shape end-to-end
+    /// without going through link/exec, which keeps the test fast and
+    /// portable even when libkarac_runtime.a or a system linker isn't
+    /// available.
+    #[test]
+    fn test_parallax_lite_full_program_compiles_clean() {
+        let src = full_program_source();
+        let mut parsed = karac::parse(&src);
+        assert!(
+            parsed.errors.is_empty(),
+            "full program (resources+workload+main) should parse; got {:?}",
+            parsed.errors
+        );
+        let resolved = karac::resolve(&parsed.program);
+        assert!(
+            resolved.errors.is_empty(),
+            "full program should resolve; got {:?}",
+            resolved.errors
+        );
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        assert!(
+            typed.errors.is_empty(),
+            "full program should typecheck; got {:?}",
+            typed.errors
+        );
+        karac::lower(&mut parsed.program, &typed);
+        let effects = karac::effectcheck(&parsed.program);
+        assert!(
+            effects.errors.is_empty(),
+            "full program should effect-check; got {:?}",
+            effects.errors
+        );
+        let _ownership = karac::ownershipcheck(&parsed.program, &typed);
+        let analysis = karac::concurrency_analyze(&parsed.program, &effects);
+        let ir = karac::codegen::compile_to_ir_with_options(
+            &parsed.program,
+            None,
+            Some(&analysis),
+            None,
+            None,
+        );
+        assert!(
+            ir.is_ok(),
+            "full program should codegen cleanly; got {:?}",
+            ir.err()
+        );
+        let ir = ir.unwrap();
+        // Sub-step 7 close-out shape pins: the nested with_provider
+        // chain in main produces three push/pop pairs (one per
+        // resource), and the par-block inside process_request emits
+        // the provider-stack inheritance plumbing.
+        let push_count = ir
+            .lines()
+            .filter(|l| l.contains("call") && l.contains("@karac_provider_push"))
+            .count();
+        assert_eq!(
+            push_count, 3,
+            "full program should emit 3 karac_provider_push calls (one per nested with_provider \
+             frame in main); got {}",
+            push_count
+        );
+        assert!(
+            ir.contains("call") && ir.contains("@karac_provider_get_stack_head"),
+            "full program should snapshot the provider stack head at par-block entry"
+        );
     }
 
     #[test]

@@ -1,24 +1,33 @@
 // main.kara — Parallax-lite entry point.
 //
-// Note (deviation from plan): a faithful `with_provider[MetricsA]`
-// nesting (mirroring `db_pipeline/src/main.kara`) is documented as the
-// preferred entry shape, but in v1 the provider-rooted dispatch path
-// (`db_pipeline::db.kara` GAP-N) has not yet been wired through codegen
-// — a `MetricsA.record(...)` call inside a `with_provider` scope is a
-// no-op at runtime. Auto-par lowering is unaffected (it keys off the
-// `writes(R_i)` effect annotations, not provider availability), so the
-// codegen tests pin auto-par behavior directly without the provider
-// dance. The entry-point falls back to calling `process_request()`
-// directly, which is sufficient for the wall-clock benchmark — each
-// `record_*` driver in workload.kara does its own busy-compute kernel
-// inline. Once GAP-N closes, this main can grow back the canonical
-// nested-`with_provider` shape (the providers, trait, and three
-// distinct effect resources are already declared in resources.kara and
-// are picked up by the analyzer).
+// Canonical Kāra shape: three distinct providers (one per effect
+// resource), nested `with_provider[R]` scopes, and a single call to
+// the auto-par'd aggregator at the innermost scope. The provider
+// stack snapshot taken at par-block entry (Theme 6 sub-step 5) flows
+// into each spawned worker, so `MetricsA.record(...)` /
+// `MetricsB.record(...)` / `MetricsC.record(...)` inside the
+// individual `record_*` driver branches all resolve through the
+// runtime-stack walk.
+//
+// Demo-shape gap (carried forward): joining results from the parallel
+// branches still requires `karac_par_run` per-branch return slots —
+// open as `phase-7-codegen.md:182` "Par codegen: return values". v1
+// ships effect-only fan-out: each driver mutates its own provider's
+// state but the aggregate result is not propagated back.
 
+import resources.{InMemoryMetrics, MetricsA, MetricsB, MetricsC};
 import workload.process_request;
 
 fn main() {
-    process_request();
+    let mut pa = InMemoryMetrics.new();
+    let mut pb = InMemoryMetrics.new();
+    let mut pc = InMemoryMetrics.new();
+    with_provider[MetricsA](pa, || {
+        with_provider[MetricsB](pb, || {
+            with_provider[MetricsC](pc, || {
+                process_request();
+            });
+        });
+    });
     println("done");
 }
