@@ -1330,19 +1330,28 @@ mod tests {
     //! Runtime unit tests for the Debugger Contract slice 4 surface
     //! (parent-frame ref + `KaracWaitTarget`).
     //!
-    //! **Env-var test isolation.** Two factors complicate
-    //! `KARAC_RUNTIME_DEBUG_METADATA` testing:
+    //! **Frame-tracking test isolation.** Two distinct hazards force
+    //! these tests to serialize on `FRAME_TRACKING_ENV_LOCK`:
     //!
-    //! 1. Cargo runs tests in parallel, so any test that mutates the env
-    //!    var races peers reading it.
-    //! 2. `runtime_debug_metadata_enabled` caches its result in a
-    //!    `OnceLock<bool>` — once initialized the env-var read never
-    //!    repeats, so a test mutating the var after another test has
-    //!    triggered initialization observes nothing.
+    //! 1. **Env-var races on `KARAC_RUNTIME_DEBUG_METADATA`.** Cargo runs
+    //!    tests in parallel, so any test that mutates the var races peers
+    //!    reading it. Compounding this, `runtime_debug_metadata_enabled`
+    //!    caches its result in a `OnceLock<bool>` — once initialized the
+    //!    env read never repeats, so a test mutating the var after another
+    //!    test has triggered initialization observes nothing.
+    //! 2. **Shared-state races on `ACTIVE_FRAMES`.** The registry is a
+    //!    process-global `static Mutex<Vec<FramePtr>>`, not thread-local.
+    //!    Any test that pushes frames into it (directly via `FrameGuard`
+    //!    or transitively by calling `karac_par_run`) or that reads it
+    //!    (directly or via `karac_runtime_list_par_blocks_into` /
+    //!    `karac_runtime_for_each_active_frame`) must hold the lock.
+    //!    Without this, a reader test can run during another test's
+    //!    barrier window and observe frames it shouldn't.
     //!
-    //! Resolution: tests serialize on `FRAME_TRACKING_ENV_LOCK`, and the
-    //! disabled-path test goes through `runtime_debug_metadata_enabled_uncached`
-    //! (test-only re-read that bypasses the cache). This mirrors slice 3's
+    //! Resolution: every frame-tracking test acquires
+    //! `FRAME_TRACKING_ENV_LOCK` at entry, and the disabled-path test
+    //! goes through `runtime_debug_metadata_enabled_uncached` (test-only
+    //! re-read that bypasses the cache). This mirrors slice 3's
     //! `SPAWN_SITE_ENV_LOCK` pattern in `tests/codegen.rs`.
     //!
     //! Frame-pointer cross-thread shuttling uses `usize` casts so the
@@ -1354,7 +1363,9 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Barrier, Mutex};
 
-    /// Serializes env-var-touching tests. See module-level comment.
+    /// Serializes tests that touch the `KARAC_RUNTIME_DEBUG_METADATA`
+    /// env var or the process-global `ACTIVE_FRAMES` registry (read or
+    /// write). See the module-level comment for the two hazards.
     static FRAME_TRACKING_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// `KaracWaitTarget` v1 layout pin. Single-variant `None` under
@@ -1839,6 +1850,17 @@ mod tests {
         // Slice 5: `karac_runtime_list_par_blocks_into` writes
         // `{null, 0, 0}` when `ACTIVE_FRAMES` is empty. Validates the
         // empty-fast-path branch.
+        //
+        // Holds `FRAME_TRACKING_ENV_LOCK` because peer tests
+        // (e.g. `test_active_frames_register_during_par`) push worker
+        // frames into the process-global `ACTIVE_FRAMES` and park on a
+        // barrier — without the lock this test races them and observes
+        // a non-empty registry, taking the allocation path instead of
+        // the fast path.
+        let _guard = FRAME_TRACKING_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
         let mut out = KaracVec {
             data: std::ptr::null_mut(),
             len: -1,
