@@ -11558,6 +11558,64 @@ impl<'ctx> Codegen<'ctx> {
         Ok(val)
     }
 
+    fn compile_vec_index_store(
+        &mut self,
+        var_name: &str,
+        index: &Expr,
+        val: BasicValueEnum<'ctx>,
+    ) -> Result<(), String> {
+        let i64_t = self.context.i64_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let vec_ty = self.vec_struct_type();
+        let elem_ty = self.vec_elem_type_for_var(var_name);
+        let vec_ptr = self
+            .get_data_ptr(var_name)
+            .ok_or_else(|| format!("Undefined Vec variable '{}' in index store", var_name))?;
+        let idx_val = self.compile_expr(index)?.into_int_value();
+
+        let len_ptr = self
+            .builder
+            .build_struct_gep(vec_ty, vec_ptr, 1, "v.st.len.ptr")
+            .unwrap();
+        let len = self
+            .builder
+            .build_load(i64_t, len_ptr, "v.st.len")
+            .unwrap()
+            .into_int_value();
+        let data_pp = self
+            .builder
+            .build_struct_gep(vec_ty, vec_ptr, 0, "v.st.data.ptr")
+            .unwrap();
+        let data = self
+            .builder
+            .build_load(ptr_ty, data_pp, "v.st.data")
+            .unwrap()
+            .into_pointer_value();
+
+        let fn_val = self.current_fn.unwrap();
+        let oob_bb = self.context.append_basic_block(fn_val, "v.st.oob");
+        let ok_bb = self.context.append_basic_block(fn_val, "v.st.ok");
+        let cmp = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::UGE, idx_val, len, "bounds")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(cmp, oob_bb, ok_bb)
+            .unwrap();
+        self.builder.position_at_end(oob_bb);
+        self.emit_panic("vec index out of bounds");
+        self.builder.build_unreachable().unwrap();
+
+        self.builder.position_at_end(ok_bb);
+        let elem_ptr = unsafe {
+            self.builder
+                .build_gep(elem_ty, data, &[idx_val], "v.st.elem.ptr")
+                .unwrap()
+        };
+        self.builder.build_store(elem_ptr, val).unwrap();
+        Ok(())
+    }
+
     fn compile_slice_index_store(
         &mut self,
         var_name: &str,
@@ -11694,6 +11752,14 @@ impl<'ctx> Codegen<'ctx> {
         if let ExprKind::Identifier(name) = &object.kind {
             if self.map_key_types.contains_key(name.as_str()) {
                 return self.compile_map_index_store(name, index, val);
+            }
+        }
+
+        // Vec[T] element store: bounds-check against `len` (not `cap`) and
+        // GEP `data[i]`. Mirrors the read-path in `compile_vec_index`.
+        if let ExprKind::Identifier(name) = &object.kind {
+            if self.vec_elem_types.contains_key(name.as_str()) {
+                return self.compile_vec_index_store(name, index, val);
             }
         }
 

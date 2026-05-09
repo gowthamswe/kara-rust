@@ -1755,6 +1755,120 @@ fn main() {
         }
     }
 
+    // ── Vec[T] indexed write (Slice Vb) ───────────────────────────
+
+    #[test]
+    fn test_e2e_vec_indexed_write_basic() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    v[1] = 99;
+    println(v[0]);
+    println(v[1]);
+    println(v[2]);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["10", "99", "30"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_vec_indexed_write_oob_panics() {
+        let captured = run_program_capturing(
+            r#"
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(1);
+    v[5] = 99;
+    println(42);
+}
+"#,
+        );
+        if let Some(c) = captured {
+            assert!(
+                c.stdout.contains("panic: vec index out of bounds"),
+                "expected vec OOB panic, got stdout={:?} stderr={:?}",
+                c.stdout,
+                c.stderr
+            );
+            assert!(
+                !c.stdout.contains("42"),
+                "code after panicking index store should not run"
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_vec_indexed_write_after_push() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(0);
+    v.push(0);
+    v[0] = 7;
+    v[1] = 8;
+    println(v[0] + v[1]);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "15");
+        }
+    }
+
+    #[test]
+    fn test_e2e_vec_indexed_write_through_mut_ref_param() {
+        let out = run_program(
+            r#"
+fn set_at(v: mut ref Vec[i64], i: i64, x: i64) {
+    v[i] = x;
+}
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    set_at(mut v, 1_i64, 99_i64);
+    println(v[0]);
+    println(v[1]);
+    println(v[2]);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["1", "99", "3"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_vec_indexed_write_string_element() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut v: Vec[String] = Vec.new();
+    v.push("alpha");
+    v.push("beta");
+    v[0] = "gamma";
+    println(v[0]);
+    println(v[1]);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["gamma", "beta"]);
+        }
+    }
+
     // ── String codegen ────────────────────────────────────────────
 
     #[test]
