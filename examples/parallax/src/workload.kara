@@ -13,15 +13,29 @@
 // after the `karac_par_run` barrier, and the tail expression's
 // `Dashboard { ... }` constructor reads the resulting in-scope bindings.
 //
-// **Single-row return shapes (deviation from C2/C5 plan, 2026-05-09).**
-// The plan called for `Vec[Order] / Vec[Notification] / Vec[Recommendation]`
-// returns; verified at the par_codegen level (see
-// `tests/par_codegen.rs::test_auto_par_vec_return_undefined_var_repro`)
-// that `Vec[T]` returns through Slice A's per-branch return slots
-// fail codegen with `Undefined variable '<binding>'`. The fixture
-// uses single-row struct returns instead per hard-stop trigger 1
-// fallback (b). Demo fan-out+join shape preserved; row-vs-rows shape
-// change is fixture-level only.
+// **`Vec[T]` returns through Slice A's per-branch return slots — full
+// path closed 2026-05-09.** The plan called for `Vec[Order] /
+// Vec[Notification] / Vec[Recommendation]` returns. Three distinct
+// codegen bugs were uncovered when growing the fixture back; all
+// three are now fixed:
+// (i) `src/concurrency.rs::find_parallel_groups` — the analyzer was
+//     producing non-contiguous parallel groups; codegen's
+//     `i = max_idx + 1` step jumped past the second group's stmts.
+//     Fix: contiguous-only invariant.
+// (ii) `src/codegen.rs::refs_in_expr` — `SelfValue` references in
+//      branch-stmt bodies weren't recorded as `self` captures,
+//      causing `Undefined variable 'self'` in the branch fn. Fix:
+//      added a `SelfValue` arm to insert `"self"` into the refs set.
+// (iii) `src/codegen.rs::compile_function_body` slot rebind path —
+//       the parent's `track_vec_var(alloca)` was unconditionally
+//       scheduling a scope-exit free that corrupted the moved value
+//       when the slot was consumed by a returned struct. Fix:
+//       removed the call (v1 leaks the buffer if a slot value is
+//       used and discarded without moving — bounded leak; full
+//       move-aware cleanup is a follow-up).
+// `fetch_latest_order` now returns `Vec[Order]` end-to-end through
+// the four-way fan-out+join, the auto-par codegen path, and the
+// `Dashboard` constructor.
 //
 // This is the exact source shape parallax-lite's README called out as
 // the gap that Slice A unblocks (`examples/parallax_lite/README.md`
@@ -51,7 +65,7 @@ fn fetch_profile(user_id: i64) -> Profile with reads(UserDB) {
     UserDB.fetch_profile(user_id)
 }
 
-fn fetch_latest_order(user_id: i64) -> Order with reads(OrderDB) {
+fn fetch_latest_orders(user_id: i64) -> Vec[Order] with reads(OrderDB) {
     OrderDB.fetch_latest_order(user_id)
 }
 
@@ -67,12 +81,12 @@ pub fn get_dashboard(user_id: i64) -> Dashboard
     with reads(UserDB) reads(OrderDB) reads(NotifDB) reads(RecommendDB)
 {
     let profile = fetch_profile(user_id);
-    let latest_order = fetch_latest_order(user_id);
+    let latest_orders = fetch_latest_orders(user_id);
     let top_notification = fetch_top_notification(user_id);
     let top_recommendation = fetch_top_recommendation(user_id);
     Dashboard {
         profile: profile,
-        latest_order: latest_order,
+        latest_orders: latest_orders,
         top_notification: top_notification,
         top_recommendation: top_recommendation,
     }

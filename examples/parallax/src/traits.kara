@@ -26,7 +26,7 @@ pub trait UserDatabase {
 }
 
 pub trait OrderDatabase {
-    fn fetch_latest_order(ref self, user_id: i64) -> Order;
+    fn fetch_latest_order(ref self, user_id: i64) -> Vec[Order];
 }
 
 pub trait NotificationDatabase {

@@ -384,10 +384,10 @@ mod parallax_tests {
         let stdout = compile_and_run(&src, "dispatch")
             .unwrap_or_else(|| panic!("compile/run failed for parallax workload"));
         for marker in &[
-            "fetch_profile called",
-            "fetch_latest_order called",
-            "fetch_top_notification called",
-            "fetch_top_recommendation called",
+            "loaded profile from UserDB",
+            "loaded latest orders from OrderDB",
+            "loaded top notification from NotifDB",
+            "loaded top recommendation from RecommendDB",
         ] {
             assert!(
                 stdout.contains(marker),
@@ -428,10 +428,10 @@ mod parallax_tests {
         );
         // Each marker exactly once.
         for marker in &[
-            "fetch_profile called",
-            "fetch_latest_order called",
-            "fetch_top_notification called",
-            "fetch_top_recommendation called",
+            "loaded profile from UserDB",
+            "loaded latest orders from OrderDB",
+            "loaded top notification from NotifDB",
+            "loaded top recommendation from RecommendDB",
         ] {
             let count = stdout.matches(marker).count();
             assert_eq!(

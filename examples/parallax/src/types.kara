@@ -57,7 +57,7 @@ pub struct Recommendation {
 
 pub struct Dashboard {
     profile: Profile,
-    latest_order: Order,
+    latest_orders: Vec[Order],
     top_notification: Notification,
     top_recommendation: Recommendation,
 }

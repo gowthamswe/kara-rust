@@ -1,7 +1,7 @@
 function get_dashboard:
   parallel_group {
      fetch_profile(...)  // reads(UserDB)
-     fetch_latest_order(...)  // reads(OrderDB)
+     fetch_latest_orders(...)  // reads(OrderDB)
      fetch_top_notification(...)  // reads(NotifDB)
      fetch_top_recommendation(...)  // reads(RecommendDB)
     reason: independent reads on different resources

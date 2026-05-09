@@ -70,11 +70,9 @@ impl UserDatabase for InMemoryUserDB {
             sum = sum + i;
             i = i + 1;
         }
-        // Side-channel marker so the four-deep dispatch test can pin
-        // that this impl was actually invoked. The `sum + self.user_seed`
-        // expression keeps the kernel's accumulator from being
-        // optimized away (the value flows into the println argument).
-        println("fetch_profile called");
+        // Trace the dispatched fetch and consume the kernel's
+        // accumulator so dead-code elimination can't strip the loop.
+        println("  loaded profile from UserDB");
         let _ = sum + self.user_seed;
         Profile {
             user_id: user_id,
@@ -99,17 +97,20 @@ impl InMemoryOrderDB {
 }
 
 impl OrderDatabase for InMemoryOrderDB {
-    fn fetch_latest_order(ref self, user_id: i64) -> Order {
+    fn fetch_latest_order(ref self, user_id: i64) -> Vec[Order] {
         let mut sum: i64 = 0;
         let mut i: i64 = 0;
         while i < FETCH_ORDERS_WORK {
             sum = sum + i;
             i = i + 1;
         }
-        println("fetch_latest_order called");
+        println("  loaded latest orders from OrderDB");
         let _ = sum + self.order_seed + self.order_count + user_id;
-        // Canned fixture: latest order for user_id = 42.
-        Order { order_id: 1001, total_cents: 4999 }
+        // Canned fixture: two latest orders for user_id = 42.
+        let mut orders: Vec[Order] = Vec.new();
+        orders.push(Order { order_id: 1001, total_cents: 4999 });
+        orders.push(Order { order_id: 1002, total_cents: 1299 });
+        orders
     }
 }
 
@@ -141,7 +142,7 @@ impl NotificationDatabase for InMemoryNotifDB {
             sum = sum + i;
             i = i + 1;
         }
-        println("fetch_top_notification called");
+        println("  loaded top notification from NotifDB");
         let _ = sum + self.notif_seed + self.notif_count + self.notif_high_water + user_id;
         // Canned fixture: top notification for user_id = 42.
         Notification { kind: 1, message: "welcome" }
@@ -178,7 +179,7 @@ impl RecommendationDatabase for InMemoryRecommendDB {
             sum = sum + i;
             i = i + 1;
         }
-        println("fetch_top_recommendation called");
+        println("  loaded top recommendation from RecommendDB");
         let _ = sum + self.rec_seed + self.rec_count + self.rec_threshold + self.rec_top_score_bps + user_id;
         // Canned fixture: top recommendation for user_id = 42.
         Recommendation { item_id: 7001, score: 0.92 }
