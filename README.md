@@ -24,12 +24,13 @@ Questions, ideas, or design feedback? [Start a GitHub Discussion](https://github
 Every function declares what it does to the world. The compiler uses this for automatic parallelization:
 
 ```
-effect resource UserDB: DatabaseProvider;
-effect resource OrderDB: DatabaseProvider;
+pub effect resource UserDB: UserDatabase;
+pub effect resource OrderDB: OrderDatabase;
+pub effect resource NotifDB: NotificationDatabase;
 
-fn load_dashboard(user_id: u64) -> Dashboard
-    reads(UserDB), reads(OrderDB), reads(NotifDB) {
-
+fn load_dashboard(user_id: i64) -> Dashboard
+    with reads(UserDB) reads(OrderDB) reads(NotifDB)
+{
     let profile = fetch_profile(user_id);       // reads(UserDB)
     let orders = fetch_orders(user_id);         // reads(OrderDB)
     let notifications = fetch_notifs(user_id);  // reads(NotifDB)

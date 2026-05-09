@@ -6,3 +6,7 @@ a.out
 
 # IDX
 .idx/
+
+# WIP scratch files and bug log (uncommitted)
+wip-*.md
+bugs.md
