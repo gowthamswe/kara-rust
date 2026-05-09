@@ -2385,6 +2385,76 @@ A compiler-internal pass that pattern-matches common safe-indexing idioms (`for 
 
 ---
 
+### Full-Hybrid State-Machine Transform (Arbitrary `suspends` Functions)
+
+State-machine codegen for *every* `suspends` function, not just network-boundary functions. Kāra v1 ships state-machine transform scoped to functions whose effect set includes `sends(Network)` / `receives(Network)`; this entry covers the broader form where any `suspends` function — disk I/O, channel receives, custom suspending primitives — gets the same lowering. Conceptually equivalent to Tokio / async-Rust applied to arbitrary control flow rather than network-bounded code. Graduated from brainstorm v64 (2026-05-09).
+
+**Why deferred:** State-machine transform of arbitrary control flow (across `try` / `defer` / `errdefer`, RC drops, panic unwinding, generics, FFI boundaries) is a multi-quarter codegen effort by itself. The cost/benefit is wrong for v1: option (d)'s 1M+ network-boundary ceiling already covers the dominant backend workloads, so going broader buys flexibility (any user-written suspending function composes naturally) without buying meaningfully more headline concurrency. Worse, full-hybrid would force RAII-across-yield from a network-boundary rule into a *language-wide* rule for every `suspends` function — currently a v1 compile error for the bounded subset, and a much larger language-surface commitment if extended.
+
+**Promotion gate:** Promote when (a) the bounded form is shipping in v1 and at least one of the deferred secondary workload classes — disk I/O at scale, channel-heavy actor patterns, custom user-defined suspending primitives — has surfaced concrete user demand for full-hybrid that the bounded form cannot serve, and (b) the language-surface design audit (RAII-across-yield, panic-during-suspend, FFI-across-yield, RC-drop ordering) has solidified to the point that extending the rules to every `suspends` function does not reopen design questions.
+
+**Why non-breaking:** Purely additive. Existing network-boundary state-machine transform continues to apply at v1; the full-hybrid lowering extends the same machinery to a broader function set without changing observable semantics for code that already worked. RAII-across-yield as a compile error widens its check surface, which can only reject additional code under the upgraded edition (per the warn-then-error edition migration policy in `design.md § Editions`).
+
+**Cross-reference:** `design.md § v1 Positioning > Concurrency target gating`; `brainstorming/archive/v64_backend_first_v1_concurrency.md` Problem 5 option (e) (declined for v1 with explicit rationale); `implementation_checklist/phase-6-runtime.md` (the bounded form's runtime + design audit work).
+
+---
+
+### gRPC (Streaming, Reflection, Server / Client)
+
+A first-class stdlib gRPC stack — server, client, streaming RPCs (server-stream, client-stream, bidirectional), reflection, codegen from `.proto` files, interceptors, deadlines / cancellation. Equivalent to Go's `google.golang.org/grpc` or Rust's `tonic`. Graduated from brainstorm v64 (2026-05-09).
+
+**Why deferred:** gRPC depends on HTTP/2 (multiplexed streams, flow control, HPACK) and protobuf (wire format, codegen). Both ship at v1 but as P1 — sequenced after the P0 spine — and gRPC sits as a layer above them. Adding gRPC to v1 P0 would either (a) gate the launch on a 4-component dependency chain (event loop → HTTP/1.1 → HTTP/2 → protobuf → gRPC) where any single link's slip propagates, or (b) ship gRPC as foreshadowed iteration violating the "consolidated reality at launch" rule. Better: ship HTTP/2 + protobuf at v1, ship gRPC at v1.x once both have shipped real users.
+
+**Promotion gate:** Promote to P1 once HTTP/2 and protobuf have shipped at v1 and gRPC user demand surfaces concretely (cloud microservices use case, internal service mesh, Kubernetes-shape integration). Prior art (Tonic for Rust) exists; the implementation is well-understood once the substrate is in place.
+
+**Why non-breaking:** Purely additive — `std.grpc` lands as a new module with no v1 surface implications. gRPC's tight coupling to HTTP/2 means its addition cannot break existing HTTP/2 users (HTTP/2 stays the lower-level stable surface).
+
+**Cross-reference:** `design.md § v1 Positioning > backend platform stdlib`; `roadmap.md § Phase 8 > Backend Platform`; `brainstorming/archive/v64_backend_first_v1_concurrency.md` Problem 6.
+
+---
+
+### HTTP/3 / QUIC
+
+HTTP/3 over QUIC, including the QUIC transport itself (UDP-based, encrypted-by-default, 0-RTT, connection migration). Equivalent in scope to Cloudflare's `quiche` or Google's QUIC implementation. Graduated from brainstorm v64 (2026-05-09).
+
+**Why deferred:** Industry-wide rollout is slow. Even Go is rolling out HTTP/3 incrementally; the IETF QUIC RFC 9000 stabilized in 2021 and ecosystem deployment is still partial in 2026. The ROI for a v1 commitment is low: HTTP/1.1 + HTTP/2 cover effectively all backend workloads at v1's launch window, and HTTP/3 adoption inflection is post-2027 for most server stacks. Building a QUIC transport is itself a multi-quarter project — UDP-level packet handling, congestion control, encryption integration, connection ID rotation, datagram extensions — and ships best once the language has post-v1 ecosystem ground truth on QUIC use cases.
+
+**Promotion gate:** Promote when (a) HTTP/3 deployment has crossed an inflection point in mainstream backends (target: >40% of Cloudflare-fronted traffic, or equivalent industry benchmarks), AND (b) Kāra's TLS substrate (rustls + aws-lc-rs) has matured QUIC integration on its side (rustls's QUIC support is ongoing).
+
+**Why non-breaking:** Purely additive. `std.http` v1 stable surface stays HTTP/1.1 + HTTP/2; HTTP/3 lands as additional negotiation paths and connection types without changing existing semantics.
+
+**Cross-reference:** `design.md § v1 Positioning > backend platform stdlib`; `brainstorming/archive/v64_backend_first_v1_concurrency.md` Problem 6.
+
+---
+
+### Microservice Mesh Primitives
+
+Service mesh primitives — service discovery, mutual TLS auto-enrollment, retry / timeout / circuit-breaker policies, distributed-trace context propagation, mesh-aware load balancing. Equivalent in scope to a service-side library that integrates with Linkerd / Istio / Consul Connect, or a sidecar-less alternative built into the language runtime. Graduated from brainstorm v64 (2026-05-09).
+
+**Why deferred:** Service mesh design is opinionated and ecosystem-divergent — sidecar (Envoy + Linkerd) vs. sidecar-less (Cilium service mesh) vs. library-mode are competing architectures with significant trade-offs. Committing Kāra v1 to one would foreclose options before the language has users to validate the choice. Further, mesh primitives sit above the basic backend platform — they're a layer on `std.http` + TLS + `std.tracing` rather than peer to them. Best to ship the floor at v1 and let mesh integrations emerge from real deployment patterns.
+
+**Promotion gate:** Promote when (a) a sustained Kāra deployment cohort surfaces concrete mesh-integration patterns (which retry / circuit-breaker shapes recur, which trace-propagation conventions stick), AND (b) the ecosystem mesh architecture (sidecar vs. sidecar-less) has stabilized enough that a library can ship without picking a losing side.
+
+**Why non-breaking:** Purely additive — new stdlib module(s), no impact on existing `std.http` or `std.tracing` surfaces.
+
+**Cross-reference:** `design.md § v1 Positioning > backend platform stdlib`; `brainstorming/archive/v64_backend_first_v1_concurrency.md` Problem 7.
+
+---
+
+### Custom Executors / Pluggable Schedulers
+
+User-extensible scheduler — pluggable executor implementations replacing the v1 work-stealing scheduler with custom shapes (single-threaded for embedded, custom-priority for real-time, deterministic-test for property testing, custom-instrumentation for profiling). Equivalent to Tokio's `Runtime::Builder::worker_threads` plus its `LocalSet` / `current_thread_runtime` shapes, but exposed as a language-level extension surface. Graduated from brainstorm v64 (2026-05-09).
+
+**Why deferred:** v1 ships a *single* opinionated work-stealing scheduler — the cost-model decisions (which group parallelizes, fork threshold, distinctness collapse rules) are coupled to the scheduler shape, and exposing pluggable scheduler implementations at v1 would force every language-surface commitment about parallelization to abstract over a scheduler interface that hasn't been validated. Tokio took years to settle the shape of its executor extension surface. Kāra's `cost-model unspecified for v1` posture (per Feature 5) means the right move is to ship the work-stealing default, observe user workloads under it, and let extension demands surface from concrete shape mismatches rather than speculation.
+
+**Promotion gate:** Promote when (a) v1 user feedback surfaces concrete workload classes the work-stealing scheduler does not serve well — e.g., real-time embedded control loops, soft-deadline scheduling for low-latency inference, deterministic property-test harnesses — and (b) the cost-model has graduated from unspecified to a stable v1.x shape, so the executor interface can abstract over a known cost-model contract rather than a moving target.
+
+**Why non-breaking:** Purely additive. The work-stealing default scheduler stays the v1 implementation; pluggable executors land as opt-in alternatives via a new builder / config surface. Existing programs run identically.
+
+**Cross-reference:** `design.md § Feature 5 > Cost Model — v1 Status`; `roadmap.md § Phase 6` (the v1 work-stealing scheduler); `brainstorming/archive/v64_backend_first_v1_concurrency.md` Problem 7.
+
+---
+
 ## P3 — Post-v1 Build Targets (library / ecosystem)
 
 Items that are **not language features** and will not be added to `design.md` — they are libraries or frameworks built on top of the language. They live here because, post-v1, the project author may choose to build them directly rather than wait for community ownership. Each entry describes the scope, what it rests on in the language, and what would need to be in place before building it.
@@ -2694,7 +2764,7 @@ All functions carry `writes(Stdout)` so they participate in conflict analysis an
 
 ### Continuous PGO with Shared-Object Hot-Swap
 
-**Decision:** Defer continuous PGO (live counter collection in production + background recompile + hot-swap) from v1. Tier is **P2 conditional on v64 (backend-first positioning) outcome**; if v64 lands as backend-first, this promotes to scheduled P2 alongside the rest of the warehouse-class story; if v64 lands as multi-persona, demotes to P3.
+**Decision:** Defer continuous PGO (live counter collection in production + background recompile + hot-swap) from v1. Tier is **P2** — confirmed alongside the rest of the warehouse-class adaptive-perf story now that v64 has landed as backend-first (2026-05-09).
 
 **What it adds beyond static PGO.** Mechanically: PGO (above) plus a hot-reload story.
 
@@ -2878,9 +2948,25 @@ The binary-size cost that motivates dynamic-linking adoption in C/C++ is address
 **Alternatives that cover the genuine adaptive-perf use cases:**
 
 1. **Static PGO + AutoFDO** (P2; see § Profile-Guided Optimization Loop). Distribution-shaped optimization without bytecode in the binary.
-2. **Continuous PGO + shared-object hot-swap** (P2 conditional on v64; see § Continuous PGO with Shared-Object Hot-Swap). Minutes-of-latency adaptive perf for warehouse services.
+2. **Continuous PGO + shared-object hot-swap** (P2, confirmed under v64 backend-first; see § Continuous PGO with Shared-Object Hot-Swap). Minutes-of-latency adaptive perf for warehouse services.
 3. **Runtime monomorphization JIT** (P2; see § Runtime Monomorphization JIT). Narrow, AOT-shaped JIT for the specific case of dynamic-boundary-discovered generic instantiations. Does not speculate, does not deopt, does not require an interpreter tier.
 
 These three together cover the adaptive-perf use cases without changing the language's deployment model or the soundness story.
 
 **Cross-reference:** `brainstorming/archive/v65_pgo_and_online_jit.md` Problem 3.5 (rejected; documented as out-of-scope-by-design); see also § Speculative Tiering with Deopt (P3) for the half-step short of full bytecode JIT that is also declined for similar reasons.
+
+### Database `database/sql`-Class Stdlib
+
+**Decision:** Kāra does not ship a stdlib database driver layer (e.g., a `std.sql` module providing `Connection`, `Statement`, `Rows` over a stable cross-DB interface — Go's `database/sql` shape). Database driver design is community territory. Permanent omission. Graduated from brainstorm v64 (2026-05-09).
+
+**Why permanent.** Every modern systems language has settled on this same answer. Go's `database/sql` is widely regarded as a partially-frozen v1 commitment that the ecosystem has been working around for fifteen years (driver inconsistency, awkward statement caching, no first-class typed-row support, prepared-statement footguns). Rust deliberately punted: `sqlx` / `diesel` / `sea-orm` / `tokio-postgres` are community libraries with diverging philosophies (compile-time-checked SQL vs. ORM vs. raw query builder vs. async-first-low-level), and the ecosystem benefits from that diversity rather than being constrained by an early stdlib choice.
+
+Database driver design has strong ecosystem-divergent forces — connection pooling philosophy (per-connection vs. global pool vs. provider-injected), async vs. sync semantics, ORM-ish vs. query-builder vs. raw-SQL, type-safe queries vs. dynamic-SQL, transaction lifecycle, prepared-statement caching, schema migration integration. A stdlib choice picks winners and ages poorly.
+
+Kāra's comptime story makes a *typed-SQL* community driver dramatically better than what Go / Rust have today: comptime SQL parameter binding can produce compile-time SQL type-check (Diesel-shape but with first-class language support, no proc-macro indirection), comptime schema migration validation is naturally expressible, comptime query plan inspection is on the table. That's a Kāra-native ecosystem opportunity, not a stdlib opportunity — locking in stdlib shape closes off the most interesting community-driver designs.
+
+**What v1 ships instead.** The connection-pool primitive (`Pool[T]`) is in v1 stdlib (Phase 8 floor) — every community database driver builds on it. Application-layer backpressure (`Semaphore`, `BoundedChannel`, `RateLimiter`) ships at v1 for use in driver implementations. The provider machinery gives drivers a clean test-injection story without driver-specific test infrastructure. The runtime story (event loop, `sends(Network)` / `receives(Network)` effects) is what database drivers route through.
+
+**Why non-breaking:** Not a restriction on existing code. v1 ships no `std.sql` module; community drivers (`std.json`-style Postgres library, comptime-typed SQL builder, etc.) operate as ordinary packages. Future v1.x or v2 reconsideration is possible if a community driver emerges as a near-universal default and ecosystem signal supports stdlib promotion — but the bar is high: a clear convergence, not a single popular library.
+
+**Cross-reference:** `design.md § v1 Positioning > What backend-first does *not* mean`; `brainstorming/archive/v64_backend_first_v1_concurrency.md` Problem 9 ⊘8 (Database driver question — community territory in every modern language, with stated and defended choice); `roadmap.md § Phase 8 > Backend Platform` (the `Pool[T]` connection-pool primitive that drivers build on).

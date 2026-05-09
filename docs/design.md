@@ -18,6 +18,7 @@ The current truth. All committed design decisions in their final form.
 ## Table of Contents
 
 - [Starting Assumptions](#starting-assumptions)
+- [v1 Positioning — Backend-First](#v1-positioning--backend-first)
 - [Specification Layers](#specification-layers)
 - [Identifiers and Naming](#identifiers-and-naming)
 - [Type System and Object Model](#type-system-and-object-model)
@@ -101,6 +102,42 @@ The current truth. All committed design decisions in their final form.
    | **Data race freedom** | No simultaneous mutable + read access across concurrent branches | Effect conflict analysis serializes conflicting accesses in `par {}` regions; RC→Arc promotion ensures shared values are atomically reference-counted. Structurally enforced — not an opt-in `Send`/`Sync` system. |
    | **Spatial safety** | No out-of-bounds reads or writes | Slice bounds checking in safe code. Bounds checks are emitted in a form LLVM's range analysis can elide when the index is provably in-bounds (e.g., `for i in 0..xs.len()`); the `unsafe { xs.get_unchecked(i) }` escape hatch covers cases the compiler cannot prove. On `embedded`/`isr` profiles bounds checking may be disabled at the profile level — see § Project Profiles. Any weakening is explicit, not silent. See § Bounds-Check Elision and the `get_unchecked` Escape Hatch. |
    | **Integer overflow** | Defined behavior — never undefined | Panics by default (`checked` arithmetic on `app`/`lib`); `wrapping` on `embedded` profile by default. See § Arithmetic Overflow. No profile produces UB on overflow; the behavior changes but is always defined. |
+
+---
+
+## v1 Positioning — Backend-First
+
+Kāra v1's lead persona is **backend-first**: the language ships at v1 with the floor needed to host real backend workloads — HTTP/1.1 server, TLS, WebSocket, a flagship-grade concurrency runtime targeting 1M+ idle connections per process, structured logging with span-context propagation, and connection-pool / backpressure primitives — rather than landing those pieces over v1.x releases.
+
+**Why this is the lead persona, not one of several.** Backend services are the workload class where Kāra's auto-concurrency, effect system, and ownership story compound most visibly: `sends(Network)` / `receives(Network)` routing through the event loop, `par {}` blocks fanning out to upstream calls, RC-fallback decisions surfacing in connection-handling hot paths, providers giving test-isolated effect injection. Other languages with similar feature sets (Rust, Go, Erlang, Java/Loom) are recognized for backend; Kāra's positioning sits in the same workload tier rather than adjacent to it.
+
+**Other personas compose on top of the v1 floor, not in competition with it.** REPL / Jupyter, data-engineering pipelines, AR/WASM deployment all build on the same v1 runtime + stdlib floor that backend-first demands. A serious data-engineering REPL hitting Kafka / S3 / Postgres needs the same event loop, connection-pool primitives, TLS, and `std.http` that the backend story ships. The personas share the floor; backend-first is the workload that pulls the floor up to credibility.
+
+**v1 launch is gated on consolidated reality, not a promise-and-trajectory.** v1 ships at the 1M+ concurrent-connection ceiling — staged internally through M1 (100K) → M2 (250K) → M3 (1M+) — with public release blocked on M3 hitting the ceiling on the flagship demo. The bar is "this is what Kāra does" rather than "this is what Kāra will do." Items that cannot meet the consolidated-reality bar at v1 stay in `deferred.md` until they can; the launch claim contains no foreshadowed iteration.
+
+**comptime + backend integration is the v1 differentiator.** comptime-generated HTTP route tables (sub-microsecond router dispatch), comptime protobuf message parsing (zero reflection cost), comptime SQL parameter binding (compile-time SQL type-check) — each is a concrete capability Kāra ships at v1 that Go and Rust do not. The comptime investment from v60 finds its first flagship payoff inside the backend bundle.
+
+**What backend-first does *not* mean.** No opinionated framework (Spring / Phoenix / Rails class) at v1 — `std.http` + community frameworks. No commitment to win benchmarks against Tokio / Go on every dimension — competitive (within ~2x apples-to-apples on the headline workload) is the bar. No abandonment of other personas — they share the same floor. No `database/sql`-class stdlib — driver design is community territory in every modern systems language and Kāra follows the same convention. See [deferred.md § Permanent Omissions > Database `database/sql`-Class Stdlib](deferred.md#database-sql-class-stdlib).
+
+**v1 backend platform stdlib (lifted from Phase 11 long-tail, graduated from v64):**
+
+| Module / capability | Tier | Notes |
+|---|---|---|
+| `std.http` (HTTP/1.1 server + client) | P0 | Required to drive the flagship demo; idle-keep-alive routes through `std.http`+WebSocket. |
+| TLS (`std.tls`, vendored rustls + aws-lc-rs default crypto provider) | P0 | Memory-safe TLS, rustls-provider plug points private at v1, modern-TLS-only (no SSLv3 etc.). |
+| WebSocket (RFC 6455) | P0 | The canonical idle-keep-alive workload that grounds the 1M+ benchmark. |
+| HTTP/2 (multiplexed streams + flow control) | P1 | Prerequisite for gRPC; ships at v1 launch, sequenced after HTTP/1.1. |
+| `std.tracing` (structured logging + span propagation, OTel-export-ready) | P1 | Operational story is a launch criterion, not v1.x. |
+| `std.regex`, `std.process`, protobuf | P1 | Lifted from Phase 11 long-tail under backend-first. |
+| Connection-pool primitives (`Pool[T]`) | P1 | Library-shape; community drivers build on this. |
+| Application-layer backpressure (`Semaphore`, `BoundedChannel[T]`, `RateLimiter`) | P1 | Complementary to the deployment-layer providers story (per-provider concurrency caps). |
+| `karac new <name>` default project template | P0 | Defaults to backend HTTP server skeleton; `--lib` / `--cli` / `--data` as alternates. |
+
+**Stable surface vs. unstable extension points.** Phase 9 (semantic lock) freezes stdlib API stability. The risk under backend-first is locking `std.http` / `std.tls` API surface earlier than originally planned. Mitigation: a deliberately minimal v1 API exposes the 80% case (server bind / serve, request / response, body streaming, headers, basic routing) as stable; advanced extension points (custom certificate verifiers, low-level frame access, custom transport, advanced TLS config) ship at v1 marked `#[unstable]` (compiler attribute, gated). The unstable surface is *present and usable* but explicitly opted in to instability via `#[allow(unstable_api)]` — converting "namespace question" (`std.http.v1`) into a finer-grained "attribute question" without changing module shape.
+
+**Concurrency target gating.** The 1M+ ceiling is a Reported-behavior measurement against the flagship demo; the staging milestones run as CI benchmark gates so regressions surface as release blockers. The 1M+ headline number is *not* a guarantee on every workload — the language guarantees the runtime architecture supports it on the flagship demo's shape; users running atypical workloads measure for themselves.
+
+This positioning was decided in [brainstorm archive v64](../brainstorming/archive/v64_backend_first_v1_concurrency.md) (2026-05-09) and lives in [the corresponding implementation tracking](implementation_checklist/phase-6-runtime.md) and the [Phase 8 Backend Platform sub-section](roadmap.md#phase-8-standard-library--floor) of the roadmap. The promotion of Phase 6.3 (network event loop) from v1.1 to v1 is a direct consequence; the lift of `std.http` / TLS / WebSocket from Phase 11 to Phase 8 is the corresponding stdlib reorganization.
 
 ---
 

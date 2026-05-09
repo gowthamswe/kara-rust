@@ -11,3 +11,5 @@ Items currently tracked here (until physical reorganization happens — they liv
 
 `std.json` stays in Phase 8 (floor) — every config / API client needs it.
 
+> **v64 reshape (2026-05-09):** `std.regex`, `std.http` (server + client), `std.websocket` (server + client), `std.process`, `std.tracing`, HTTP/2, protobuf, `Pool[T]`, and application-layer backpressure primitives were lifted from Phase 11 long-tail to Phase 8 floor under the [backend-first lead-persona decision](../../brainstorming/archive/v64_backend_first_v1_concurrency.md). Trackers for the lifted items now live in [`phase-8-stdlib-floor.md § Backend Platform (v64-lifted)`](phase-8-stdlib-floor.md). `std.stats` (data-science specific) stays in Phase 11.
+

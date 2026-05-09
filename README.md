@@ -11,7 +11,9 @@
   [▓▓▓▓▓▓▓▓▓▓▒▒▒▒░░░░░░]
 ```
 
-Kāra is an experimental systems programming language designed for the AI era. The compiler handles memory layout and concurrency; the programmer handles intent — and hardware targets, like GPU, when they matter.
+Kāra is a systems programming language designed for the AI era. The compiler handles memory layout and concurrency; the programmer handles intent — and hardware targets, like GPU, when they matter.
+
+**Backend-first at v1.** Kāra v1 ships with a flagship-grade concurrency runtime (1M+ idle connections per process), `std.http` server, TLS, and WebSocket — built to host real backend workloads from launch, not after. REPL, data-engineering, and AR/WASM compose on top of the same v1 floor. See [docs/design.md § v1 Positioning](docs/design.md#v1-positioning--backend-first).
 
 Questions, ideas, or design feedback? [Start a GitHub Discussion](https://github.com/gowthamswe/karac-rust/discussions/new/choose) — all input welcome.
 

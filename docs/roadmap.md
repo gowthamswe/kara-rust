@@ -285,9 +285,9 @@ Note: Basic diagnostics (`--output=json`, source spans, error suggestions) are b
 
 ---
 
-## Phase 6: Auto-Concurrency Runtime — COMPLETE (6.1 + 6.2; 6.3 deferred to v1.1)
+## Phase 6: Auto-Concurrency Runtime — backend-first v1 (6.1 + 6.2 COMPLETE; 6.3 promoted to v1)
 
-**Goal:** Compiler-driven parallel execution using effect analysis.
+**Goal:** Compiler-driven parallel execution using effect analysis. Under the v64 backend-first decision (2026-05-09), Phase 6.3 (network event loop + state-machine transform for network-boundary functions) is promoted from v1.1 to v1, with the concurrency target staged to 1M+ idle connections per process — see [`design.md § v1 Positioning — Backend-First`](design.md#v1-positioning--backend-first) and [`brainstorming/archive/v64_backend_first_v1_concurrency.md`](../brainstorming/archive/v64_backend_first_v1_concurrency.md).
 
 ### 6.1: Concurrency Analysis — COMPLETE
 - [x] Data dependency graph: Build dependency graph from variable usage
@@ -316,14 +316,34 @@ Note: Basic diagnostics (`--output=json`, source spans, error suggestions) are b
 
 **Done when:** A benchmark program with three independent I/O calls runs ~3x faster with auto-concurrency than with `--sequential`. Cancellation works: if one branch fails, siblings are cancelled and the first error is returned. Pure programs have zero scheduling overhead (measured).
 
-### 6.3: v1.1 Runtime (Network Event Loop)
-- [ ] Event loop integration: epoll (Linux) / kqueue (macOS) for network I/O
-- [ ] Effect-routed execution: Compiler routes `sends(Network)` / `receives(Network)` to event loop
-- [ ] Task parking: Network I/O tasks park without blocking threads, resume on completion
-- [ ] RAII-across-yield warnings: Warn when mutex guards or file handles span effect boundaries
-- [ ] State machine transform: For network-boundary functions only (limited scope)
+### 6.3: v1 Runtime (Network Event Loop) — promoted under v64 backend-first
 
-**Done when:** A simple TCP echo server handles 100K concurrent idle connections on a single machine without running out of threads. The same server code runs identically (correct output) under `--sequential` mode, just slower.
+**Pre-implementation design audit (P0, 4-6 weeks before runtime engineering starts).** Land full `design.md` subsections for: state-machine transform (network-boundary only); RAII-across-yield as compile error; panic-during-suspend semantics; debugger contract for parked tasks; FFI-across-yield; RC-drop ordering across yield points. The audit prevents language-surface decisions from being made under engineering deadline pressure — the cheapest time to lock the rules is *before* the codegen work starts. Tracker: [`implementation_checklist/phase-6-runtime.md`](implementation_checklist/phase-6-runtime.md).
+
+- [ ] Event loop integration: epoll (Linux) / kqueue (macOS) / IOCP (Windows) for network I/O
+- [ ] Effect-routed execution: Compiler routes `sends(Network)` / `receives(Network)` to event loop instead of blocking on OS thread
+- [ ] Task parking: Network I/O tasks park without blocking threads, resume on completion via the event loop
+- [ ] **RAII-across-yield as compile error** (promoted from warning under v64). Functions with `sends(Network)` / `receives(Network)` in their effect set cannot hold a non-cancel-safe resource (e.g., `MutexGuard`, file handle without `cancel_safe` marker) across a suspension point. Resources that opt into cancel-safety via the `CancelSafe` marker trait are permitted; everything else is a hard error with a fix-it suggesting the lock-narrowing or scope-restructuring shape.
+- [ ] State machine transform: For network-boundary functions only (limited scope — full-hybrid lowering of arbitrary `suspends` functions is post-v1, see [`deferred.md § Full-Hybrid State-Machine Transform`](deferred.md#full-hybrid-state-machine-transform-arbitrary-suspends-functions)).
+
+**Concurrency staging — 100K → 250K → 1M+ (public v1 launch gated on M3).**
+
+| Milestone | Target | Gate to next |
+|---|---|---|
+| **M1** | 100K stable idle connections | Flagship demo (Parallax-shape) runs the workload at 100K |
+| **M2** | 250K stable idle connections | Same demo, 2.5× scale, no P99 cliff |
+| **M3** | **1M+ stable idle connections** | Same demo + cross-platform parity (Linux io_uring, macOS kqueue, Windows IOCP), no regression vs. M2 baseline |
+| **v1 public launch** | **gated on M3 hitting target** | M3 verified end-to-end on flagship demo |
+
+The 1M+ headline number is consolidated reality at launch — "Kāra ships at 1M+" rather than "ship at 100K, promise 1M". CI benchmark gates run against the flagship demo at every PR; >5% regression on steady-state P50/P95/P99/P99.9 blocks merge without explicit override + justification.
+
+**Flagship demos (verification gates).** Layered to insure the launch:
+
+- **Demo 1 (P0): minimal HTTP+WebSocket server** — proves runtime can hold 1M+ idle WebSocket connections under TLS.
+- **Demo 2 (P0): Parallax (full)** — proves auto-concurrency under realistic load (four upstreams + provider story). Parallax-lite is the conditional fallback if cost-model tuning has not resolved by launch.
+- **Demo 3 (P1): data-engineering pipeline** (Kafka → S3 → DuckDB-shape) — proves the compounding-into-other-personas claim that v64 stakes (REPL / data-eng share the same runtime floor).
+
+**Done when:** M3 gate clears — flagship demo (Parallax or Parallax-lite) sustains 1M+ concurrent idle connections per process on Linux + macOS + Windows under HTTPS + WebSocket; CI benchmark suite enforces no >5% regression. Pre-implementation design audit subsections are landed in `design.md` and `implementation_checklist/phase-6-runtime.md` reflects shipped status. The same server code runs identically (correct output) under `--sequential` mode, just slower.
 
 ---
 
@@ -380,7 +400,7 @@ Scope: memory layouts and the minimum method set needed to exercise those layout
 
 Note: Core stdlib types (`Option`, `Result`, `Vec`, `String`, `Array[T, N]`) are introduced as interpreter builtins in Phase 4 with minimal APIs, and their codegen (memory layout + minimum method set) ships in Phase 7.2. Phase 8 adds the full method sets, plus the remaining collections, iterator traits, operator traits, I/O with effect annotations, error conversion (`From` trait for `?`), and provider implementations. **This phase owns the floor API surface, not type codegen and not domain-specific stacks.**
 
-**Scope boundary:** Domain-specific stdlib (numerical/data-science, security, embedded primitives, scripting-critical helpers like `std.regex`/`std.http`/`std.process`, codegen IR optimization pass) ships later in [Phase 11: Standard Library — Long-Tail](#phase-11-standard-library--long-tail). The split lets v1 ship semantically locked (Phase 9) and target-complete (Phase 10) before the long-tail stdlib lands; full v1 release is at the end of Phase 11.
+**Scope boundary:** Domain-specific stdlib (numerical/data-science, security, embedded primitives, codegen IR optimization pass) ships later in [Phase 11: Standard Library — Long-Tail](#phase-11-standard-library--long-tail). The split lets v1 ship semantically locked (Phase 9) and target-complete (Phase 10) before the long-tail stdlib lands; full v1 release is at the end of Phase 11. **v64 reshape (2026-05-09):** the backend-platform bundle (`std.http`, TLS, WebSocket, `std.tracing`, HTTP/2, `std.regex`, `std.process`, protobuf, file-system event loop, `Pool[T]`, backpressure primitives) was lifted from Phase 11 long-tail into Phase 8 floor under the backend-first lead-persona decision — see § Backend Platform below.
 
 ### Collections (Full APIs)
 
@@ -509,6 +529,24 @@ Note: Core stdlib types (`Option`, `Result`, `Vec`, `String`, `Array[T, N]`) are
 - [ ] **P1.5 Layout query** — gated on layout-block stability (Phase 7.2 — shipped). Resolution: existing layout-block syntax.
 - [ ] **P1.3 Inlining + branch hints** — codegen-side hooks; tracked separately at [`phase-7-codegen.md`](implementation_checklist/phase-7-codegen.md).
 - [ ] **P1.6 Auto-concurrency fork threshold** — gated on cost-model graduating from "unspecified for v1"; lands in [Phase 11](#phase-11-standard-library--long-tail) at earliest. Resolution: `#[fork_at(N)]`.
+
+### Backend Platform (v64-lifted)
+
+> **Lifted from Phase 11 long-tail under the v64 backend-first decision (2026-05-09).** Full rationale at [`design.md § v1 Positioning — Backend-First`](design.md#v1-positioning--backend-first). This sub-section bundles the stdlib modules that the backend-first lead persona requires at v1 — co-located with the Phase 8 floor rather than split into a separate Phase 8.5 to keep the structure clean. P0 items load-bearing for the flagship 1M+ demo; P1 items ship at v1 launch sequenced after the P0 spine.
+
+- [ ] **`std.http` — HTTP/1.1 server + client (P0).** Connection lifecycle (keep-alive, chunked transfer, Host routing), `Server::bind` / `Server::serve` / `Request` / `Response` / `Client::get` / `Client::post`, body streaming, header manipulation, basic routing. Stable v1 surface — minimal API exposing the 80% case; advanced extension points (connection-level customization, custom transport, low-level frame access) ship `#[unstable]`-gated. Pre-lock audit against Go `net/http`, Rust `hyper` + `axum`, Node `http` for known footguns (Go middleware composition, Rust body-ownership, Node error propagation).
+- [ ] **TLS — vendored rustls + aws-lc-rs default crypto provider (P0).** `std.tls` API exposes the cross-platform server + client surface; rustls-provider plug points private at v1 (no public crypto-provider extension API, revisited at v2 if FIPS / post-quantum forces it). Modern-TLS-only stance (no SSLv3, no insecure ciphers); legacy-interop callers use community wrappers. Audit posture: rustls + aws-lc-rs already audited upstream, but the FFI binding layer + `std.tls` API + verification callbacks + certificate-chain handling + error-mode coverage are *new* code and need their own audit pass before v1 ship.
+- [ ] **WebSocket — RFC 6455 (P0).** Server-side framing, handshake, ping/pong, close. Built on `std.http`. The canonical idle-keep-alive workload that grounds the 1M+ flagship benchmark — Demo 1 (minimal HTTP+WebSocket server) is shaped around this surface.
+- [ ] **HTTP/2 — multiplexed streams + flow control (P1).** Required for gRPC. Ships at v1 launch sequenced after HTTP/1.1; not a P0 architectural commit because the 1M+ verification gate runs over HTTP/1.1 + WebSocket. HPACK header compression, server push (default-off), `Server-Sent Events` interop.
+- [ ] **`std.tracing` — structured logging + span/trace context propagation, OTel-export-ready (P1).** Operational story is a v1 launch criterion (per the "ship reality" decision in v64). Span context + trace propagation primitives that *can* export to OTel collector at v1.x without API change. Comptime-generated trace-context plumbing is a Kāra-native opportunity (no proc-macro indirection like in Rust's `tracing`); land the comptime path alongside the surface.
+- [ ] **`std.regex` — compile patterns, match / find / replace (P1, lifted from Phase 11).** Common backend need; lifted into v1 floor under v64.
+- [ ] **`std.process` — `Command` / `Child`; new `ProcessTable` effect resource (P1, lifted from Phase 11).** Subprocess spawning + wait + I/O. Lifted into v1 floor under v64.
+- [ ] **protobuf — wire format + codegen (P1).** gRPC-adjacent. Comptime-driven codegen from `.proto` files (no separate codegen tool — comptime parses the schema and emits the message types directly). gRPC itself is post-v1 (see [`deferred.md § gRPC`](deferred.md#grpc-streaming-reflection-server--client)).
+- [ ] **File-system event loop — io_uring on Linux, sticky kqueue on BSD/macOS (P1).** Lifts disk-I/O ceiling on Linux beyond what epoll covers. Not load-bearing for the 1M+ socket benchmark (epoll/kqueue/IOCP are sufficient there) but matters for mixed-workload demos and disk-bound backends.
+- [ ] **`Pool[T]` — connection-pool primitive (P1).** `acquire / release`, bounded waiters, health checks. Library-shape; community database drivers build on this. Same `Pool[T]` primitive serves HTTP client connection reuse, Redis client pooling, custom resource pooling.
+- [ ] **Application-layer backpressure primitives (P1).** `Semaphore` (with `acquire(timeout)` / `release`), `BoundedChannel[T]` (size limit + send-blocks-when-full / send-fails-fast configurable), `RateLimiter` (token bucket — "max N requests/sec per key"). Complementary to the deployment-layer providers story (which handles per-provider concurrency caps); user code routinely needs application-layer backpressure too.
+- [ ] **`karac new <name>` default project template (P0).** Defaults to a backend HTTP server skeleton: `std.http` + `std.tracing` + a `/health` endpoint + a `/ws` WebSocket route. `--lib` for libraries, `--cli` for CLI tools, `--data` for data-pipeline scaffolding (Kafka consumer + processor + sink shape). Default-being-backend reinforces positioning at the friction-zero entry point.
+- [ ] **Demo 3: data-engineering pipeline (Kafka → S3 → DuckDB-shape) (P1).** Verification artifact for the v64 second-order-positive claim that backend-first investment compounds into the data-engineering persona. Same v1 runtime, same `Pool[T]`, same TLS, same `std.tracing` — proves the personas share the floor rather than competing for it. Cheap incremental engineering, multiplies the v1 launch story.
 
 ### Standard Library Layers (`core` / `alloc` / `std`)
 - [ ] `core` layer: primitives, `Option`, `Result`, `Array[T, N]`, traits, effect system, math — no OS or allocator dependency
@@ -718,7 +756,7 @@ This subsection is intentionally empty at Phase 8.5's creation (2026-05-08). It 
 
 ## Phase 11: Standard Library — Long-Tail
 
-**Goal:** Domain-specific stdlib that programs need beyond the floor — numerical/data-science stack, scripting helpers, security types, embedded primitives, plus codegen IR optimization. **End of this phase = v1 release.** The split from [Phase 8](#phase-8-standard-library--floor) lets v1 ship semantically locked (after Phase 9) and target-complete (after Phase 10) before the long-tail lands. Co-locating the long-tail with target work pays off concretely: the numerical stack composes with the GPU call-site backend, embedded primitives co-design with the embedded target, and WASM portability is already proven for new modules.
+**Goal:** Domain-specific stdlib that programs need beyond the floor — numerical/data-science stack, security types, embedded primitives, plus codegen IR optimization. **End of this phase = v1 release.** The split from [Phase 8](#phase-8-standard-library--floor) lets v1 ship semantically locked (after Phase 9) and target-complete (after Phase 10) before the long-tail lands. Co-locating the long-tail with target work pays off concretely: the numerical stack composes with the GPU call-site backend, embedded primitives co-design with the embedded target, and WASM portability is already proven for new modules. **v64 reshape (2026-05-09):** the backend-platform stdlib bundle (`std.http`, TLS, WebSocket, etc.) was lifted into Phase 8 floor — see [Phase 8 § Backend Platform](#backend-platform-v64-lifted) — leaving Phase 11 narrowly scoped to the numerical / data-science / security / embedded long-tail.
 
 ### `f16` / `bf16` Numeric Primitives
 - [ ] Reserve `f16` and `bf16` as lexer-level keywords in v1 (compile error if used as identifiers — prevents future source-breaking rename).
@@ -747,14 +785,11 @@ Semantics in `design.md § Numerical Types`, `§ Numeric Semantics > Literal-inv
 - [ ] `DataFrame` — schema-bearing table of named columns.
 - [ ] Arrow IPC, Parquet, CSV readers/writers with effect annotations.
 
-### Scripting-critical stdlib (10B surface)
-- [ ] `std.regex` — compile patterns, match/find/replace.
-- [ ] `std.http` — client only (server v1.5+).
-- [ ] `std.websocket` — client only (server v1.5+); `WebSocket` connection type with `send`/`recv`/`close`; `sends(Net)` / `receives(Net)` effect annotations; pairs with `std.http` for upgrade handshake. Browser playground uses a WebSocket shim — this is load-bearing for the interactive tools track.
-- [ ] `std.process` — `Command`/`Child`; new `ProcessTable` effect resource.
-- [ ] `std.stats` — mean, stddev, percentile, median, min/max, argmin/argmax, sort, argsort. Trait-dispatched via `Reduce` / `ElementwiseMap` / `ElementwiseOrd` so future `GpuTensor` implements the same surface.
+### Scripting-critical stdlib (data-science narrow surface)
 
-**Fallback.** If Phase 11 slips, `regex` and `http` are the most at-risk items (pushable to v1.1). Rest stays in v1.
+> **Note (v64 lift, 2026-05-09):** `std.regex`, `std.http` (server + client), `std.websocket` (server + client), and `std.process` were lifted to [Phase 8 § Backend Platform](#backend-platform-v64-lifted) under the backend-first decision. Only `std.stats` (data-science specific) remains in this Phase 11 sub-section. Browser playground's WebSocket shim is now satisfied by the v1 `std.websocket` server which lives in Phase 8.
+
+- [ ] `std.stats` — mean, stddev, percentile, median, min/max, argmin/argmax, sort, argsort. Trait-dispatched via `Reduce` / `ElementwiseMap` / `ElementwiseOrd` so future `GpuTensor` implements the same surface.
 
 ### Security (`std.secret`)
 - [ ] `Secret[T]` — compiler-enforced wrapper that blocks `Debug`/`Display`/`Serialize`/`Deserialize`/`PartialEq`/`Eq`/`PartialOrd`/`Ord`/`Hash`/`Deref`/`Borrow`/`AsRef`/`Copy` impls on itself; `.expose()` / `.expose_mut()` are the only access paths; `.clone()` re-wraps
@@ -804,10 +839,10 @@ Semantics in `design.md § Numerical Types`, `§ Numeric Semantics > Literal-inv
 - [ ] **Phase 11+ (P1) — `RichDisplay` trait.** MIME-typed display protocol for the Jupyter kernel. Plotting and DataFrame libraries implement this to render charts and tables inline. See `design.md § Rich Output Display Protocol`.
 - [ ] **Phase 11+ (P1) — `std.crypto`.** Constant-time cryptographic primitives: ChaCha20-Poly1305 (AEAD), X25519 (key exchange), Ed25519 (signatures), Argon2id (password hashing), BLAKE3 (general hashing). Delegates to a vetted C library via FFI. `reads(EntropySource)` effect on key-generation calls. See `deferred.md § std.crypto`.
 - [ ] **Phase 11 (P1) — `CircularBuffer[T]`.** Fixed-capacity ring buffer; O(1) push/pop at both ends; allocation-free after construction. Enables audio DSP, networking packet queues, and embedded sensor pipelines to share a common type. See `deferred.md § CircularBuffer[T]`.
-- [ ] **v1.5 — `std.http` server + `std.websocket` server.** HTTP client ships in Phase 11; server-side HTTP and WebSocket upgrade handler land in v1.5 alongside shape arithmetic and lazy evaluation.
+- [x] ~~**v1.5 — `std.http` server + `std.websocket` server.**~~ Lifted to v1 under v64 backend-first (2026-05-09); server-side HTTP and WebSocket land in [Phase 8 § Backend Platform](#backend-platform-v64-lifted) at v1 launch.
 - [ ] **Post-Phase-10 — GPU call-site backend.** Revisit once Phase 10 codegen has ground truth. Expected shape: `GpuTensor[T, Shape]` with `.on(gpu)` / `.to_cpu()` boundary ops (CuPy / PyTorch / JAX semantics). Numerical stdlib composes with whatever GPU story lands — trait-dispatched ops keep API open.
 
-**Done when:** The numerical/data-science stack (Tensor, Column, DataFrame, Arrow IPC, Parquet, CSV) is usable. Specialty stdlib (regex, http client, websocket client, process, stats) ships. Security types (`Secret[T]`, `ConstantTimeEq`, `Zeroize`) are enforced. Embedded primitives (`volatile_read`/`write`, inline `asm`, `Atomic`, `#[interrupt]`) compile and run on a target board. Codegen IR optimization closes the Rust performance gap to ≤10% on compute-bound benchmarks. **End of this phase = v1 release.**
+**Done when:** The numerical/data-science stack (Tensor, Column, DataFrame, Arrow IPC, Parquet, CSV) is usable. Stats stdlib ships. Security types (`Secret[T]`, `ConstantTimeEq`, `Zeroize`) are enforced. Embedded primitives (`volatile_read`/`write`, inline `asm`, `Atomic`, `#[interrupt]`) compile and run on a target board. Codegen IR optimization closes the Rust performance gap to ≤10% on compute-bound benchmarks. **End of this phase = v1 release.** (Backend platform — `std.http`, TLS, WebSocket, `std.tracing`, HTTP/2, `std.regex`, `std.process`, protobuf — ships earlier in [Phase 8](#phase-8-standard-library--floor) under the v64 lift.)
 
 ---
 

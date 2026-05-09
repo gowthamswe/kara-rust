@@ -108,7 +108,25 @@ When two or more threads are each waiting for the other to release a resource, s
 A concurrency pattern: spawn N independent tasks (fork), wait for all to complete (join), combine results. Kāra's auto-concurrency generates this pattern from non-conflicting effects.
 
 **Backpressure**
-When a system slows down producers to match the speed of consumers. If your code spawns 10K database queries but the connection pool only allows 10 concurrent connections, backpressure queues the excess. In Kāra, providers implement backpressure via connection pools and semaphores.
+When a system slows down producers to match the speed of consumers. If your code spawns 10K database queries but the connection pool only allows 10 concurrent connections, backpressure queues the excess. In Kāra, providers implement backpressure via connection pools and semaphores. v1 ships application-layer primitives (`Semaphore`, `BoundedChannel[T]`, `RateLimiter`) alongside the deployment-layer provider machinery — graduated from brainstorm v64.
+
+**Backend-First**
+Kāra v1's lead persona — the language ships at v1 with the floor needed to host real backend workloads (HTTP/1.1 server, TLS, WebSocket, 1M+ concurrent connections per process, `std.tracing`). Other personas (REPL, data-engineering, AR/WASM) compose on top of the same v1 floor rather than competing for runtime budget. Decided in brainstorm v64 (2026-05-09). See `design.md § v1 Positioning — Backend-First`.
+
+**Idle-Keep-Alive**
+A workload class — long-lived mostly-idle connections (WebSocket, SSE, long-poll, real-time messaging) where most connections are parked waiting for events rather than actively transferring data. The cliff that distinguishes "credible backend language" from "moderate-scale only": thread-per-connection cannot scale here at any stack size; only an event loop crosses the threshold. Drives Kāra's promotion of Phase 6.3 (network event loop) into v1.
+
+**Network-Boundary Functions**
+Functions whose inferred or declared effect set includes `sends(Network)` or `receives(Network)`. The state-machine transform applies to this bounded subset at v1 — not to arbitrary `suspends` functions. Routing happens via the effect system: callers of network-boundary functions automatically park on the event loop instead of blocking an OS thread.
+
+**RAII-Across-Yield**
+The rule that resources held across a suspension point (e.g., a `MutexGuard` held while a network call yields control) must release cleanly when the task is cancelled, when a panic unwinds, or when the task is destroyed in a non-completion path. v1 promotes this from a warning to a compile error for network-boundary functions — the compiler rejects code that holds a non-cancel-safe resource across a yield point. Decided in v64 (2026-05-09).
+
+**M1 / M2 / M3 Staging**
+The staged concurrency milestones for Kāra v1's pre-release: M1 (Phase 6.3 lands, 100K stable on flagship demo), M2 (polish layer 1, 250K stable), M3 (io_uring + cross-platform parity, 1M+ stable). Public v1 launch is gated on M3 — the headline number is consolidated reality, not a promise. Decided in v64.
+
+**Flagship Demo**
+The verification gate workload that pins the concurrency claim. v1 layers three demos: (1) minimal HTTP+WebSocket server proves 1M+ idle connections (P0 unconditional); (2) Parallax (full or "lite") proves auto-concurrency under realistic load (P0); (3) data-engineering pipeline (Kafka→S3→DuckDB-shape) proves the compounding-into-other-personas claim (P1). Demos are CI benchmark gates — regression > 5% on the steady-state number blocks merge.
 
 ---
 
@@ -181,7 +199,7 @@ LLVM's binary profile data format. Structural-hash-keyed for source-drift resili
 Profile-guided optimization driven by `perf`-collected production samples rather than instrumented builds. Lower deployment cost (no separate workload run, no instrumentation overhead) but higher source-drift sensitivity — the sampled binary and the rebuilt binary may not be byte-identical, and function-name stability across rebuilds becomes load-bearing. Linux kernel mainlined AutoFDO + Propeller in 2024; published numbers show ~5–10% over instrumented PGO on warehouse workloads.
 
 **Hot-Swap (Runtime Code Replacement)**
-Replacing the running version of a function (or module) without restarting the process. In Kāra's planned form (P2 conditional on v64): production binary collects PGO counters live → background recompile produces `v2.so` → running process `dlopen`s the new shared object and redirects function-pointer indirection to the new bodies → old bodies stay live until in-flight calls drain (RCU-style quiescence). Latency is minutes, not microseconds — fine for warehouse-scale services. Granularity is module-level, not function-level.
+Replacing the running version of a function (or module) without restarting the process. In Kāra's planned form (P2, confirmed under v64 backend-first): production binary collects PGO counters live → background recompile produces `v2.so` → running process `dlopen`s the new shared object and redirects function-pointer indirection to the new bodies → old bodies stay live until in-flight calls drain (RCU-style quiescence). Latency is minutes, not microseconds — fine for warehouse-scale services. Granularity is module-level, not function-level.
 
 **Drain Protocol**
 The rule for when old code can be unmapped after a hot-swap. Kāra's planned approach: tie to the `suspends` effect verb — loops with suspend points are drain-safe; loops without get a compile warning. RCU-style quiescence: wait until every thread has crossed at least one suspend point since the swap before retiring the old code.
