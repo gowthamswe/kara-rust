@@ -501,6 +501,15 @@ Note: Core stdlib types (`Option`, `Result`, `Vec`, `String`, `Array[T, N]`) are
 ### `std.hash`
 - [ ] `Hash` trait, `Hasher` interface, default hasher; `#[derive(Hash)]` codegen path (interpreter form already shipped).
 
+### Compiler Queries Channel (P0 architectural commit)
+- [ ] **P0 architectural commit — stable item identity, per-phase queries field, `karac query queries` CLI surface, stability classification.** Ships the channel infrastructure even with zero query catalogue entries; subsequent P1 entries are non-breaking additions. Stable item identity (path-based DefId + structural-hash sub-item slots) is load-bearing — without it, every later query addition becomes a breaking change for tools storing resolved answers. Spec at [`design.md § Specification Layers > Compiler Queries`](design.md#compiler-queries) (graduated from brainstorm v63, 2026-05-08); tracker at [`phase-8-stdlib-floor.md`](implementation_checklist/phase-8-stdlib-floor.md).
+- [ ] **P1.1 RC fallback query** — first catalogue entry; reuses existing `RcFallbackNote` decision site. Resolution: existing `#[no_rc]` + new `#[prefer_rc]`.
+- [ ] **P1.2 Specialization query** — typechecker-driven; stress-tests fan-out queries (one decision, many monomorphizations). Resolution: `#[specialize(T = i64)]`.
+- [ ] **P1.4 Effect-narrowing query** — function-exit hook. Resolution: existing effect declaration.
+- [ ] **P1.5 Layout query** — gated on layout-block stability (Phase 7.2 — shipped). Resolution: existing layout-block syntax.
+- [ ] **P1.3 Inlining + branch hints** — codegen-side hooks; tracked separately at [`phase-7-codegen.md`](implementation_checklist/phase-7-codegen.md).
+- [ ] **P1.6 Auto-concurrency fork threshold** — gated on cost-model graduating from "unspecified for v1"; lands in [Phase 11](#phase-11-standard-library--long-tail) at earliest. Resolution: `#[fork_at(N)]`.
+
 ### Standard Library Layers (`core` / `alloc` / `std`)
 - [ ] `core` layer: primitives, `Option`, `Result`, `Array[T, N]`, traits, effect system, math — no OS or allocator dependency
 - [ ] `alloc` layer: `Vec[T]`, `Map`, `String`, `f"..."` interpolation, `shared struct`/`shared enum` (RC), `Pool[T]` — requires heap allocator

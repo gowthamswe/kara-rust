@@ -156,6 +156,21 @@ Only recompiling the parts of a program that changed. If you modify one function
 **Canonicalization**
 Producing a single "canonical" representation for equivalent inputs. Kāra's formatter (`karac fmt`) canonicalizes code so that two programs with the same meaning produce identical formatted output. This makes AI-generated diffs clean and reviewable.
 
+**Compiler Query**
+A specific optimization decision the compiler hedged on, surfaced back to the author as a structured entry in the queries report (`karac query queries`). Each query carries a stable ID, the decision site, the options the compiler considered with rationale per option, the default it picked, and the resolution surface (which attribute, written where, would pin the answer). Distinct from a *diagnostic* (which fires on suspected mistakes) and from an *optimization remark* (which is read-only with no structured response surface).
+
+**Query Channel / Queries Report**
+The mechanism by which Kāra closes the JIT-vs-AOT optimization gap: the AOT compiler enumerates residual decisions; the LLM author resolves them at authorship time via source annotations; resolved queries drop out of the next compile's report. PGO answers distribution-shaped questions; the query channel answers intent-shaped ones (hot path, specialization, escape-or-not). The two are complementary signals, not substitutes. See [design.md § Compiler Queries](design.md#compiler-queries).
+
+**Hedged Decision**
+An optimization point where the compiler picked a safe default but a tighter choice exists if spec context clarifies intent. RC fallback (`Rc` vs `Arc` vs owned), generic specialization, inlining, branch hints, layout choice, and auto-concurrency fork thresholds are all hedged decisions. The query channel surfaces them; resolution annotations bake the author's answer into source.
+
+**Resolution Surface**
+The specific attribute (or sidecar entry) that, when written on a given item, resolves a particular compiler query. Source annotations are the common case (`#[no_rc]`, `#[prefer_rc]`, `#[specialize(T = i64)]`, `#[inline]`, `#[likely]`, `#[fork_at(N)]`); a sidecar `karac.queries.toml` is the fallback for sub-item or per-call-site decisions where attribute syntax is awkward.
+
+**Intent vs Distribution**
+The boundary between what the query channel answers and what PGO answers. Intent-shaped questions come from program understanding ("is this the hot path?", "is this allocation expected to escape?") and are answerable from spec; distribution-shaped questions come from production traffic ("what fraction of inputs are ≤16 bytes?") and require runtime measurement. Kāra v1 ships the intent channel; PGO is deferred to post-v1.
+
 ---
 
 ## Language Design

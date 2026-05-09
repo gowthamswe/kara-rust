@@ -421,25 +421,23 @@ fn broadcast[T: Concurrent](value: T, n_tasks: i64) {
 
 ### RC Flavor User Control (`#[prefer_rc]` / `#[rc_only]`)
 
-**Decision:** Defer any user-facing knobs for influencing the compiler's `Rc`→`Arc` promotion decision until real-world profiling demonstrates a concrete need. Ship v1 with the automatic Phase 2 algorithm and `#[no_rc]` as the only escape hatch.
+**Decision (updated 2026-05-08):** `#[prefer_rc]` is the **resolution surface for compiler queries channel P1.1** (RC fallback at use site) — graduated from a standalone deferred item into the queries channel catalogue per brainstorm v63. `#[rc_only]` remains deferred as a separate sharper-than-`#[prefer_rc]` assertion form.
 
 **Context.** The compiler's RC fallback (Feature 4 Part 4) inserts tentative `Rc` at re-use-after-consume / closure-capture / container-store sites, then Phase 2 promotes to `Arc` wherever a live range crosses a parallel region (spawn, par block, task boundary). The conservative default is `Arc` when the promotion decision is ambiguous (`design.md:5271`). Users can inspect the chosen representation via `karac explain` but cannot currently direct it.
 
 **What v51 resolved.** The "I want `Arc` because this value is concurrent" case is now handled by declaring `par struct` / `par enum` — the type's concurrent intent is stated at definition, not via attribute. The remaining open question is the `Rc`-preference direction: "I know this `shared struct` is single-threaded; keep it `Rc` to avoid atomic overhead."
 
-**Why deferred.** Kāra's pitch is "trust the compiler for memory discipline." Adding flavor knobs in v1 signals low confidence in the Phase 2 algorithm. The right sequence: ship v1, observe real performance profiles, refine the algorithm's conservatism before adding user overrides. If the Phase 2 analysis is tightened or a richer effect-based sharing notion lands, the need for knobs may shrink or disappear.
+**What v63 resolved.** The "should I add a knob for this?" question is resolved into "this is exactly what the compiler queries channel is for." Each `RcFallbackNote` decision site emits a structured query enumerating `{ keep_rc | prefer_rc | no_rc }` with the compiler's rationale per option; `#[prefer_rc]` is the resolution annotation that pins the answer. The forcing function shifts from "real production profiles" to "P1.1 of the queries channel landing in [Phase 8 stdlib floor](implementation_checklist/phase-8-stdlib-floor.md)" — the channel infrastructure (P0) ships with v1, P1.1 is the first user-visible query, `#[prefer_rc]` ships as its resolution surface.
 
-**Intended design shape (if forced).** Two affordances, not one:
-- `#[prefer_rc]` on a function or module — a *hint* that the Phase 2 pass respects in ambiguous cases but overrides when it has proof Arc is required. Fails safe.
-- `#[rc_only]` on a function or module — a *safety-checked assertion*: the compiler errors if it determines `Arc` is actually required. Same shape as `#[no_rc]` but one step milder ("cheap RC or error" rather than "no RC at all"). Conflict with `#[no_rc]` is a compile error.
+**Intended design shape.** Two affordances, not one:
+- `#[prefer_rc]` on a function or module — a *hint* that the Phase 2 pass respects in ambiguous cases but overrides when it has proof Arc is required. Fails safe. **Ships with P1.1 of the queries channel.**
+- `#[rc_only]` on a function or module — a *safety-checked assertion*: the compiler errors if it determines `Arc` is actually required. Same shape as `#[no_rc]` but one step milder ("cheap RC or error" rather than "no RC at all"). Conflict with `#[no_rc]` is a compile error. **Remains deferred** — it is not a query resolution surface (queries hint, do not assert), so it sits outside the channel and waits for separate motivation.
 
 Granularity: per-function and per-module. Per-binding is too granular (RC sites are compiler-inserted, not named in source). Per-type is too coarse (would change behavior wherever the type is instantiated, not just in the hot-path function). A project-wide default (e.g., `prefer_rc = true` in the manifest) is plausible for embedded / kernel profiles where atomics are never wanted.
 
 **Diagnostic improvement (non-deferred).** The RC-insertion note (already emitted per `design.md:5175`) should name the chosen flavor: *"note: inserted `Rc[T]` at line 37 (not promoted; value does not cross a parallel region)"* or *"note: promoted to `Arc[T]` at line 37 (crosses `spawn` at line 42)"*. This is independent of the knob question and is a small one-line diagnostic change with high visibility payoff.
 
-**Forcing function:** Real production profiles showing `Arc` in hot loops attributable to the conservative Phase 2 default, after algorithm improvements have been attempted.
-
-**Cross-reference:** `design.md § Feature 4 Part 4` (RC insertion and Phase 2 algorithm); `design.md:5271` (conservative Arc default); `design.md:124` (`karac explain` representation field); `Concurrent` auto-trait (above).
+**Cross-reference:** `design.md § Compiler Queries` (the channel that resolves `#[prefer_rc]`); `design.md § Feature 4 Part 4` (RC insertion and Phase 2 algorithm); `design.md:5271` (conservative Arc default); `design.md:124` (`karac explain` representation field); `Concurrent` auto-trait (above).
 
 ---
 
@@ -2665,6 +2663,66 @@ All functions carry `writes(Stdout)` so they participate in conflict analysis an
 - `writes(Stdout)` effect, which is already in v1
 
 **Cross-reference:** `design.md § I/O Functions` — `print`/`println` with `writes(Stdout)` are the v1 primitive; this module is an ergonomic layer above them.
+
+---
+
+### Profile-Guided Optimization Loop
+
+**Decision:** Defer instrumented or sample-based PGO from v1. The compiler queries channel ([design.md § Compiler Queries](design.md#compiler-queries)) ships at v1 covering *intent-shaped* optimization decisions; PGO answers *distribution-shaped* questions and is the complementary signal, not a substitute. Both will eventually exist; v1 ships only the queries channel.
+
+**Why deferred.** PGO requires a full instrumented-or-sampled build flow, a representative-workload protocol, multi-platform replication of the workload, and the storage / merge / version-skew machinery for `.profdata` / AutoFDO files. Large surface, separate from the queries channel architecturally. The architectural prerequisites — debug info quality and symbol-stable identity — are partially helped by the v1 P0 commit (path-based DefId; see `design.md § Compiler Queries`) but neither prerequisite blocks the queries channel itself.
+
+**Distinction from the queries channel.** PGO answers questions the LLM author cannot ("what fraction of inputs are ≤16 bytes?", "which call site is on the hot path in production?"); the queries channel answers questions PGO cannot ("is this branch unreachable in correct usage?", "should this trait method specialize on `i64`?"). The two operate on different signals — runtime measurement vs. spec context — and their outputs are independent. A v1.x or v2 build will likely consume both: the queries channel for intent, PGO for distribution.
+
+**Promotion gate (P2 → scheduled).** Promote when (a) the queries channel has shipped P1.1–P1.3 and observed real-world resolution patterns, AND (b) the v1 stable item identity primitive (DefId) has shown adequate symbol stability across realistic source-edit patterns to support PGO-style profile keying. Without (a), shipping PGO first risks confusing the channel-vs-PGO boundary in user mental models; without (b), profile-key drift dominates the cost-benefit calculus.
+
+**Why non-breaking:** Purely additive. PGO flags (`-fprofile-generate`/`-fprofile-use` analogs), the `.profdata` format, and the corresponding `karac build --profile-guided=...` invocation are all new build-time surface. Existing builds continue unchanged.
+
+**Cross-reference:** `design.md § Compiler Queries` (the v1 channel; PGO is its complementary signal); `design.md § Specification Layers > Reported behavior > Auto-concurrency cost-model decisions` (the cost model that PGO would feed into); brainstorm archive `brainstorming/archive/v63_llm_compiler_query_channel.md` Problem 7 (PGO-vs-queries scope decision).
+
+---
+
+### MLGO Trained Policy Artifacts
+
+**Decision:** Defer MLGO-style trained policy artifacts from v1. A trained model is the *answer* (compiler output), not the *question* (compiler input) — different shape from the queries channel. Possible v2 if real-world data shows the queries channel alone underperforms.
+
+**Why deferred.** LLVM's MLGO trains TFLite policies for inliner / regalloc decisions and ships the trained model as a build-time artifact. Kāra's queries channel takes a different stance: surface the decision back to the LLM author at authorship time and bake the resolution into source. The MLGO and queries-channel approaches are not contradictory — they could coexist post-v1 — but the queries channel is the smaller commitment and ships first.
+
+**Promotion gate (P2 → scheduled).** Promote when (a) the queries channel catalogue has shipped P1.1–P1.6 and observed real-world adoption, AND (b) measurable evidence exists that author-resolved queries fail to capture optimization wins MLGO would capture. Without (a), shipping a policy artifact pre-empties the channel; without (b), the case for MLGO over queries is hypothetical.
+
+**Why non-breaking:** Additive. Trained policy artifacts are build-time inputs to specific optimization passes; they do not change source semantics, public APIs, or the queries channel's interface.
+
+**Cross-reference:** `design.md § Compiler Queries` (the v1 alternative); brainstorm archive `brainstorming/archive/v63_llm_compiler_query_channel.md` Problem 7.
+
+---
+
+### Schedule-Language Layer
+
+**Decision:** Defer Halide-style decoupled schedule languages from v1. `layout` blocks (Feature 1) cover the data-layout half of "separate authoring surface for optimization"; the loop-schedule half is deferred. The queries channel ([design.md § Compiler Queries](design.md#compiler-queries)) is the smaller v1 commitment for surfacing optimization decisions.
+
+**Why deferred.** Halide / TVM / Tiramisu / Exo all separate the algorithm from the schedule, with the schedule being a complete, parallel authoring discipline targeted at perf engineers writing tight numeric loops. This is a substantial language commitment with its own grammar, its own type system for schedule values, and its own audience. The queries channel surfaces only the un-baked residual decisions and resolves them as item attributes — a much narrower surface that fits Kāra's existing attribute discipline. If real Kāra workloads accumulate that need full decoupled schedules, that's the signal to add the schedule layer alongside the queries channel.
+
+**Promotion gate (P2 → scheduled).** Promote when (a) Phase 11 numerical / data-science stdlib has shipped, AND (b) a corpus of Kāra numerical code accumulates that hits the limits of `layout` blocks + queries-channel resolution annotations. Without (a), the audience for a schedule language doesn't exist yet; without (b), the queries channel + `layout` blocks may be sufficient, and shipping a schedule language pre-empts the simpler combination.
+
+**Why non-breaking:** Additive — a new authoring surface that opts in. Existing programs without schedule annotations would compile unchanged.
+
+**Cross-reference:** `design.md § Feature 1` (layout blocks — the v1 form of decoupled-layout authoring); `design.md § Compiler Queries` (the v1 form of decoupled-optimization-decision authoring); brainstorm archive `brainstorming/archive/v63_llm_compiler_query_channel.md` Problem 7.
+
+---
+
+### Verifier-Backed Query Resolution
+
+**Decision:** Defer Alive2-class equivalence verification of author-supplied query resolution annotations from v1. Trust-the-author is the v1 baseline; verification is the known future direction.
+
+**Why deferred.** A wrong `#[likely]` or `#[specialize(T = i64)]` produces suboptimal codegen — no worse than today's annotation surface. But the queries channel deliberately concentrates author claims into a structured surface, which both invites *more* claims and makes those claims *more* tractable for verification than today's scattered annotations. STOKE / Souper / Alive2 / Hydra / Minotaur / Iago demonstrate that verifier-backed claim-checking is feasible at the LLVM-IR level; the same primitives could check author claims like "this branch is unreachable in correct usage" against the program's effect/type structure.
+
+**Promotion gate (P2 → scheduled).** Promote when (a) the queries channel catalogue has shipped P1.1–P1.6 and adoption has surfaced concrete cases of wrong author claims producing observable codegen pessimization, AND (b) a verifier infrastructure exists in Kāra (Alive2-style equivalence checks against author invariants, separate from but adjacent to the existing effect / ownership / type systems). Without (a), the case for verification is theoretical; without (b), shipping verifier-backed resolution requires building the verifier from scratch alongside, which doubles the v2 commitment.
+
+**Intended design shape.** A `karac check --verify-resolutions` mode (or build-time flag) that, for each query resolution annotation in the source tree, attempts to verify the author's claim against the surrounding program structure. Verification failures emit a new diagnostic class — distinct from "this annotation is suboptimal" — that names the specific invariant the verifier could not establish. Authors who don't run verification continue to operate in the v1 trust-the-author mode.
+
+**Why non-breaking:** Purely additive. Existing resolution annotations continue to be honored at trust-the-author level by the codegen path. The new verification mode is opt-in; failure to run it does not change codegen behavior.
+
+**Cross-reference:** `design.md § Compiler Queries` (the v1 trust-the-author baseline); `design.md § Specification Layers > Compiler Queries > Author claims are trusted at v1` (the v1 stance); brainstorm archive `brainstorming/archive/v63_llm_compiler_query_channel.md` Problem 7 and Open Questions on author-claim verification.
 
 ---
 

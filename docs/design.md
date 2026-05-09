@@ -156,6 +156,66 @@ The following are classified up front because the question is already live (`kar
 
 **What the three layers do not cover.** The layer system is about *what a conforming compiler must do*, not about *which features exist*. Whether a feature is in the language at all is decided elsewhere in this document. The layer system answers "given that the feature exists, how much of its behavior is locked down?"
 
+### Compiler Queries
+
+Each compile produces a **queries report** (`karac.queries.json`, surfaced as `karac query queries`) listing optimization decisions the compiler hedged on. The author — typically an LLM acting at authorship time — reads the report, decides which queries to resolve, and writes resolution annotations on the relevant items. Subsequent compiles re-emit the report with resolved queries dropped.
+
+This closes the JIT-vs-AOT gap not by adding runtime profiling but by routing semantic intent through the LLM author, whose understanding of the spec is the relevant signal. PGO answers *distribution-shaped* questions ("what fraction of inputs are ≤16 bytes?"); the queries channel answers *intent-shaped* ones ("is this the hot path?", "should this trait method specialize on type X?", "is this allocation expected to escape?"). The two are complementary, not substitutes — distribution data and intent data are different signals — and PGO is deferred from v1 (see [deferred.md § Profile-Guided Optimization Loop](deferred.md#profile-guided-optimization-loop)).
+
+**Mechanism.** Each query carries:
+
+- A **stable ID** (path-based DefId for the carrying item; structural hash for sub-item slots). Identity choice survives line/byte edits, body refactors that do not change the decision shape, and renames of unrelated items.
+- The **decision site** — function, expression, or type — with source span for human display.
+- The **options** the compiler considered (e.g., `inline | no_inline | inline_always`), with the compiler's rationale per option.
+- The **default the compiler chose**, plus its confidence ("conservative — would rather defer").
+- The **resolution surface** — which attribute, written where, would pin the answer.
+
+Resolutions live as source annotations (the common case) — reviewable as code, version-controlled, scoped to the item, surviving moves with the item. Sub-item or per-call-site decisions where attribute syntax is awkward may use a sidecar resolutions file as a fallback; the report format is JSON canonical with a derived markdown view (`--format=md`) for human review.
+
+**A clean codebase has zero open queries the author cares about, not zero queries.** Unresolved queries are not warnings — they are the compiler reporting "I picked the safe default; you can do better if you have spec context I don't." Queries describe optimization opportunities the compiler explicitly chose not to take, not suspected mistakes (those remain lints).
+
+**Layer classification.** The queries report is **Reported behavior** — same band as the inferred private-function effect set, the would-be parameter mode (above), `karac query concurrency` decisions, and `karac query monomorphization` counts. Stable within a compiler release; explicitly unstable across minor releases. Tools that consume `karac query queries` must tolerate version skew on which queries fire and which IDs they carry. Resolution annotations themselves are language items and follow language SemVer separately — once an annotation is committed, the language guarantees the attribute keeps parsing across versions even if the underlying query the annotation resolved no longer fires.
+
+**Author claims are trusted at v1.** A wrong `#[likely]` or `#[specialize(T = i64)]` that does not match real usage produces suboptimal codegen — no worse than today's annotation surface, but the channel concentrates author claims into a structured surface that *invites* more of them. Verifier-backed resolution (Alive2-class equivalence checks against author invariants) is a known future direction but deferred from v1; see [deferred.md § Verifier-Backed Query Resolution](deferred.md#verifier-backed-query-resolution).
+
+**Aging — orphan resolutions.** When the body of an item changes such that a previously-applicable query no longer fires, the resolution attribute on that item is *orphaned*. Orphans are surfaced as a reverse query category in the next compile ("this resolution no longer matches any decision; remove or update") rather than auto-stripped. This keeps the channel symmetric — the compiler reports both decisions it hedged on *and* resolutions it can no longer apply — and gives the author a clear next action without losing intent silently.
+
+**Architectural commitment for v1 (P0).** v1 ships the channel infrastructure even if zero query catalogue entries are wired through:
+
+1. **Stable item identity** — path-based DefId carried alongside `Span` at every AST/HIR node, with structural-hash sub-item slots. Load-bearing — without this, every later query addition is a breaking change for tools storing resolved answers.
+2. **Per-phase `queries: Vec<CompilerQuery>` field** on each phase result struct (`OwnershipCheckResult`, `TypeCheckResult`, etc.). Empty-by-default in v1; phases populate incrementally.
+3. **`karac query queries`** CLI surface — new `Queries` variant of `QueryKind`. JSON output, no-op-but-present until the catalogue grows.
+4. **This classification.**
+
+The P0 commit lands in [Phase 8 stdlib floor](implementation_checklist/phase-8-stdlib-floor.md). Specific query catalogue entries are P1 additions tracked separately.
+
+**P1 query catalogue.** Initial queries, ordered by (optimization win × spec-context resolvability) ÷ (implementation cost). Each P1 entry has a corresponding tracker line under `implementation_checklist/`.
+
+| # | Query | Decision site | Resolution surface | Phase |
+|---|---|---|---|---|
+| P1.1 | RC fallback at use site | `RcFallbackNote` decision in ownership pass | existing `#[no_rc]`; new `#[prefer_rc]` (see § Feature 4 Part 4) | 8 |
+| P1.2 | Generic specialization on monomorphization tuple | typechecker monomorphization counter | `#[specialize(T = i64)]` (new) | 8 |
+| P1.3 | Inlining + branch hints | codegen | existing `#[inline]` / `#[inline(never)]` / `#[likely]` / `#[unlikely]` (see § Codegen Hint Attributes) | 7+ |
+| P1.4 | Effect-set narrowing | effect inference at function exit | existing effect declaration on the function | 11 |
+| P1.5 | Layout choice (SoA/AoS, field grouping ambiguity) | layout validation pass | existing `layout` block syntax (see § Feature 1) | 11 |
+| P1.6 | Auto-concurrency fork threshold | concurrency cost model (unspecified for v1) | `#[fork_at(...)]` (new) | 11+ |
+
+**Distinction from neighboring mechanisms.**
+
+- *Not LLVM-style optimization remarks.* Remarks are read-only with no structured response surface and no stable IDs. Queries enumerate hedged decisions at item granularity, key them by stable ID, and accept structured resolutions that round-trip across compiles.
+- *Not a schedule language.* Halide-style schedules describe a complete optimization plan in a separate authoring surface; queries surface only the un-baked residual decisions and resolve them as item attributes in source. Schedule-language layering for tight numeric loops is deferred from v1 (see [deferred.md § Schedule Language Layer](deferred.md#schedule-language-layer)).
+- *Not LLM-in-the-compile-loop.* The LLM operates at authorship time — between compiles — not inside a single compile invocation. Resolutions persist as committed source annotations, auditable like any other code; they are never opaque trained-model artifacts. (MLGO-style trained policy artifacts are deferred — see [deferred.md § MLGO Trained Policy Artifacts](deferred.md#mlgo-trained-policy-artifacts).)
+- *Not a runtime-profile substitute.* Distribution data is PGO's domain. The queries channel and PGO are complementary signals; v1 ships only the queries channel.
+- *Not a lint pass.* Lints fire on suspected mistakes; queries fire on optimization opportunities the compiler explicitly chose not to take.
+
+**Cross-references.**
+
+- The "would-be parameter mode" precedent (Reported behavior layer above) — same band, same stability classification.
+- § Codegen Hint Attributes — `#[inline]`, `#[cold]`, `#[inline(always|never)]` double as resolution surfaces for category P1.3.
+- § Feature 4 Part 4 — RC fallback decision sites and `#[no_rc]` (resolution surface for P1.1).
+- § AI-First Compiler Interface — the JSON output channel and structured-diagnostic discipline the queries report joins.
+- deferred.md entries on [PGO](deferred.md#profile-guided-optimization-loop), [MLGO](deferred.md#mlgo-trained-policy-artifacts), [schedule languages](deferred.md#schedule-language-layer), and [verifier-backed query resolution](deferred.md#verifier-backed-query-resolution).
+
 ---
 
 ## Identifiers and Naming

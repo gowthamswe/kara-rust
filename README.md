@@ -1,5 +1,9 @@
 # Kāra
 
+<p align="center">
+  <img src="docs/img/wip.png" alt="Work In Progress" width="150">
+</p>
+
 **A language where the programmer declares *what* and *why*, and the compiler decides *how* and *where*.**
 
 ```

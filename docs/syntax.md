@@ -2321,6 +2321,10 @@ Known attributes:
 | `#[snapshot]` | Test function | Snapshot test (output compared against saved baseline) |
 | `#[test(requires = [...])]` | Test function | Declare resources needed for test |
 | `#[with_provider(resource, constructor)]` | Test function | Per-test provider injection |
+| `#[prefer_rc]` | Function/Module | Compiler queries channel resolution surface for the RC fallback decision (P1.1). Hint that the Phase 2 RC→Arc promotion respects in ambiguous cases; conflicts with `#[no_rc]`. See design.md § Compiler Queries and § Feature 4 Part 4. |
+| `#[specialize(T = TYPE, ...)]` | Function | Compiler queries channel resolution surface for the specialization decision (P1.2). Author directs the compiler to specialize the body for the named monomorphization tuple. See design.md § Compiler Queries. |
+| `#[likely]` / `#[unlikely]` | `match` arm / `if`-`else` branch | Compiler queries channel resolution surface for the branch-hint decision (P1.3). Author asserts the branch is hot or cold. See design.md § Compiler Queries and § Codegen Hint Attributes. |
+| `#[fork_at(N)]` | Function | Compiler queries channel resolution surface for the auto-concurrency fork threshold decision (P1.6). Author overrides the cost-model fork threshold for this function's parallel groups. See design.md § Compiler Queries and § Auto-concurrency cost-model decisions. |
 
 ---
 
