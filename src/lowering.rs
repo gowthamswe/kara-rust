@@ -56,6 +56,16 @@ pub fn lower_program(program: &mut Program, tc: &TypeCheckResult) {
         .iter()
         .map(|(k, v)| ((k.0, k.1), v.clone()))
         .collect();
+    // PB sibling slice (2026-05-09): forward the inner element-type table
+    // for `Vec[T]` / `Slice[T]` pattern bindings so codegen can populate
+    // `vec_elem_types` / `slice_elem_types` keyed by the binding's variable
+    // name and route direct method dispatch on the binding through the
+    // right element-typed path. See `bind_pattern_values` in src/codegen.rs.
+    program.pattern_binding_inner_types = tc
+        .pattern_binding_inner_types
+        .iter()
+        .map(|(k, v)| ((k.0, k.1), v.clone()))
+        .collect();
 }
 
 struct Lowerer<'a> {

@@ -2119,6 +2119,19 @@ pub struct TypeCheckResult {
     /// Only `Type::Named` types are recorded (primitives, refs, etc. don't
     /// need the reconstruction step).
     pub pattern_binding_types: HashMap<SpanKey, String>,
+    /// Sibling table to `pattern_binding_types` carrying the inner element
+    /// `TypeExpr` for `Vec[T]` / `Slice[T]` pattern bindings only. Keyed by
+    /// the same `SpanKey` (the pattern's span). Populated alongside the
+    /// String-name entry in `bind_pattern_types` / `check_pattern_against`
+    /// when the surface type is `Vec[T]` or `Slice[T]`. Consumed by codegen
+    /// at `bind_pattern_values` to populate `vec_elem_types` /
+    /// `slice_elem_types` keyed by the binding's variable name, so direct
+    /// method dispatch on a pattern-bound `Vec` / `Slice` payload (`xs.len()`,
+    /// `xs[0]`, `xs.push(...)`) routes through the right element-typed path
+    /// without going through function-arg routing as a work-around. Empty
+    /// for non-collection bindings (the existing String-name table is
+    /// sufficient for those). PB sibling slice (2026-05-09).
+    pub pattern_binding_inner_types: HashMap<SpanKey, TypeExpr>,
     /// Names of functions declared with `#[compiler_builtin]` (CR-202
     /// slice 2). The signature lives in `env.functions`; the entry here
     /// flags the function as having its body replaced by Rust dispatch.
@@ -2235,6 +2248,10 @@ pub struct TypeChecker<'a> {
     /// Pattern-binding name → canonical type name. See the public copy on
     /// `TypeCheckResult` for the consumer doc.
     pattern_binding_types: HashMap<SpanKey, String>,
+    /// Pattern-binding span → inner element `TypeExpr` for `Vec[T]` / `Slice[T]`
+    /// bindings. Sibling to `pattern_binding_types`. See the public copy on
+    /// `TypeCheckResult` for the full rationale (PB sibling slice 2026-05-09).
+    pattern_binding_inner_types: HashMap<SpanKey, TypeExpr>,
     /// Trait bounds for the generic parameters in the current enclosing scope
     /// (impl-level + function/method-level). Indexed by the param's textual
     /// name so it pairs naturally with `Type::TypeParam(name)`. Populated on
@@ -2302,6 +2319,7 @@ impl<'a> TypeChecker<'a> {
             bare_assoc_fn_targets: HashMap::new(),
             call_type_subs: HashMap::new(),
             pattern_binding_types: HashMap::new(),
+            pattern_binding_inner_types: HashMap::new(),
             enclosing_bounds: HashMap::new(),
             enclosing_trait: None,
             closure_once_reasons: HashMap::new(),
@@ -2354,6 +2372,7 @@ impl<'a> TypeChecker<'a> {
             bare_assoc_fn_targets: self.bare_assoc_fn_targets,
             call_type_subs: self.call_type_subs,
             pattern_binding_types: self.pattern_binding_types,
+            pattern_binding_inner_types: self.pattern_binding_inner_types,
             compiler_builtins,
         }
     }
@@ -12244,6 +12263,12 @@ impl<'a> TypeChecker<'a> {
                     self.pattern_binding_types
                         .insert(SpanKey::from_span(&pattern.span), type_name.clone());
                 }
+                // PB sibling slice (2026-05-09): mirror
+                // `bind_pattern_types`'s sibling-table write so direct
+                // method dispatch on a pattern-bound `Vec[T]` / `Slice[T]`
+                // payload (the canonical match-arm shape) routes through
+                // the right element-typed path.
+                self.record_pattern_inner_type(pattern, expected);
             }
             PatternKind::Literal(_) => {
                 // Type checking of literal patterns deferred
@@ -12384,6 +12409,138 @@ impl<'a> TypeChecker<'a> {
 
     // ── Pattern Binding for Let ─────────────────────────────────
 
+    /// Reverse direction of `lower_type_expr` for the subset needed by the
+    /// pattern-binding sibling table (PB sibling slice 2026-05-09): convert
+    /// a `Type` back to a synthetic `TypeExpr` so it can be forwarded
+    /// through the lowering pass for codegen consumption (it lowers each
+    /// surface element type back to an LLVM type via
+    /// `llvm_type_for_type_expr`). Coverage: primitive integer / float /
+    /// bool / char / str / unit, `Type::Named` (Vec, Slice, Map, struct,
+    /// enum names), `Type::Tuple`, `Type::Array`, `Type::Slice`, `Type::Ref`,
+    /// `Type::MutRef`, `Type::Shared`, `Type::Rc`, `Type::Arc`,
+    /// `Type::TypeParam`. Pieces outside this set (function types, type
+    /// vars, assoc projections, errors) fall back to `TypeKind::Error`,
+    /// which `llvm_type_for_type_expr` lowers to i64 — adequate for the
+    /// element-type registration use case (those payloads are not
+    /// supported in pattern-bound Vec/Slice element positions today).
+    fn type_to_type_expr(ty: &Type) -> TypeExpr {
+        let span = Span::default();
+        let path = |name: &str, args: Vec<TypeExpr>| TypeExpr {
+            kind: TypeKind::Path(PathExpr {
+                segments: vec![name.to_string()],
+                generic_args: if args.is_empty() {
+                    None
+                } else {
+                    Some(args.into_iter().map(GenericArg::Type).collect())
+                },
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        match ty {
+            Type::Int(IntSize::I8) => path("i8", vec![]),
+            Type::Int(IntSize::I16) => path("i16", vec![]),
+            Type::Int(IntSize::I32) => path("i32", vec![]),
+            Type::Int(IntSize::I64) => path("i64", vec![]),
+            Type::UInt(UIntSize::U8) => path("u8", vec![]),
+            Type::UInt(UIntSize::U16) => path("u16", vec![]),
+            Type::UInt(UIntSize::U32) => path("u32", vec![]),
+            Type::UInt(UIntSize::U64) => path("u64", vec![]),
+            Type::UInt(UIntSize::Usize) => path("usize", vec![]),
+            Type::Float(FloatSize::F32) => path("f32", vec![]),
+            Type::Float(FloatSize::F64) => path("f64", vec![]),
+            Type::Bool => path("bool", vec![]),
+            Type::Char => path("char", vec![]),
+            Type::Str => path("str", vec![]),
+            Type::Unit => TypeExpr {
+                kind: TypeKind::Unit,
+                span,
+            },
+            Type::Named { name, args } => {
+                let arg_exprs = args.iter().map(Self::type_to_type_expr).collect();
+                path(name, arg_exprs)
+            }
+            Type::Shared(name) => path(name, vec![]),
+            Type::Rc(inner) => path("Rc", vec![Self::type_to_type_expr(inner)]),
+            Type::Arc(inner) => path("Arc", vec![Self::type_to_type_expr(inner)]),
+            Type::Tuple(elems) => TypeExpr {
+                kind: TypeKind::Tuple(elems.iter().map(Self::type_to_type_expr).collect()),
+                span,
+            },
+            Type::Array { element, size } => TypeExpr {
+                kind: TypeKind::Array {
+                    element: Box::new(Self::type_to_type_expr(element)),
+                    size: Box::new(Expr {
+                        kind: ExprKind::Integer(*size as i64, None),
+                        span: span.clone(),
+                    }),
+                },
+                span,
+            },
+            Type::Slice { element, mutable } => {
+                let inner = Box::new(Self::type_to_type_expr(element));
+                if *mutable {
+                    TypeExpr {
+                        kind: TypeKind::MutSlice(inner),
+                        span,
+                    }
+                } else {
+                    path("Slice", vec![*inner])
+                }
+            }
+            Type::Ref(inner) => TypeExpr {
+                kind: TypeKind::Ref(Box::new(Self::type_to_type_expr(inner))),
+                span,
+            },
+            Type::MutRef(inner) => TypeExpr {
+                kind: TypeKind::MutRef(Box::new(Self::type_to_type_expr(inner))),
+                span,
+            },
+            Type::Weak(inner) => TypeExpr {
+                kind: TypeKind::Weak(Box::new(Self::type_to_type_expr(inner))),
+                span,
+            },
+            Type::TypeParam(name) => path(name, vec![]),
+            // Fallback for shapes that don't have a clean TypeExpr round-trip
+            // (TypeVar, Function, OnceFunction, Pointer, AssocProjection,
+            // Error). The element-type registration use case never sees
+            // these as Vec[T] / Slice[T] inner types in a well-typed
+            // program, so falling back to Error → i64 lowering is safe.
+            _ => TypeExpr {
+                kind: TypeKind::Error,
+                span,
+            },
+        }
+    }
+
+    /// If `ty` is `Vec[T]` / `Slice[T]` / `mut Slice[T]`, record the inner
+    /// element type at `pattern.span` in the sibling table so codegen can
+    /// register it under the binding's variable name (`vec_elem_types` /
+    /// `slice_elem_types`). For `Type::Slice` (which isn't a `Type::Named`
+    /// shape), also write the canonical `"Slice"` surface name into the
+    /// String-name table so codegen's `bind_pattern_values` knows which
+    /// element-type registry to populate. `Vec` already gets a String-name
+    /// entry from the existing `Type::Named` write. PB sibling slice
+    /// (2026-05-09).
+    fn record_pattern_inner_type(&mut self, pattern: &Pattern, ty: &Type) {
+        let (elem, name): (Option<&Type>, Option<&'static str>) = match ty {
+            Type::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                (Some(&args[0]), None)
+            }
+            Type::Slice { element, .. } => (Some(element.as_ref()), Some("Slice")),
+            _ => (None, None),
+        };
+        if let Some(elem_ty) = elem {
+            let elem_te = Self::type_to_type_expr(elem_ty);
+            self.pattern_binding_inner_types
+                .insert(SpanKey::from_span(&pattern.span), elem_te);
+            if let Some(canon_name) = name {
+                self.pattern_binding_types
+                    .insert(SpanKey::from_span(&pattern.span), canon_name.to_string());
+            }
+        }
+    }
+
     fn bind_pattern_types(&mut self, pattern: &Pattern, ty: &Type) {
         match &pattern.kind {
             PatternKind::Binding(name) => {
@@ -12399,6 +12556,14 @@ impl<'a> TypeChecker<'a> {
                     self.pattern_binding_types
                         .insert(SpanKey::from_span(&pattern.span), type_name.clone());
                 }
+                // PB sibling slice (2026-05-09): record the inner element
+                // type for `Vec[T]` / `Slice[T]` bindings so codegen can
+                // register the LLVM elem type under the binding's variable
+                // name (vec_elem_types / slice_elem_types). Lights up
+                // direct method dispatch (`xs.len()`, `xs[0]`, `xs.push(...)`)
+                // on a pattern-bound collection payload without needing
+                // function-arg routing as a work-around.
+                self.record_pattern_inner_type(pattern, ty);
             }
             PatternKind::Tuple(patterns) => {
                 if let Type::Tuple(types) = ty {

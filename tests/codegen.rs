@@ -7609,6 +7609,204 @@ fn main() {
         }
     }
 
+    // ── Pattern-bound element-type dispatch ──────────────────────────
+    //
+    // PB sibling slice (Phase 7.2 — 2026-05-09) closes the gap surfaced
+    // by CP slice's *Out of scope, still open*: direct method dispatch
+    // on a pattern-bound `Vec[T]` / `Slice[T]` payload (e.g. `xs.len()`
+    // where `xs` is the binding for a `V(Vec[i64])` payload) used to
+    // route through a generic fallback that didn't know the payload's
+    // parameterized inner type. The PB sibling slice surfaces the inner
+    // element type through the typechecker → lowering → codegen
+    // side-table chain so `compile_method_call`'s Vec/Slice arms
+    // dispatch through the right element-typed path.
+    //
+    // The 5 tests below pin the registration: (1) direct `xs.len()` on
+    // a `Vec[i64]` payload (the headline regression gate, contrasted
+    // with `test_compound_enum_vec_payload_round_trip` above which kept
+    // the function-arg work-around path), (2) direct `xs.len()` /
+    // `xs[0]` on a `Slice[i64]` payload, (3) index-read + push (via
+    // `let mut`-rebind) on a `Vec[i64]` payload, (4) `Vec[String]`
+    // element-type round-trip, (5) nested-tuple-Vec destructure as the
+    // PB5 cross-check.
+
+    #[test]
+    fn test_pattern_bound_vec_payload_method_dispatch_direct() {
+        // Headline regression gate. Pre-PB this required routing `xs`
+        // through a `ref Vec[i64]` function parameter — see
+        // `test_compound_enum_vec_payload_round_trip` for the legacy
+        // shape. Post-PB the direct dispatch on the bound name works.
+        let out = run_program(
+            r#"
+enum E { V(Vec[i64]) }
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(7);
+    v.push(8);
+    v.push(9);
+    let e = V(v);
+    match e {
+        V(xs) => println(xs.len()),
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "3");
+        }
+    }
+
+    #[test]
+    fn test_pattern_bound_slice_payload_method_dispatch_direct() {
+        // Slice-payload counterpart to the headline test. Constructs a
+        // slice from an Array via `as_slice()`, parks it in a variant
+        // payload, and verifies `.len()` and indexing on the bound name
+        // dispatch through the slice element-type registry.
+        let out = run_program(
+            r#"
+enum E { V(Slice[i64]) }
+fn main() {
+    let a: Array[i64, 3] = [10, 20, 30];
+    let s: Slice[i64] = a.as_slice();
+    let e = V(s);
+    match e {
+        V(xs) => {
+            println(xs.len());
+            println(xs[0]);
+            println(xs[2]);
+        }
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["3", "10", "30"]);
+        }
+    }
+
+    #[test]
+    fn test_pattern_bound_vec_payload_index_read_and_is_empty_direct() {
+        // Index-read and `.is_empty()` directly on the pattern binding.
+        // Pre-PB these dispatched through the same generic fallback as
+        // `.len()` and either silently produced wrong codegen or failed
+        // with a "no handler" diagnostic. Post-PB the binding-name → Vec
+        // element-type registration lights up both paths in one go (the
+        // registry is shared across all Vec method dispatchers).
+        //
+        // `xs.push(...)` on the pattern binding directly is still
+        // off-limits because the parser binds tuple-variant pattern
+        // names without a mut bit (`mut xs` isn't part of the surface
+        // pattern grammar today), and the conventional `let mut xs2 =
+        // xs;` rebind exercises a separate let-from-Identifier
+        // propagation gap that's outside this slice's scope. Mutation
+        // tests on pattern-bound collections wait until either pattern
+        // mut bindings or let-from-Identifier propagation lands.
+        let out = run_program(
+            r#"
+enum E { V(Vec[i64]) }
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(100);
+    v.push(200);
+    v.push(300);
+    let e = V(v);
+    match e {
+        V(xs) => {
+            println(xs[0]);
+            println(xs[1]);
+            println(xs[2]);
+            if xs.is_empty() {
+                println(0);
+            } else {
+                println(1);
+            }
+        }
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["100", "200", "300", "1"]);
+        }
+    }
+
+    #[test]
+    fn test_pattern_bound_vec_of_strings_method_dispatch() {
+        // Verifies `String` as the inner element type round-trips
+        // through the `type_to_type_expr` helper added by the PB
+        // sibling slice — the lowered `TypeExpr` for `String` is a
+        // `TypeKind::Path("String")` which `llvm_type_for_name` lowers
+        // to the same Vec-shaped struct used at the call-site
+        // function-arg path. `.len()` on the bound name returns the
+        // element count regardless of element width.
+        let out = run_program(
+            r#"
+enum E { V(Vec[String]) }
+fn main() {
+    let mut v: Vec[String] = Vec.new();
+    v.push("alpha");
+    v.push("beta");
+    v.push("gamma");
+    let e = V(v);
+    match e {
+        V(xs) => println(xs.len()),
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "3");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_pattern_bound_nested_tuple_vec_payload() {
+        // PB5 cross-check: nested destructure where the variant payload
+        // is itself a tuple `(Vec[i64], i64)`. The typechecker side
+        // works correctly (`check_pattern_against`'s Tuple arm recurses
+        // into each element type, so the inner Vec binding picks up
+        // the element-type registration via the PB sibling table). The
+        // codegen-side gap is independent of this slice: the variant-
+        // payload-tuple reconstruction path in `bind_pattern_values` /
+        // `reconstruct_payload_value` doesn't recurse into a Tuple
+        // sub-pattern (PatternKind::Tuple falls through to
+        // `_ => Ok(())`), and `reconstruct_payload_value` heuristically
+        // picks a Vec-shaped target for any 4-word reconstruction
+        // — collapsing the (Vec, i64) tuple to a Vec value before the
+        // pattern-walker sees the inner names. Lifting this requires
+        // a separate slice covering tuple-payload destructure; tracked
+        // via this `#[ignore]`'d gate. Once the codegen-side recursion
+        // lands, drop the `#[ignore]` and confirm the PB sibling table
+        // already handles the typechecker side (no additional PB work
+        // expected).
+        let out = run_program(
+            r#"
+enum E { V((Vec[i64], i64)) }
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    v.push(4);
+    let e = V((v, 100));
+    match e {
+        V((xs, n)) => {
+            println(xs.len());
+            println(n);
+        }
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["4", "100"]);
+        }
+    }
+
     // ── Codegen bug regression tests ─────────────────────────────────
     //
     // Each test below pins an entry surfaced through

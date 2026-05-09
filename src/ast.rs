@@ -82,6 +82,17 @@ pub type MethodCalleeTypesTable = std::collections::HashMap<(usize, usize), Stri
 /// dispatches through the right struct shape.
 pub type PatternBindingTypesTable = std::collections::HashMap<(usize, usize), String>;
 
+/// Sibling to `PatternBindingTypesTable`: maps each pattern-binding's span
+/// `(offset, length)` to the inner element `TypeExpr` for `Vec[T]` /
+/// `Slice[T]` bindings only. Populated by the lowering pass from the
+/// typechecker's `pattern_binding_inner_types` map. Consumed by codegen at
+/// `bind_pattern_values` to register `vec_elem_types` / `slice_elem_types`
+/// under the binding's variable name, so direct method dispatch on a
+/// pattern-bound collection payload (`xs.len()` / `xs[0]` / `xs.push(...)`)
+/// routes through the right element-typed path. PB sibling slice
+/// (2026-05-09).
+pub type PatternBindingInnerTypesTable = std::collections::HashMap<(usize, usize), TypeExpr>;
+
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub items: Vec<Item>,
@@ -97,6 +108,9 @@ pub struct Program {
     pub method_callee_types: MethodCalleeTypesTable,
     /// Set by the lowering pass from `TypeCheckResult.pattern_binding_types`.
     pub pattern_binding_types: PatternBindingTypesTable,
+    /// Set by the lowering pass from `TypeCheckResult.pattern_binding_inner_types`.
+    /// PB sibling slice (2026-05-09).
+    pub pattern_binding_inner_types: PatternBindingInnerTypesTable,
 }
 
 // ── Top-level Items ──────────────────────────────────────────────

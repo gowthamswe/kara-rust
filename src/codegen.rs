@@ -645,6 +645,17 @@ struct Codegen<'ctx> {
     /// struct, so subsequent `.field` access dispatches through the right
     /// struct shape.
     pattern_binding_types: HashMap<(usize, usize), String>,
+    /// Sibling to `pattern_binding_types` carrying the inner element
+    /// `TypeExpr` for `Vec[T]` / `Slice[T]` pattern bindings only. Populated
+    /// from `Program.pattern_binding_inner_types`. Read by
+    /// `bind_pattern_values` to lower the inner element type to a
+    /// `BasicTypeEnum` (via `llvm_type_for_type_expr`) and register it
+    /// under the binding's variable name in `vec_elem_types` /
+    /// `slice_elem_types`, so subsequent method-dispatch (`xs.len()` /
+    /// `xs[0]` / `xs.push(...)`) on a pattern-bound `Vec` / `Slice` payload
+    /// routes through the right element-typed path. PB sibling slice
+    /// (2026-05-09).
+    pattern_binding_inner_types: HashMap<(usize, usize), TypeExpr>,
     /// Top-level `const NAME: T = value` declarations, populated by
     /// `compile_program` from `Item::ConstDecl` items before any function
     /// body is compiled. Key: const name. Value: the const's value
@@ -1252,6 +1263,7 @@ impl<'ctx> Codegen<'ctx> {
             callee_effectful: HashMap::new(),
             method_callee_types: HashMap::new(),
             pattern_binding_types: HashMap::new(),
+            pattern_binding_inner_types: HashMap::new(),
             consts: HashMap::new(),
             source_filename: None,
             source_filename_global: None,
@@ -3106,6 +3118,15 @@ impl<'ctx> Codegen<'ctx> {
         // i64 word at match-arm bind sites — so `Err(e) => e.field` works
         // when the variant payload is a struct.
         self.pattern_binding_types = program.pattern_binding_types.clone();
+
+        // Side-table set by `lowering::lower_program`: each pattern-
+        // binding's span maps to its inner element TypeExpr for `Vec[T]` /
+        // `Slice[T]` bindings only. Read by `bind_pattern_values` to
+        // populate `vec_elem_types` / `slice_elem_types` under the
+        // binding's variable name so direct method dispatch on the
+        // binding (`xs.len()`, `xs[0]`, `xs.push(...)`) routes through
+        // the right element-typed path. PB sibling slice (2026-05-09).
+        self.pattern_binding_inner_types = program.pattern_binding_inner_types.clone();
 
         // Top-level `const NAME: T = value` collection. References from
         // function bodies (parsed as `ExprKind::Identifier(name)` for bare
@@ -14342,6 +14363,31 @@ impl<'ctx> Codegen<'ctx> {
                 // table; user struct types use it for `.field` access.
                 let key = (pattern.span.offset, pattern.span.length);
                 if let Some(type_name) = self.pattern_binding_types.get(&key).cloned() {
+                    // PB sibling slice (2026-05-09): when the binding's
+                    // surface type is `Vec[T]` / `Slice[T]`, look up the
+                    // inner element TypeExpr in the sibling table and
+                    // register the LLVM element type under the binding's
+                    // variable name. This lights up direct method dispatch
+                    // (`xs.len()` / `xs[0]` / `xs.push(...)`) on a
+                    // pattern-bound collection payload — without it, the
+                    // dispatch falls through to a generic path that
+                    // doesn't know the element type and either produces
+                    // wrong codegen or fails with cryptic diagnostics.
+                    // String / user-struct surface types don't populate
+                    // any elem-type registry — they're sufficient via
+                    // the existing String-name table.
+                    if let Some(inner_te) = self.pattern_binding_inner_types.get(&key).cloned() {
+                        let elem_llvm = self.llvm_type_for_type_expr(&inner_te);
+                        match type_name.as_str() {
+                            "Vec" => {
+                                self.vec_elem_types.insert(name.clone(), elem_llvm);
+                            }
+                            "Slice" => {
+                                self.slice_elem_types.insert(name.clone(), elem_llvm);
+                            }
+                            _ => {}
+                        }
+                    }
                     self.var_type_names.insert(name.clone(), type_name);
                 }
                 Ok(())
