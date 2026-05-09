@@ -1853,6 +1853,11 @@ impl<'a> OwnershipChecker<'a> {
                 {
                     self.binding_types.insert(name.clone(), t.clone());
                 }
+                // Slice 2 polish (D5) — record scope depth so the
+                // shape D drain can match the LHS's "outer" scope
+                // against the source's "inner" scope at exit.
+                self.binding_scope_depth
+                    .insert(name.clone(), self.current_scope_depth);
             }
             StmtKind::LetElse {
                 pattern,
@@ -1924,6 +1929,25 @@ impl<'a> OwnershipChecker<'a> {
                     // Track mutation of parameters
                     if let Some(usage) = param_usage.get_mut(name) {
                         *usage = ParamUsage::Mutated;
+                    }
+                    // Slice 2 polish (D5) — when the LHS is a slice-typed
+                    // binding (typically a `LetUninit` outer binding) and
+                    // the RHS produced a slice creation, record the LHS's
+                    // scope depth against the source root so block-exit
+                    // drain can detect "slice outlives source" cases.
+                    // The LHS's scope depth is already captured in
+                    // `binding_scope_depth` from the `LetUninit` arm.
+                    if let Some(entry) = self
+                        .slice_borrow_sources
+                        .get(&SpanKey::from_span(&value.span))
+                        .cloned()
+                    {
+                        if let Some(&lhs_depth) = self.binding_scope_depth.get(name) {
+                            self.slice_binding_sources
+                                .insert(name.clone(), entry.clone());
+                            self.slice_binding_scope_depth
+                                .insert(entry.0.root.clone(), lhs_depth);
+                        }
                     }
                 } else {
                     // Field/index assignment — track mutation on the root object
@@ -2005,6 +2029,25 @@ impl<'a> OwnershipChecker<'a> {
         self.callee_param_slice_kind
             .get(&key)
             .and_then(|kinds| kinds.get(arg_index).copied().flatten())
+    }
+
+    /// Slice 2 follow-up — return the call-arg-side borrow kind for a
+    /// non-slice ref formal at `arg_index`. `Ref T` formals push
+    /// `BorrowKind::ImmRef`; `MutRef T` formals push `BorrowKind::MutRef`.
+    /// Slice formals (`Slice[T]` / `mut Slice[T]`) return `None` here so
+    /// the existing slice creation hook owns those — the slice push
+    /// already routes through the conflict matrix as `ImmSlice` / `MutSlice`.
+    /// Owned formals and unresolvable callees also return `None`.
+    fn arg_formal_ref_borrow_kind(&self, callee: &Expr, arg_index: usize) -> Option<BorrowKind> {
+        if self.arg_formal_slice_kind(callee, arg_index).is_some() {
+            return None;
+        }
+        let modes = self.callee_modes_for_call(callee)?;
+        match modes.get(arg_index)? {
+            OwnershipMode::Ref => Some(BorrowKind::ImmRef),
+            OwnershipMode::MutRef => Some(BorrowKind::MutRef),
+            OwnershipMode::Own => None,
+        }
     }
 
     /// Resolve the root binding of a place expression at a slice creation
@@ -2338,18 +2381,25 @@ impl<'a> OwnershipChecker<'a> {
     /// Slice 2 — the receiver-side `BorrowKind` for a `MethodCall`. Drives
     /// the call-statement-scoped ref-side push that Slice 2's sub-step (g)
     /// gates on. Returns `None` for static methods, bare-self consumes
-    /// (no borrow), and unresolved methods (typecheck error upstream or
-    /// stdlib methods whose impls aren't in user code).
+    /// (no borrow), and unresolved methods. Falls through to a small
+    /// table of stdlib method receiver modes when the user-impl lookup
+    /// misses — `Vec.push` / `Map.insert` etc. don't have user-side
+    /// `impl` blocks, so without the table cross-borrow detection would
+    /// silently miss for the most common case (`let _s = v.as_slice();
+    /// v.push(99);`).
     fn method_self_borrow_kind(&self, method_call: &Expr) -> Option<BorrowKind> {
         let key = self
             .typecheck_result
             .method_callee_types
             .get(&SpanKey::from_span(&method_call.span))?;
-        match self.method_self_modes.get(key)? {
-            SelfParam::Owned => None,
-            SelfParam::Ref => Some(BorrowKind::ImmRef),
-            SelfParam::MutRef => Some(BorrowKind::MutRef),
+        if let Some(self_param) = self.method_self_modes.get(key) {
+            return match self_param {
+                SelfParam::Owned => None,
+                SelfParam::Ref => Some(BorrowKind::ImmRef),
+                SelfParam::MutRef => Some(BorrowKind::MutRef),
+            };
         }
+        stdlib_method_self_borrow_kind(key)
     }
 
     /// Whether the resolved method's receiver is `mut ref self`. Used by the
@@ -2804,6 +2854,13 @@ impl<'a> OwnershipChecker<'a> {
                     // `check_expr_reading`'s Call arm for rationale.
                     if let Some(formal_mutable) = self.arg_formal_slice_kind(callee, i) {
                         self.record_slice_creation(&arg.value.span, &arg.value, formal_mutable);
+                    } else if let Some(borrow_kind) = self.arg_formal_ref_borrow_kind(callee, i) {
+                        // Slice 2 follow-up — non-slice ref formal cross-
+                        // borrow push; see `check_expr_reading`'s Call arm
+                        // for rationale.
+                        if let Some(place) = self.place_expr_root(&arg.value) {
+                            self.push_active_borrow(borrow_kind, place, arg.value.span.clone());
+                        }
                     }
                 }
                 self.restore_active_borrows_to_snapshot(&snapshot);
@@ -2978,9 +3035,10 @@ impl<'a> OwnershipChecker<'a> {
             }
             ExprKind::Call { callee, args } => {
                 // Slice 2 — snapshot before arg walking so call-arg-
-                // coerced slice borrows are call-statement-scoped (drop
-                // at call return). Conflicts mid-call still fire because
-                // the push side-effects the diagnostic.
+                // coerced slice borrows AND ref-formal transient borrows
+                // are call-statement-scoped (drop at call return).
+                // Conflicts mid-call still fire because the push side-
+                // effects the diagnostic.
                 let snapshot = self.snapshot_active_borrow_lens();
                 self.check_call_callee(callee, states, param_types, param_usage);
                 for (i, arg) in args.iter().enumerate() {
@@ -2999,6 +3057,15 @@ impl<'a> OwnershipChecker<'a> {
                     // the source attribution against the arg's span.
                     if let Some(formal_mutable) = self.arg_formal_slice_kind(callee, i) {
                         self.record_slice_creation(&arg.value.span, &arg.value, formal_mutable);
+                    } else if let Some(borrow_kind) = self.arg_formal_ref_borrow_kind(callee, i) {
+                        // Slice 2 follow-up — non-slice `ref T` / `mut ref T`
+                        // formal at this position. Push a transient borrow
+                        // on the arg's root so cross-borrow detection fires
+                        // against any live slice on the same source. The
+                        // borrow drops at the call's snapshot-restore.
+                        if let Some(place) = self.place_expr_root(&arg.value) {
+                            self.push_active_borrow(borrow_kind, place, arg.value.span.clone());
+                        }
                     }
                 }
                 self.restore_active_borrows_to_snapshot(&snapshot);
@@ -4848,6 +4915,60 @@ enum BorrowConflict {
     None,
     SliceShape(SliceConflictShape),
     CrossForm,
+}
+
+/// Slice 2 polish (b) — receiver-mode lookup for stdlib methods. The
+/// user-impl `method_self_modes` map only covers methods declared in
+/// user source; built-in `Vec` / `Map` / `Set` / `String` / `Slice`
+/// methods are resolved by the typechecker but have no `impl` block to
+/// scan. This table returns the receiver `BorrowKind` for stdlib
+/// method keys (`"Vec.push"`, etc.) so cross-borrow detection still
+/// fires when calling stdlib methods on a binding with a live slice.
+/// Returns `None` for owned (consume) receivers and any key not in the
+/// table — keeping unrecognized methods read-only-equivalent (no push)
+/// is the conservative default.
+fn stdlib_method_self_borrow_kind(key: &str) -> Option<BorrowKind> {
+    use BorrowKind::*;
+    let kind = match key {
+        // Vec[T] mutating methods — `mut ref self` / write borrow.
+        "Vec.push" | "Vec.pop" | "Vec.insert" | "Vec.remove" | "Vec.swap_remove" | "Vec.clear"
+        | "Vec.truncate" | "Vec.resize" | "Vec.retain" | "Vec.extend" | "Vec.sort"
+        | "Vec.sort_by" | "Vec.reverse" | "Vec.fill" | "Vec.swap" | "Vec.as_slice_mut" => MutRef,
+        // Vec[T] read methods — `ref self` / read borrow.
+        "Vec.len" | "Vec.is_empty" | "Vec.first" | "Vec.last" | "Vec.get" | "Vec.contains"
+        | "Vec.iter" | "Vec.binary_search" | "Vec.split_at" | "Vec.chunks" | "Vec.windows"
+        | "Vec.as_slice" | "Vec.sorted" | "Vec.sorted_by" | "Vec.clone" => ImmRef,
+        // Map[K, V] mutating methods.
+        "Map.insert" | "Map.remove" | "Map.clear" | "Map.merge" => MutRef,
+        // Map[K, V] read methods.
+        "Map.len" | "Map.is_empty" | "Map.contains_key" | "Map.get" | "Map.get_or" | "Map.iter"
+        | "Map.keys" | "Map.values" | "Map.entries" | "Map.clone" => ImmRef,
+        // Set[T] / SortedSet[T] mutating methods.
+        "Set.insert" | "Set.remove" | "Set.clear" | "SortedSet.insert" | "SortedSet.remove"
+        | "SortedSet.clear" => MutRef,
+        // Set[T] / SortedSet[T] read methods.
+        "Set.len" | "Set.is_empty" | "Set.contains" | "Set.iter" | "Set.clone"
+        | "SortedSet.len" | "SortedSet.is_empty" | "SortedSet.contains" | "SortedSet.iter"
+        | "SortedSet.clone" => ImmRef,
+        // String mutating methods.
+        "String.push" | "String.push_str" | "String.clear" | "String.insert_str" => MutRef,
+        // String read methods.
+        "String.len" | "String.is_empty" | "String.contains" | "String.starts_with"
+        | "String.ends_with" | "String.bytes" | "String.chars" | "String.clone"
+        | "String.to_string" => ImmRef,
+        // Array[T, N] / Slice[T] read methods (the snapshot fence in the
+        // interpreter materializes Slice → Array, so the same method
+        // names appear under both type prefixes).
+        "Array.len" | "Array.is_empty" | "Array.first" | "Array.last" | "Array.get"
+        | "Array.iter" | "Slice.len" | "Slice.is_empty" | "Slice.first" | "Slice.last"
+        | "Slice.get" | "Slice.iter" => ImmRef,
+        // Mutating methods on Slice / Array — only `mut Slice[T]` carries
+        // these in v1; the receiver-side push fires regardless because
+        // mut Slice has its own slice-form borrow tracking.
+        "Slice.swap" => MutRef,
+        _ => return None,
+    };
+    Some(kind)
 }
 
 /// Render a `BorrowKind` for diagnostic messages.

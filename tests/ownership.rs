@@ -3648,51 +3648,88 @@ fn mut_slice_then_mutate_source_via_method_rejected_cross_borrow() {
 }
 
 #[test]
-fn slice_outlives_source_drop_rejected_shape_d() {
-    // The source `v` is bound inside an inner block; a slice into `v`
-    // is captured into an outer-scope binding `let mut s_outer:
-    // Slice[i64];` and assigned from inside. When the inner block
-    // exits, `v` drops while the slice into it is still live in the
-    // outer scope.
-    //
-    // The drop-of-borrowed trigger requires the slice's binding scope
-    // to be shallower than the source's. v1 detects this at block-exit
-    // drain when both the source binding and the slice binding are
-    // tracked. This test pins the diagnostic firing path for the
-    // canonical case.
-    //
-    // Note: v1 uses LetUninit + assignment to express the outer-bound
-    // slice, since let-binding with annotation alone doesn't capture
-    // the slice from a separately-scoped source the way the test
-    // wants. If parser support for the exact LetUninit + Slice-typed
-    // form isn't ready, the test falls back to a positive accept (no
-    // false negative on a valid program); the explicit drop-of-
-    // borrowed test ships when LetUninit reaches it as the slice-2
-    // polish item.
-    //
-    // For v1 we use the construction that works today: a slice taken
-    // inside an inner block whose source escapes via let-rebind to
-    // outer scope. The chain-through propagation tracks the slice
-    // binding scope; the drain detects the outlives condition.
+fn imm_slice_then_mut_ref_call_arg_rejected_cross_borrow() {
+    // An immutable slice into `v` is live, then `take_mut` is called
+    // with `mut v`. The `mut ref Vec[T]` formal pushes a transient
+    // `MutRef` borrow at the call boundary; the conflict matrix sees
+    // `ImmSlice` + `MutRef` against the same root and emits
+    // `CrossBorrowConflict`. Slice 2 follow-up sub-step (c) — symmetric
+    // to the receiver-side push for instance methods, but driven from
+    // the `Call` arm via the formal's declared param mode.
+    let errors = slice_conflict_errors(
+        "fn take_mut(v: mut ref Vec[i64]) {}
+         fn main() {
+             let mut v: Vec[i64] = Vec.new();
+             v.push(1);
+             let _s = v.as_slice();
+             take_mut(mut v);
+         }",
+    );
+    let cross: Vec<_> = errors
+        .iter()
+        .filter(|e| matches!(e.kind, OwnershipErrorKind::CrossBorrowConflict))
+        .collect();
+    assert_eq!(
+        cross.len(),
+        1,
+        "expected one CrossBorrowConflict, got {:?}",
+        errors
+    );
+}
+
+#[test]
+fn imm_slice_then_stdlib_mut_method_rejected_cross_borrow() {
+    // A `Slice[T]` into `v` is live, then `v.push(99)` is called.
+    // `Vec.push` has no user-side `impl Vec` block but `method_self_modes`
+    // lookup falls through to the stdlib receiver-mode table, which
+    // returns `BorrowKind::MutRef`. The receiver-side push at MethodCall
+    // emits `CrossBorrowConflict` against the live ImmSlice. Slice 2
+    // polish (b) — symmetric to the receiver-side push for user-defined
+    // instance methods, but driven by the stdlib table when user
+    // metadata is absent.
     let errors = slice_conflict_errors(
         "fn main() {
-             let mut v_outer: Vec[i64] = Vec.new();
-             v_outer.push(1);
-             let _s = v_outer.as_slice();
+             let mut v: Vec[i64] = Vec.new();
+             v.push(1);
+             let _s = v.as_slice();
+             v.push(99);
+         }",
+    );
+    let cross: Vec<_> = errors
+        .iter()
+        .filter(|e| matches!(e.kind, OwnershipErrorKind::CrossBorrowConflict))
+        .collect();
+    assert_eq!(
+        cross.len(),
+        1,
+        "expected one CrossBorrowConflict via stdlib method table, got {:?}",
+        errors
+    );
+}
+
+#[test]
+fn slice_outlives_source_drop_rejected_shape_d() {
+    // Canonical drop-of-borrowed: a `LetUninit Slice[T]` outer binding
+    // captures a slice taken inside an inner block. When the inner
+    // block exits, the source `v` drops while `s_outer` still holds a
+    // slice into freed storage. Shape D fires at the block-exit drain.
+    //
+    // This is the positive form of the v1 polish (D5) — earlier scoped
+    // out because the LetUninit + Slice-typed assignment surface was
+    // assumed unavailable; verified at probe time that
+    // `let mut s: Slice[i64];` followed by `s = v.as_slice();`
+    // typechecks cleanly. The Assign arm now propagates
+    // `slice_binding_scope_depth` from the LHS's recorded scope
+    // (captured at the LetUninit binding) so the drain matches.
+    let errors = slice_conflict_errors(
+        "fn main() {
+             let mut s_outer: Slice[i64];
              {
-                 let mut v_inner: Vec[i64] = Vec.new();
-                 v_inner.push(99);
-                 let _inner_s = v_inner.as_slice();
+                 let v: Vec[i64] = Vec.new();
+                 s_outer = v.as_slice();
              }
          }",
     );
-    // The inner-scoped slice drains cleanly; no shape D fires for this
-    // shape under v1's drain rules. The test pins the *no false
-    // positive* case — shape D should not fire when the slice's
-    // binding scope is at or deeper than the source's. The
-    // intentionally-failing shape D path (slice escaping outer-bound
-    // while source drops) is gated on LetUninit + slice-typed
-    // assignment which is post-v1 polish.
     let shape_d: Vec<_> = errors
         .iter()
         .filter(|e| {
@@ -3704,9 +3741,29 @@ fn slice_outlives_source_drop_rejected_shape_d() {
             )
         })
         .collect();
-    assert!(
-        shape_d.is_empty(),
-        "shape D should not false-positive on a well-scoped slice; got {:?}",
+    assert_eq!(
+        shape_d.len(),
+        1,
+        "expected one shape D drop-of-borrowed error, got {:?}",
         errors
+    );
+}
+
+#[test]
+fn slice_well_scoped_no_shape_d_false_positive() {
+    // Negative complement: when the slice's binding scope is at or
+    // deeper than the source binding's, no shape D fires. Pins the
+    // drain doesn't false-positive on well-scoped programs.
+    ownership_ok(
+        "fn main() {
+             let mut v_outer: Vec[i64] = Vec.new();
+             v_outer.push(1);
+             let _s = v_outer.as_slice();
+             {
+                 let mut v_inner: Vec[i64] = Vec.new();
+                 v_inner.push(99);
+                 let _inner_s = v_inner.as_slice();
+             }
+         }",
     );
 }
