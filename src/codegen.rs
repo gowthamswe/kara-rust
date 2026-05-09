@@ -4637,17 +4637,51 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 // Fallback: when there is no type annotation and the RHS is a
                 // call (or any expression `type_name_of` can't classify), but
-                // the compiled value is a struct, reverse-lookup the type by
-                // its LLVM struct identity. Lets `let f = Foo.default()` —
-                // UFCS associated-fn calls returning the impl owner — still
-                // populate `var_type_names` so `f.value` field access
-                // resolves correctly.
+                // the compiled value is a struct, recover the user-type name
+                // from the source AST when possible (UFCS shape `Target.fn(...)`
+                // where the receiver is the target type's name) before falling
+                // back to LLVM-struct-identity reverse-lookup. Lets
+                // `let f = Foo.default()` populate `var_type_names` so
+                // `f.value` resolves correctly — and also disambiguates
+                // distinct user types that lower to the same LLVM struct
+                // shape (e.g. two providers each `{ i64 }`), which the bare
+                // LLVM-identity reverse-lookup would alias by HashMap-iteration
+                // order. See `bugs.md` entry "Provider struct identity
+                // collision in codegen's `var_type_names`".
                 if type_hint.is_none() {
                     if let (BasicValueEnum::StructValue(sv), PatternKind::Binding(var_name)) =
                         (&val, &pattern.kind)
                     {
                         let st = sv.get_type();
-                        if let Some((name, _)) = self.struct_types.iter().find(|(_, ty)| **ty == st)
+                        // Prefer source-AST identity for UFCS associated-fn calls
+                        // whose target is a known user struct and whose LLVM
+                        // return type matches that struct's LLVM identity.
+                        let ast_hint = if let ExprKind::Call { callee, .. } = &value.kind {
+                            if let ExprKind::Path { segments, .. } = &callee.kind {
+                                if segments.len() == 2 {
+                                    let target = &segments[0];
+                                    if let Some(target_st) = self.struct_types.get(target) {
+                                        if *target_st == st {
+                                            Some(target.clone())
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(name) = ast_hint {
+                            self.var_type_names.insert(var_name.clone(), name);
+                        } else if let Some((name, _)) =
+                            self.struct_types.iter().find(|(_, ty)| **ty == st)
                         {
                             let name = name.clone();
                             self.var_type_names.insert(var_name.clone(), name);

@@ -7608,4 +7608,79 @@ fn main() {
             assert_eq!(out.trim(), "disk full");
         }
     }
+
+    // ── Codegen bug regression tests ─────────────────────────────────
+    //
+    // Each test below pins an entry surfaced through
+    // `docs/implementation_checklist/bugs.md`. Tests gated `#[ignore]`
+    // pin a still-open bug (running with `--include-ignored` or
+    // `cargo test --features llvm -- --ignored <name>` exercises the
+    // failing path); ungated tests are the regression gate after the
+    // underlying fix has landed.
+
+    /// Regression gate for the previously-latent "Provider struct
+    /// identity collision in codegen's `var_type_names`" bug (bugs.md
+    /// entry). Two distinct user types that lower to the same LLVM
+    /// struct shape used to collide in the LLVM-struct-identity reverse
+    /// lookup at `let p = Provider.new()` (the UFCS-associated-fn
+    /// fallback path in `compile_let`). The `var_type_names` mapping
+    /// would pick an arbitrary match in HashMap iteration order, so
+    /// `with_provider[R](p, || R.method())` routed to whichever
+    /// provider's vtable iteration produced first.
+    ///
+    /// Fix: in the fallback path of `compile_let`, prefer the source-AST
+    /// identity for UFCS calls of the shape `Target.fn(...)` whose LLVM
+    /// return type matches `Target`'s LLVM struct identity. The bare
+    /// LLVM-identity reverse-lookup remains as a final fallback for any
+    /// other call shape that yields a struct value.
+    ///
+    /// Repro: two providers `ProvA` / `ProvB` with identical `{ i64 }`
+    /// LLVM shape, each with a `pub fn new()` associated-fn constructor.
+    /// `with_provider[Ra](ProvA.new(), …)` and `with_provider[Rb](
+    /// ProvB.new(), …)` must each dispatch to its own impl — pre-fix,
+    /// both `Ra.record(0)` and `Rb.record(0)` routed to the same impl
+    /// (e.g., "100\n100" instead of "100\n200").
+    #[test]
+    fn test_var_type_names_struct_identity_collision_repro() {
+        let out = run_program(
+            r#"
+pub trait Recorder { fn record(ref self, value: i64) -> i64; }
+
+pub struct ProvA { x: i64 }
+impl ProvA { pub fn new() -> ProvA { ProvA { x: 1 } } }
+impl Recorder for ProvA { fn record(ref self, value: i64) -> i64 { 100 } }
+
+pub struct ProvB { x: i64 }
+impl ProvB { pub fn new() -> ProvB { ProvB { x: 2 } } }
+impl Recorder for ProvB { fn record(ref self, value: i64) -> i64 { 200 } }
+
+pub effect resource Ra: Recorder;
+pub effect resource Rb: Recorder;
+
+fn main() {
+    let a = ProvA.new();
+    let b = ProvB.new();
+    with_provider[Ra](a, || {
+        with_provider[Rb](b, || {
+            println(Ra.record(0));
+            println(Rb.record(0));
+        });
+    });
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(
+                lines,
+                vec!["100", "200"],
+                "expected each `with_provider[R]` to route to its own impl \
+                 (ProvA.record => 100, ProvB.record => 200); got {:?}. \
+                 If both lines match (e.g., both `200`), the LLVM-struct- \
+                 identity reverse-lookup at compile_let collided ProvA's \
+                 binding onto ProvB's name (or vice versa).",
+                lines
+            );
+        }
+    }
 }
