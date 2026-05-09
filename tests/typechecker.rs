@@ -4798,13 +4798,181 @@ fn test_method_resolution_slice_typo_suggestion() {
     );
 }
 
+// ── Method resolution: per-arm always-error flip on phase-8 stdlib arms ──
+//
+// Sub-item 7(d) closes by flipping the nine phase-8-floor arms (String,
+// Slice, Map, Entry, SortedSet, Set, Iterator, Sender, Receiver) from the
+// typo-only `handle_unknown_method` fallback to the always-error
+// `require_known_method` helper. Unknown methods on these types now fail
+// loudly with `NoMethodFound` even when no typo-suggestion exists. The
+// four phase-11 arms (Regex, HTTP Client/Response/HttpError) stay
+// typo-only by design — see `_stdlib_phase11_arms_silent_for_runtime_only`
+// below. Plan source: phase-4-interpreter.md § Method Resolution Step 7(d).
+
 #[test]
-fn test_method_resolution_stdlib_silent_for_runtime_only() {
-    // `s.completely_unrelated()` on a String stays silent (no edit-distance
-    // match to `sorted` / `sorted_by`). Preserves the permissive fall-through
-    // for runtime-only methods like `len` that aren't yet typechecker-known.
-    // `typecheck_ok` asserts there are no errors at all.
-    typecheck_ok("fn main() { let s = \"hi\"; s.completely_unrelated(); }");
+fn test_string_unknown_method_now_errors() {
+    // `s.completely_unrelated()` on a String is far from any known method
+    // (`sorted` / `sorted_by`) — pre-7(d) this stayed silent; post-7(d) it
+    // fires NoMethodFound unconditionally.
+    let errors = typecheck_errors("fn main() { let s = \"hi\"; s.completely_unrelated(); }");
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on String");
+    assert!(
+        msg.contains("'String'") && msg.contains("'completely_unrelated'"),
+        "expected String unknown-method diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_slice_unknown_method_now_errors() {
+    let errors = typecheck_errors(
+        "fn main() { let v = [1_i64, 2_i64, 3_i64]; v.as_slice().completely_unrelated(); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Slice");
+    assert!(
+        msg.contains("'Slice'") && msg.contains("'completely_unrelated'"),
+        "expected Slice unknown-method diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_map_unknown_method_now_errors() {
+    let errors = typecheck_errors(
+        "fn main() { let m: Map[String, i64] = Map.new(); m.completely_unrelated(); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Map");
+    assert!(
+        msg.contains("'Map'") && msg.contains("'completely_unrelated'"),
+        "expected Map unknown-method diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_entry_unknown_method_now_errors() {
+    let errors = typecheck_errors(
+        "fn main() {\n\
+             let m: Map[String, i64] = Map.new();\n\
+             m.entry(\"x\").completely_unrelated();\n\
+         }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Entry");
+    assert!(
+        msg.contains("'Entry'") && msg.contains("'completely_unrelated'"),
+        "expected Entry unknown-method diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_sorted_set_unknown_method_now_errors() {
+    let errors = typecheck_errors(
+        "fn main() { let s: SortedSet[i64] = SortedSet.new(); s.completely_unrelated(); }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on SortedSet");
+    assert!(
+        msg.contains("'SortedSet'") && msg.contains("'completely_unrelated'"),
+        "expected SortedSet unknown-method diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_set_unknown_method_now_errors() {
+    let errors =
+        typecheck_errors("fn main() { let s: Set[i64] = Set.new(); s.completely_unrelated(); }");
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Set");
+    assert!(
+        msg.contains("'Set'") && msg.contains("'completely_unrelated'"),
+        "expected Set unknown-method diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_iterator_unknown_method_now_errors() {
+    let errors = typecheck_errors(
+        "fn main() {\n\
+             let v: Vec[i64] = Vec.new();\n\
+             let mut it = v.into_iter();\n\
+             it.completely_unrelated();\n\
+         }",
+    );
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Iterator");
+    assert!(
+        msg.contains("'Iterator'") && msg.contains("'completely_unrelated'"),
+        "expected Iterator unknown-method diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_channel_sender_unknown_method_now_errors() {
+    let errors = typecheck_errors("fn f(s: Sender[i64]) { s.completely_unrelated(); }");
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Sender");
+    assert!(
+        msg.contains("'Sender'") && msg.contains("'completely_unrelated'"),
+        "expected Sender unknown-method diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_channel_receiver_unknown_method_now_errors() {
+    let errors = typecheck_errors("fn f(r: Receiver[i64]) { r.completely_unrelated(); }");
+    let msg = errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::NoMethodFound)
+        .map(|e| e.message.clone())
+        .expect("expected NoMethodFound on Receiver");
+    assert!(
+        msg.contains("'Receiver'") && msg.contains("'completely_unrelated'"),
+        "expected Receiver unknown-method diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_method_resolution_stdlib_phase11_arms_silent_for_runtime_only() {
+    // The four phase-11 arms (Regex, HTTP Client/Response/HttpError) still
+    // use `handle_unknown_method` — typo-only by design until their floors
+    // land. A typed name far from any enumerated method stays silent so
+    // the runtime-only methods these types expose continue to fall through
+    // until enumeration catches up. `typecheck_ok` asserts no errors fire.
+    //
+    // Phase-8 arms (String / Slice / Map / Entry / SortedSet / Set /
+    // Iterator / Sender / Receiver) flipped to always-error in slice 7(d) —
+    // see the per-arm `_unknown_method_now_errors` tests above.
+    typecheck_ok(
+        "fn main() {\n\
+             let r = Regex.compile(\"[0-9]+\").unwrap();\n\
+             r.completely_unrelated();\n\
+         }",
+    );
 }
 
 // ── Method resolution: conditional impl filtering ───────────────

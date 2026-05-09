@@ -2554,6 +2554,11 @@ impl<'a> TypeChecker<'a> {
     /// silent fallback for far-from-anything names preserves the historical
     /// permissive behavior for runtime-only methods that the typechecker
     /// has not yet enumerated.
+    ///
+    /// Reserved for arms whose typechecker enumeration has *not yet* reached
+    /// parity with the interpreter (currently the four phase-11 arms — Regex
+    /// and the three HTTP types). Phase-8-floor arms have flipped to
+    /// `require_known_method` so unknown methods on those types fail loudly.
     fn handle_unknown_method(
         &mut self,
         type_name: &str,
@@ -2563,6 +2568,40 @@ impl<'a> TypeChecker<'a> {
         span: &Span,
     ) -> Type {
         self.maybe_emit_method_typo(type_name, method, known_methods, span);
+        for arg in args {
+            self.infer_expr(&arg.value);
+        }
+        Type::Error
+    }
+
+    /// Default `_` arm body for per-type `infer_*_method` dispatch on arms
+    /// whose typechecker enumeration has reached parity with the interpreter:
+    /// **always** emit `NoMethodFound`, type-check the arguments, and return
+    /// `Type::Error`. If the typed name is edit-distance ≤ 2 from a known
+    /// method, the diagnostic includes a `did you mean ...?` suggestion;
+    /// otherwise it reports the unknown name plainly. Either way the
+    /// diagnostic fires — there is no silent fall-through.
+    ///
+    /// Used by phase-8-floor arms (String, Slice, Map, Entry, SortedSet,
+    /// Set, Iterator, Sender, Receiver). Phase-11 arms keep using
+    /// `handle_unknown_method` until their floor lands.
+    /// See phase-4-interpreter.md § Method Resolution Step 7(d).
+    fn require_known_method(
+        &mut self,
+        type_name: &str,
+        method: &str,
+        known_methods: &[&str],
+        args: &[CallArg],
+        span: &Span,
+    ) -> Type {
+        let msg = match crate::edit_distance::suggest_similar(method, known_methods) {
+            Some(suggestion) => format!(
+                "no method '{}' on type '{}', did you mean '{}'?",
+                method, type_name, suggestion
+            ),
+            None => format!("no method '{}' on type '{}'", method, type_name),
+        };
+        self.type_error(msg, span.clone(), TypeErrorKind::NoMethodFound);
         for arg in args {
             self.infer_expr(&arg.value);
         }
@@ -10043,7 +10082,7 @@ impl<'a> TypeChecker<'a> {
             // Flip to always-error once enumeration catches up to the
             // interpreter's String surface — design.md § Method Resolution
             // Step 7.
-            _ => self.handle_unknown_method("String", method, &["sorted", "sorted_by"], args, span),
+            _ => self.require_known_method("String", method, &["sorted", "sorted_by"], args, span),
         }
     }
 
@@ -10206,7 +10245,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Unit
             }
-            _ => self.handle_unknown_method(
+            _ => self.require_known_method(
                 "Slice",
                 method,
                 &[
@@ -10421,7 +10460,7 @@ impl<'a> TypeChecker<'a> {
                     args: vec![k.clone(), v.clone()],
                 }
             }
-            _ => self.handle_unknown_method(
+            _ => self.require_known_method(
                 "Map",
                 method,
                 &[
@@ -10536,7 +10575,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 entry_kv
             }
-            _ => self.handle_unknown_method(
+            _ => self.require_known_method(
                 "Entry",
                 method,
                 &["and_modify", "or_insert", "or_insert_with"],
@@ -10639,7 +10678,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 sorted_set_elem
             }
-            _ => self.handle_unknown_method(
+            _ => self.require_known_method(
                 "SortedSet",
                 method,
                 &[
@@ -10738,7 +10777,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 set_elem
             }
-            _ => self.handle_unknown_method(
+            _ => self.require_known_method(
                 "Set",
                 method,
                 &[
@@ -11430,7 +11469,7 @@ impl<'a> TypeChecker<'a> {
                     args: vec![item.clone()],
                 }
             }
-            _ => self.handle_unknown_method(
+            _ => self.require_known_method(
                 "Iterator",
                 method,
                 &[
@@ -11689,7 +11728,7 @@ impl<'a> TypeChecker<'a> {
                     }
                     sender_elem
                 }
-                _ => self.handle_unknown_method("Sender", method, &["clone", "send"], args, span),
+                _ => self.require_known_method("Sender", method, &["clone", "send"], args, span),
             }
         } else {
             // Receiver
@@ -11714,13 +11753,9 @@ impl<'a> TypeChecker<'a> {
                     }
                     option_elem
                 }
-                _ => self.handle_unknown_method(
-                    "Receiver",
-                    method,
-                    &["recv", "try_recv"],
-                    args,
-                    span,
-                ),
+                _ => {
+                    self.require_known_method("Receiver", method, &["recv", "try_recv"], args, span)
+                }
             }
         }
     }
