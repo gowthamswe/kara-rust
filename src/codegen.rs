@@ -629,6 +629,13 @@ struct Codegen<'ctx> {
     // ── Closure compilation ────────────────────────────────────────
     /// Monotonic counter used to generate unique closure function names.
     closure_counter: u32,
+    /// Monotonic counter for synthesized identifier names emitted by the
+    /// indexed-receiver method-dispatch lowering (`__indexed_elem_<n>`).
+    /// Each call site that lowers an `Index { object, index }` receiver
+    /// allocates one synth name, registers it in the variable + element-type
+    /// registries pointing into the outer container's storage, dispatches the
+    /// method through the existing identifier path, and cleans up after.
+    indexed_elem_counter: u32,
     /// Maps local variable names that hold closure fat-pointers to their LLVM function type.
     /// Required for indirect calls: `build_indirect_call` needs the callee's function type.
     closure_fn_types: HashMap<String, FunctionType<'ctx>>,
@@ -1306,6 +1313,7 @@ impl<'ctx> Codegen<'ctx> {
             generated_monos: HashSet::new(),
             type_subst: HashMap::new(),
             closure_counter: 0,
+            indexed_elem_counter: 0,
             closure_fn_types: HashMap::new(),
             pending_closure_fn_type: None,
             shared_types: HashMap::new(),
@@ -6360,6 +6368,22 @@ impl<'ctx> Codegen<'ctx> {
             .cloned();
         self.emit_branch_cancel_check("mcall", callee_key.as_deref());
 
+        // Slice MR (2026-05-09): indexed-receiver method dispatch. When the
+        // receiver expression is `obj[i]` (an `Index` node), lower the index
+        // access to obtain a pointer into the outer container's storage,
+        // synthesize an identifier bound to that pointer with the element's
+        // type registries populated, and re-dispatch the method through the
+        // existing identifier path. Closes the LeetCode 3629 kata's primary
+        // blocker (`factors[j].push(i)`). MR5: chained `a[i][j].method()` is
+        // rejected with a clear diagnostic — bind to a temporary first.
+        if let ExprKind::Index {
+            object: inner,
+            index,
+        } = &object.kind
+        {
+            return self.compile_indexed_receiver_method(inner, index, method, args, call_span);
+        }
+
         // Map.entry(k) chain dispatch — `m.entry(k){.and_modify(f)}*.{or_insert(d)|
         // or_insert_with(f)|and_modify(f)}` is lowered as a single sequence
         // around one `karac_map_entry` call so the slot pointer stays valid
@@ -6613,6 +6637,313 @@ impl<'ctx> Codegen<'ctx> {
              or mark the test `#[ignore]` if the method is genuinely deferred)",
             method, receiver_desc
         ))
+    }
+
+    /// Slice MR helper: lower an indexed-receiver method call
+    /// `obj[i].method(args)`. Computes the element pointer through the outer
+    /// container's index machinery, synthesizes an identifier name pointing
+    /// into the outer storage with the element's type registries populated,
+    /// recursively dispatches the method through the existing identifier
+    /// path, and cleans up the synth registrations on return.
+    ///
+    /// Locked design choices (MR1–MR5, see `phase-7-codegen.md`):
+    /// - MR1 receiver-shape early dispatch at the top of `compile_method_call`.
+    /// - MR2 routes by container shape (Vec/Slice/Array), not method name.
+    /// - MR3 read-only and mutating methods both flow through the same path
+    ///   — the elem pointer aliases the outer storage so writes propagate.
+    /// - MR4 synthesized name `__indexed_elem_<n>` + per-call-site temporary
+    ///   registry injection + post-call cleanup.
+    /// - MR5 chained `a[i][j].method()` is rejected (single-level only in v1).
+    fn compile_indexed_receiver_method(
+        &mut self,
+        inner: &Expr,
+        index: &Expr,
+        method: &str,
+        args: &[CallArg],
+        call_span: &crate::token::Span,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        // MR5: reject chained indexed receivers up front. The user must bind
+        // the inner element to a temporary first.
+        if matches!(inner.kind, ExprKind::Index { .. }) {
+            return Err(format!(
+                "codegen: chained indexed receivers (`a[i][j].{}(...)`) are deferred to v1.x; \
+                 bind the inner element to a temporary first",
+                method
+            ));
+        }
+
+        // Container must be an identifier in v1 — `get_grid()[i].push(x)` is
+        // out of scope. The error mirrors the existing fall-through diagnostic.
+        let outer_name = if let ExprKind::Identifier(name) = &inner.kind {
+            name.clone()
+        } else {
+            return Err(format!(
+                "codegen: indexed-receiver method '{}' requires the indexed container to be a \
+                 named variable in v1 (got non-identifier inner expression)",
+                method
+            ));
+        };
+
+        // Determine the element TypeExpr from the outer's recorded element
+        // type. Without this we can't populate the synth's side tables, so
+        // the recursive dispatch would fall through to the silent-`0` arm.
+        let elem_te = self
+            .var_elem_type_exprs
+            .get(outer_name.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "codegen: indexed-receiver method '{}' on '{}' — element TypeExpr unknown \
+                     (outer is not a tracked Vec/Slice/Array variable)",
+                    method, outer_name
+                )
+            })?;
+
+        // Lower the index access to an element pointer through the outer's
+        // container-shape-specific path. Bounds check goes through
+        // `emit_panic` on OOB; the OK BB leaves the builder positioned for
+        // the post-elem-ptr work.
+        let (elem_ptr, elem_ll_ty) = if self.vec_elem_types.contains_key(outer_name.as_str()) {
+            self.lower_indexed_elem_ptr_vec(&outer_name, index)?
+        } else if self.slice_elem_types.contains_key(outer_name.as_str()) {
+            self.lower_indexed_elem_ptr_slice(&outer_name, index)?
+        } else {
+            // Array shape via slot.ty inspection. v1 supports fixed-size
+            // arrays only when the slot's LLVM type is ArrayType.
+            let slot = self
+                .variables
+                .get(outer_name.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "codegen: indexed-receiver method '{}' — outer '{}' has no slot",
+                        method, outer_name
+                    )
+                })?;
+            if let BasicTypeEnum::ArrayType(_) = slot.ty {
+                self.lower_indexed_elem_ptr_array(slot, index)?
+            } else {
+                return Err(format!(
+                    "codegen: indexed-receiver method '{}' on '{}' — outer is not a Vec/Slice/Array",
+                    method, outer_name
+                ));
+            }
+        };
+
+        // Mint a fresh synth name and register it so the recursive dispatch
+        // sees a regular identifier-receiver flow.
+        let synth = format!("__indexed_elem_{}", self.indexed_elem_counter);
+        self.indexed_elem_counter += 1;
+        self.variables.insert(
+            synth.clone(),
+            VarSlot {
+                ptr: elem_ptr,
+                ty: elem_ll_ty,
+            },
+        );
+        self.register_var_from_type_expr(&synth, &elem_te);
+        // User-struct receiver: also populate `var_type_names` so the
+        // impl-block dispatch path resolves `Type.method`.
+        if let TypeKind::Path(path) = &elem_te.kind {
+            if let Some(seg) = path.segments.first() {
+                if self.struct_types.contains_key(seg.as_str()) {
+                    self.var_type_names.insert(synth.clone(), seg.clone());
+                }
+            }
+        }
+
+        // Build a fresh Identifier expr at the original call site's span and
+        // recursively dispatch. The recursive call will skip this arm
+        // (Identifier, not Index) and fall into the regular flow.
+        let synth_expr = Expr {
+            kind: ExprKind::Identifier(synth.clone()),
+            span: inner.span.clone(),
+        };
+        let result = self.compile_method_call(&synth_expr, method, args, call_span);
+
+        // Clean up synth registrations.  The LLVM IR is already emitted; this
+        // is bookkeeping cleanup so subsequent compilations in the same
+        // function don't see stale entries.
+        self.variables.remove(&synth);
+        self.vec_elem_types.remove(&synth);
+        self.slice_elem_types.remove(&synth);
+        self.var_elem_type_exprs.remove(&synth);
+        self.var_type_names.remove(&synth);
+        self.map_key_types.remove(&synth);
+        self.map_val_types.remove(&synth);
+        self.map_key_type_names.remove(&synth);
+        self.map_key_type_exprs.remove(&synth);
+        self.set_elem_types.remove(&synth);
+        self.set_elem_type_names.remove(&synth);
+        self.set_elem_type_exprs.remove(&synth);
+
+        result
+    }
+
+    /// Slice MR: lower `outer[i]` for an outer Vec[T] receiver into an
+    /// element pointer + element LLVM type. Bounds-checks against `len`
+    /// (not `cap`). Mirrors `compile_vec_index`'s machinery.
+    fn lower_indexed_elem_ptr_vec(
+        &mut self,
+        outer_name: &str,
+        index: &Expr,
+    ) -> Result<(PointerValue<'ctx>, BasicTypeEnum<'ctx>), String> {
+        let i64_t = self.context.i64_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let vec_ty = self.vec_struct_type();
+        let elem_ty = self.vec_elem_type_for_var(outer_name);
+        let vec_ptr = self.get_data_ptr(outer_name).ok_or_else(|| {
+            format!(
+                "Undefined Vec variable '{}' in indexed-receiver lowering",
+                outer_name
+            )
+        })?;
+        let idx_val = self.compile_expr(index)?.into_int_value();
+
+        let len_ptr = self
+            .builder
+            .build_struct_gep(vec_ty, vec_ptr, 1, "v.mr.len.ptr")
+            .unwrap();
+        let len = self
+            .builder
+            .build_load(i64_t, len_ptr, "v.mr.len")
+            .unwrap()
+            .into_int_value();
+        let data_pp = self
+            .builder
+            .build_struct_gep(vec_ty, vec_ptr, 0, "v.mr.data.ptr")
+            .unwrap();
+        let data = self
+            .builder
+            .build_load(ptr_ty, data_pp, "v.mr.data")
+            .unwrap()
+            .into_pointer_value();
+
+        let fn_val = self.current_fn.unwrap();
+        let oob_bb = self.context.append_basic_block(fn_val, "v.mr.oob");
+        let ok_bb = self.context.append_basic_block(fn_val, "v.mr.ok");
+        let cmp = self
+            .builder
+            .build_int_compare(IntPredicate::UGE, idx_val, len, "bounds")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(cmp, oob_bb, ok_bb)
+            .unwrap();
+        self.builder.position_at_end(oob_bb);
+        self.emit_panic("vec index out of bounds");
+        self.builder.build_unreachable().unwrap();
+
+        self.builder.position_at_end(ok_bb);
+        let elem_ptr = unsafe {
+            self.builder
+                .build_gep(elem_ty, data, &[idx_val], "v.mr.elem.ptr")
+                .unwrap()
+        };
+        Ok((elem_ptr, elem_ty))
+    }
+
+    /// Slice MR: lower `outer[i]` for an outer Slice[T] receiver.
+    fn lower_indexed_elem_ptr_slice(
+        &mut self,
+        outer_name: &str,
+        index: &Expr,
+    ) -> Result<(PointerValue<'ctx>, BasicTypeEnum<'ctx>), String> {
+        let i64_t = self.context.i64_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let slice_ty = self.slice_struct_type();
+        let elem_ty = *self.slice_elem_types.get(outer_name).ok_or_else(|| {
+            format!(
+                "Undefined Slice variable '{}' in indexed-receiver lowering",
+                outer_name
+            )
+        })?;
+        let slice_ptr = self.get_data_ptr(outer_name).ok_or_else(|| {
+            format!(
+                "Undefined Slice variable '{}' in indexed-receiver lowering",
+                outer_name
+            )
+        })?;
+        let idx_val = self.compile_expr(index)?.into_int_value();
+
+        let data_pp = self
+            .builder
+            .build_struct_gep(slice_ty, slice_ptr, 0, "s.mr.data.pp")
+            .unwrap();
+        let len_p = self
+            .builder
+            .build_struct_gep(slice_ty, slice_ptr, 1, "s.mr.len.p")
+            .unwrap();
+        let data = self
+            .builder
+            .build_load(ptr_ty, data_pp, "s.mr.data")
+            .unwrap()
+            .into_pointer_value();
+        let len = self
+            .builder
+            .build_load(i64_t, len_p, "s.mr.len")
+            .unwrap()
+            .into_int_value();
+
+        let fn_val = self.current_fn.unwrap();
+        let oob_bb = self.context.append_basic_block(fn_val, "s.mr.oob");
+        let ok_bb = self.context.append_basic_block(fn_val, "s.mr.ok");
+        let cmp = self
+            .builder
+            .build_int_compare(IntPredicate::UGE, idx_val, len, "bounds")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(cmp, oob_bb, ok_bb)
+            .unwrap();
+        self.builder.position_at_end(oob_bb);
+        self.emit_panic("slice index out of bounds");
+        self.builder.build_unreachable().unwrap();
+
+        self.builder.position_at_end(ok_bb);
+        let elem_ptr = unsafe {
+            self.builder
+                .build_gep(elem_ty, data, &[idx_val], "s.mr.elem.ptr")
+                .unwrap()
+        };
+        Ok((elem_ptr, elem_ty))
+    }
+
+    /// Slice MR: lower `outer[i]` for a fixed-size Array[T, N] receiver.
+    fn lower_indexed_elem_ptr_array(
+        &mut self,
+        slot: VarSlot<'ctx>,
+        index: &Expr,
+    ) -> Result<(PointerValue<'ctx>, BasicTypeEnum<'ctx>), String> {
+        let i64_t = self.context.i64_type();
+        let arr_ty = match slot.ty {
+            BasicTypeEnum::ArrayType(at) => at,
+            _ => return Err("Array shape required for Array indexed-receiver lowering".to_string()),
+        };
+        let elem_ty = arr_ty.get_element_type();
+        let idx_val = self.compile_expr(index)?.into_int_value();
+        let len = i64_t.const_int(arr_ty.len() as u64, false);
+
+        let fn_val = self.current_fn.unwrap();
+        let oob_bb = self.context.append_basic_block(fn_val, "a.mr.oob");
+        let ok_bb = self.context.append_basic_block(fn_val, "a.mr.ok");
+        let cmp = self
+            .builder
+            .build_int_compare(IntPredicate::UGE, idx_val, len, "bounds")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(cmp, oob_bb, ok_bb)
+            .unwrap();
+        self.builder.position_at_end(oob_bb);
+        self.emit_panic("array index out of bounds");
+        self.builder.build_unreachable().unwrap();
+
+        self.builder.position_at_end(ok_bb);
+        let zero = i64_t.const_int(0, false);
+        let elem_ptr = unsafe {
+            self.builder
+                .build_gep(arr_ty, slot.ptr, &[zero, idx_val], "a.mr.elem.ptr")
+                .unwrap()
+        };
+        Ok((elem_ptr, elem_ty))
     }
 
     /// Infer the declared struct/enum type name of a method-call receiver,

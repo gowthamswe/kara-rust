@@ -1849,6 +1849,183 @@ fn main() {
         }
     }
 
+    // ── Vec/Slice/Array indexed-receiver method dispatch (Slice Vc) ──
+
+    #[test]
+    fn test_e2e_indexed_receiver_inner_vec_len() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut outer: Vec[Vec[i64]] = Vec.new();
+    let mut a: Vec[i64] = Vec.new();
+    a.push(1);
+    a.push(2);
+    a.push(3);
+    outer.push(a);
+    let mut b: Vec[i64] = Vec.new();
+    b.push(10);
+    outer.push(b);
+    println(outer[0].len());
+    println(outer[1].len());
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["3", "1"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_indexed_receiver_inner_vec_is_empty() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut outer: Vec[Vec[i64]] = Vec.new();
+    let mut a: Vec[i64] = Vec.new();
+    a.push(7);
+    outer.push(a);
+    let b: Vec[i64] = Vec.new();
+    outer.push(b);
+    println(outer[0].is_empty());
+    println(outer[1].is_empty());
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["false", "true"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_indexed_receiver_inner_vec_push() {
+        // Headline regression gate — closes the LeetCode 3629 kata's primary
+        // blocker (`factors[j].push(i)`). The push must write back through
+        // the elem pointer aliasing the outer storage so subsequent reads of
+        // `outer[0]` observe the new element.  We verify via len() and
+        // for-loop element iteration since chained-index reads `outer[i][j]`
+        // are out of scope for v1.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut outer: Vec[Vec[i64]] = Vec.new();
+    let a: Vec[i64] = Vec.new();
+    outer.push(a);
+    let b: Vec[i64] = Vec.new();
+    outer.push(b);
+    outer[0].push(42);
+    outer[0].push(43);
+    outer[1].push(99);
+    println(outer[0].len());
+    println(outer[1].len());
+    let mut acc: i64 = 0;
+    for inner in outer {
+        for x in inner { acc = acc + x; }
+    }
+    println(acc);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            // 42 + 43 + 99 = 184
+            assert_eq!(lines, vec!["2", "1", "184"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_indexed_receiver_slice_path_len() {
+        // The outer is a `mut Slice[Vec[i64]]` view; indexed-receiver
+        // dispatch goes through the slice lowering path.
+        let out = run_program(
+            r#"
+fn outer_lens(xs: mut Slice[Vec[i64]]) {
+    println(xs[0].len());
+    println(xs[1].len());
+}
+fn main() {
+    let mut a: Vec[i64] = Vec.new();
+    a.push(1);
+    a.push(2);
+    let mut b: Vec[i64] = Vec.new();
+    b.push(10);
+    b.push(20);
+    b.push(30);
+    let mut arr: Array[Vec[i64], 2] = [a, b];
+    outer_lens(arr);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["2", "3"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_indexed_receiver_chained_rejected() {
+        // MR5: `outer[i][j].method()` is rejected up front by codegen with
+        // a clear diagnostic. Pin the diagnostic so the rejection doesn't
+        // silently regress to a fall-through compile.
+        let src = r#"
+fn main() {
+    let mut outer: Vec[Vec[Vec[i64]]] = Vec.new();
+    let mut a: Vec[Vec[i64]] = Vec.new();
+    let inner: Vec[i64] = Vec.new();
+    a.push(inner);
+    outer.push(a);
+    outer[0][0].push(7);
+}
+"#;
+        let mut parsed = karac::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        let err = compile_to_ir(&parsed.program, None, None)
+            .expect_err("expected codegen to reject chained indexed receivers");
+        assert!(
+            err.contains("chained indexed receivers"),
+            "expected chained-rejection diagnostic; got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_e2e_indexed_receiver_user_struct_method() {
+        // Vec[Counter] indexed receiver dispatching through `Counter.bump`.
+        // Verifies var_type_names wiring for synth identifiers and that
+        // the mut-ref-self method writes back through the elem pointer.
+        let out = run_program(
+            r#"
+struct Counter { n: i64 }
+impl Counter {
+    fn bump(mut ref self) { self.n = self.n + 1; }
+    fn read(ref self) -> i64 { self.n }
+}
+fn main() {
+    let mut v: Vec[Counter] = Vec.new();
+    v.push(Counter { n: 10 });
+    v.push(Counter { n: 20 });
+    v[0].bump();
+    v[0].bump();
+    v[1].bump();
+    println(v[0].read());
+    println(v[1].read());
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["12", "21"]);
+        }
+    }
+
     #[test]
     fn test_e2e_vec_indexed_write_string_element() {
         let out = run_program(
