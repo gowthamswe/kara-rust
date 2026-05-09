@@ -61,8 +61,14 @@ pub struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
     errors: Vec<ParseError>,
-    /// Active loop labels for disambiguating `break label` vs `break value`
-    loop_labels: Vec<String>,
+    /// Active labels for disambiguating `break label` vs `break value` and
+    /// for routing labeled-block label scopes. Each entry carries a
+    /// `LabelKind` tag (`Loop` for labeled loops, `Block` for labeled
+    /// blocks) — the kind is consulted by the resolver, not the parser,
+    /// but the parser tracks it so that `is_known_label` lookups (which
+    /// disambiguate `break label expr`) work uniformly across both label
+    /// kinds. Pushed at the entry to a labeled construct, popped on exit.
+    loop_labels: Vec<(String, LabelKind)>,
     /// Doc-comment text accumulated by the leading-`///` collection at the
     /// top of `parse_item`. Each item-construction site calls
     /// `Self::take_pending_doc` when filling the new node's `doc_comment`
@@ -4093,7 +4099,7 @@ impl Parser {
         self.expect(&Token::While)?;
 
         if let Some(ref l) = label {
-            self.loop_labels.push(l.clone());
+            self.loop_labels.push((l.clone(), LabelKind::Loop));
         }
 
         // while let pattern = expr { ... }
@@ -4140,7 +4146,7 @@ impl Parser {
         let start = self.current_span();
         self.expect(&Token::For)?;
         if let Some(ref l) = label {
-            self.loop_labels.push(l.clone());
+            self.loop_labels.push((l.clone(), LabelKind::Loop));
         }
         let pattern = self.parse_pattern()?;
         self.expect(&Token::In)?;
@@ -4317,7 +4323,8 @@ impl Parser {
         let start = self.current_span();
         let name = self.expect_identifier()?;
 
-        // Check for labeled loop: label: while/for/loop
+        // Check for labeled loop / labeled block: `label: while/for/loop`
+        // or `label: { ... }`. `is_loop_label` accepts both shapes.
         if self.check(&Token::Colon) && self.is_loop_label() {
             self.advance(); // consume ':'
             match self.peek_token() {
@@ -4325,13 +4332,31 @@ impl Parser {
                 Token::For => return self.parse_for_expr_with_label(Some(name)),
                 Token::Loop => {
                     self.advance();
-                    self.loop_labels.push(name.clone());
+                    self.loop_labels.push((name.clone(), LabelKind::Loop));
                     let body = self.parse_block()?;
                     self.loop_labels.pop();
                     return Some(Expr {
                         span: self.span_from(&start),
                         kind: ExprKind::Loop {
                             label: Some(name),
+                            body,
+                        },
+                    });
+                }
+                Token::LeftBrace => {
+                    // Labeled block: `label: { ... }`. Use the label
+                    // identifier's span (`start`) for diagnostic span fidelity
+                    // (LB hard-stop default fallback: label_span on
+                    // LabeledBlock only; loop-side parity is v1.x polish).
+                    let label_span = start.clone();
+                    self.loop_labels.push((name.clone(), LabelKind::Block));
+                    let body = self.parse_block()?;
+                    self.loop_labels.pop();
+                    return Some(Expr {
+                        span: self.span_from(&start),
+                        kind: ExprKind::LabeledBlock {
+                            label: name,
+                            label_span,
                             body,
                         },
                     });
@@ -4782,16 +4807,19 @@ impl Parser {
 
     // ── Label Helpers ─────────────────────────────────────────────
 
-    /// Check if current position is `ident:` followed by a loop keyword (labeled loop).
+    /// Check if current position is `ident:` followed by a loop keyword
+    /// (labeled loop) or `{` (labeled block — design.md § Loops > "Labeled
+    /// blocks", syntax.md §5.3). Both forms share the `IDENT ":"` prefix
+    /// and route through `parse_identifier_expr` to the appropriate sub-parser.
     fn is_loop_label(&self) -> bool {
         if self.pos + 1 >= self.tokens.len() {
             return false;
         }
-        // Current token must be `:`, next must be while/for/loop
+        // Current token must be `:`, next must be while/for/loop or `{`.
         matches!(&self.tokens[self.pos].token, Token::Colon)
             && matches!(
                 &self.tokens[self.pos + 1].token,
-                Token::While | Token::For | Token::Loop
+                Token::While | Token::For | Token::Loop | Token::LeftBrace
             )
     }
 
@@ -4802,7 +4830,7 @@ impl Parser {
         }
         if let Token::Identifier { ref name, .. } = self.peek_token() {
             let name = name.clone();
-            let is_known_label = self.loop_labels.contains(&name);
+            let is_known_label = self.loop_labels.iter().any(|(n, _)| n == &name);
             if self.pos + 1 < self.tokens.len() {
                 let after = &self.tokens[self.pos + 1].token;
                 if is_known_label && matches!(after, Token::Semicolon | Token::RightBrace) {

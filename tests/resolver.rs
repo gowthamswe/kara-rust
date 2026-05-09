@@ -850,6 +850,99 @@ fn test_labeled_for_loop_ok() {
     resolve_ok("fn main() { outer: for x in [1, 2] { for y in [3, 4] { break outer (); } } }");
 }
 
+// ── Labeled Block Validation ───────────────────────────────────
+
+#[test]
+fn test_labeled_block_nested_same_name_shadows() {
+    // Inner labeled block shadows outer same-name label; inner
+    // `break label` resolves to inner. Outer `break label` after
+    // exiting inner refers to outer. Resolver-level check: both
+    // breaks resolve without an unknown-label diagnostic.
+    resolve_ok("fn main() { lbl: { lbl: { break lbl; } break lbl; } }");
+}
+
+#[test]
+fn test_labeled_block_unknown_label_diagnostic() {
+    // `continue never_declared;` outside any labeled construct
+    // produces UndefinedLabel — same diagnostic family used for
+    // labeled loops. (Use `continue` rather than `break <expr>`
+    // to avoid the parser swallowing the identifier as a value.)
+    let errors = resolve_errors("fn main() { loop { continue never_declared; } }");
+    assert!(errors.iter().any(|e| {
+        e.kind == ResolveErrorKind::UndefinedLabel && e.message.contains("never_declared")
+    }));
+}
+
+#[test]
+fn test_continue_label_to_block_rejected() {
+    // `lbl: { continue lbl; }` is rejected with the new
+    // E_CONTINUE_LABEL_BLOCK diagnostic — `continue` is only valid
+    // for loop labels, not for labeled blocks.
+    let errors = resolve_errors("fn main() { lbl: { continue lbl; } }");
+    let hit = errors.iter().find(|e| {
+        e.kind == ResolveErrorKind::ContinueOnBlockLabel
+            && e.message.contains("E_CONTINUE_LABEL_BLOCK")
+            && e.message.contains("labeled block")
+            && e.message.contains("`lbl`")
+    });
+    assert!(
+        hit.is_some(),
+        "expected ContinueOnBlockLabel diagnostic; got: {:?}",
+        errors
+    );
+    // The diagnostic carries a fix-it suggestion (renames or
+    // restructure as loop).
+    let hit = hit.unwrap();
+    assert!(
+        hit.suggestion.is_some(),
+        "expected suggestion on ContinueOnBlockLabel, got None"
+    );
+}
+
+#[test]
+fn test_break_inside_closure_cannot_target_enclosing_label() {
+    // LB4 — closure-boundary rule. A `break label` inside a closure
+    // body cannot target an enclosing labeled block; the resolver
+    // surfaces this as `undefined loop label`. Same shape with a
+    // labeled `for` loop also rejects (audit-finding fix: the
+    // labeled-loop closure-boundary gap was missed before this slice).
+    let errors_block = resolve_errors("fn main() { lbl: { let f = || { break lbl; }; f(); } }");
+    assert!(
+        errors_block
+            .iter()
+            .any(|e| e.kind == ResolveErrorKind::UndefinedLabel && e.message.contains("lbl")),
+        "labeled-block closure-boundary not enforced: {:?}",
+        errors_block
+    );
+
+    // Labeled-loop variant — fixes the audit-finding gap (LB4 fixes
+    // the loop-side closure-boundary rule as a side-effect).
+    let errors_loop =
+        resolve_errors("fn main() { lbl: for x in [1, 2] { let f = || { continue lbl; }; f(); } }");
+    assert!(
+        errors_loop
+            .iter()
+            .any(|e| e.kind == ResolveErrorKind::UndefinedLabel && e.message.contains("lbl")),
+        "labeled-loop closure-boundary not enforced: {:?}",
+        errors_loop
+    );
+}
+
+#[test]
+fn test_labeled_block_label_scope_ends_at_closing_brace() {
+    // The label scope ends at the closing `}` of the labeled
+    // block. A subsequent `continue lbl;` at the same scope as the
+    // labeled block's parent rejects with UndefinedLabel.
+    let errors = resolve_errors("fn main() { loop { lbl: { } continue lbl; } }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == ResolveErrorKind::UndefinedLabel && e.message.contains("lbl")),
+        "label scope should end at closing brace; errors: {:?}",
+        errors
+    );
+}
+
 // ── Built-in Module Resolution ────────────────────────────────
 
 #[test]

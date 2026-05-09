@@ -457,6 +457,13 @@ pub enum ResolveErrorKind {
     /// reserved for stdlib source baked into the compiler binary
     /// (CR-202 slice 1). `E0237`.
     CompilerBuiltinReserved,
+    /// `continue label` where `label` refers to a labeled block (rather
+    /// than a loop). `continue` is only valid for loop labels — reject
+    /// the use site with `error[E_CONTINUE_LABEL_BLOCK]`. The diagnostic
+    /// carries a secondary span pointing at the labeled-block declaration
+    /// so users can rename the label or restructure the block.
+    /// See design.md § Loops > "Labeled blocks".
+    ContinueOnBlockLabel,
 }
 
 impl std::fmt::Display for ResolveError {
@@ -597,8 +604,16 @@ pub struct Resolver<'a> {
     errors: Vec<ResolveError>,
     /// The target type name when inside an impl block.
     current_impl_type: Option<String>,
-    /// Stack of loop labels for validating break/continue targets.
-    loop_labels: Vec<Option<String>>,
+    /// Stack of label-stack entries for validating `break` / `continue`
+    /// targets. Each entry is `(name, kind)` where `name: Option<String>`
+    /// is `None` for an unlabeled loop and `Some(label)` for a labeled
+    /// loop / labeled block; `kind: LabelKind` distinguishes loops from
+    /// labeled blocks. `continue label` referring to a `Block` entry is
+    /// rejected with `error[E_CONTINUE_LABEL_BLOCK]`. The stack is
+    /// reset to empty at each closure boundary (LB4 — labels are lexical
+    /// to the function-body control flow; closure bodies cannot target
+    /// outer labels).
+    loop_labels: Vec<(Option<String>, LabelKind)>,
     /// True iff the program being resolved is the synthetic stdlib package
     /// (baked into the compiler binary by CR-202 slice 3). When false,
     /// `#[compiler_builtin]` on any item is rejected with `E0237`. The flag
@@ -2044,18 +2059,39 @@ impl<'a> Resolver<'a> {
 
             ExprKind::Continue { label } => {
                 if let Some(name) = label {
-                    if !self
+                    let entry = self
                         .loop_labels
                         .iter()
-                        .any(|l| l.as_deref() == Some(name.as_str()))
-                    {
-                        self.errors.push(ResolveError {
-                            message: format!("undefined loop label `{}`", name),
-                            span: expr.span.clone(),
-                            kind: ResolveErrorKind::UndefinedLabel,
-                            suggestion: None,
-                            replacement: None,
-                        });
+                        .find(|(l, _)| l.as_deref() == Some(name.as_str()));
+                    match entry {
+                        Some((_, LabelKind::Loop)) => {
+                            // accepted — `continue` to a labeled loop
+                        }
+                        Some((_, LabelKind::Block)) => {
+                            // LB2 — `continue` to a labeled block is rejected.
+                            self.errors.push(ResolveError {
+                                message: format!(
+                                    "error[E_CONTINUE_LABEL_BLOCK]: continue label `{}` refers to a labeled block; continue is only valid for loops",
+                                    name
+                                ),
+                                span: expr.span.clone(),
+                                kind: ResolveErrorKind::ContinueOnBlockLabel,
+                                suggestion: Some(format!(
+                                    "rename the label or restructure `{}` as a loop if iteration is intended",
+                                    name
+                                )),
+                                replacement: None,
+                            });
+                        }
+                        None => {
+                            self.errors.push(ResolveError {
+                                message: format!("undefined loop label `{}`", name),
+                                span: expr.span.clone(),
+                                kind: ResolveErrorKind::UndefinedLabel,
+                                suggestion: None,
+                                replacement: None,
+                            });
+                        }
                     }
                 }
             }
@@ -2065,7 +2101,7 @@ impl<'a> Resolver<'a> {
                     if !self
                         .loop_labels
                         .iter()
-                        .any(|l| l.as_deref() == Some(name.as_str()))
+                        .any(|(l, _)| l.as_deref() == Some(name.as_str()))
                     {
                         self.errors.push(ResolveError {
                             message: format!("undefined loop label `{}`", name),
@@ -2252,7 +2288,7 @@ impl<'a> Resolver<'a> {
                 label,
             } => {
                 self.resolve_expr(condition);
-                self.loop_labels.push(label.clone());
+                self.loop_labels.push((label.clone(), LabelKind::Loop));
                 self.table.push_scope(ScopeKind::Loop);
                 self.resolve_block_no_scope(body);
                 self.table.pop_scope();
@@ -2266,7 +2302,7 @@ impl<'a> Resolver<'a> {
                 label,
             } => {
                 self.resolve_expr(value);
-                self.loop_labels.push(label.clone());
+                self.loop_labels.push((label.clone(), LabelKind::Loop));
                 self.table.push_scope(ScopeKind::Loop);
                 self.resolve_pattern(pattern);
                 self.resolve_block_no_scope(body);
@@ -2281,7 +2317,7 @@ impl<'a> Resolver<'a> {
                 label,
             } => {
                 self.resolve_expr(iterable);
-                self.loop_labels.push(label.clone());
+                self.loop_labels.push((label.clone(), LabelKind::Loop));
                 self.table.push_scope(ScopeKind::Loop);
                 self.define_pattern_bindings(pattern, false);
                 self.resolve_block_no_scope(body);
@@ -2290,8 +2326,19 @@ impl<'a> Resolver<'a> {
             }
 
             ExprKind::Loop { body, label } => {
-                self.loop_labels.push(label.clone());
+                self.loop_labels.push((label.clone(), LabelKind::Loop));
                 self.table.push_scope(ScopeKind::Loop);
+                self.resolve_block_no_scope(body);
+                self.table.pop_scope();
+                self.loop_labels.pop();
+            }
+
+            ExprKind::LabeledBlock { label, body, .. } => {
+                // LB1 — labeled block: register label with `Block` kind so
+                // the resolver can reject `continue label` referring here.
+                self.loop_labels
+                    .push((Some(label.clone()), LabelKind::Block));
+                self.table.push_scope(ScopeKind::Block);
                 self.resolve_block_no_scope(body);
                 self.table.pop_scope();
                 self.loop_labels.pop();
@@ -2303,6 +2350,14 @@ impl<'a> Resolver<'a> {
                 prefix_span: _,
                 body,
             } => {
+                // LB4 — closure-boundary rule. Save the current label stack
+                // and replace it with an empty stack while resolving the
+                // closure body, so a `break label` / `continue label` inside
+                // the body cannot target an enclosing loop / block label.
+                // Restored on exit. Also fixes the missing closure-boundary
+                // rule for labeled loops as a side-effect (audit finding
+                // 2026-05-08).
+                let saved_labels = std::mem::take(&mut self.loop_labels);
                 self.table.push_scope(ScopeKind::Closure);
                 for param in params {
                     self.define_pattern_bindings(&param.pattern, false);
@@ -2312,6 +2367,7 @@ impl<'a> Resolver<'a> {
                 }
                 self.resolve_expr(body);
                 self.table.pop_scope();
+                self.loop_labels = saved_labels;
             }
 
             ExprKind::Return(inner) => {
@@ -2328,7 +2384,7 @@ impl<'a> Resolver<'a> {
                     if !self
                         .loop_labels
                         .iter()
-                        .any(|l| l.as_deref() == Some(name.as_str()))
+                        .any(|(l, _)| l.as_deref() == Some(name.as_str()))
                     {
                         self.errors.push(ResolveError {
                             message: format!("undefined loop label `{}`", name),

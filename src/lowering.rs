@@ -205,6 +205,7 @@ impl<'a> Lowerer<'a> {
                 self.lower_block(body);
             }
             ExprKind::Loop { body, .. } => self.lower_block(body),
+            ExprKind::LabeledBlock { body, .. } => self.lower_block(body),
             ExprKind::Closure { body, .. } => self.lower_expr(body),
             ExprKind::Return(opt) => {
                 if let Some(e) = opt {

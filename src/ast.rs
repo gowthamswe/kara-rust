@@ -892,6 +892,24 @@ pub enum ExprKind {
         label: Option<String>,
         body: Block,
     },
+    /// Labeled block expression — `label: { ... }` (design.md § Loops >
+    /// Labeled blocks; syntax.md §5.3). The block becomes a `break` target
+    /// (with optional value); `continue label` referring to a labeled block
+    /// is rejected by the resolver. The block's type is the LUB of all
+    /// reachable `break label expr` value sites and the tail expression.
+    /// Unlabeled blocks continue to use `ExprKind::Block` — the
+    /// `LabeledBlock` variant is added rather than mutating `Block` so
+    /// existing AST consumers (which heavily destructure `Block`) keep
+    /// working unchanged.
+    LabeledBlock {
+        label: String,
+        /// Source span of the label identifier (the `IDENT` before the
+        /// colon). Threaded through for diagnostic span fidelity —
+        /// `error[E_CONTINUE_LABEL_BLOCK]` points its secondary span at
+        /// the label binding using this.
+        label_span: Span,
+        body: Block,
+    },
     Closure {
         params: Vec<ClosureParam>,
         /// Explicit per-closure borrow-mode override (Rule 2½).
@@ -1239,6 +1257,18 @@ pub struct ClosureParam {
     pub pattern: Pattern,
     pub ty: Option<TypeExpr>,
     pub span: Span,
+}
+
+/// Discriminator for active label-stack entries — distinguishes labeled
+/// loops (which accept both `break label` and `continue label`) from
+/// labeled blocks (which accept `break label` only). Carried alongside
+/// the label name in the parser's and resolver's label stacks; the
+/// resolver consults this when validating `continue label` targets.
+/// See design.md § Loops > "Labeled blocks".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelKind {
+    Loop,
+    Block,
 }
 
 /// Explicit closure capture-mode prefix (design.md § Closure Behavior, Rule 2½).

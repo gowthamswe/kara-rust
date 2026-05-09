@@ -1475,6 +1475,7 @@ fn collect_free_idents_expr(expr: &Expr, bound: &mut HashSet<String>, out: &mut 
             *bound = snapshot;
         }
         ExprKind::Loop { body, .. } => collect_free_idents_block(body, bound, out),
+        ExprKind::LabeledBlock { body, .. } => collect_free_idents_block(body, bound, out),
         ExprKind::For {
             pattern,
             iterable,

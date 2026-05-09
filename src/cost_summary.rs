@@ -371,6 +371,7 @@ fn walk_expr_for_with_provider(expr: &Expr, out: &mut Vec<WithProviderSite>) {
             walk_block_for_with_provider(body, out);
         }
         ExprKind::Loop { body, .. } => walk_block_for_with_provider(body, out),
+        ExprKind::LabeledBlock { body, .. } => walk_block_for_with_provider(body, out),
         ExprKind::Closure { body, .. } => walk_expr_for_with_provider(body, out),
         ExprKind::MethodCall { object, args, .. } => {
             walk_expr_for_with_provider(object, out);

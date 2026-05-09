@@ -9980,3 +9980,31 @@ fn test_compound_enum_nested_enum_payload_via_vec_is_allowed() {
         ),
     );
 }
+
+// ── Labeled Blocks (LB3 — LUB inference) ─────────────────────────
+
+#[test]
+fn test_labeled_block_bare_break_exits_with_unit() {
+    // `let x: () = lbl: { break lbl; -1 };` — bare `break label` exits
+    // with unit; the post-break tail (`-1`) is `Type::Never`-reachable
+    // (typechecker ignores its type for LUB unless it's reached).
+    // Expected: block type is `()`. Confirmed by check-mode against `()`.
+    typecheck_ok("fn main() { let x: () = lbl: { break lbl; }; }");
+}
+
+#[test]
+fn test_labeled_block_break_with_value_joined_with_tail() {
+    // Block type is i64 via LUB of break-with-value (1) and tail (-1).
+    typecheck_ok(
+        "fn main() { let x: i64 = found: { for r in [1, 2] { if r == 1 { break found 1; } } -1 }; }",
+    );
+}
+
+#[test]
+fn test_labeled_block_multi_break_lub_inference() {
+    // Two `break label expr` sites with the same i64 type; tail is also
+    // i64. Block type infers as i64 via LUB.
+    typecheck_ok(
+        "fn main() { let x: i64 = lbl: { if true { break lbl 1; } if false { break lbl 2; } 3 }; }",
+    );
+}

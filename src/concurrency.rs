@@ -618,6 +618,9 @@ impl<'a> ConcurrencyChecker<'a> {
             ExprKind::Loop { body, .. } => {
                 self.collect_block_reads(body, reads);
             }
+            ExprKind::LabeledBlock { body, .. } => {
+                self.collect_block_reads(body, reads);
+            }
             ExprKind::Closure { body, .. } => {
                 self.collect_expr_reads(body, reads);
             }
@@ -830,6 +833,9 @@ impl<'a> ConcurrencyChecker<'a> {
                 self.collect_block_effects(body, info);
             }
             ExprKind::Loop { body, .. } => {
+                self.collect_block_effects(body, info);
+            }
+            ExprKind::LabeledBlock { body, .. } => {
                 self.collect_block_effects(body, info);
             }
             ExprKind::Closure { body, .. } => {

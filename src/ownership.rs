@@ -3327,6 +3327,9 @@ impl<'a> OwnershipChecker<'a> {
                 self.check_block(body, states, param_types, param_usage);
                 restore_uninit_after_loop(pre_uninit, states);
             }
+            ExprKind::LabeledBlock { body, .. } => {
+                self.check_block(body, states, param_types, param_usage);
+            }
             ExprKind::Unsafe(body)
             | ExprKind::Try(body)
             | ExprKind::Seq(body)
@@ -4288,6 +4291,7 @@ fn scan_expr_for_par_uses(
         }
         ExprKind::Block(block)
         | ExprKind::Loop { body: block, .. }
+        | ExprKind::LabeledBlock { body: block, .. }
         | ExprKind::Unsafe(block)
         | ExprKind::Try(block)
         | ExprKind::Seq(block)

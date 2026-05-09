@@ -3522,6 +3522,81 @@ fn test_continue_with_label() {
     }
 }
 
+/// Helper: extract the function-body's first expression — the labeled-
+/// loop / labeled-block tests above use `body.stmts[0]`, but the parser
+/// is free to place the construct in `body.final_expr` when no
+/// trailing semicolon is present. This helper accepts either layout.
+fn first_fn_expr(prog: &Program) -> &Expr {
+    let f = match &prog.items[0] {
+        Item::Function(f) => f,
+        _ => panic!("Expected first item to be a function"),
+    };
+    if let Some(ref expr) = f.body.final_expr {
+        return expr;
+    }
+    if let StmtKind::Expr(ref e) = f.body.stmts[0].kind {
+        return e;
+    }
+    panic!("function body has no expression");
+}
+
+#[test]
+fn test_labeled_block_basic_parse() {
+    // `label: { ... }` parses to ExprKind::LabeledBlock with the label
+    // attached to the AST node and the body parsed as a normal block.
+    // Inner `break label;` is recognized as labeled break (the label is
+    // active in `loop_labels` during body parse).
+    let prog = parse_ok("fn main() { outer: { break outer; } }");
+    let expr = first_fn_expr(&prog);
+    if let ExprKind::LabeledBlock { label, body, .. } = &expr.kind {
+        assert_eq!(label, "outer");
+        // Inner stmt is `break outer;`
+        if let StmtKind::Expr(inner) = &body.stmts[0].kind {
+            if let ExprKind::Break { label, value } = &inner.kind {
+                assert_eq!(label.as_deref(), Some("outer"));
+                assert!(value.is_none());
+            } else {
+                panic!("Expected Break inside labeled block, got {:?}", inner.kind);
+            }
+        }
+    } else {
+        panic!("Expected LabeledBlock, got {:?}", expr.kind);
+    }
+}
+
+#[test]
+fn test_labeled_block_nested_parse() {
+    // Two nested labeled blocks parse with the inner block as a
+    // distinct LabeledBlock node within the outer's body.
+    let prog = parse_ok("fn main() { outer: { inner: { break outer; } } }");
+    let expr = first_fn_expr(&prog);
+    if let ExprKind::LabeledBlock { label, body, .. } = &expr.kind {
+        assert_eq!(label, "outer");
+        // Outer body contains the inner labeled block as its tail or
+        // first stmt.
+        let inner_expr = body
+            .final_expr
+            .as_deref()
+            .or_else(|| {
+                body.stmts.first().and_then(|s| match &s.kind {
+                    StmtKind::Expr(e) => Some(e),
+                    _ => None,
+                })
+            })
+            .expect("expected inner expr in outer body");
+        if let ExprKind::LabeledBlock {
+            label: inner_label, ..
+        } = &inner_expr.kind
+        {
+            assert_eq!(inner_label, "inner");
+        } else {
+            panic!("Expected nested LabeledBlock, got {:?}", inner_expr.kind);
+        }
+    } else {
+        panic!("Expected outer LabeledBlock, got {:?}", expr.kind);
+    }
+}
+
 #[test]
 fn test_range_pattern_integer() {
     let prog = parse_ok("fn main() { match x { 1..=10 => a, _ => b, } }");

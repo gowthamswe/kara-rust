@@ -162,6 +162,7 @@ fn walk_expr(
         }
         ExprKind::Block(block)
         | ExprKind::Loop { body: block, .. }
+        | ExprKind::LabeledBlock { body: block, .. }
         | ExprKind::Seq(block)
         | ExprKind::Par(block)
         | ExprKind::Unsafe(block)

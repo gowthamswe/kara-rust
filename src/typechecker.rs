@@ -1073,6 +1073,56 @@ fn is_subtype(super_ty: &Type, sub_ty: &Type) -> bool {
     }
 }
 
+/// LB3 — labeled-block LUB inference helper.
+///
+/// Compute the labeled-block expression's type by joining the tail
+/// expression's type with each `break label expr` value-type collected
+/// during body inference. Rules:
+/// - `Type::Never` is the unit element: a `break label expr` after which
+///   control cannot fall through (or vice versa) doesn't constrain the
+///   block type.
+/// - `Type::Error` propagates (any error participating in the LUB poisons
+///   the result so cascading errors don't fire).
+/// - All non-`Never` participants must be pairwise `types_compatible`;
+///   otherwise the block type collapses to `Type::Error`. Diagnosing the
+///   actual mismatch is left to the surrounding context (the
+///   labeled-block expression participates as an operand and the parent
+///   site emits the focused diagnostic).
+///
+/// The helper is deliberately conservative — it does not perform unification
+/// across type metavariables. The current `if`-arm joining path uses the
+/// same one-shot `types_compatible` check, so this is consistent with the
+/// rest of the typechecker. A more aggressive `lub_n` over metavariables
+/// is a future refactor (out-of-scope for this slice).
+fn lub_block_type(tail: Type, breaks: &[Type]) -> Type {
+    // Pick the first non-Never as the candidate.
+    let mut candidate: Option<Type> = if tail != Type::Never {
+        Some(tail.clone())
+    } else {
+        None
+    };
+    for b in breaks {
+        if *b == Type::Never {
+            continue;
+        }
+        if *b == Type::Error {
+            return Type::Error;
+        }
+        match &candidate {
+            None => candidate = Some(b.clone()),
+            Some(c) => {
+                if *c == Type::Error {
+                    return Type::Error;
+                }
+                if !types_compatible(c, b) {
+                    return Type::Error;
+                }
+            }
+        }
+    }
+    candidate.unwrap_or(tail)
+}
+
 fn types_compatible(a: &Type, b: &Type) -> bool {
     if a == b {
         return true;
@@ -2139,6 +2189,18 @@ pub struct TypeChecker<'a> {
     warnings: Vec<TypeError>,
     expr_types: HashMap<SpanKey, Type>,
     current_return_type: Option<Type>,
+    /// LB3 — per-label collector stack for labeled-block break-with-value
+    /// LUB inference. Pushed at labeled-block entry; each `Break { label:
+    /// Some(name), value: Some(e) }` site appends `infer_expr(e)` to the
+    /// matching frame; bare `break label` (no value) appends `Type::Unit`.
+    /// Popped at labeled-block exit; the labeled block's type is the LUB
+    /// of `tail_type` and the collected break types. Saved/restored at
+    /// closure boundaries (LB4) so labels are lexical to the function-
+    /// body control flow. Loops keep their existing `Type::Never`-by-
+    /// default behavior — loop-LUB inference is a separate slice that
+    /// will reuse the same machinery once the design entry promotes
+    /// (out-of-scope here).
+    break_value_types: Vec<(String, Vec<Type>)>,
     current_self_type: Option<Type>,
     /// True when type-checking inside a defer/errdefer block.
     in_defer: bool,
@@ -2229,6 +2291,7 @@ impl<'a> TypeChecker<'a> {
             warnings: Vec::new(),
             expr_types: HashMap::new(),
             current_return_type: None,
+            break_value_types: Vec::new(),
             current_self_type: None,
             in_defer: false,
             question_conversions: HashMap::new(),
@@ -5924,6 +5987,16 @@ impl<'a> TypeChecker<'a> {
                 );
             }
 
+            ExprKind::LabeledBlock { body, .. } => {
+                self.walk_capture_consume_block(
+                    body,
+                    CaptureWalkMode::Reading,
+                    outer,
+                    shadows,
+                    reason,
+                );
+            }
+
             ExprKind::Break { value: Some(v), .. } | ExprKind::Return(Some(v)) => {
                 self.walk_capture_consume(v, CaptureWalkMode::Consuming, outer, shadows, reason);
             }
@@ -7493,6 +7566,21 @@ impl<'a> TypeChecker<'a> {
                 Type::Never
             }
 
+            ExprKind::LabeledBlock { label, body, .. } => {
+                // LB3 — push a fresh per-label collector frame, infer the
+                // body's tail type, pop the frame, and compute the block's
+                // type as the LUB of `tail_type` and the collected
+                // `break label expr` value types.
+                self.break_value_types.push((label.clone(), Vec::new()));
+                let tail_ty = self.infer_block(body);
+                let frame = self
+                    .break_value_types
+                    .pop()
+                    .map(|(_, v)| v)
+                    .unwrap_or_default();
+                lub_block_type(tail_ty, &frame)
+            }
+
             ExprKind::Closure {
                 params,
                 capture_mode,
@@ -7508,6 +7596,16 @@ impl<'a> TypeChecker<'a> {
                     .iter()
                     .flat_map(|p| p.pattern.binding_names())
                     .collect();
+                // LB4 — closure-boundary rule for the LUB collector. A
+                // `break label` inside a closure body cannot target an
+                // enclosing labeled block (the resolver rejects it as
+                // `undefined loop label`), but we still save/restore the
+                // collector stack defensively so an inner labeled-block
+                // frame doesn't leak across closure bodies if the
+                // resolver's check is bypassed (e.g., during
+                // single-phase typechecker tests). Closure bodies start
+                // with a fresh empty stack; restored on exit.
+                let saved_break_values = std::mem::take(&mut self.break_value_types);
                 self.local_scope.push();
                 let param_types: Vec<Type> = params
                     .iter()
@@ -7529,6 +7627,7 @@ impl<'a> TypeChecker<'a> {
                     .collect();
                 let body_ty = self.infer_expr(body);
                 self.local_scope.pop();
+                self.break_value_types = saved_break_values;
                 self.closure_type_with_capture_inference(
                     &expr.span,
                     *capture_mode,
@@ -7559,9 +7658,27 @@ impl<'a> TypeChecker<'a> {
                 Type::Never
             }
 
-            ExprKind::Break { value, .. } => {
-                if let Some(ref e) = value {
-                    self.infer_expr(e);
+            ExprKind::Break { label, value } => {
+                let val_ty = if let Some(ref e) = value {
+                    self.infer_expr(e)
+                } else {
+                    Type::Unit
+                };
+                // LB3 — feed the per-label LUB collector for labeled
+                // blocks. Find the matching frame by label name (innermost
+                // wins) and append the value type. Unlabeled `break`s
+                // and breaks targeting a labeled loop have no matching
+                // collector frame and are ignored here — loops keep
+                // their `Type::Never`-by-default behavior.
+                if let Some(name) = label {
+                    if let Some(frame) = self
+                        .break_value_types
+                        .iter_mut()
+                        .rev()
+                        .find(|(n, _)| n == name)
+                    {
+                        frame.1.push(val_ty);
+                    }
                 }
                 Type::Never
             }

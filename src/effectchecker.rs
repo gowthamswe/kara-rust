@@ -1595,6 +1595,10 @@ impl<'a> EffectChecker<'a> {
                 let block_calls = self.collect_calls_in_block(body, bounds);
                 calls.extend(block_calls);
             }
+            ExprKind::LabeledBlock { body, .. } => {
+                let block_calls = self.collect_calls_in_block(body, bounds);
+                calls.extend(block_calls);
+            }
             ExprKind::Lock { body, .. } => {
                 let block_calls = self.collect_calls_in_block(body, bounds);
                 calls.extend(block_calls);
@@ -3162,6 +3166,7 @@ impl<'a> EffectChecker<'a> {
             | ExprKind::Par(body) => {
                 self.check_subtyping_in_block_owned(body);
             }
+            ExprKind::LabeledBlock { body, .. } => self.check_subtyping_in_block_owned(body),
             ExprKind::Lock { body, .. } => self.check_subtyping_in_block_owned(body),
             ExprKind::Closure { body, .. } => self.check_subtyping_in_expr_owned(*body),
             ExprKind::MethodCall { object, args, .. } => {

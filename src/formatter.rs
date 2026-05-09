@@ -1353,6 +1353,10 @@ impl Formatter {
                 self.write_str("loop ");
                 self.format_block(body);
             }
+            ExprKind::LabeledBlock { label, body, .. } => {
+                write!(self.output, "{label}: ").unwrap();
+                self.format_block(body);
+            }
             ExprKind::Closure {
                 params,
                 capture_mode,
