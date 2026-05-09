@@ -1,0 +1,6 @@
+# Normalize line endings to LF on checkout across platforms.
+# Snapshot fixtures under tests/snapshots/ are compared byte-for-byte
+# by integration tests (e.g. tests/concurrency_report.rs); a Windows
+# checkout with core.autocrlf=true would rewrite them to CRLF and
+# break the comparison against LF-emitting code.
+* text=auto eol=lf
