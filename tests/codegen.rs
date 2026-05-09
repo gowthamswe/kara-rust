@@ -7722,4 +7722,120 @@ fn main() {
             );
         }
     }
+
+    // ── Labeled blocks runtime ──────────────────────────────────
+    //
+    // Labeled-block codegen + interpreter sibling slice (LBC1-LBC5).
+    // The frontend slice (commit 85e49c8) shipped parser + resolver +
+    // typechecker; this slice wires runtime semantics so the typed
+    // program actually runs correctly. See
+    // `docs/implementation_checklist/phase-5-diagnostics.md` § 5.2 →
+    // "Labeled blocks: codegen + interpreter sibling".
+
+    /// `lbl: { break lbl 42; -1 }` evaluates to 42. The early `break label
+    /// expr` exits the labeled block with the given value; the
+    /// fall-through tail (`-1`) never runs.
+    #[test]
+    fn test_labeled_block_break_with_value_e2e() {
+        let out = run_program(
+            r#"
+fn main() {
+    let x: i64 = lbl: { break lbl 42; -1 };
+    println(x);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "42");
+        }
+    }
+
+    /// `lbl: { break lbl; }` typed as `()` — bare break exits with unit.
+    /// Verifies the post-block code path runs (println marker).
+    #[test]
+    fn test_labeled_block_bare_break_e2e() {
+        let out = run_program(
+            r#"
+fn main() {
+    lbl: { break lbl; };
+    println(7);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "7");
+        }
+    }
+
+    /// `lbl: { 99 }` evaluates to 99 — no break path exercised; the
+    /// labeled block falls through normally and the slot stores the tail.
+    #[test]
+    fn test_labeled_block_tail_expression_when_no_break_e2e() {
+        let out = run_program(
+            r#"
+fn main() {
+    let x: i64 = lbl: { 99 };
+    println(x);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "99");
+        }
+    }
+
+    /// Outer `lbl: { inner: { break lbl 7; 0 } }` evaluates to 7. The
+    /// inner labeled block's tail (`0`) never runs because `break lbl`
+    /// transfers control past the inner exit straight to the outer exit.
+    /// Stresses the label-aware frame walk (LBC1) — the resolver
+    /// guarantees `lbl` resolves to the outer block, and codegen's
+    /// `compile_break` rev-walk picks the matching frame, not the
+    /// innermost.
+    #[test]
+    fn test_labeled_block_break_from_nested_block_e2e() {
+        let out = run_program(
+            r#"
+fn main() {
+    let x: i64 = lbl: { inner: { break lbl 7; 0 } };
+    println(x);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "7");
+        }
+    }
+
+    /// **Latent-bug regression gate.** `outer: while ... { inner: while
+    /// ... { break outer; } }` exits the outer loop, not just the inner.
+    /// Pre-slice codegen always picked `loop_stack.last()` regardless of
+    /// label, so `break outer` would have broken only `inner` and the
+    /// outer-loop termination would never have observed the inner break.
+    /// Today's label-aware lookup (LBC1 side-effect) closes the gap; the
+    /// post-loop println marker must print `done` in one shot.
+    #[test]
+    fn test_labeled_loop_nested_break_outer_e2e() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut count = 0;
+    outer: while true {
+        inner: while true {
+            count = count + 1;
+            break outer ();
+        }
+        // Without the latent-bug fix, the outer-loop body would
+        // re-enter `inner` here every iteration. With the fix, the
+        // `break outer` transfers control past this point straight to
+        // the outer loop's exit BB.
+        count = count + 100;
+    }
+    println(count);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "1");
+        }
+    }
 }

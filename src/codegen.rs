@@ -448,13 +448,35 @@ enum SetOpFilter<'ctx> {
 
 // ── Loop frame: break / continue targets ───────────────────────
 
-#[derive(Clone, Copy)]
+/// One control-flow frame on `Codegen::loop_stack`. Pushed by every
+/// labeled-loop / labeled-block compile entry point; popped on exit.
+/// `compile_break` / `compile_continue` walk the stack to find the
+/// matching frame: when the source-level `break` / `continue` carries a
+/// label they take the topmost frame whose `label == Some(l)`; otherwise
+/// they take the innermost frame (last in the stack).
+///
+/// `label: None` is used by unlabeled loops (the dominant case today).
+/// `Copy` is intentionally not derived: `Option<String>` is not `Copy`.
+/// Reads at the four `compile_break` / `compile_continue` sites use
+/// `.last().cloned()` instead of `.copied()`.
+#[derive(Clone)]
 struct LoopFrame<'ctx> {
-    /// Block to branch to on `continue`
+    /// Source-level label of this frame, or `None` for unlabeled loops.
+    /// Set from the loop AST node's `label: Option<String>` field for
+    /// loops, and from `ExprKind::LabeledBlock { label, .. }` for blocks.
+    label: Option<String>,
+    /// Block to branch to on `continue`. For labeled blocks this is a
+    /// freshly-created `lblock.continue.unreachable` BB whose body is a
+    /// single `unreachable` instruction — the resolver rejects
+    /// `continue label` referring to a labeled-block label, so this BB
+    /// is never reached at runtime; the field stays uniform to avoid
+    /// splitting `LoopFrame` into a `LoopOrBlockFrame` enum.
     continue_bb: BasicBlock<'ctx>,
-    /// Block to branch to on `break` (loop exit)
+    /// Block to branch to on `break` (loop / labeled-block exit).
     break_bb: BasicBlock<'ctx>,
-    /// Optional alloca for `break value`
+    /// Optional alloca for `break value`. For labeled blocks the slot is
+    /// always `Some` and stores both the body's tail value (on normal
+    /// fall-through) and any `break label expr` value (on early exit).
     result_slot: Option<PointerValue<'ctx>>,
 }
 
@@ -5093,11 +5115,15 @@ impl<'ctx> Codegen<'ctx> {
                 else_branch,
             } => self.compile_if(condition, then_block, else_branch.as_deref()),
             ExprKind::While {
-                condition, body, ..
-            } => self.compile_while(condition, body),
-            ExprKind::Loop { body, .. } => self.compile_loop(body),
-            ExprKind::Break { value, .. } => self.compile_break(value.as_deref()),
-            ExprKind::Continue { .. } => self.compile_continue(),
+                label,
+                condition,
+                body,
+            } => self.compile_while(label.as_deref(), condition, body),
+            ExprKind::Loop { label, body } => self.compile_loop(label.as_deref(), body),
+            ExprKind::Break { label, value } => {
+                self.compile_break(label.as_deref(), value.as_deref())
+            }
+            ExprKind::Continue { label } => self.compile_continue(label.as_deref()),
             ExprKind::Closure { params, body, .. } => self.compile_closure(params, body),
             ExprKind::Return(val) => {
                 if let Some(e) = val {
@@ -5134,11 +5160,11 @@ impl<'ctx> Codegen<'ctx> {
             }
             ExprKind::Match { scrutinee, arms } => self.compile_match(scrutinee, arms),
             ExprKind::For {
+                label,
                 pattern,
                 iterable,
                 body,
-                ..
-            } => self.compile_for(pattern, iterable, body),
+            } => self.compile_for(label.as_deref(), pattern, iterable, body),
             ExprKind::IfLet {
                 pattern,
                 value,
@@ -5161,6 +5187,7 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::Index { object, index } => self.compile_index(object, index),
             ExprKind::Question(inner) => self.compile_question(inner, &expr.span),
             ExprKind::Path { segments, .. } => self.compile_path_expr(segments),
+            ExprKind::LabeledBlock { label, body, .. } => self.compile_labeled_block(label, body),
             _ => Ok(self.context.i64_type().const_int(0, false).into()),
         }
     }
@@ -12566,6 +12593,7 @@ impl<'ctx> Codegen<'ctx> {
     /// Currently supports ranges (`start..end`, `start..=end`) and array literals.
     fn compile_for(
         &mut self,
+        label: Option<&str>,
         pattern: &Pattern,
         iterable: &Expr,
         body: &Block,
@@ -12575,7 +12603,7 @@ impl<'ctx> Codegen<'ctx> {
                 start,
                 end,
                 inclusive,
-            } => self.compile_for_range(pattern, start, end, *inclusive, body),
+            } => self.compile_for_range(label, pattern, start, end, *inclusive, body),
             ExprKind::ArrayLiteral(elems) => {
                 // Compile each element eagerly and iterate by index
                 let elems: Vec<BasicValueEnum<'ctx>> = elems
@@ -12588,29 +12616,29 @@ impl<'ctx> Codegen<'ctx> {
                 if let Some(slot) = self.variables.get(name.as_str()).copied() {
                     // Owned array
                     if let BasicTypeEnum::ArrayType(at) = slot.ty {
-                        return self.compile_for_array_var(pattern, slot.ptr, at, body);
+                        return self.compile_for_array_var(label, pattern, slot.ptr, at, body);
                     }
                     // Ref array
                     if let Some(&BasicTypeEnum::ArrayType(at)) = self.ref_params.get(name.as_str())
                     {
                         let arr_ptr = self.get_data_ptr(name).unwrap();
-                        return self.compile_for_array_var(pattern, arr_ptr, at, body);
+                        return self.compile_for_array_var(label, pattern, arr_ptr, at, body);
                     }
                     // Vec/String iteration (owned or ref)
                     if self.vec_elem_types.contains_key(name.as_str()) {
-                        return self.compile_for_vec_var(pattern, name, body);
+                        return self.compile_for_vec_var(label, pattern, name, body);
                     }
                     // Slice iteration: `{ptr, len}` struct alloca.
                     if self.slice_elem_types.contains_key(name.as_str()) {
-                        return self.compile_for_slice_var(pattern, name, body);
+                        return self.compile_for_slice_var(label, pattern, name, body);
                     }
                     // Map iteration: for (k, v) in map { }
                     if self.map_key_types.contains_key(name.as_str()) {
-                        return self.compile_for_map_var(pattern, name, body);
+                        return self.compile_for_map_var(label, pattern, name, body);
                     }
                     // Set iteration: for x in set { }
                     if self.set_elem_types.contains_key(name.as_str()) {
-                        return self.compile_for_set_var(pattern, name, body);
+                        return self.compile_for_set_var(label, pattern, name, body);
                     }
                 }
                 Ok(self.context.i64_type().const_int(0, false).into())
@@ -12624,6 +12652,7 @@ impl<'ctx> Codegen<'ctx> {
 
     fn compile_for_range(
         &mut self,
+        label: Option<&str>,
         pattern: &Pattern,
         start: &Option<Box<Expr>>,
         end: &Option<Box<Expr>>,
@@ -12656,6 +12685,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(cond_bb).unwrap();
 
         self.loop_stack.push(LoopFrame {
+            label: label.map(str::to_string),
             continue_bb: incr_bb,
             break_bb: exit_bb,
             result_slot: None,
@@ -12718,6 +12748,7 @@ impl<'ctx> Codegen<'ctx> {
 
     fn compile_for_slice_var(
         &mut self,
+        label: Option<&str>,
         pattern: &Pattern,
         var_name: &str,
         body: &Block,
@@ -12761,6 +12792,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(cond_bb).unwrap();
 
         self.loop_stack.push(LoopFrame {
+            label: label.map(str::to_string),
             continue_bb: incr_bb,
             break_bb: exit_bb,
             result_slot: None,
@@ -12826,6 +12858,7 @@ impl<'ctx> Codegen<'ctx> {
 
     fn compile_for_vec_var(
         &mut self,
+        label: Option<&str>,
         pattern: &Pattern,
         var_name: &str,
         body: &Block,
@@ -12870,6 +12903,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(cond_bb).unwrap();
 
         self.loop_stack.push(LoopFrame {
+            label: label.map(str::to_string),
             continue_bb: incr_bb,
             break_bb: exit_bb,
             result_slot: None,
@@ -12949,6 +12983,7 @@ impl<'ctx> Codegen<'ctx> {
     /// path in `bind_pattern`.
     fn compile_for_map_var(
         &mut self,
+        label: Option<&str>,
         pattern: &Pattern,
         var_name: &str,
         body: &Block,
@@ -12999,6 +13034,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(loop_bb).unwrap();
 
         self.loop_stack.push(LoopFrame {
+            label: label.map(str::to_string),
             continue_bb: loop_bb,
             break_bb: exit_bb,
             result_slot: None,
@@ -13069,6 +13105,7 @@ impl<'ctx> Codegen<'ctx> {
     /// destructuring like Map's tuple-shaped iteration delivery).
     fn compile_for_set_var(
         &mut self,
+        label: Option<&str>,
         pattern: &Pattern,
         var_name: &str,
         body: &Block,
@@ -13115,6 +13152,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(loop_bb).unwrap();
 
         self.loop_stack.push(LoopFrame {
+            label: label.map(str::to_string),
             continue_bb: loop_bb,
             break_bb: exit_bb,
             result_slot: None,
@@ -13174,6 +13212,7 @@ impl<'ctx> Codegen<'ctx> {
 
     fn compile_for_array_var(
         &mut self,
+        label: Option<&str>,
         pattern: &Pattern,
         arr_ptr: PointerValue<'ctx>,
         arr_ty: inkwell::types::ArrayType<'ctx>,
@@ -13197,6 +13236,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(cond_bb).unwrap();
 
         self.loop_stack.push(LoopFrame {
+            label: label.map(str::to_string),
             continue_bb: incr_bb,
             break_bb: exit_bb,
             result_slot: None,
@@ -13636,6 +13676,7 @@ impl<'ctx> Codegen<'ctx> {
 
     fn compile_while(
         &mut self,
+        label: Option<&str>,
         condition: &Expr,
         body: &Block,
     ) -> Result<BasicValueEnum<'ctx>, String> {
@@ -13647,6 +13688,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_unconditional_branch(cond_bb).unwrap();
 
         self.loop_stack.push(LoopFrame {
+            label: label.map(str::to_string),
             continue_bb: cond_bb,
             break_bb: exit_bb,
             result_slot: None,
@@ -13675,7 +13717,11 @@ impl<'ctx> Codegen<'ctx> {
         Ok(self.context.i64_type().const_int(0, false).into())
     }
 
-    fn compile_loop(&mut self, body: &Block) -> Result<BasicValueEnum<'ctx>, String> {
+    fn compile_loop(
+        &mut self,
+        label: Option<&str>,
+        body: &Block,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
         let fn_val = self.current_fn.unwrap();
         let loop_bb = self.context.append_basic_block(fn_val, "loop.body");
         let exit_bb = self.context.append_basic_block(fn_val, "loop.exit");
@@ -13685,6 +13731,7 @@ impl<'ctx> Codegen<'ctx> {
             self.create_entry_alloca(fn_val, "loop.result", self.context.i64_type().into());
 
         self.loop_stack.push(LoopFrame {
+            label: label.map(str::to_string),
             continue_bb: loop_bb,
             break_bb: exit_bb,
             result_slot: Some(result_slot),
@@ -13717,9 +13764,127 @@ impl<'ctx> Codegen<'ctx> {
         Ok(result)
     }
 
-    fn compile_break(&mut self, value: Option<&Expr>) -> Result<BasicValueEnum<'ctx>, String> {
+    /// Compile `label: { body }` (`ExprKind::LabeledBlock`).
+    ///
+    /// LBC2 / LBC3: allocate an i64 result slot at the entry BB, push a
+    /// `LoopFrame` carrying the label and the slot, compile the body,
+    /// store the body's tail value (when control falls through normally)
+    /// into the slot, branch to a freshly-created `lblock.exit` BB, and
+    /// load the slot at the exit. Any `break label expr` inside the body
+    /// goes through `compile_break`'s label-aware lookup, stores its
+    /// value into the same slot, and branches to the same exit BB.
+    ///
+    /// Slot LLVM type: i64 today, matching `compile_loop`'s precedent.
+    /// The typechecker's LUB constraint already guarantees that for
+    /// non-i64-shaped block types, all break sites carry a value of the
+    /// same shape — when v1 codegen extends to non-i64 break payloads
+    /// (consume `expr_types` lookup), this function and `compile_loop`
+    /// flip together. For unit-typed blocks LBC3 specifies the slot is
+    /// i64 and `break label` (no value) stores zero.
+    ///
+    /// `continue_bb` for the frame is a dead `lblock.continue.unreachable`
+    /// BB: the resolver rejects `continue label` referring to a labeled
+    /// block (`E_CONTINUE_LABEL_BLOCK`), so the BB is never reached at
+    /// runtime; pre-allocating it keeps the `LoopFrame` shape uniform.
+    fn compile_labeled_block(
+        &mut self,
+        label: &str,
+        body: &Block,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let fn_val = self.current_fn.unwrap();
+        let i64_t = self.context.i64_type();
+
+        let result_slot = self.create_entry_alloca(fn_val, "lblock.result", i64_t.into());
+        // Defense-in-depth zero-init so a never-stored slot loads as 0
+        // (matching the unit-equivalent semantics for control paths the
+        // typechecker rules out but which a future divergence wouldn't
+        // catch).
+        self.builder
+            .build_store(result_slot, i64_t.const_int(0, false))
+            .unwrap();
+
+        let body_bb = self
+            .context
+            .append_basic_block(fn_val, &format!("lblock.{}.body", label));
+        let exit_bb = self
+            .context
+            .append_basic_block(fn_val, &format!("lblock.{}.exit", label));
+        let continue_unreachable_bb = self
+            .context
+            .append_basic_block(fn_val, &format!("lblock.{}.continue.unreachable", label));
+
+        // Populate the unreachable BB once; it will never branch in.
+        // Position back at the previous insert point afterwards.
+        let prev_bb = self.builder.get_insert_block();
+        self.builder.position_at_end(continue_unreachable_bb);
+        self.builder.build_unreachable().unwrap();
+        if let Some(bb) = prev_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        self.builder.build_unconditional_branch(body_bb).unwrap();
+        self.builder.position_at_end(body_bb);
+
+        self.loop_stack.push(LoopFrame {
+            label: Some(label.to_string()),
+            continue_bb: continue_unreachable_bb,
+            break_bb: exit_bb,
+            result_slot: Some(result_slot),
+        });
+
+        // Compile the body. `compile_block` returns the tail expression's
+        // value when the block has one; on normal fall-through we store
+        // that value into the slot and branch to exit. If the body
+        // already terminated (e.g., the tail was an early `break label`,
+        // a `return`, or a `panic`), don't add a fall-through branch.
+        let tail = self.compile_block(body)?;
+        if self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_terminator()
+            .is_none()
+        {
+            if let Some(v) = tail {
+                if v.is_int_value() {
+                    self.builder.build_store(result_slot, v).unwrap();
+                }
+            }
+            self.builder.build_unconditional_branch(exit_bb).unwrap();
+        }
+
+        self.loop_stack.pop();
+        self.builder.position_at_end(exit_bb);
+        let result = self
+            .builder
+            .build_load::<BasicTypeEnum<'ctx>>(i64_t.into(), result_slot, "lblock.val")
+            .unwrap();
+        Ok(result)
+    }
+
+    fn compile_break(
+        &mut self,
+        label: Option<&str>,
+        value: Option<&Expr>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
         let zero = self.context.i64_type().const_int(0, false);
-        if let Some(frame) = self.loop_stack.last().copied() {
+        // LBC1: label-aware lookup. With `Some(l)`, walk the frame stack
+        // top-down and pick the first frame whose label matches; with
+        // `None`, fall back to the innermost frame. This is what makes
+        // `break outer;` actually skip past `inner` when `outer` is the
+        // labeled loop / labeled block (today's pre-slice behavior would
+        // always pick the innermost — silent miscompile under nested
+        // labels, no test fixture exercised it before this slice).
+        let frame = match label {
+            Some(l) => self
+                .loop_stack
+                .iter()
+                .rev()
+                .find(|f| f.label.as_deref() == Some(l))
+                .cloned(),
+            None => self.loop_stack.last().cloned(),
+        };
+        if let Some(frame) = frame {
             if let Some(slot) = frame.result_slot {
                 let val = if let Some(v) = value {
                     self.compile_expr(v)?
@@ -13738,9 +13903,21 @@ impl<'ctx> Codegen<'ctx> {
         Ok(zero.into())
     }
 
-    fn compile_continue(&mut self) -> Result<BasicValueEnum<'ctx>, String> {
+    fn compile_continue(&mut self, label: Option<&str>) -> Result<BasicValueEnum<'ctx>, String> {
         let zero = self.context.i64_type().const_int(0, false);
-        if let Some(frame) = self.loop_stack.last().copied() {
+        // LBC1: same label-aware lookup as `compile_break`. The resolver
+        // guarantees `continue label` only resolves to a `Loop`-kind
+        // frame, but the codegen-side dispatch is uniform.
+        let frame = match label {
+            Some(l) => self
+                .loop_stack
+                .iter()
+                .rev()
+                .find(|f| f.label.as_deref() == Some(l))
+                .cloned(),
+            None => self.loop_stack.last().cloned(),
+        };
+        if let Some(frame) = frame {
             self.builder
                 .build_unconditional_branch(frame.continue_bb)
                 .unwrap();

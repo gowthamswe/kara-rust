@@ -2014,6 +2014,76 @@ fn test_unlabeled_break_still_works() {
     );
 }
 
+// ── Labeled blocks runtime ───────────────────────────────────
+//
+// Sibling slice to `tests/codegen.rs` "Labeled blocks runtime" — the
+// interpreter side of the LBC4 design choice. The labeled-block expr
+// arm in `eval_expr_inner` matches `ControlFlow::Break { label, value
+// }` against its own label; non-matching labels propagate. See
+// `docs/implementation_checklist/phase-5-diagnostics.md` § 5.2.
+
+#[test]
+fn test_interpreter_labeled_block_break_with_value() {
+    // Mirror of codegen test 1: `lbl: { break lbl 42; -1 }` evaluates
+    // to 42 through the tree-walk path.
+    assert_eq!(
+        run("fn main() {\n\
+             let x: i64 = lbl: { break lbl 42; -1 };\n\
+             println(x);\n\
+         }"),
+        "42\n"
+    );
+}
+
+#[test]
+fn test_interpreter_labeled_block_bare_break_unit() {
+    // Bare `break label` exits with `Value::Unit`. Observable check:
+    // post-block println runs.
+    assert_eq!(
+        run("fn main() {\n\
+             lbl: { break lbl; };\n\
+             println(7);\n\
+         }"),
+        "7\n"
+    );
+}
+
+#[test]
+fn test_interpreter_labeled_block_tail_expression() {
+    // No break: the block falls through normally and the tail value
+    // becomes the labeled block's value.
+    assert_eq!(
+        run("fn main() {\n\
+             let x: i64 = lbl: { 99 };\n\
+             println(x);\n\
+         }"),
+        "99\n"
+    );
+}
+
+#[test]
+fn test_interpreter_nested_labeled_break_outer() {
+    // Mirror of codegen latent-bug regression gate: `outer: while {
+    // inner: while { break outer; } }` exits the outer loop. Pre-slice
+    // interpreter already routed through `ControlFlow::Break.label`
+    // correctly, but the test pins the contract to prevent a future
+    // regression that flattens the label match.
+    assert_eq!(
+        run("fn main() {\n\
+             let mut count = 0;\n\
+             outer: while true {\n\
+                 inner: while true {\n\
+                     count = count + 1;\n\
+                     break outer ();\n\
+                 }\n\
+                 count = count + 100;\n\
+             }\n\
+             println(count);\n\
+         }"),
+        "1\n"
+    );
+}
+
 // ── Error Return Trace Tests ──────────────────────────────────
 
 #[test]

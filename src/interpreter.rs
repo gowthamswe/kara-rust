@@ -3105,6 +3105,22 @@ impl<'a> Interpreter<'a> {
 
             ExprKind::Providers { bindings, body } => self.eval_providers_block(bindings, body),
 
+            // LBC4 — `label: { body }`. Routes the existing
+            // `ControlFlow::Break { label, value }` signal: a `break label
+            // expr` inside the body matches by label, returns the value
+            // (or `Value::Unit` when bare `break label`); any non-matching
+            // control-flow signal (outer-label break, return, cancel,
+            // exit, runtime error) propagates unchanged. No new
+            // `ControlFlow` variants needed.
+            ExprKind::LabeledBlock { label, body, .. } => match self.eval_block_inner(body) {
+                Ok(v) => v,
+                Err(ControlFlow::Break {
+                    label: Some(ref l),
+                    ref value,
+                }) if l == label => value.clone().unwrap_or(Value::Unit),
+                Err(cf) => self.set_cf(cf),
+            },
+
             ExprKind::SelfType | ExprKind::PipePlaceholder | ExprKind::Error => Value::Unit,
 
             _ => todo!(
