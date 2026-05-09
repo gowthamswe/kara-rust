@@ -306,14 +306,14 @@ fn test_chain_dependency() {
 
     let main_fc = get_function(&analysis, "main");
     assert_eq!(main_fc.total_statements, 3);
-    // a->b and b->c are dependencies, but a and c are independent
-    // (c reads b, not a). So a and c can be grouped.
-    // However b cannot be in that group (it depends on a and c depends on it).
-    assert_eq!(main_fc.parallel_groups.len(), 1);
-    let group = &main_fc.parallel_groups[0];
-    assert_eq!(group.statement_indices.len(), 2);
-    assert!(group.statement_indices.contains(&0)); // a
-    assert!(group.statement_indices.contains(&2)); // c
+    // `a` and `c` have no direct edge between them (c reads b, not a),
+    // but `b` sits between them with a hard dep on both. The
+    // contiguous-only grouping rule rejects [0, 2]: codegen emits a
+    // single `karac_par_run` fan-out at the group's min_idx, so
+    // skipping over a dependent middle stmt would either drop stmt 1
+    // entirely or produce a branch that reads a binding the analyzer
+    // can't guarantee is in scope. So no parallel group fires here.
+    assert_eq!(main_fc.parallel_groups.len(), 0);
 }
 
 // ── Full chain: every statement reads previous ─────────────────

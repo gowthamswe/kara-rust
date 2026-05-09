@@ -771,33 +771,25 @@ fn main() {
         );
     }
 
-    /// Slice A return-shape gap reproduction (filed as Slice C
-    /// `phase-8-stdlib-floor.md` hard-stop trigger 1 fallback (a),
-    /// 2026-05-09): a `Vec[T]` typed return through Slice A's
-    /// per-branch return slots fails codegen with `Undefined variable
-    /// '<binding>'` when the slot binding is consumed by a downstream
-    /// statement after the par-run barrier. `compute_return_slots`
-    /// recognises `Vec[T]` (`llvm_type_for_type_expr` returns the
-    /// `vec_struct_type`), so the slot is materialized — but the
-    /// parent-side rebinding into `self.variables` doesn't surface
-    /// the slot binding for one of the let-targets in some Vec shape
-    /// path, so a subsequent reference like `use_v(b)` fails with
-    /// "Undefined variable 'b'" before the loaded slot value is
-    /// re-bound.
+    /// Regression: `let a = fetch_a(); let b = fetch_b(); use_v(a);
+    /// use_v(b);` previously codegen'd with `Undefined variable 'b'`.
     ///
-    /// `#[ignore]`-gated as a known regression to track until the
-    /// underlying mechanism in `compile_function_body`'s slot
-    /// rebinding path lands a fix. Slice C reduced its demo fixture
-    /// to single-row struct returns (`Order` instead of `Vec[Order]`)
-    /// to side-step this gap; once the gap closes, Slice C's demo
-    /// fixture can grow back to `Vec[T]` returns additively.
+    /// Root cause was upstream of Slice A's slot ABI: the analyzer's
+    /// greedy grouping in `find_parallel_groups` would skip over
+    /// dependent middle stmts and emit non-contiguous parallel groups
+    /// (e.g., `[0, 3]` and `[1, 2]`). The codegen's
+    /// `i = max_idx + 1` step then jumped past the second group's
+    /// stmts entirely, so `let b` never ran in the parent scope and
+    /// `use_v(b)` (which had been pulled into the first group's
+    /// branch fn for stmt 3) failed to resolve `b`.
+    ///
+    /// Fixed at the analyzer level — parallel groups are now
+    /// contiguous-only (`src/concurrency.rs::find_parallel_groups`
+    /// breaks on the first non-eligible candidate instead of
+    /// skipping). This test pins that the source compiles cleanly
+    /// without the spurious diagnostic.
     #[test]
-    #[ignore]
-    fn test_auto_par_vec_return_undefined_var_repro() {
-        // Build the runtime is unnecessary — the failure is a codegen-
-        // time error, not a link/exec issue. We invoke the in-process
-        // `ir_for_with_concurrency` and assert the codegen call
-        // produces the diagnostic.
+    fn test_auto_par_non_contiguous_group_no_undefined_var() {
         let src = r#"
 effect resource R1;
 effect resource R2;
@@ -833,15 +825,170 @@ fn main() {
         let analysis = karac::concurrency_analyze(&parsed.program, &effects);
         let res = compile_to_ir_with_options(&parsed.program, None, Some(&analysis), None, None);
         assert!(
-            res.is_err(),
-            "expected codegen failure on Vec[T] auto-par return shape; \
-             got Ok IR — gap is closed and this regression test should be \
-             un-ignored or removed"
+            res.is_ok(),
+            "expected clean compile post-contiguous-only fix; got: {:?}",
+            res.err()
         );
-        let err = format!("{}", res.err().unwrap());
+    }
+
+    /// Bug fix: when an auto-par group's branch-stmt body reads
+    /// `self.X` (a `FieldAccess { object: SelfValue, ... }` shape),
+    /// the capture-set computation in `emit_par_run` previously
+    /// missed `self` because `refs_in_expr` had no `SelfValue` arm.
+    /// The branch fn was emitted without `self` in its env-struct,
+    /// and `load_variable("self")` inside the branch body errored
+    /// with `Undefined variable 'self'`.
+    ///
+    /// Fixed 2026-05-09 in `src/codegen.rs::refs_in_expr`: added a
+    /// `SelfValue` arm that inserts `"self"` into the refs set, so
+    /// captures pick it up and the env-struct unpack rebinds `self`
+    /// in the branch fn's `self.variables`. Surfaced when growing
+    /// `examples/parallax/`'s `fetch_latest_order` from `-> Order`
+    /// to `-> Vec[Order]`; the parallax demo also exposes a
+    /// downstream slot-rebind use-after-free issue (tracked in
+    /// `bugs.md`) so this regression test uses a smaller shape that
+    /// only exercises the capture-set path.
+    /// Regression for bug #3 (closed 2026-05-09): auto-par grouping
+    /// puts a `Vec[T]` return through a slot, then the value is
+    /// moved into the surrounding fn's returned struct. Pre-fix, the
+    /// slot rebind unconditionally called `track_vec_var(alloca)`,
+    /// scheduling a free at the parent's scope exit. When the slot
+    /// value was moved into a returned struct, the free corrupted
+    /// the moved Vec's data pointer → SIGABRT.
+    ///
+    /// Fixed in `src/codegen.rs::compile_function_body` slot rebind
+    /// path: the `track_vec_var(alloca)` call was removed (see the
+    /// inline comment for the leak/correctness trade-off rationale).
+    /// This test pins the demo-shape end-to-end behaviour.
+    #[test]
+    fn test_auto_par_vec_slot_into_struct_returned() {
+        // Build the binary and run it. Both println markers must
+        // appear — if "after" is missing, the cleanup of the returned
+        // struct's Vec fields is unsafe (use-after-free or double-free).
+        let src = r#"
+struct Holder {
+    a: Vec[i64],
+    b: Vec[i64],
+}
+
+trait DbA { fn fetch(ref self) -> Vec[i64]; }
+trait DbB { fn fetch(ref self) -> Vec[i64]; }
+
+pub effect resource R1: DbA;
+pub effect resource R2: DbB;
+
+struct InMemA {}
+struct InMemB {}
+
+impl DbA for InMemA {
+    fn fetch(ref self) -> Vec[i64] {
+        let mut v: Vec[i64] = Vec.new();
+        v.push(1);
+        v
+    }
+}
+
+impl DbB for InMemB {
+    fn fetch(ref self) -> Vec[i64] {
+        let mut v: Vec[i64] = Vec.new();
+        v.push(2);
+        v
+    }
+}
+
+fn fetch_a() -> Vec[i64] with reads(R1) { R1.fetch() }
+fn fetch_b() -> Vec[i64] with reads(R2) { R2.fetch() }
+
+fn assemble() -> Holder with reads(R1) reads(R2) {
+    let a = fetch_a();
+    let b = fetch_b();
+    Holder { a: a, b: b }
+}
+
+fn main() {
+    let mut da = InMemA {};
+    let mut db = InMemB {};
+    with_provider[R1](da, || {
+        with_provider[R2](db, || {
+            let h = assemble();
+            println("before");
+            let _ = h;
+            println("after");
+        });
+    });
+}
+"#;
+        // Inline the link-and-run helper from tests/parallax.rs.
+        use karac::codegen::{compile_to_object_with_options, link_executable};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let mut parsed = karac::parse(src);
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        let effects = karac::effectcheck(&parsed.program);
+        let analysis = karac::concurrency_analyze(&parsed.program, &effects);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let obj = format!("/tmp/karac_bug3_{pid}_{id}.o");
+        let exe = format!("/tmp/karac_bug3_{pid}_{id}");
+        compile_to_object_with_options(&parsed.program, &obj, None, Some(&analysis), None, None)
+            .unwrap();
+        link_executable(&obj, &exe).unwrap();
+        let out = std::process::Command::new(&exe).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let _ = std::fs::remove_file(&obj);
+        let _ = std::fs::remove_file(&exe);
         assert!(
-            err.contains("Undefined variable 'b'") || err.contains("Undefined variable 'a'"),
-            "expected `Undefined variable` diagnostic; got: {err}"
+            out.status.success(),
+            "binary should exit cleanly; got {:?}, stdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            stdout.trim(),
+            "before\nafter",
+            "expected both markers; if `after` is missing, the \
+             cleanup of the returned Holder (whose fields came \
+             through par-slot rebinds) corrupted memory."
+        );
+    }
+
+    #[test]
+    fn test_impl_ref_self_self_field_in_branch_stmt_captures_self() {
+        let src = r#"
+struct InMemOrders { seed: i64 }
+
+impl InMemOrders {
+    fn get_orders(ref self, user_id: i64) -> Vec[i64] {
+        let s: i64 = self.seed + user_id;
+        let mut v: Vec[i64] = Vec.new();
+        v.push(s);
+        v
+    }
+}
+
+fn main() {
+    let db = InMemOrders { seed: 100 };
+    let _ = db.get_orders(42);
+    println("done");
+}
+"#;
+        use karac::codegen::compile_to_ir_with_options;
+        let mut parsed = karac::parse(src);
+        assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        let effects = karac::effectcheck(&parsed.program);
+        let analysis = karac::concurrency_analyze(&parsed.program, &effects);
+        let res = compile_to_ir_with_options(&parsed.program, None, Some(&analysis), None, None);
+        assert!(
+            res.is_ok(),
+            "expected clean compile (SelfValue capture-set fix); got: {:?}",
+            res.err()
         );
     }
 }

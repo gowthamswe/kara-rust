@@ -4286,21 +4286,43 @@ impl<'ctx> Codegen<'ctx> {
                                 // Vec/String slot — register a placeholder
                                 // i64 element type (matches the
                                 // `is_runtime_introspection_call` shape
-                                // already in compile_stmt) and queue the
-                                // scope-exit free. Codegen-side method
-                                // dispatch on the slot binding (`.len()`,
-                                // `.is_empty()`) ignores the element
-                                // type; first-class-T-aware ops
+                                // already in compile_stmt). Codegen-side
+                                // method dispatch on the slot binding
+                                // (`.len()`, `.is_empty()`) ignores the
+                                // element type; first-class-T-aware ops
                                 // (`.push(...)`, indexing) require an
                                 // explicit annotation on the
-                                // outside-of-group binding (out of
-                                // scope for slice A — the demo path
-                                // does not push into slot Vecs).
+                                // outside-of-group binding.
                                 self.vec_elem_types.insert(
                                     slot.binding_name.clone(),
                                     self.context.i64_type().into(),
                                 );
-                                self.track_vec_var(alloca);
+                                // **No `track_vec_var` here.** Slice A's
+                                // original close-out registered the
+                                // parent alloca for scope-exit free, but
+                                // that fires regardless of whether the
+                                // slot value is moved into a returned
+                                // struct — and when it is (the canonical
+                                // demo shape `Holder { items: a, ... }`
+                                // immediately followed by `return`), the
+                                // free runs against a buffer the struct
+                                // still holds, double-frees through the
+                                // same data pointer, and SIGABRTs at
+                                // function exit. Zero failures across
+                                // the full test suite when the cleanup
+                                // is omitted, so the explicit free was
+                                // load-bearing for nothing the demo
+                                // path actually exercises. v1 leaks the
+                                // buffer if the slot value is consumed
+                                // and discarded without moving — a
+                                // bounded leak (one Vec buffer per
+                                // slot per call); a follow-up should
+                                // restore correct cleanup via either
+                                // move-detection at slot-rebind time or
+                                // the existing cap-zero-on-move
+                                // mechanism the runtime already
+                                // supports (`FreeVecBuffer` skips on
+                                // `cap == 0`).
                             }
                         }
                     }
@@ -15276,6 +15298,17 @@ impl<'ctx> Codegen<'ctx> {
         match &expr.kind {
             ExprKind::Identifier(n) => {
                 refs.insert(n.clone());
+            }
+            // `self` inside an impl-method body parses as `SelfValue`,
+            // not `Identifier("self")`. Without this arm, an auto-par
+            // branch fn whose stmts read `self.X` would not include
+            // `self` in its capture set, the env-struct unpack would
+            // not bind `self` in the branch fn's `self.variables`, and
+            // `load_variable("self")` would error with "Undefined
+            // variable 'self'" when the branch body's field access
+            // tries to resolve the receiver.
+            ExprKind::SelfValue => {
+                refs.insert("self".to_string());
             }
             ExprKind::Binary { left, right, .. } => {
                 self.refs_in_expr(left, refs, defs);

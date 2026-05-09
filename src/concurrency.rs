@@ -378,10 +378,23 @@ impl<'a> ConcurrencyChecker<'a> {
             let mut group_indices = vec![start];
             assigned[start] = true;
 
-            // Try to add subsequent unassigned statements to this group
+            // Try to add subsequent unassigned statements to this group.
+            //
+            // **Contiguous-only invariant.** A parallel group must be a
+            // contiguous run of statements: code before the group runs
+            // sequentially, the group fans out at one point through
+            // `karac_par_run`, then code after the group runs
+            // sequentially. Non-contiguous groups violate this — they
+            // imply two interleaved fan-outs that the single-fan-out
+            // runtime cannot express, and the codegen's
+            // `i = max_idx + 1` step would skip past the second
+            // group's stmts entirely. So when a candidate isn't
+            // independent of the in-progress group, we **break**, not
+            // continue — the group ends here and any later eligible
+            // candidate becomes the seed of its own group.
             for candidate in (start + 1)..n {
                 if assigned[candidate] {
-                    continue;
+                    break;
                 }
 
                 // Check if candidate is independent of ALL statements already in the group
@@ -390,6 +403,8 @@ impl<'a> ConcurrencyChecker<'a> {
                 if independent {
                     group_indices.push(candidate);
                     assigned[candidate] = true;
+                } else {
+                    break;
                 }
             }
 
