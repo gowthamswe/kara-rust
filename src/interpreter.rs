@@ -3833,6 +3833,9 @@ impl<'a> Interpreter<'a> {
                 "Map.new" => {
                     return Value::Map(Vec::new());
                 }
+                "Vec.new" => {
+                    return Value::array_of(Vec::new());
+                }
                 "SortedSet.new" => {
                     return Value::SortedSet(BTreeMap::new());
                 }

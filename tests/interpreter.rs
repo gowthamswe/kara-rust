@@ -1248,6 +1248,26 @@ fn test_prefix_vec_len() {
     );
 }
 
+#[test]
+fn test_interpreter_vec_new_construct_push_len() {
+    // `Vec.new()` returns an empty Vec through the interpreter's path-string
+    // dispatch. Exercises construct → push → len-read → indexed read so a
+    // regression in the dispatch arm fails this test rather than panicking
+    // inside `karac run` with `path 'Vec.new' not found`.
+    assert_eq!(
+        run("fn main() {\n\
+                 let mut v: Vec[i64] = Vec.new();\n\
+                 v.push(10_i64);\n\
+                 v.push(20_i64);\n\
+                 v.push(30_i64);\n\
+                 println(f\"{v.len()}\");\n\
+                 println(f\"{v[0]}\");\n\
+                 println(f\"{v[2]}\");\n\
+             }"),
+        "3\n10\n30\n"
+    );
+}
+
 // ── Repeat literal `[v; n]` ────────────────────────────────────
 
 #[test]
