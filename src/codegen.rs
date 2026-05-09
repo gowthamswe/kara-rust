@@ -531,6 +531,13 @@ struct Codegen<'ctx> {
     struct_types: HashMap<String, StructType<'ctx>>,
     /// Field names in declaration order (struct name → field names).
     struct_field_names: HashMap<String, Vec<String>>,
+    /// Field type-names in declaration order (struct name → per-field
+    /// user-type name, or `None` if the field's declared type isn't a
+    /// path / isn't a known user struct). Used to recover the inner
+    /// type of chained field accesses (`o.inner.name` requires knowing
+    /// the type of `o.inner` to resolve `name`'s field index in
+    /// `compile_field_access` / `field_index_for`).
+    struct_field_type_names: HashMap<String, Vec<Option<String>>>,
     /// Enum layouts for tagged-union codegen (enum name → layout).
     enum_layouts: HashMap<String, EnumLayout<'ctx>>,
     /// Nested loop stack — innermost frame is last.
@@ -1198,6 +1205,7 @@ impl<'ctx> Codegen<'ctx> {
             snprintf_fn,
             struct_types: HashMap::new(),
             struct_field_names: HashMap::new(),
+            struct_field_type_names: HashMap::new(),
             enum_layouts: HashMap::new(),
             loop_stack: Vec::new(),
             generic_fns: HashMap::new(),
@@ -2524,6 +2532,22 @@ impl<'ctx> Codegen<'ctx> {
                     .map(|f| self.llvm_type_for_type_expr(&f.ty))
                     .collect();
                 let names: Vec<String> = s.fields.iter().map(|f| f.name.clone()).collect();
+                // Per-field user-type name (last path segment if the
+                // declared type is a `Path`; `None` otherwise). Lets
+                // chained field-access lowering resolve the inner type
+                // of `o.inner` so `o.inner.name` walks past the first
+                // hop into the nested struct's field registry. See
+                // `field_index_for` / `type_name_of_expr`.
+                let field_type_names: Vec<Option<String>> = s
+                    .fields
+                    .iter()
+                    .map(|f| match &f.ty.kind {
+                        TypeKind::Path(p) => p.segments.last().cloned(),
+                        _ => None,
+                    })
+                    .collect();
+                self.struct_field_type_names
+                    .insert(s.name.clone(), field_type_names);
 
                 if s.is_shared {
                     // Shared struct: heap layout is { i64 refcount, field0, field1, … }
@@ -11362,25 +11386,42 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn field_index_for(&self, object: &Expr, field: &str) -> Option<u32> {
-        // Try to resolve by variable name → type name → field registry.
-        // `self` inside impl methods is stored as a regular local named "self"
-        // with its type recorded in `var_type_names`.
-        let var_name = match &object.kind {
-            ExprKind::Identifier(n) => Some(n.as_str()),
-            ExprKind::SelfValue => Some("self"),
-            _ => None,
-        };
-        if let Some(var_name) = var_name {
-            if let Some(type_name) = self.var_type_names.get(var_name) {
-                if let Some(names) = self.struct_field_names.get(type_name.as_str()) {
-                    if let Some(idx) = names.iter().position(|n| n == field) {
-                        return Some(idx as u32);
-                    }
+        // Try to resolve by walking the object expression to its
+        // user-type name, then looking up `field` in that struct's
+        // field registry. Chained `o.inner.name` requires walking the
+        // inner FieldAccess to recover `o.inner`'s declared type from
+        // `struct_field_type_names`. See `type_name_of_expr`.
+        if let Some(type_name) = self.type_name_of_expr(object) {
+            if let Some(names) = self.struct_field_names.get(type_name.as_str()) {
+                if let Some(idx) = names.iter().position(|n| n == field) {
+                    return Some(idx as u32);
                 }
             }
         }
         // Fall back: numeric index for tuple fields like `.0`, `.1`
         field.parse::<u32>().ok()
+    }
+
+    /// Resolve the user-type name of an arbitrary expression by walking
+    /// `Identifier` / `SelfValue` / `FieldAccess` chains. Returns
+    /// `None` for primitive-typed expressions, calls whose return type
+    /// isn't a known struct, or any shape outside this trio. Companion
+    /// to `type_name_of` (which only handles direct identifiers and
+    /// struct literals).
+    fn type_name_of_expr(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Identifier(n) => self.var_type_names.get(n.as_str()).cloned(),
+            ExprKind::SelfValue => self.var_type_names.get("self").cloned(),
+            ExprKind::StructLiteral { path, .. } => path.last().cloned(),
+            ExprKind::FieldAccess { object, field } => {
+                let obj_ty = self.type_name_of_expr(object)?;
+                let field_names = self.struct_field_names.get(obj_ty.as_str())?;
+                let idx = field_names.iter().position(|n| n == field)?;
+                let field_ty_names = self.struct_field_type_names.get(obj_ty.as_str())?;
+                field_ty_names.get(idx).and_then(|n| n.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Return the Kāra type name for a compiled expression, if known.

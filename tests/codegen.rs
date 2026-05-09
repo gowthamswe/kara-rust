@@ -7683,4 +7683,43 @@ fn main() {
             );
         }
     }
+
+    /// Regression gate for the previously-latent "chained-field
+    /// `println` returns 0" bug (bugs.md entry). `println(o.inner.name)`
+    /// where `Outer { inner: Inner }` and `Inner { name: String }` used
+    /// to emit a load that resolved to 0 at runtime regardless of the
+    /// field value. Single-level access (`o.field`) worked; the gap was
+    /// at chain-depth ≥ 2 because `field_index_for` only resolved an
+    /// `Identifier` / `SelfValue` object — a `FieldAccess` object
+    /// (`o.inner` in `o.inner.name`) returned `None`, falling through
+    /// to the constant-zero fallback in `compile_field_access`.
+    ///
+    /// Fix: track per-field user-type names in
+    /// `struct_field_type_names` at struct-declaration time, and walk
+    /// `FieldAccess` chains in a new `type_name_of_expr` helper used by
+    /// `field_index_for`. The helper returns the inner struct's name
+    /// for `o.inner` so `name` resolves in `Inner`'s field registry.
+    #[test]
+    fn test_chained_field_access_returns_zero_repro() {
+        let out = run_program(
+            r#"
+struct Inner { name: String }
+struct Outer { inner: Inner }
+fn main() {
+    let o = Outer { inner: Inner { name: "alice" } };
+    println(o.inner.name);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out.trim(),
+                "alice",
+                "expected `o.inner.name` to load the actual String value; \
+                 got {:?}. If the output is `0`, the chain-depth ≥ 2 load \
+                 path zeroed the value regardless of the field contents.",
+                out.trim()
+            );
+        }
+    }
 }
