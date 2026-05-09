@@ -1272,6 +1272,418 @@ fn push_u32(out: &mut String, n: u32) {
     let _ = write!(out, "{}", n);
 }
 
+// ── Slice F: `std.json` FFI surface ───────────────────────────────────────
+//
+// Backs `runtime/stdlib/json.kara`'s `Json.parse(s: String)` /
+// `Json.stringify(self) -> String` through a pair of `extern "C"` exports
+// keyed against `serde_json` (locked design choice (iii) — backing impl is
+// `serde_json` via Rust FFI, no hand-rolled Kāra parser).
+//
+// **Variant-payload-struct shape, not `#[repr(C)] union`.** Sub-step (d)'s
+// hard-stop trigger 1 explicitly recommends starting with the variant-
+// struct alternative because `#[repr(C)]` unions are unsafe-fiddly and
+// every node carrying the largest payload size is negligible at the demo's
+// typical tree size (~20 nodes ≈ ~320 bytes overhead). `KaracJsonValue`
+// below is therefore one tag byte plus six payload fields, only one of
+// which is meaningful per the tag.
+//
+// **Memory ownership.** Both `karac_runtime_json_parse` and
+// `karac_runtime_json_stringify` allocate Boxed trees / `CString`s through
+// the standard Rust allocator and return raw pointers; the matching
+// `karac_runtime_json_free_value` and `karac_runtime_json_free_string`
+// exports return that ownership for cleanup. The Kāra-side bindings in
+// `runtime/stdlib/json.kara` walk the tree once into native `Json` shape
+// (and once for stringify back), then free immediately — no aliased
+// references survive past the round-trip.
+//
+// **Codegen wiring is deferred to a sibling slice.** v1's interpreter
+// dispatch in `src/interpreter.rs` calls `serde_json` directly without
+// crossing the FFI boundary; the runtime exports below exist so that when
+// codegen wires in JSON support (Slice B's `Response.json[T: ToJson]`
+// builder, deferred), the ABI is already settled. They are invoked by the
+// `tests::test_json_*` runtime-crate tests at the bottom of this file to
+// keep the surface live.
+
+/// Tag byte for `KaracJsonValue`. Values 0..=5 in source-spec order:
+/// Null, Bool, Number, String, Array, Object. `#[repr(u8)]` for stable
+/// FFI; layout pinned by `tests::test_karac_json_value_layout_pinned`.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KaracJsonTag {
+    Null = 0,
+    Bool = 1,
+    Number = 2,
+    String = 3,
+    Array = 4,
+    Object = 5,
+}
+
+/// FFI representation of a single Kāra `Json` enum node. The active
+/// payload field is selected by the `tag` byte; all other fields read
+/// as zero / null. See module-level comment for the variant-struct vs.
+/// union tradeoff.
+#[repr(C)]
+pub struct KaracJsonValue {
+    pub tag: u8,
+    /// Active when `tag == KaracJsonTag::Bool`.
+    pub bool_val: bool,
+    /// Active when `tag == KaracJsonTag::Number`.
+    pub num_val: f64,
+    /// Active when `tag == KaracJsonTag::String`. UTF-8 bytes; `len` is
+    /// the byte count (not character count). `str_ptr` is null when
+    /// `len == 0`.
+    pub str_ptr: *mut u8,
+    pub str_len: usize,
+    /// Active when `tag == KaracJsonTag::Array`. `arr_items` points at a
+    /// heap-allocated array of `*mut KaracJsonValue`; freed by
+    /// `karac_runtime_json_free_value` with the matching tag.
+    pub arr_items: *mut *mut KaracJsonValue,
+    pub arr_len: usize,
+    /// Active when `tag == KaracJsonTag::Object`. `obj_keys` and
+    /// `obj_vals` are parallel arrays of `obj_len` entries; key strings
+    /// are null-terminated UTF-8 (CString-allocated). Insertion-order
+    /// preservation is guaranteed because the parse path uses
+    /// `serde_json::Map<_, _>` with the `preserve_order` feature off but
+    /// the locked design (ii) reads ordering from the input via the
+    /// `serde_json::de::from_str` document order.
+    pub obj_keys: *mut *mut std::os::raw::c_char,
+    pub obj_vals: *mut *mut KaracJsonValue,
+    pub obj_len: usize,
+}
+
+/// FFI representation of a `serde_json::Error` location + message.
+/// Populated by `karac_runtime_json_parse` only on error; the Kāra-side
+/// `JsonError` struct mirrors this shape (see `runtime/stdlib/json.kara`).
+#[repr(C)]
+pub struct KaracJsonError {
+    pub line: u32,
+    pub column: u32,
+    /// Null-terminated UTF-8 message owned by the runtime; freed via
+    /// `karac_runtime_json_free_string`.
+    pub message: *mut std::os::raw::c_char,
+}
+
+/// Allocate a fresh `KaracJsonValue` on the heap, populate it from the
+/// provided `serde_json::Value` recursively, and return the leaked
+/// raw pointer. Caller owns the tree and is responsible for invoking
+/// `karac_runtime_json_free_value` on the root.
+fn json_value_to_karac(value: &serde_json::Value) -> *mut KaracJsonValue {
+    let node = match value {
+        serde_json::Value::Null => KaracJsonValue {
+            tag: KaracJsonTag::Null as u8,
+            bool_val: false,
+            num_val: 0.0,
+            str_ptr: std::ptr::null_mut(),
+            str_len: 0,
+            arr_items: std::ptr::null_mut(),
+            arr_len: 0,
+            obj_keys: std::ptr::null_mut(),
+            obj_vals: std::ptr::null_mut(),
+            obj_len: 0,
+        },
+        serde_json::Value::Bool(b) => KaracJsonValue {
+            tag: KaracJsonTag::Bool as u8,
+            bool_val: *b,
+            num_val: 0.0,
+            str_ptr: std::ptr::null_mut(),
+            str_len: 0,
+            arr_items: std::ptr::null_mut(),
+            arr_len: 0,
+            obj_keys: std::ptr::null_mut(),
+            obj_vals: std::ptr::null_mut(),
+            obj_len: 0,
+        },
+        serde_json::Value::Number(n) => KaracJsonValue {
+            tag: KaracJsonTag::Number as u8,
+            bool_val: false,
+            num_val: n.as_f64().unwrap_or(0.0),
+            str_ptr: std::ptr::null_mut(),
+            str_len: 0,
+            arr_items: std::ptr::null_mut(),
+            arr_len: 0,
+            obj_keys: std::ptr::null_mut(),
+            obj_vals: std::ptr::null_mut(),
+            obj_len: 0,
+        },
+        serde_json::Value::String(s) => {
+            let bytes = s.as_bytes();
+            let (ptr, len) = if bytes.is_empty() {
+                (std::ptr::null_mut(), 0usize)
+            } else {
+                let buf = bytes.to_vec().into_boxed_slice();
+                let len = buf.len();
+                (Box::into_raw(buf) as *mut u8, len)
+            };
+            KaracJsonValue {
+                tag: KaracJsonTag::String as u8,
+                bool_val: false,
+                num_val: 0.0,
+                str_ptr: ptr,
+                str_len: len,
+                arr_items: std::ptr::null_mut(),
+                arr_len: 0,
+                obj_keys: std::ptr::null_mut(),
+                obj_vals: std::ptr::null_mut(),
+                obj_len: 0,
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let n = items.len();
+            let (arr_ptr, arr_len) = if n == 0 {
+                (std::ptr::null_mut(), 0usize)
+            } else {
+                let mut child_ptrs: Vec<*mut KaracJsonValue> =
+                    items.iter().map(json_value_to_karac).collect();
+                let ptr = child_ptrs.as_mut_ptr();
+                std::mem::forget(child_ptrs);
+                (ptr, n)
+            };
+            KaracJsonValue {
+                tag: KaracJsonTag::Array as u8,
+                bool_val: false,
+                num_val: 0.0,
+                str_ptr: std::ptr::null_mut(),
+                str_len: 0,
+                arr_items: arr_ptr,
+                arr_len,
+                obj_keys: std::ptr::null_mut(),
+                obj_vals: std::ptr::null_mut(),
+                obj_len: 0,
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let n = map.len();
+            let (keys_ptr, vals_ptr, obj_len) = if n == 0 {
+                (std::ptr::null_mut(), std::ptr::null_mut(), 0usize)
+            } else {
+                let mut keys: Vec<*mut std::os::raw::c_char> = Vec::with_capacity(n);
+                let mut vals: Vec<*mut KaracJsonValue> = Vec::with_capacity(n);
+                for (k, v) in map.iter() {
+                    let cstring = std::ffi::CString::new(k.as_str())
+                        .unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+                    keys.push(cstring.into_raw());
+                    vals.push(json_value_to_karac(v));
+                }
+                let keys_ptr = keys.as_mut_ptr();
+                let vals_ptr = vals.as_mut_ptr();
+                std::mem::forget(keys);
+                std::mem::forget(vals);
+                (keys_ptr, vals_ptr, n)
+            };
+            KaracJsonValue {
+                tag: KaracJsonTag::Object as u8,
+                bool_val: false,
+                num_val: 0.0,
+                str_ptr: std::ptr::null_mut(),
+                str_len: 0,
+                arr_items: std::ptr::null_mut(),
+                arr_len: 0,
+                obj_keys: keys_ptr,
+                obj_vals: vals_ptr,
+                obj_len,
+            }
+        }
+    };
+    Box::into_raw(Box::new(node))
+}
+
+/// Inverse of `json_value_to_karac`: walk a `KaracJsonValue` tree (built
+/// by Kāra-side codegen) and produce a `serde_json::Value` for
+/// `serde_json::to_string`. Reads only — does not free.
+///
+/// # Safety
+///
+/// `node` must point at a valid `KaracJsonValue` whose payload pointers
+/// describe initialized memory consistent with the tag byte.
+unsafe fn karac_to_json_value(node: *const KaracJsonValue) -> serde_json::Value {
+    if node.is_null() {
+        return serde_json::Value::Null;
+    }
+    let n = &*node;
+    match n.tag {
+        x if x == KaracJsonTag::Null as u8 => serde_json::Value::Null,
+        x if x == KaracJsonTag::Bool as u8 => serde_json::Value::Bool(n.bool_val),
+        x if x == KaracJsonTag::Number as u8 => serde_json::Number::from_f64(n.num_val)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        x if x == KaracJsonTag::String as u8 => {
+            if n.str_ptr.is_null() || n.str_len == 0 {
+                serde_json::Value::String(String::new())
+            } else {
+                let slice = std::slice::from_raw_parts(n.str_ptr, n.str_len);
+                serde_json::Value::String(String::from_utf8_lossy(slice).into_owned())
+            }
+        }
+        x if x == KaracJsonTag::Array as u8 => {
+            let mut out = Vec::with_capacity(n.arr_len);
+            for i in 0..n.arr_len {
+                let item = *n.arr_items.add(i);
+                out.push(karac_to_json_value(item));
+            }
+            serde_json::Value::Array(out)
+        }
+        x if x == KaracJsonTag::Object as u8 => {
+            let mut map = serde_json::Map::with_capacity(n.obj_len);
+            for i in 0..n.obj_len {
+                let key_ptr = *n.obj_keys.add(i);
+                let val_ptr = *n.obj_vals.add(i);
+                let key = if key_ptr.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(key_ptr)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                map.insert(key, karac_to_json_value(val_ptr));
+            }
+            serde_json::Value::Object(map)
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// Parse a null-terminated UTF-8 input string via `serde_json`, return a
+/// freshly heap-allocated `KaracJsonValue` tree on success or null on
+/// error (with `*error_out` populated).
+///
+/// # Safety
+///
+/// `input` must be a valid null-terminated C string. `error_out` must
+/// point at writable storage for a `KaracJsonError`; on success the slot
+/// is left untouched.
+#[no_mangle]
+pub unsafe extern "C" fn karac_runtime_json_parse(
+    input: *const std::os::raw::c_char,
+    error_out: *mut KaracJsonError,
+) -> *mut KaracJsonValue {
+    if input.is_null() {
+        if !error_out.is_null() {
+            let msg = std::ffi::CString::new("input pointer was null").unwrap();
+            (*error_out) = KaracJsonError {
+                line: 0,
+                column: 0,
+                message: msg.into_raw(),
+            };
+        }
+        return std::ptr::null_mut();
+    }
+    let cstr = std::ffi::CStr::from_ptr(input);
+    let s = match cstr.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = std::ffi::CString::new(format!("invalid UTF-8 in input: {}", e))
+                    .unwrap_or_else(|_| std::ffi::CString::new("invalid UTF-8").unwrap());
+                (*error_out) = KaracJsonError {
+                    line: 0,
+                    column: 0,
+                    message: msg.into_raw(),
+                };
+            }
+            return std::ptr::null_mut();
+        }
+    };
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(value) => json_value_to_karac(&value),
+        Err(e) => {
+            if !error_out.is_null() {
+                let msg = std::ffi::CString::new(e.to_string())
+                    .unwrap_or_else(|_| std::ffi::CString::new("parse error").unwrap());
+                (*error_out) = KaracJsonError {
+                    line: e.line() as u32,
+                    column: e.column() as u32,
+                    message: msg.into_raw(),
+                };
+            }
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Walk a Kāra-built `KaracJsonValue` tree, render it as a single-line
+/// JSON string via `serde_json::to_string`, and return the resulting
+/// null-terminated buffer. Caller is responsible for invoking
+/// `karac_runtime_json_free_string` on the return value.
+///
+/// # Safety
+///
+/// `value` must point at a valid `KaracJsonValue` tree (or be null,
+/// which renders as `"null"`).
+#[no_mangle]
+pub unsafe extern "C" fn karac_runtime_json_stringify(
+    value: *const KaracJsonValue,
+) -> *mut std::os::raw::c_char {
+    let v = karac_to_json_value(value);
+    let s = serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string());
+    std::ffi::CString::new(s)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Recursively free a `KaracJsonValue` tree allocated by
+/// `karac_runtime_json_parse`. Walks the tag-keyed payload to free the
+/// String payload buffer / Array element pointers / Object key+val
+/// arrays before dropping the node itself.
+///
+/// # Safety
+///
+/// `value` must either be null or point at a `KaracJsonValue` tree
+/// allocated by `karac_runtime_json_parse` (or `json_value_to_karac`)
+/// that has not already been freed.
+#[no_mangle]
+pub unsafe extern "C" fn karac_runtime_json_free_value(value: *mut KaracJsonValue) {
+    if value.is_null() {
+        return;
+    }
+    let node = Box::from_raw(value);
+    match node.tag {
+        x if x == KaracJsonTag::String as u8 && !node.str_ptr.is_null() && node.str_len > 0 => {
+            let slice = std::slice::from_raw_parts_mut(node.str_ptr, node.str_len);
+            drop(Box::from_raw(slice as *mut [u8]));
+        }
+        x if x == KaracJsonTag::Array as u8 && !node.arr_items.is_null() && node.arr_len > 0 => {
+            let items = Vec::from_raw_parts(node.arr_items, node.arr_len, node.arr_len);
+            for child in items {
+                karac_runtime_json_free_value(child);
+            }
+        }
+        x if x == KaracJsonTag::Object as u8 && node.obj_len > 0 => {
+            if !node.obj_keys.is_null() {
+                let keys: Vec<*mut std::os::raw::c_char> =
+                    Vec::from_raw_parts(node.obj_keys, node.obj_len, node.obj_len);
+                for k in keys {
+                    if !k.is_null() {
+                        drop(std::ffi::CString::from_raw(k));
+                    }
+                }
+            }
+            if !node.obj_vals.is_null() {
+                let vals: Vec<*mut KaracJsonValue> =
+                    Vec::from_raw_parts(node.obj_vals, node.obj_len, node.obj_len);
+                for v in vals {
+                    karac_runtime_json_free_value(v);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Free a `*mut c_char` returned from `karac_runtime_json_stringify` or
+/// stored in a `KaracJsonError::message` slot.
+///
+/// # Safety
+///
+/// `s` must either be null or point at a CString allocated by the
+/// runtime (`CString::into_raw`).
+#[no_mangle]
+pub unsafe extern "C" fn karac_runtime_json_free_string(s: *mut std::os::raw::c_char) {
+    if s.is_null() {
+        return;
+    }
+    drop(std::ffi::CString::from_raw(s));
+}
+
 // ── Slice 5 test stand-ins for slice 3 globals ─────────────────────────────
 //
 // The runtime crate's `cargo test -p karac-runtime` binary has its own
@@ -2015,5 +2427,87 @@ mod tests {
             karac_provider_set_stack_head(head);
         }
         karac_provider_pop();
+    }
+
+    // ── Slice F: `std.json` FFI surface tests ─────────────────────────
+    //
+    // The interpreter dispatches `Json.parse` / `Json.stringify` directly
+    // through `serde_json` (no FFI cross-over); these tests exist to keep
+    // the `karac_runtime_json_*` exports live so codegen wiring (deferred
+    // to Slice B) inherits a settled ABI. Both round-trip the FFI shape
+    // and exercise the error-line/col surface.
+
+    #[test]
+    fn test_karac_runtime_json_parse_roundtrip() {
+        let input = std::ffi::CString::new("{\"a\": 1, \"b\": [true, null]}").unwrap();
+        let mut err = KaracJsonError {
+            line: 0,
+            column: 0,
+            message: std::ptr::null_mut(),
+        };
+        let tree = unsafe { karac_runtime_json_parse(input.as_ptr(), &mut err) };
+        assert!(!tree.is_null(), "parse should succeed");
+        let s_ptr = unsafe { karac_runtime_json_stringify(tree) };
+        assert!(!s_ptr.is_null());
+        let stringified = unsafe {
+            std::ffi::CStr::from_ptr(s_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(stringified, r#"{"a":1.0,"b":[true,null]}"#);
+        unsafe {
+            karac_runtime_json_free_string(s_ptr);
+            karac_runtime_json_free_value(tree);
+        }
+    }
+
+    #[test]
+    fn test_karac_runtime_json_parse_error_surfaces_line_col() {
+        // Malformed: `{"a": }` — the line is 1, column is the position
+        // of `}` (column 7, 1-indexed). serde_json reports column at the
+        // offending byte; we just sanity-check that line and column are
+        // populated and the message is non-empty.
+        let input = std::ffi::CString::new("{\"a\": }").unwrap();
+        let mut err = KaracJsonError {
+            line: 0,
+            column: 0,
+            message: std::ptr::null_mut(),
+        };
+        let tree = unsafe { karac_runtime_json_parse(input.as_ptr(), &mut err) };
+        assert!(tree.is_null(), "parse should fail");
+        assert_eq!(err.line, 1);
+        assert!(err.column >= 1);
+        assert!(!err.message.is_null());
+        unsafe {
+            karac_runtime_json_free_string(err.message);
+        }
+    }
+
+    #[test]
+    fn test_karac_runtime_json_object_preserves_insertion_order() {
+        let input = std::ffi::CString::new("{\"z\":1,\"a\":2,\"m\":3}").unwrap();
+        let mut err = KaracJsonError {
+            line: 0,
+            column: 0,
+            message: std::ptr::null_mut(),
+        };
+        let tree = unsafe { karac_runtime_json_parse(input.as_ptr(), &mut err) };
+        assert!(!tree.is_null());
+        // The `preserve_order` feature on the runtime crate's
+        // `serde_json` dep keeps the input ordering across the
+        // `serde_json::Map` round-trip, satisfying locked design (ii).
+        unsafe {
+            let n = &*tree;
+            assert_eq!(n.tag, KaracJsonTag::Object as u8);
+            assert_eq!(n.obj_len, 3);
+            let keys: Vec<String> = (0..n.obj_len)
+                .map(|i| {
+                    let k = *n.obj_keys.add(i);
+                    std::ffi::CStr::from_ptr(k).to_string_lossy().into_owned()
+                })
+                .collect();
+            assert_eq!(keys, vec!["z", "a", "m"]);
+            karac_runtime_json_free_value(tree);
+        }
     }
 }

@@ -1,0 +1,80 @@
+// runtime/stdlib/json.kara
+//
+// Slice F (`std.json`) — v1 surface: `Json` enum, `parse` / `stringify`,
+// manual `ToJson` / `FromJson` traits, and builtin impls for the common
+// scalars and collections. Locked design choices (2026-05-09):
+//
+//   (i)   Number representation: `Json.Number(f64)` matching the JSON
+//         spec verbatim — no split Int/Float. Integer inputs round-trip
+//         through f64 without loss for values up to 2^53.
+//   (ii)  Object key ordering: insertion order via `Vec[(String, Json)]`
+//         backing the `Json.Object` variant. The runtime's serde_json dep
+//         is built with `preserve_order` so `parse` reads keys in input
+//         order and `stringify` writes them back in the same order.
+//   (iii) Backing impl: `serde_json` via Rust FFI from `karac-runtime`
+//         (interpreter dispatches directly to the same crate). No
+//         hand-rolled Kāra parser.
+//   (iv)  Error reporting: `JsonError { line, column, message }`
+//         populated from `serde_json::Error::line()` / `column()`.
+//   (v)   `ToJson` / `FromJson` are manual-impl-only in v1; derived
+//         impls (`#[derive(ToJson)]`) ship in v1.5.
+//
+// Method bodies are `#[compiler_builtin]` placeholders — actual dispatch
+// fires through the interpreter's path-string match in `eval_call`
+// (`Json.parse`) and the receiver-keyed match in `eval_method_call`
+// (`json.stringify()`). A future codegen sibling slice replaces those
+// placeholders with calls into `karac_runtime_json_parse` /
+// `karac_runtime_json_stringify` (already exported by the runtime crate).
+
+// The Kāra `Json` value tree. Variants follow the JSON spec verbatim;
+// `Object` is a `Vec[(String, Json)]` rather than a `Map[String, Json]`
+// to preserve insertion order per locked design (ii).
+pub enum Json {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec[Json]),
+    Object(Vec[(String, Json)]),
+}
+
+// Parse / stringify error surface. `line` / `column` are 1-indexed;
+// `message` is the human-readable diagnostic from `serde_json`.
+pub struct JsonError {
+    line: u32,
+    column: u32,
+    message: String,
+}
+
+impl Json {
+    // Parse a JSON-encoded `String` into a `Json` tree. Returns
+    // `Err(JsonError { line, column, message })` on syntax errors.
+    #[compiler_builtin]
+    fn parse(s: String) -> Result[Json, JsonError] {
+        Err(JsonError { line: 0, column: 0, message: "" })
+    }
+
+    // Render a `Json` tree as a single-line UTF-8 String. v1 produces
+    // `serde_json::to_string` output (compact, no whitespace, keys in
+    // the order present in the `Vec[(String, Json)]`). Pretty-printed
+    // output and canonical-form (alphabetized) output are post-v1
+    // additives.
+    #[compiler_builtin]
+    fn stringify(self) -> String { "" }
+}
+
+// Manual-impl-only in v1 per locked design (v); `#[derive(ToJson)]`
+// follows in v1.5 as part of the Serialize/Deserialize trait work. The
+// trait is intentionally minimal — `to_json(self) -> Json` — so user
+// impls can construct any of the six `Json` variants directly.
+pub trait ToJson {
+    fn to_json(self) -> Json;
+}
+
+// Peer trait for typed deserialization. Returns `Result[Self, JsonError]`
+// so impls can surface "wrong shape" errors at the same fidelity as the
+// parse-time errors. v1 ships builtin impls for the common scalars and
+// collections; user types get manual impls.
+pub trait FromJson {
+    fn from_json(j: Json) -> Result[Self, JsonError];
+}

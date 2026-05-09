@@ -19,6 +19,12 @@ regex = "1"
 ureq = "2"
 rustyline = "18.0.0"
 pulldown-cmark = { version = "0.13.3", default-features = false, features = ["html"] }
+# Slice F (`std.json`): backs the interpreter's `Json.parse` /
+# `Json.stringify` dispatch directly (the runtime crate exposes the
+# same impl through FFI for codegen builds — locked design choice (iii)).
+# `preserve_order` feature gives insertion-order Object iteration per
+# locked design choice (ii).
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # Binary-size phase 1: drop `__eh_frame` + `__unwind_info` from emitted
 # binaries by removing unwind tables from the runtime's release build.

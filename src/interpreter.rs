@@ -3830,6 +3830,36 @@ impl<'a> Interpreter<'a> {
                 "Runtime.list_par_blocks" | "Runtime.list_tasks" => {
                     return Value::array_of(Vec::new());
                 }
+                // Slice F (`std.json`): `Json.parse(s)` parses via
+                // `serde_json` and builds a Kāra `Json` enum tree. The
+                // runtime crate exposes the same impl through
+                // `karac_runtime_json_parse` for the codegen path; the
+                // interpreter calls `serde_json` directly to avoid the
+                // FFI cross-over (both link the same crate). Returns
+                // `Result[Json, JsonError]` per the signature in
+                // `runtime/stdlib/json.kara`.
+                "Json.parse" => {
+                    let s = if let Some(arg) = args.first() {
+                        match self.eval_expr_inner(&arg.value) {
+                            Value::String(s) => s,
+                            _ => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    return match serde_json::from_str::<serde_json::Value>(&s) {
+                        Ok(v) => Value::EnumVariant {
+                            enum_name: "Result".to_string(),
+                            variant: "Ok".to_string(),
+                            data: EnumData::Tuple(vec![serde_json_to_kara_json(&v)]),
+                        },
+                        Err(e) => Value::EnumVariant {
+                            enum_name: "Result".to_string(),
+                            variant: "Err".to_string(),
+                            data: EnumData::Tuple(vec![make_json_error(&e)]),
+                        },
+                    };
+                }
                 "Map.new" => {
                     return Value::Map(Vec::new());
                 }
@@ -4026,6 +4056,32 @@ impl<'a> Interpreter<'a> {
                             enum_name: segments[0].clone(),
                             variant: segments[1].clone(),
                             data: EnumData::Unit,
+                        };
+                    }
+                    // Slice F (`std.json`): qualified `Json.Variant(args)`
+                    // construction. The bare-name path (`Bool(true)`)
+                    // collides with `bool::from`, so users must qualify
+                    // every Json variant. The interpreter's generic
+                    // `find_enum_for_variant` fallback only fires when
+                    // the callee evaluates to a non-callable, but
+                    // `eval_expr_inner(Path)` panics before that on
+                    // unknown enum variants — so we build the variant
+                    // directly here. Mirrors the Ordering arm above.
+                    if segments.len() == 2 && segments[0] == "Json" {
+                        let variant = segments[1].clone();
+                        let arg_vals: Vec<Value> = args
+                            .iter()
+                            .map(|a| self.eval_expr_inner(&a.value))
+                            .collect();
+                        let data = if variant == "Null" {
+                            EnumData::Unit
+                        } else {
+                            EnumData::Tuple(arg_vals)
+                        };
+                        return Value::EnumVariant {
+                            enum_name: "Json".to_string(),
+                            variant,
+                            data,
                         };
                     }
                     // Numeric primitive From conversion: `T.from(x)` for
@@ -5575,6 +5631,23 @@ impl<'a> Interpreter<'a> {
             }
             other => other,
         };
+
+        // Slice F (`std.json`): `j.stringify()` on a `Json`-typed
+        // receiver. Walks the enum tree to a `serde_json::Value` and
+        // calls `serde_json::to_string`. Locked design (ii)'s insertion-
+        // order property is preserved because the receiver's `Object`
+        // payload is a `Vec[(String, Json)]` and the runtime crate's
+        // `serde_json` is built with `preserve_order`, so the
+        // intermediate `serde_json::Map` round-trips key ordering.
+        if method == "stringify" {
+            if let Value::EnumVariant { ref enum_name, .. } = obj {
+                if enum_name == "Json" {
+                    let v = kara_json_to_serde_json(&obj);
+                    let s = serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string());
+                    return Value::String(s);
+                }
+            }
+        }
 
         // `#[derive(Display)]` — `to_string()` on a unit enum variant.
         if method == "to_string" {
@@ -9399,6 +9472,142 @@ fn eval_http_get(url: &str) -> Value {
     match ureq::get(url).call() {
         Ok(resp) => wrap_ok_response(resp),
         Err(e) => make_http_error(e.to_string()),
+    }
+}
+
+// ── Slice F (`std.json`) helpers ─────────────────────────────────────────
+//
+// Translation between `serde_json::Value` and the Kāra `Json` enum
+// (modeled as `Value::EnumVariant { enum_name: "Json", ... }`). The
+// interpreter dispatches `Json.parse(s)` and `j.stringify()` directly
+// against `serde_json` rather than crossing the runtime FFI surface —
+// the runtime crate's `karac_runtime_json_*` exports exist for codegen
+// builds (Slice B's `Response.json[T: ToJson]` builder, deferred), but
+// going through them from the interpreter is pure overhead since both
+// sides link the same `serde_json` version.
+
+/// Build a Kāra `Json` enum value from a `serde_json::Value` tree.
+fn serde_json_to_kara_json(v: &serde_json::Value) -> Value {
+    let (variant, data) = match v {
+        serde_json::Value::Null => ("Null", EnumData::Unit),
+        serde_json::Value::Bool(b) => ("Bool", EnumData::Tuple(vec![Value::Bool(*b)])),
+        serde_json::Value::Number(n) => (
+            "Number",
+            EnumData::Tuple(vec![Value::Float(n.as_f64().unwrap_or(0.0))]),
+        ),
+        serde_json::Value::String(s) => ("String", EnumData::Tuple(vec![Value::String(s.clone())])),
+        serde_json::Value::Array(items) => {
+            let xs: Vec<Value> = items.iter().map(serde_json_to_kara_json).collect();
+            ("Array", EnumData::Tuple(vec![Value::array_of(xs)]))
+        }
+        serde_json::Value::Object(map) => {
+            // Locked design (ii): Object backs a `Vec[(String, Json)]`.
+            // The interpreter shape is `Value::Array` of `Value::Tuple`s.
+            let pairs: Vec<Value> = map
+                .iter()
+                .map(|(k, val)| {
+                    Value::Tuple(vec![Value::String(k.clone()), serde_json_to_kara_json(val)])
+                })
+                .collect();
+            ("Object", EnumData::Tuple(vec![Value::array_of(pairs)]))
+        }
+    };
+    Value::EnumVariant {
+        enum_name: "Json".to_string(),
+        variant: variant.to_string(),
+        data,
+    }
+}
+
+/// Inverse: walk a Kāra `Json` value and produce a `serde_json::Value`
+/// for `serde_json::to_string`. Reads the variant tag off the
+/// `EnumVariant`'s `variant` string and pulls the payload out of the
+/// `EnumData::Tuple` slot. Mismatched shapes degrade to `null` rather
+/// than panicking — pre-typecheck guarantees match the legal shape, but
+/// defensiveness here keeps stringify side-effect-free under stress.
+fn kara_json_to_serde_json(v: &Value) -> serde_json::Value {
+    let Value::EnumVariant {
+        enum_name,
+        variant,
+        data,
+    } = v
+    else {
+        return serde_json::Value::Null;
+    };
+    if enum_name != "Json" {
+        return serde_json::Value::Null;
+    }
+    let payload = match data {
+        EnumData::Unit => Vec::new(),
+        EnumData::Tuple(vals) => vals.clone(),
+        EnumData::Struct(_) => Vec::new(),
+    };
+    match variant.as_str() {
+        "Null" => serde_json::Value::Null,
+        "Bool" => match payload.first() {
+            Some(Value::Bool(b)) => serde_json::Value::Bool(*b),
+            _ => serde_json::Value::Null,
+        },
+        "Number" => match payload.first() {
+            Some(Value::Float(f)) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Some(Value::Int(i)) => serde_json::Number::from_f64(*i as f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Some(Value::TotalFloat64(f)) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Some(Value::TotalFloat32(f)) => serde_json::Number::from_f64(*f as f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            _ => serde_json::Value::Null,
+        },
+        "String" => match payload.first() {
+            Some(Value::String(s)) => serde_json::Value::String(s.clone()),
+            _ => serde_json::Value::Null,
+        },
+        "Array" => match payload.first() {
+            Some(Value::Array(rc)) => {
+                let items: Vec<serde_json::Value> = rc
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(kara_json_to_serde_json)
+                    .collect();
+                serde_json::Value::Array(items)
+            }
+            _ => serde_json::Value::Null,
+        },
+        "Object" => match payload.first() {
+            Some(Value::Array(rc)) => {
+                let mut map = serde_json::Map::with_capacity(rc.read().unwrap().len());
+                for entry in rc.read().unwrap().iter() {
+                    if let Value::Tuple(t) = entry {
+                        if t.len() == 2 {
+                            if let Value::String(k) = &t[0] {
+                                map.insert(k.clone(), kara_json_to_serde_json(&t[1]));
+                            }
+                        }
+                    }
+                }
+                serde_json::Value::Object(map)
+            }
+            _ => serde_json::Value::Null,
+        },
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// Build a `JsonError` struct value from `serde_json::Error`.
+fn make_json_error(e: &serde_json::Error) -> Value {
+    let mut fields = HashMap::new();
+    fields.insert("line".to_string(), Value::Int(e.line() as i64));
+    fields.insert("column".to_string(), Value::Int(e.column() as i64));
+    fields.insert("message".to_string(), Value::String(e.to_string()));
+    Value::Struct {
+        name: "JsonError".to_string(),
+        fields,
     }
 }
 

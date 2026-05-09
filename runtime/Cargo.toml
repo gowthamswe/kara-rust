@@ -8,6 +8,15 @@ publish = false
 name = "karac_runtime"
 crate-type = ["staticlib"]
 
+[dependencies]
+# Slice F (`std.json`): backing impl for `karac_runtime_json_parse` /
+# `karac_runtime_json_stringify`. Locked design choice (iii) — use
+# serde_json via FFI rather than a hand-rolled Kāra parser. The
+# `preserve_order` feature backs the `Map<_, _>` with `IndexMap` instead
+# of `BTreeMap`, satisfying locked design choice (ii) — Json.Object
+# iterates in input insertion order, not alphabetical.
+serde_json = { version = "1", features = ["preserve_order"] }
+
 # Note: the runtime's release-profile `panic = "abort"` setting lives in
 # the workspace root `Cargo.toml` (cargo ignores `[profile.*]` in
 # non-root manifests with a warning). See the workspace Cargo.toml's

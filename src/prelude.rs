@@ -107,6 +107,11 @@ pub const PRELUDE_TYPES: &[&str] = &[
     "ParBlockInfo",
     "TaskInfo",
     "WaitTarget",
+    // Slice F (`std.json`): `Json` enum + `JsonError` struct visible at
+    // scope-0 so user code can write `Json.parse(s)`, `match j { Json.Null => ... }`,
+    // and pattern-match on the `JsonError` fields without an explicit import.
+    "Json",
+    "JsonError",
 ];
 
 /// Operator and conversion trait names visible without import. Lets
@@ -149,6 +154,11 @@ pub const PRELUDE_TRAITS: &[&str] = &[
     "Debug",
     "Iterator",
     "IntoIterator",
+    // Slice F (`std.json`): `ToJson` / `FromJson` are user-impl-only in
+    // v1 (no derived form); making them prelude-visible lets user types
+    // declare `impl ToJson for MyType` without an explicit import.
+    "ToJson",
+    "FromJson",
 ];
 
 /// Enum variant names from prelude enums (`Option`, `Result`, `Ordering`,
@@ -303,6 +313,8 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
         "runtime.kara",
         include_str!("../runtime/stdlib/runtime.kara"),
     ),
+    // Slice F (`std.json`).
+    ("json.kara", include_str!("../runtime/stdlib/json.kara")),
 ];
 
 /// Parsed AST of every entry in [`STDLIB_SOURCES`]. Parsed lazily on first

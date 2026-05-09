@@ -430,6 +430,16 @@ pub fn type_display(ty: &Type) -> String {
 
 // ── Type Compatibility ──────────────────────────────────────────
 
+/// True iff `name` is a primitive / prelude type or stdlib module name
+/// reachable at scope-0 — used by `resolve_identifier_type`'s variant
+/// fallback to skip name-shadow cases like `Json.String(String)` where
+/// the variant name collides with the primitive type name. See the
+/// comment block at the variant-fallback site.
+fn is_prelude_type_or_module_name(name: &str) -> bool {
+    crate::prelude::PRELUDE_PRIMITIVES.contains(&name)
+        || crate::prelude::PRELUDE_TYPES.contains(&name)
+}
+
 fn is_numeric(ty: &Type) -> bool {
     matches!(ty, Type::Int(_) | Type::UInt(_) | Type::Float(_))
 }
@@ -8067,9 +8077,25 @@ impl<'a> TypeChecker<'a> {
         // as constructor functions). Generic enums thread their declared
         // type parameters through the return type's `args` so call-site
         // inference can solve them (see `infer_call`).
+        //
+        // **Variant-name shadow rule (Slice F).** Skip variants whose
+        // bare name collides with a primitive type name (`String`,
+        // `Array`, `Map`, `Set`, etc.) — those identifiers are
+        // overwhelmingly used as type/module aliases at the call-site
+        // (`String.from(...)`, `Map.new()`, `Vec.new()`), not as
+        // variant constructors. Without this skip, declaring an enum
+        // like `Json.String(String)` retroactively breaks every
+        // pre-existing `String.from("...")` call by routing it through
+        // the variant-as-function dispatch instead of the impl
+        // resolution. Variants are still reachable through the
+        // qualified path form (`Json.String(...)`) — `resolve_path_type`
+        // above runs before this fallback and finds them by enum name.
         for (enum_name, enum_info) in &self.env.enums {
             for (variant_name, variant_type) in &enum_info.variants {
                 if variant_name == name {
+                    if is_prelude_type_or_module_name(name) {
+                        continue;
+                    }
                     let return_args: Vec<Type> = enum_info
                         .generic_params
                         .iter()
