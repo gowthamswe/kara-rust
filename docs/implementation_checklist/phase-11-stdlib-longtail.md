@@ -7,7 +7,7 @@ Items currently tracked here (until physical reorganization happens — they liv
 - **Numerical and data-science stdlib** — entire `### Numerical and data-science stdlib (Phase 11 — long-tail)` sub-section above.
 - **Embedded / hardware primitives** — `Volatile memory access`, `Inline assembly`, `Atomic[T] and memory ordering`, `#[interrupt] handler ABI`, `Critical sections`.
 - **Security** — `std.secret` module / `Secret[T]` wrapper.
-- **Codegen IR optimization pass** — inline hints, alias metadata (`noalias`/`tbaa`), `nsw`/`nuw` arithmetic flags, LTO, PGO stubs (per `roadmap.md § Phase 11 > Codegen Optimization (IR quality pass)`).
+- **Codegen IR optimization pass** — inline hints, alias metadata (`noalias`/`tbaa`), `nsw`/`nuw` arithmetic flags, LTO, static branch hints from effect analysis (`llvm.expect` emission — *not* PGO; see [`deferred.md § Profile-Guided Optimization Loop`](../deferred.md#profile-guided-optimization-loop) for the post-v1 PGO entry).
 
 `std.json` stays in Phase 8 (floor) — every config / API client needs it.
 

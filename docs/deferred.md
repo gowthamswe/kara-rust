@@ -2668,17 +2668,128 @@ All functions carry `writes(Stdout)` so they participate in conflict analysis an
 
 ### Profile-Guided Optimization Loop
 
-**Decision:** Defer instrumented or sample-based PGO from v1. The compiler queries channel ([design.md § Compiler Queries](design.md#compiler-queries)) ships at v1 covering *intent-shaped* optimization decisions; PGO answers *distribution-shaped* questions and is the complementary signal, not a substitute. Both will eventually exist; v1 ships only the queries channel.
+**Decision:** Defer instrumented + sample-based (AutoFDO) PGO from v1, ship as **P2**. The compiler queries channel ([design.md § Compiler Queries](design.md#compiler-queries)) ships at v1 covering *intent-shaped* optimization decisions; PGO answers *distribution-shaped* questions and is the complementary signal, not a substitute. Graduated from brainstorm v65 (2026-05-09).
 
-**Why deferred.** PGO requires a full instrumented-or-sampled build flow, a representative-workload protocol, multi-platform replication of the workload, and the storage / merge / version-skew machinery for `.profdata` / AutoFDO files. Large surface, separate from the queries channel architecturally. The architectural prerequisites — debug info quality and symbol-stable identity — are partially helped by the v1 P0 commit (path-based DefId; see `design.md § Compiler Queries`) but neither prerequisite blocks the queries channel itself.
+**Why deferred.** PGO requires a full instrumented-or-sampled build flow, a representative-workload protocol, multi-platform replication, and the storage / merge / version-skew machinery for `.profdata` / AutoFDO files. Large surface, separate from the queries channel architecturally. The architectural prerequisites — debug info quality and symbol-stable identity — are partially helped by the v1 P0 commit (path-based DefId; see `design.md § Compiler Queries`) but neither blocks the queries channel itself.
 
-**Distinction from the queries channel.** PGO answers questions the LLM author cannot ("what fraction of inputs are ≤16 bytes?", "which call site is on the hot path in production?"); the queries channel answers questions PGO cannot ("is this branch unreachable in correct usage?", "should this trait method specialize on `i64`?"). The two operate on different signals — runtime measurement vs. spec context — and their outputs are independent. A v1.x or v2 build will likely consume both: the queries channel for intent, PGO for distribution.
+**Two flavors, different cost ladders.**
+
+- **Instrumented PGO (the v1.x deliverable).** Standard `--profile-generate` → run workload → `llvm-profdata merge` → `--profile-use` flow. New codegen mode wired through inkwell's `PassBuilder` invoking LLVM's `InstrProfiling` pass; counter runtime in `libkarac_runtime` (atomic u64 counters, `__llvm_profile_write_file` analog, signal-safe dump on exit); CLI flags `karac build --profile-generate=DIR` and `--profile-use=PATH`; profile lifecycle defaulting to `target/profile/` with `--profile-out=PATH` for committable "blessed" profiles. Counter runtime stance: **Rust port from day one** (~200 lines: atomics + file write + signal-safe formatting), not a `compiler-rt/lib/profile` link — keeps the runtime minimal-dependency, matches Kāra's "small runtime" pitch.
+
+- **Sample-based PGO / AutoFDO (the v2 add-on).** No instrumented build, no separate workload run. `perf record` → `create_llvm_prof` → `--profile-use`. Requires DWARF-quality debug info that survives optimization (audit `DIBuilder` usage in `src/codegen.rs` before estimating); `create_llvm_prof` is external (link, don't bundle); function-name stability across rebuilds — i.e., the v1 P0 stable-identity work, with *higher* tolerance for source drift than the queries channel needs.
+
+**Post-link rewriting (BOLT, Propeller).** Plan around them, not against them. Out of v1 scope; Propeller more interesting long-term (linker-integrated). Tracked separately if pulled forward.
+
+**Distinction from the queries channel.** PGO answers questions the LLM author cannot ("what fraction of inputs are ≤16 bytes?", "which call site is on the hot path in production?"); the queries channel answers questions PGO cannot ("is this branch unreachable in correct usage?", "should this trait method specialize on `i64`?"). The two operate on different signals — runtime measurement vs. spec context — and their outputs are independent. A v1.x or v2 build will likely consume both: the queries channel for intent, PGO for distribution. **PGO also unblocks two v63 deferrals:** the cost-model graduation from "unspecified for v1" to "empirically tuned" (per design.md § Reported behavior > Auto-concurrency cost-model decisions), and the verifier-backed-resolution narrow case for distribution-shaped author claims (`#[likely]` / `#[unlikely]`). Alive2-class verification of arbitrary author invariants stays separately deferred (see § Verifier-Backed Query Resolution).
+
+**Profile representation.** Reuse LLVM `.profdata`. Custom format = no benefit, lots of work, breaks tool interop. Structural-hash keying is what we want for source-drift resilience. **Key alignment risk:** v1 P0's stable identity is path-based DefId + AST-shape structural hash (per design.md § Compiler Queries); LLVM's `.profdata` keys on its own structural hash over LLVM IR. These are not the same hash. The v1.x implementation must decide whether `.profdata` keys are computed at the LLVM-IR level (LLVM's hash, opaque to Kāra) or re-keyed against Kāra's DefId before serialization — open question, decide at PGO ship time.
 
 **Promotion gate (P2 → scheduled).** Promote when (a) the queries channel has shipped P1.1–P1.3 and observed real-world resolution patterns, AND (b) the v1 stable item identity primitive (DefId) has shown adequate symbol stability across realistic source-edit patterns to support PGO-style profile keying. Without (a), shipping PGO first risks confusing the channel-vs-PGO boundary in user mental models; without (b), profile-key drift dominates the cost-benefit calculus.
 
-**Why non-breaking:** Purely additive. PGO flags (`-fprofile-generate`/`-fprofile-use` analogs), the `.profdata` format, and the corresponding `karac build --profile-guided=...` invocation are all new build-time surface. Existing builds continue unchanged.
+**Why non-breaking:** Purely additive. PGO flags, the `.profdata` format, and the corresponding `karac build --profile-generate/use=...` invocation are all new build-time surface. Existing builds continue unchanged.
 
-**Cross-reference:** `design.md § Compiler Queries` (the v1 channel; PGO is its complementary signal); `design.md § Specification Layers > Reported behavior > Auto-concurrency cost-model decisions` (the cost model that PGO would feed into); brainstorm archive `brainstorming/archive/v63_llm_compiler_query_channel.md` Problem 7 (PGO-vs-queries scope decision).
+**Cross-reference:** `design.md § Compiler Queries` (the v1 channel; PGO is its complementary signal); `design.md § Specification Layers > Reported behavior > Profile-guided optimization output and runtime-JIT'd code` (the spec-layer classification); `roadmap.md § Phase 11 > Codegen Optimization > Static branch hints from effect analysis` (the v1 `llvm.expect`-emission line that is *not* PGO and was previously labeled "PGO stubs"); brainstorm archive `brainstorming/archive/v65_pgo_and_online_jit.md` Problem 2.
+
+---
+
+### Continuous PGO with Shared-Object Hot-Swap
+
+**Decision:** Defer continuous PGO (live counter collection in production + background recompile + hot-swap) from v1. Tier is **P2 conditional on v64 (backend-first positioning) outcome**; if v64 lands as backend-first, this promotes to scheduled P2 alongside the rest of the warehouse-class story; if v64 lands as multi-persona, demotes to P3.
+
+**What it adds beyond static PGO.** Mechanically: PGO (above) plus a hot-reload story.
+
+1. Production binary collects counters live (low-overhead instrumentation, AutoFDO-style sampling, or hardware perf counters).
+2. Counter snapshots ship to a build farm or sidecar periodically.
+3. Background compile produces a `v2.so` with updated profile.
+4. Running process `dlopen`s the new shared object; function pointers redirect to new bodies. Old bodies stay live until in-flight calls drain.
+
+No deopt, no OSR, no fresh verification — the v2 binary went through the same AOT checker as v1. Soundness story identical to AOT; effects/ownership invariants survive trivially. Latency is minutes, not microseconds — fine for warehouse-scale services, wrong shape for sub-second adaptation.
+
+**Architectural commitments at v1 freeze (P0 — landed alongside this entry's deferral).** Without these in v1, retrofitting hot-swap means recompiling every binary:
+
+1. **`--enable-hot-swap` codegen flag** (off by default in v1) — emits PLT-style indirection for `extern`-public module symbols. Default off; turning it on is non-breaking. **Granularity is module-level, not function-level** — internal calls stay direct; hot-swap targets module boundaries. Reload `auth` module to swap `auth.verify`, not the function in isolation.
+2. **AOT-perf cost of indirection** must be benchmarked at flag-ship time. "Tentative <1% overall" applies amortized over a whole program; worst-case hot inner-loop sites can be 10–20%. Per-symbol opt-in is a fallback if module-wide cost is unacceptable, but contradicts the warehouse use case if hot-swap targets are dispersed.
+
+**What ships post-v1 (P2 conditional).**
+
+- Drain protocol — RCU-style quiescence for retiring old code. Tied to the `suspends` effect verb: loops that already have suspend points are drain-safe; loops without get a compile warning. Realistic engineering scope: 10–12 weeks (more than the doc's 6–8 estimate).
+- Orchestrator — daemon, k8s sidecar, or `karac` subcommand that triggers rebuild and reload.
+- Counter collection wire format — concatenable per LLVM `.profdata` precedent, with the same key-alignment caveat as the PGO entry above.
+
+**Audience constraint.** Same W^X gate as runtime monomorphization (below): production with strict W^X (browsers, iOS, gVisor sandboxes, FIPS deployments) cannot hot-swap; falls back to AOT-only. Real audience for 3.2 is "Linux + macOS + Windows servers without strict W^X enforcement."
+
+**Promotion gate.** v64 resolution is the conditional. If v64 lands as backend-first positioning with warehouse-grade adaptive perf as a stated goal, this promotes to scheduled P2 work. Other promotion criteria (drain protocol design audit; orchestrator design; counter collection format spec) are downstream — gate first on the positioning decision.
+
+**Why non-breaking:** Architectural commits in v1 (hot-swap codegen flag) are off-by-default; the runtime piece is post-v1. Existing v1 binaries continue to work; opting into hot-swap requires rebuild with `--enable-hot-swap`.
+
+**Cross-reference:** `design.md § Specification Layers > Reported behavior > Profile-guided optimization output and runtime-JIT'd code`; `brainstorming/64_backend_first_v1_concurrency.md` (the conditional dependency); `brainstorming/archive/v65_pgo_and_online_jit.md` Problem 3.2 + Problem 4.B.
+
+---
+
+### Runtime Monomorphization JIT
+
+**Decision:** Defer runtime monomorphization JIT (in-process specialization of generics on first call, for `T` arriving via a dynamic boundary) from v1, ship as **P2**.
+
+**What it is.** Kāra is monomorphization-first; AOT generates one body per `Vec[T]` instantiation it can see. The narrow gap: a `T` arriving via a dynamic boundary — JSON / msgpack / protobuf deserialization into a generic container, FFI returning an opaque type, dynamically-loaded plugins instantiating templates declared in the host. For these cases, today's options are monomorphize-everything-needed at AOT (impossible if `T` is genuinely runtime-discovered) or fall back to dyn-trait. The runtime monomorphization JIT compiles the missing instantiation on first use; subsequent calls hit a code cache.
+
+**Why uniquely defensible for Kāra.**
+
+- **Unit of JIT is well-defined** — one generic instantiation. Not a hot loop, not an inlining decision; a whole function body for a specific `T`.
+- **No fresh verification.** Effects, ownership, trait bounds were AOT-checked on the *generic* body. The JIT's job is purely codegen-substitution. **This is what differentiates 3.3 from speculative tiering (HotSpot-class) — engineering you can throw bodies at; verification surface you can't.**
+- **IR shipping is bounded.** Bitcode for JIT-deferred generics ships in the binary's `.kara_jit_template` section. Binary-size cost is opt-in per author.
+- **Fallback is well-defined.** JIT-unavailable (W^X-locked target) → call site errors at the dynamic boundary, not silently.
+
+**Strongest motivating use case: deserialization.** Every Kāra service that parses JSON / msgpack / protobuf into a `Vec[T]` where `T` is data-driven (a polymorphic event union, a schema-discovered row type) hits exactly this gap. Not an HPC niche — mainstream backend code. The use-case overlap argument is *stronger* in Kāra than in C++: Kāra has fewer escape hatches than `std::variant` / virtual dispatch / `dlopen`-plugin patterns / external codegen frameworks, so the narrow gap matters more.
+
+**Bitcode-embedding policy.** Author opt-in via `#[jit_template]` annotation — predictable, requires per-library decisions. **Picked over compiler-derived ("any generic crossing a dynamic boundary") for v1 ship**; compiler-derived is a v1.x refinement once usage patterns surface. "Embed all generics" is untenable (template-heavy libraries 10–100× the bytecode size when bodies are embedded as IR).
+
+**Architectural commitment at v1 freeze (P0 — landed alongside this entry's deferral).**
+
+- **`.kara_jit_template` section + opaque-payload version manifest** — define the section name and version manifest in v1, leave actual emission and consumption for P2. Manifest format: single byte for "version" + length-prefixed opaque payload. v1 ships `[0x00, 0x00, 0x00, 0x00]`; v2 picks any format under version 1+. **Trivially future-proof** — accepting that v2 may pick a different shape than the brainstorm anticipates.
+- **Hard-error on `karac build --target=embedded` and `--target=wasm-*`** — both gate categorically (no `mmap(PROT_EXEC)` on embedded; WASM has no equivalent at all). Same gate that applies to `--enable-hot-swap`.
+
+**IR ABI stability across runtime / compiler version skew.** This is the operational kill that ended ClangJIT (the C++ research project that prototyped this exact architecture in 2019) — embedded LLVM IR is not stable across LLVM major versions; binaries with embedded bitcode broke under runtime upgrades. **v1 stance is (a):** pin runtime + AOT-compiler to the same Kāra version. Practical short-term; means a v1 binary with embedded JIT templates is not redistributable across Kāra releases. The harder solutions — (b) Cranelift CLIF as the embedded format, or (c) re-emit a portable Kāra-side stable IR (KIR) — are evaluated at promotion time, not v1.
+
+**JIT engine choice (Cranelift vs LLVM ORC2).** Tentative Cranelift: smaller, faster-compiling, JIT-tuned, ~10% slower steady-state code than AOT in exchange for ~30× compile speed and ~10× smaller runtime footprint. ORC2 reuses the AOT pipeline exactly. Decide at ship time. **Position: REPL JIT (archive/v62) and runtime monomorphization JIT (this entry) share infrastructure** — locks future implementations to converge on a single Kāra in-process compiler runtime rather than shipping two. Implies Cranelift; the REPL pays a small steady-state perf cost vs. LLJIT but the runtime stays single-source.
+
+**Audience constraint (W^X).** Production with strict W^X enforcement cannot run runtime JIT: browsers (Chrome's V8 hardening), iOS, Android, hardened kernels, gVisor-style sandboxes, FIPS-compliant deployments. WASM target categorically lacks `mmap(PROT_EXEC)`. Real audience for 3.3 is "Linux + macOS + Windows servers without strict W^X" — real but smaller than naive framing implies.
+
+**Modeled as effects.** A function that triggers JIT compilation `allocates(jit_code)` and `panics(jit_failure)`. The type system reflects the runtime cost.
+
+**Cost surface (engineering).** Cranelift-based runtime specializer + code cache + mmap+exec capability detection + W^X fallback + IR-version-skew handling + security review of arbitrary code generation in production processes + operational tooling (cache invalidation on binary upgrade, profile-of-JIT'd-code observability). **Realistic estimate: 16–20 weeks** for a production-shippable 3.3, not the 8–12 happy-path number.
+
+**Prior art that worked / didn't.** CUDA driver JIT (GPU bitcode → device code on kernel launch) — works at warehouse scale, validates the embedded-IR + runtime-specializer architecture. ClangJIT (Hal Finkel et al., SC19 2019) — C++ research project that designed exactly this for templates; worked technically; never landed in mainline Clang. Failure modes documented above (IR-version coupling; W^X; bitcode size; use-case overlap with existing escape hatches; maintenance ownership; scope of upstream surgery).
+
+**Promotion gate.** Promote when (a) the IR ABI stability question has a definite v2-compatible position (pick (b) or (c) above; v1's (a) is shipping-only), (b) the W^X audience constraint is acceptable to the target user base, and (c) at least one in-tree use case (e.g., dynamic deserialization in a stdlib JSON path) has materialized.
+
+**Why non-breaking:** Architectural commits in v1 (`.kara_jit_template` section + manifest) are reserved-and-empty surface; v1 binaries do not embed bitcode. `#[jit_template]` annotation, when added, attaches to opt-in items only.
+
+**Cross-reference:** `design.md § Specification Layers > Reported behavior > Profile-guided optimization output and runtime-JIT'd code`; `design.md § Compiler Queries > P1.2` (specialization queries become PGO-augmented when 3.3 lands); `brainstorming/archive/v62_interpreter_perf_and_binary_size.md` (REPL JIT story; shares infrastructure); `brainstorming/archive/v65_pgo_and_online_jit.md` Problem 3.3 + Problem 4.C.
+
+---
+
+### Speculative Tiering with Deopt
+
+**Decision:** Decline speculative tiering (HotSpot-class adaptive optimization with deoptimization points and on-stack replacement) from v1 and from the committed post-v1 work. Tier is **P3** — considered, declined, documented for durability.
+
+**What it would be.** AOT-compiled binary recompiles hot paths at runtime with speculative assumptions ("this `match` arm never taken"; "this virtual call always dispatches to `Foo`"); when the assumption is invalidated, deoptimize back to a slower, more general body without losing in-flight execution. Required infrastructure: deoptimization points in IR, type-feedback profiling at runtime, on-stack replacement (OSR) for tier-up, invariant-violation handlers.
+
+**Why declined.** Three Kāra-specific frictions plus one architectural cost:
+
+- **Effects.** Speculative inlining across an effect boundary changes the function's effect set. Re-checking at JIT time doubles the verification surface.
+- **Ownership.** Move/borrow analysis is a property of AOT-checked source; speculative reordering must preserve it. Re-running ownership analysis on JIT'd code is feasible but complicates the soundness argument.
+- **Frame layout.** Stack frames for OSR need a stable on-disk schema; none exists today.
+- **Deopt-point cost on AOT performance.** Even programs that never deopt pay a pessimization tax: deopt points constrain instruction scheduling (no reordering across them) and frame state preservation (more spills, less aggressive register allocation). Java HotSpot has this; V8 has this; **it's the reason GraalVM native image underperforms HotSpot in steady state**. Adopting speculative tiering means accepting this tax for *every* Kāra binary, even ones that never speculate.
+
+**The reward-to-complexity ratio is poor.** Backend services and embedded targets do not need HotSpot-class adaptation. The cases where speculative tiering pays off (long-running JVM-style monoliths with very high throughput) are precisely the cases where continuous PGO + hot-swap (above) gets most of the win at a fraction of the cost. Continuous PGO has minutes-of-latency adaptation; speculative tiering has sub-second. For warehouse services, minutes is fine.
+
+**Conflict with Kāra's positioning.** Effects + ownership + monomorphization-first are load-bearing for Kāra's correctness story. Speculative tiering routes around all three: it speculates past effect boundaries, reorders past ownership analysis, and re-specializes past AOT monomorphization. The whole runtime invariant-stack would need to be re-validated under speculation. Even a credible design effort here is multi-quarter and conflicts with the language's first-principles correctness narrative.
+
+**Cost surface.** ~16–24+ engineering weeks. Very high risk; interacts with every part of the runtime/codegen stack.
+
+**Why this isn't simply "rejected".** Speculative tiering is a real technique that real systems benefit from; it's not technically unsound. The decision is that the trade-off doesn't fit Kāra's design — not that the technique is wrong. P3 is the right tier ("considered, declined, may revisit if circumstances change").
+
+**Cross-reference:** `brainstorming/archive/v65_pgo_and_online_jit.md` Problem 3.4. The continuous PGO + hot-swap path (above) is the documented alternative for warehouse-scale adaptive perf needs.
 
 ---
 
@@ -2749,3 +2860,27 @@ The binary-size cost that motivates dynamic-linking adoption in C/C++ is address
 **Why non-breaking:** Not a restriction on existing code. Purely a statement that the language does not allocate first-class surface or stdlib infrastructure to dynamic linking. Users who need the feature today construct it through FFI; those mechanisms remain available.
 
 **Cross-reference:** `design.md § Foreign Function Interface` (manual `dlopen` in `unsafe` blocks); `roadmap.md § Phase 10` (WASM target as the supported plugin pattern); `design.md § Auto-Concurrency via Effect Analysis` (IPC + channels as the in-language extensibility pattern).
+
+### Full Bytecode-First JIT (HotSpot / V8 / JVM-class)
+
+**Decision:** Kāra does not ship as a bytecode-first language with a tier-up JIT (interpret → baseline JIT → optimizing JIT). Source ships as native; the optimizing compiler runs at AOT time, not in-process for every program. Permanent omission. Graduated from brainstorm v65 (2026-05-09).
+
+**Why permanent.** Bytecode-first JIT is a different language design, not just a different runtime. It implies:
+
+- Source ships as IR or bytecode, not native binaries — contradicts `karac build` producing distributable artifacts.
+- Cold-start penalty becomes the norm — every program pays "warm-up" before steady-state perf kicks in.
+- The optimizing compiler runs in-process for *every* program, not just adaptive workloads — ~10–50 MB of compiler in every binary, every server, every embedded target.
+- Effect / ownership / borrow checking would have to (partially) move to JIT time — splits the verification surface and complicates the soundness story.
+- Backend services and embedded targets — Kāra's primary positioning — gain nothing from this and pay all of it.
+
+**Why this is rejected on design grounds, not feasibility.** The technique works (HotSpot, V8, JavaScriptCore, .NET, modern Java with C2/Graal). It's the right shape for languages where source distribution is the deployment model (browsers, JVM containers, .NET assemblies) and cold-start latency is acceptable. Kāra's positioning — AOT-first systems language, deployable as native binaries, embedded-friendly — makes bytecode-first the wrong shape *by design*, not by accident of cost.
+
+**Alternatives that cover the genuine adaptive-perf use cases:**
+
+1. **Static PGO + AutoFDO** (P2; see § Profile-Guided Optimization Loop). Distribution-shaped optimization without bytecode in the binary.
+2. **Continuous PGO + shared-object hot-swap** (P2 conditional on v64; see § Continuous PGO with Shared-Object Hot-Swap). Minutes-of-latency adaptive perf for warehouse services.
+3. **Runtime monomorphization JIT** (P2; see § Runtime Monomorphization JIT). Narrow, AOT-shaped JIT for the specific case of dynamic-boundary-discovered generic instantiations. Does not speculate, does not deopt, does not require an interpreter tier.
+
+These three together cover the adaptive-perf use cases without changing the language's deployment model or the soundness story.
+
+**Cross-reference:** `brainstorming/archive/v65_pgo_and_online_jit.md` Problem 3.5 (rejected; documented as out-of-scope-by-design); see also § Speculative Tiering with Deopt (P3) for the half-step short of full bytecode JIT that is also declined for similar reasons.

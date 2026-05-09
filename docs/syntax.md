@@ -2325,6 +2325,7 @@ Known attributes:
 | `#[specialize(T = TYPE, ...)]` | Function | Compiler queries channel resolution surface for the specialization decision (P1.2). Author directs the compiler to specialize the body for the named monomorphization tuple. See design.md § Compiler Queries. |
 | `#[likely]` / `#[unlikely]` | `match` arm / `if`-`else` branch | Compiler queries channel resolution surface for the branch-hint decision (P1.3). Author asserts the branch is hot or cold. See design.md § Compiler Queries and § Codegen Hint Attributes. |
 | `#[fork_at(N)]` | Function | Compiler queries channel resolution surface for the auto-concurrency fork threshold decision (P1.6). Author overrides the cost-model fork threshold for this function's parallel groups. See design.md § Compiler Queries and § Auto-concurrency cost-model decisions. |
+| `#[jit_template]` | Function (generic) | Marks a generic function whose IR should be embedded in the binary's `.kara_jit_template` section for runtime monomorphization (post-v1; see deferred.md § Runtime Monomorphization JIT). Author opt-in policy: only annotated generics ship bitcode in the binary; binary-size cost is bounded by per-author annotation rather than emergent. v1 reserves the section but does not emit bitcode; the attribute parses without effect under v1 codegen. |
 
 ---
 

@@ -171,6 +171,33 @@ The specific attribute (or sidecar entry) that, when written on a given item, re
 **Intent vs Distribution**
 The boundary between what the query channel answers and what PGO answers. Intent-shaped questions come from program understanding ("is this the hot path?", "is this allocation expected to escape?") and are answerable from spec; distribution-shaped questions come from production traffic ("what fraction of inputs are ≤16 bytes?") and require runtime measurement. Kāra v1 ships the intent channel; PGO is deferred to post-v1.
 
+**PGO (Profile-Guided Optimization)**
+Compiler optimization that uses runtime measurement of a representative workload to drive code-generation decisions (block layout, inlining heuristic weights, branch hints, function ordering, register allocation priorities). Two flavors: **instrumented** (build with counters → run workload → counters dump to `.profdata` → re-build using `.profdata`) and **sample-based / AutoFDO** (no instrumented build; sample a release binary in production with `perf record` → convert with `create_llvm_prof` → re-build). Kāra defers PGO to P2; the v1 `llvm.expect` static-branch-hint emission is *not* PGO.
+
+**`.profdata`**
+LLVM's binary profile data format. Structural-hash-keyed for source-drift resilience. Concatenable across multiple workload runs via `llvm-profdata merge`. The canonical artifact format for both instrumented PGO and AutoFDO.
+
+**AutoFDO (Sample-Based PGO)**
+Profile-guided optimization driven by `perf`-collected production samples rather than instrumented builds. Lower deployment cost (no separate workload run, no instrumentation overhead) but higher source-drift sensitivity — the sampled binary and the rebuilt binary may not be byte-identical, and function-name stability across rebuilds becomes load-bearing. Linux kernel mainlined AutoFDO + Propeller in 2024; published numbers show ~5–10% over instrumented PGO on warehouse workloads.
+
+**Hot-Swap (Runtime Code Replacement)**
+Replacing the running version of a function (or module) without restarting the process. In Kāra's planned form (P2 conditional on v64): production binary collects PGO counters live → background recompile produces `v2.so` → running process `dlopen`s the new shared object and redirects function-pointer indirection to the new bodies → old bodies stay live until in-flight calls drain (RCU-style quiescence). Latency is minutes, not microseconds — fine for warehouse-scale services. Granularity is module-level, not function-level.
+
+**Drain Protocol**
+The rule for when old code can be unmapped after a hot-swap. Kāra's planned approach: tie to the `suspends` effect verb — loops with suspend points are drain-safe; loops without get a compile warning. RCU-style quiescence: wait until every thread has crossed at least one suspend point since the swap before retiring the old code.
+
+**Runtime Monomorphization JIT**
+Just-in-time compilation of a generic function body for a concrete type `T` only known at runtime — typically because `T` arrived via JSON/msgpack/protobuf deserialization, FFI, or dynamic plugin load. Kāra's planned form (P2): bitcode for `#[jit_template]`-annotated generics is embedded in the binary's `.kara_jit_template` section; on first call with an unseen `T`, runtime pulls the bitcode, runs Cranelift to produce native code, caches it. Effects, ownership, and trait bounds are AOT-checked on the *generic* body — JIT performs codegen substitution only, no fresh verification.
+
+**W^X (Write-XOR-Execute)**
+Memory-protection policy that disallows pages from being both writable and executable at the same time. Increasingly common in production: browsers (Chrome's V8 hardening), iOS, Android, hardened kernels, gVisor sandboxes, FIPS deployments. WASM lacks `mmap(PROT_EXEC)` entirely. Any in-process JIT (runtime monomorphization, hot-swap reload) cannot run in W^X-enforced environments — falls back to AOT-only.
+
+**In-Process JIT**
+A JIT compiler embedded in the running program rather than in a separate compiler tool. Kāra's planned in-process JIT (Cranelift-based, post-v1) supports runtime monomorphization (3.3) and may be shared with the REPL JIT (per archive/v62). Distinguished from out-of-process JIT (separate `karac` invocation that produces a `v2.so`) which is what continuous PGO + hot-swap uses.
+
+**Code Cache**
+LRU-bounded mapping from `(generic_def_id, type_arg_pattern)` to JIT-compiled native code, kept in writable+executable memory pages. Each entry is the cached output of one runtime-monomorphization JIT compile. Cache is invalidated on binary upgrade (since the IR ABI is version-pinned in v1).
+
 ---
 
 ## Language Design

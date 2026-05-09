@@ -781,7 +781,7 @@ Semantics in `design.md § Numerical Types`, `§ Numeric Semantics > Literal-inv
 - [ ] Alias metadata: `noalias` on owned parameters, `tbaa` type-based alias analysis tags
 - [ ] Arithmetic flags: `nsw`/`nuw` on integer ops where overflow is defined-UB in Kāra semantics
 - [ ] LTO: enable link-time optimization in `karac build --release`
-- [ ] PGO stubs: `llvm.expect` intrinsic on branch conditions where effect analysis can predict likelihood
+- [ ] Static branch hints from effect analysis (`llvm.expect` emission): emit `llvm.expect` intrinsic on branch conditions where effect analysis can predict likelihood. **This is not PGO** — no instrumentation, no profile collection, no recompile loop. Real PGO (instrumented + AutoFDO) is deferred to post-v1; see [`deferred.md § Profile-Guided Optimization Loop`](deferred.md#profile-guided-optimization-loop).
 
 **Goal of this pass:** Reduce the Phase 7 ≤2x gap to ≤10% of equivalent hand-written Rust on compute-bound benchmarks. Ships at the end of v1 because IR-quality polish only pays off once the long-tail stdlib is the last thing being measured.
 
