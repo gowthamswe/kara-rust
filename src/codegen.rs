@@ -96,6 +96,7 @@ pub fn compile_to_object_with_options(
     cg.compile_program(program)?;
 
     let target_machine = create_target_machine()?;
+    apply_optimization_passes(&cg.module, &target_machine)?;
     target_machine
         .write_to_file(&cg.module, FileType::Object, Path::new(output_path))
         .map_err(|e| format!("Failed to write object file: {}", e))
@@ -243,11 +244,106 @@ fn create_target_machine() -> Result<TargetMachine, String> {
             &triple,
             "generic",
             "",
-            OptimizationLevel::Default,
+            backend_optimization_level(),
             RelocMode::Default,
             CodeModel::Default,
         )
         .ok_or_else(|| "Failed to create target machine".to_string())
+}
+
+/// Resolve the optimization level used by both the **target machine** (LLVM
+/// backend codegen quality) and the mid-end **pass pipeline** (the
+/// `default<…>` string passed to `Module::run_passes`). They must stay in
+/// sync — emitting `-O0`-level pass-pipeline output into a `-O2`-level
+/// backend (or vice versa) leaves performance on the table without saving
+/// compile time.
+///
+/// Reads the `KARAC_OPT_LEVEL` env var (set per-invocation, not cached at
+/// compiler-binary build time):
+///
+/// | env value | backend `OptimizationLevel` | pass-pipeline string |
+/// |-----------|------------------------------|----------------------|
+/// | `0`       | `None`                       | (passes skipped)     |
+/// | `1`       | `Less`                       | `default<O1>`        |
+/// | unset / `2` / `s` / `z` | `Default`         | `default<O2>` *(default)* |
+/// | `3`       | `Aggressive`                 | `default<O3>`        |
+///
+/// `s` and `z` (size-optimized) map onto `-O2` for the backend at v1 — LLVM's
+/// new-pass-manager pipeline strings have native `default<Os>` / `default<Oz>`
+/// counterparts but inkwell's `OptimizationLevel` enum has no separate
+/// size-tier. Until size-tier is wired through `--target` flags, the env var
+/// gives users a way to ask for size-optimization mid-end passes while
+/// keeping the backend at `-O2` parity with `Default`.
+fn read_opt_level_env() -> &'static str {
+    // OnceLock cache so repeated `karac build` invocations within one
+    // compiler-process lifetime (e.g., tests that compile many .kara files)
+    // observe a stable level. Test-only `read_opt_level_env_uncached` —
+    // mirrors the `KARAC_RUNTIME_DEBUG_METADATA` cache pattern.
+    static CACHE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    CACHE.get_or_init(read_opt_level_env_uncached)
+}
+
+fn read_opt_level_env_uncached() -> &'static str {
+    match std::env::var("KARAC_OPT_LEVEL").as_deref() {
+        Ok("0") => "0",
+        Ok("1") => "1",
+        Ok("3") => "3",
+        // Default + explicit "2", "s", "z" all map to the `-O2` mid-end
+        // pipeline. See doc-comment table above.
+        _ => "2",
+    }
+}
+
+fn backend_optimization_level() -> OptimizationLevel {
+    match read_opt_level_env() {
+        "0" => OptimizationLevel::None,
+        "1" => OptimizationLevel::Less,
+        "3" => OptimizationLevel::Aggressive,
+        _ => OptimizationLevel::Default,
+    }
+}
+
+/// Run LLVM mid-end optimization passes on the constructed module.
+///
+/// karac builds raw IR with locals as alloca'd stack slots (the natural
+/// shape produced by a non-SSA-aware codegen). Without this pass run,
+/// `mem2reg` + downstream optimizations never fire and tight integer
+/// kernels (e.g., the Parallax bench's `busy_loop`) emit ~12 instructions
+/// per iter through a stack-spill chain instead of the 4-instruction
+/// register-only inner loop LLVM-O2 produces. See
+/// `docs/investigations/parallax_perf.md § Findings, 2026-05-10` for the
+/// before/after disasm + bench numbers that motivated wiring this up.
+///
+/// Pass string is the LLVM new-pass-manager pipeline alias `default<O…>` —
+/// the same pipeline `clang -O…` runs. `KARAC_OPT_LEVEL=0` short-circuits
+/// the pass run entirely (debugging fallback for "did the optimizer eat
+/// my IR construct?"). Other levels run the matching `default<O…>`
+/// pipeline; size tiers (`s`, `z`) currently fold into `-O2` (see
+/// `read_opt_level_env` table).
+fn apply_optimization_passes(
+    module: &Module<'_>,
+    target_machine: &TargetMachine,
+) -> Result<(), String> {
+    let level = read_opt_level_env();
+    if level == "0" {
+        return Ok(());
+    }
+    let pipeline = match level {
+        "1" => "default<O1>",
+        "3" => "default<O3>",
+        _ => "default<O2>",
+    };
+    let options = inkwell::passes::PassBuilderOptions::create();
+    module
+        .run_passes(pipeline, target_machine, options)
+        .map_err(|e| {
+            format!(
+                "LLVM optimization pass `{}` failed: {}. \
+                 Workaround: set KARAC_OPT_LEVEL=0 to skip the pass run.",
+                pipeline,
+                e.to_string()
+            )
+        })
 }
 
 /// Read the `KARAC_RUNTIME_DEBUG_METADATA` env var to decide whether

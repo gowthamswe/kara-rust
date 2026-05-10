@@ -91,44 +91,83 @@ regression gate.
 
 ## Throughput results
 
-**Measured on 2026-05-09** (post-`karac_par_run` worker-pool fix,
-`3953a14`), Apple M5 Pro (10P + 8E cores, 18 logical CPUs), 64 GB
-RAM, macOS 26.4.1, `wrk 4.2.0`. `bench.sh` defaults (`-t4 -c100`,
-10s warmup + 30s measurement, sequential per-impl runs).
+**Measured on 2026-05-10** (post-codegen-IR-opts fix; see History
+below), Apple M5 Pro (10P + 8E cores, 18 logical CPUs), 64 GB RAM,
+macOS 26.4.1, `wrk 4.2.0`. `bench.sh` defaults (`-t4 -c100`, 10s
+warmup + 30s measurement, sequential per-impl runs).
 
 | Impl   | req/s     | p99 latency | Notes                       |
 |--------|-----------|-------------|-----------------------------|
-| Rust   | 47,312.86 | 5.09 ms     | tokio + hyper + `tokio::join!` (perf ceiling reference) |
-| Go     |  7,598.96 | 64.36 ms    | `net/http` + goroutines + `sync.WaitGroup`, default `GOMAXPROCS` |
-| Kāra   |  1,053.75 | 237.76 ms   | auto-par fan-out via long-lived global pool |
-| Node   |     93.62 | 1.10 s      | `http` + `Promise.all`, single-process per F4 |
+| Kāra   | 97,172.48 |  56.83 ms   | auto-par fan-out, `default<O2>` mid-end passes; busy_loops elided by DCE — see ⚠ below |
+| Rust   | 47,489.12 |   4.98 ms   | tokio + hyper + `tokio::join!`; busy_loops also DCE'd by `rustc` release codegen |
+| Go     |  7,728.67 |  61.87 ms   | `net/http` + goroutines + `sync.WaitGroup`, default `GOMAXPROCS` |
+| Node   |     92.71 |   1.01 s    | `http` + `Promise.all`, single-process per F4 |
 
-**How to read this.** The Rust row sets the cohort's perf ceiling
-because Kāra's runtime sits on the same tokio multi-thread scheduler.
-Rust ÷ Kāra ≈ 45×; that gap is what auto-par's value-type ABI +
-handler trampoline + monomorphization-conservative codegen cost
-relative to hand-written `tokio::join!`. Most of it is recoverable
-headroom (see [`docs/demo_ideas.md § Slice E`](../../../docs/demo_ideas.md)
-"Out of scope" — gap-closure path conditional on F3, and
-[`docs/investigations/parallax_perf.md`](../../../docs/investigations/parallax_perf.md)
-for the open root-cause investigation). Go's row reflects `net/http`
-+ goroutines on default `GOMAXPROCS`; Node's row reflects single-
-process `Promise.all` serializing four CPU-bound busy loops on the
-event-loop thread (F4 footnote — cluster-mode Node would multiply by
-≈ `num_cpus`).
+> **⚠ The bench is currently optimization-eaten and not apples-to-
+> apples.** Both Kāra and Rust release codegen identified the
+> `busy_loop` body as the triangular-number sum (`Σi = n(n-1)/2`)
+> and replaced the loop with the closed-form arithmetic. Rust then
+> dead-code-eliminated the `let _ = busy_loop(...)` calls outright;
+> Kāra's `default<O2>` pass pipeline does the same. Neither impl is
+> actually doing the four 2/5/8/12 ms loops the design intended.
+> The Kāra row's 97 K req/s is the **trampoline + HTTP-path
+> ceiling** (no-op-handler probe gave 108 K) and the Rust row's
+> 47 K reflects per-request hyper/tokio framing on Rust's side
+> being heavier than Kāra's hand-rolled trampoline at the
+> "everything optimizes away" floor — *not* a real fan-out
+> comparison. Re-instating apples-to-apples requires an
+> optimization-barrier in both impls (`black_box` in Rust + a Kāra
+> equivalent extern, or weaving `Dashboard` values into the
+> response body). Tracked at
+> [`docs/investigations/parallax_perf.md § Recommended next step
+> (separate slice)`](../../../docs/investigations/parallax_perf.md).
 
-**History.** The first verification run (`4f7b72d`) measured Kāra at
-1,089.99 req/s / 438.18 ms p99. Profiling diagnosed that 60 % of the
-process's CPU was being spent in `mach_vm_protect` setting up
-pthread stack guard pages — `karac_par_run` was creating fresh OS
-threads on every fan-out call. Replacing that with a long-lived
-worker pool (`3953a14`) **dropped p99 by 46 %** (438 → 238 ms) and
-moved CPU spent on the actual benchmark work from 7.5 % to 66.7 %
-of samples. Throughput is essentially unchanged because the bench
-is `wrk`-connection-bound, not pool-capacity-bound (with `-c100`
-keep-alive connections, throughput ≈ 100 / per-request-wall-clock-
-latency, regardless of CPU efficiency). The full diagnostic story
-lives at [`docs/investigations/parallax_perf.md`](../../../docs/investigations/parallax_perf.md).
+**How to read this for now.** The Kāra row's 97 K is *headline-
+shape correct* — Kāra's compiler now produces optimized native
+code for tight integer kernels at parity with Rust's release
+codegen. The Kāra-vs-Rust *throughput* numbers in this snapshot
+should not be taken as evidence that Kāra is faster than Rust on
+real workloads — it's evidence that both impls' optimizers ate the
+benchmark's intended work, and Kāra's per-request framing is
+lighter than hyper/tokio's. Go's row is unchanged from pre-fix
+(Go's release codegen has done DCE all along; the busy_loops never
+ran in Go either); Node's row is unchanged because V8 is
+conservative on this idiom + single-process serialization
+dominates regardless.
+
+## History
+
+**v1 — first verification run (`4f7b72d`, 2026-05-09).** Kāra at
+1,089.99 req/s / 438.18 ms p99, four-language table populated.
+First end-to-end measurement of the Kāra HTTP stack under sustained
+load.
+
+**v2 — `karac_par_run` worker-pool fix (`3953a14`, 2026-05-09).**
+Profiling diagnosed that 60 % of the process's CPU was being spent
+in `mach_vm_protect` setting up pthread stack guard pages —
+`karac_par_run` was creating fresh OS threads on every fan-out
+call. Replaced with a long-lived worker pool: thread churn -94 %,
+p99 -46 % (438 → 238 ms), CPU efficiency 9× better. Throughput
+essentially unchanged because the bench was wrk-connection-bound,
+not pool-capacity-bound at that point.
+
+**v3 — codegen `default<O2>` pass pipeline (this commit,
+2026-05-10).** Probe sweep revealed that `karac_par_run`, the
+trampoline, frame-tracking, and HTTP layer were all *not* the
+bottleneck — the no-op-handler ceiling is 108 K req/s. The
+remaining gap was that karac never ran any LLVM mid-end
+optimization passes on its IR (`OptimizationLevel::Default` was set
+on the target machine but no `PassManager` was wired up), so
+`busy_loop` shipped with locals in stack slots and inner loops at
+~12 cycles/iter. Wiring `module.run_passes("default<O2>", …)` lets
+LLVM's `mem2reg` + `loop-idiom` + `instcombine` reduce the loop
+body to the Gauss-sum closed form and DCE the dropped results.
+Throughput jumped 92× (1,054 → 97,172). See ⚠ above for why this
+makes the bench less, not more, comparable until an optimization-
+barrier is added.
+
+Full investigation log + per-step disassembly + reasoning lives at
+[`docs/investigations/parallax_perf.md`](../../../docs/investigations/parallax_perf.md).
 
 ## Fairness controls (F4)
 

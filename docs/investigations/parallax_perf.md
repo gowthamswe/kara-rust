@@ -654,3 +654,96 @@ Bench validation criterion for the codegen fix: the Kāra row
 should jump to **20-40 K req/s** (within striking distance of
 Rust's 47 K), since the codegen overhead currently dominates and
 the trampoline ceiling is already 108 K.
+
+### 2026-05-10 — Codegen IR-opts landed, 92× throughput improvement
+
+**Fix landed.** Wired `module.run_passes("default<O2>", &target_machine,
+options)` into `compile_to_object_with_options` between IR
+construction and object emission. Plus an `apply_optimization_passes`
+helper, an env-var routing layer (`KARAC_OPT_LEVEL=0|1|2|3` for
+opt-out / future tuning), and target-machine + pass-pipeline level
+sync via `backend_optimization_level()`. ~120 LoC total in
+`src/codegen.rs`. Design record at
+[`phase-7-codegen.md § "Run LLVM mid-end optimization passes"`](../implementation_checklist/phase-7-codegen.md).
+
+**Tests.** Full LLVM-feature suite green (~1,500 tests across codegen,
+par_codegen, parallax, http_server, memory_sanitizer, etc.) — `-O2`
+did not unmask any UB in our codegen. clippy + fmt clean.
+
+**Bench (full 4-impl re-run on the same hardware as 2026-05-09):**
+
+| Impl | req/s pre-O2 | req/s post-O2 | Change |
+|---|---|---|---|
+| Rust |  47,313 |  47,489 | +0.4% (noise — Rust was already optimized) |
+| Go   |   7,599 |   7,728 | +1.7% (noise) |
+| **Kāra** | **1,054** | **97,172** | **+92×** |
+| Node |      94 |      93 | flat |
+
+**Disassembly evidence.** `_busy_loop` post-fix is no longer a loop
+at all — LLVM's `LoopIdiomRecognize` pass identified the body as the
+triangular-number sum (`Σ_{i=0}^{n-1} i = n(n-1)/2`) and replaced
+the entire loop with the closed-form arithmetic:
+
+```
+_busy_loop:
+  subs  x8, x0, #0x1            ; x8 = n - 1
+  b.lt  .return_zero             ; n < 1 → return 0
+  sub   x9, x0, #0x2            ; x9 = n - 2
+  mul   x10, x8, x9              ; (n-1)(n-2) low 64
+  umulh x9,  x8, x9              ; (n-1)(n-2) high 64
+  extr  x9,  x9, x10, #0x1       ; >> 1 — divide by 2
+  add   x0,  x8, x9              ; (n-1) + (n-1)(n-2)/2 = n(n-1)/2
+  ret
+```
+
+Better, the per-call result is dropped (`let _ = busy_loop(N)…` in
+the bench source), so dead-code elimination further removed the
+busy_loop *calls themselves* from the four `fetch_*` helpers — they
+now compile to immediate-return-the-constant:
+
+```
+_fetch_latest_order_id:
+  mov w0, #0x3e9   ; 1001
+  ret
+```
+
+**This means the bench is no longer measuring fan-out work** — both
+Kāra and Rust got the busy_loops fully elided by their optimizers.
+The 97 K req/s the Kāra row reports is the **trampoline + HTTP-path
+ceiling** (consistent with the earlier no-op-handler probe at 108 K
+— the 11 K gap is per-request `get_dashboard` framing overhead that
+DCE can't eliminate because of the `Dashboard` struct construction
++ FFI boundary).
+
+**Reading the post-fix table.** Apples-to-oranges: the codegen fix
+moved Kāra into a regime where its trampoline ceiling shows
+through. Comparing 97 K (Kāra trampoline) to 47 K (Rust still doing
+some real work — Rust's release codegen also elides the loops, but
+hyper + tokio overhead on Rust's side is more substantial than on
+Kāra's hand-rolled trampoline). The Kāra row is faster than Rust
+*on this bench*, but it does not mean Kāra is faster than Rust at
+real work — it means **the bench is no longer load-bearing** for
+the comparison the design intended to set up (fan-out efficiency
+under sustained CPU load).
+
+**Recommended next step (separate slice).** Make the bench
+optimization-resistant. Two paths:
+1. Use `std::hint::black_box` (Rust) and a Kāra equivalent (TBD —
+   likely a `karac_runtime_black_box` extern) around the busy_loop
+   results so the optimizer can't elide them.
+2. Weave `Dashboard`'s field values back into the response body —
+   the `f-string`-codegen-gap follow-up enumerated in
+   `examples/parallax/bench/kara/server.kara:99-114` would close
+   this naturally, since the field values would have user-observable
+   uses.
+
+(2) is the better long-term path because it also closes the
+"response body is a fixed JSON literal" v1 limitation noted in the
+bench README; (1) is a quick fix that preserves the bench's
+diagnostic shape without depending on the codegen-gap follow-up.
+
+**The Kāra-vs-Rust gap is now closed (or inverted) for this
+specific bench, but the closure is partly artifact-of-DCE rather
+than actual runtime-speed parity.** The codegen fix is real and
+correct (every production compiler does this); the bench needs the
+follow-up above before its numbers become apples-to-apples again.
