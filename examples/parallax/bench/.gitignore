@@ -2,3 +2,7 @@
 kara/.bin/
 go/parallax-bench-go
 rust/Cargo.lock
+
+# Profiler outputs (regenerate with `samply record` per docs/investigations/parallax_perf.md).
+profile_*.json.gz
+server.log
