@@ -4743,6 +4743,59 @@ fn test_method_resolution_no_suggestion_when_nothing_close() {
     );
 }
 
+// ── Method resolution: args-specialization tightening ───────────
+//
+// When a method is declared on a *specialized* impl of a prelude type
+// (e.g., `impl Option[Ordering] { fn is_lt(...) }`), calling that
+// method on a *different* args-instantiation (`Option[i32].is_lt()`)
+// must fire `NoMethodFound` rather than silently falling through —
+// otherwise the bad call reaches the interpreter and dispatches to the
+// args-blind impl key with a wrong-type self, producing a silent wrong
+// answer. The tightening preserves the existing silent fall-through
+// when the method is genuinely absent from every specialization.
+
+#[test]
+fn test_method_resolution_specialized_impl_wrong_args_fires_diagnostic() {
+    // `impl Option[Ordering] { fn is_lt(...) }` is the only declaration
+    // of `is_lt` on Option. Calling `is_lt()` on `Option[i32]` must
+    // emit NoMethodFound — args-aware lookup fails, but the silent
+    // fall-through is overridden because `is_lt` exists on a different
+    // specialization of Option.
+    let errors = typecheck_errors(
+        "impl Option[Ordering] { fn is_lt(ref self) -> bool { false } }\n\
+         fn main() { let o: Option[i64] = Some(5); o.is_lt(); }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::NoMethodFound),
+        "expected NoMethodFound for Option[i64].is_lt() against impl Option[Ordering], got: {:?}",
+        errors.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_method_resolution_specialized_impl_correct_args_resolves() {
+    // Same impl, but called on the matching `Option[Ordering]`
+    // instantiation — must resolve cleanly with no NoMethodFound
+    // diagnostic from the args-specialization tightening.
+    typecheck_ok(
+        "impl Option[Ordering] { fn is_lt(ref self) -> bool { false } }\n\
+         fn main() { let o: Option[Ordering] = Some(Ordering.Less); o.is_lt(); }",
+    );
+}
+
+#[test]
+fn test_method_resolution_prelude_silent_fallthrough_preserved_when_method_absent() {
+    // No impl declares `truly_nonexistent_method` anywhere on Option —
+    // the silent fall-through must be preserved (the args-specialization
+    // tightening only fires when the method exists on a *different*
+    // specialization). This is the regression gate for the historical
+    // partially-implicit prelude method surface comment in
+    // `src/typechecker.rs` (around line 10082).
+    typecheck_ok("fn main() { let o: Option[i64] = Some(5); o.truly_nonexistent_method(); }");
+}
+
 // ── Method resolution: stdlib typo suggestions ──────────────────
 //
 // Each per-type `infer_*_method` arm in the typechecker now emits a

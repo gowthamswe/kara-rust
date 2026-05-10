@@ -10088,7 +10088,20 @@ impl<'a> TypeChecker<'a> {
                 let is_user_defined = (self.env.structs.contains_key(&type_name)
                     || self.env.enums.contains_key(&type_name))
                     && !crate::prelude::PRELUDE_TYPES.contains(&type_name.as_str());
-                if is_user_defined {
+                // Args-specialization tightening: even on prelude types, fire
+                // NoMethodFound when the method exists on a *different*
+                // args-specialization of this type-name (e.g.,
+                // `Option[i32].is_lt()` when only `impl Option[Ordering]`
+                // declares `is_lt`). Preserves the silent fall-through when
+                // the method is genuinely absent (`Vec[i32].some_typo()`
+                // stays silent) while surfacing the args-mismatch case that
+                // would otherwise silently reach the interpreter and produce
+                // a wrong answer through unrelated dispatch.
+                let method_on_other_specialization =
+                    self.env.impls.iter().any(|imp| {
+                        imp.target_type == type_name && imp.methods.contains_key(method)
+                    });
+                if is_user_defined || method_on_other_specialization {
                     let candidates = self.env.collect_method_names(&type_name, &[]);
                     let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
                     let mut msg = format!("no method '{}' on type '{}'", method, type_name);
