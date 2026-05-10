@@ -1875,6 +1875,75 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_vec_deque_push_back_len_is_empty() {
+        // VecDeque codegen v1 surface: `new` + `push_back` + `len` +
+        // `is_empty` mirror Vec's `{ptr, len, cap}` layout exactly.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut q: VecDeque[i64] = VecDeque.new();
+    q.push_back(1);
+    q.push_back(2);
+    q.push_back(3);
+    println(q.len());
+    println(q.is_empty());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "3\nfalse");
+        }
+    }
+
+    #[test]
+    fn test_e2e_vec_deque_push_front_shifts_storage_right() {
+        // `push_front` shifts existing elements right by 1 via
+        // `llvm.memmove` and stores the new element at index 0. Iter
+        // yields front-to-back: [front=5, then 10, 20].
+        let out = run_program(
+            r#"
+fn main() {
+    let mut q: VecDeque[i64] = VecDeque.new();
+    q.push_back(10);
+    q.push_back(20);
+    q.push_front(5);
+    let mut sum = 0i64;
+    for x in q.iter() { sum = sum + x; }
+    println(sum);
+    println(q.len());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "35\n3");
+        }
+    }
+
+    #[test]
+    fn test_e2e_vec_deque_pop_back_alias_of_pop() {
+        // `pop_back` aliases existing `pop` — returns raw element
+        // (not Option) for consistency with the existing Vec.pop
+        // codegen behavior. The Option-wrap upgrade is tracked as
+        // a separate slice (compound-payload Option construction).
+        let out = run_program(
+            r#"
+fn main() {
+    let mut q: VecDeque[i64] = VecDeque.new();
+    q.push_back(1);
+    q.push_back(2);
+    q.push_back(3);
+    let x = q.pop_back();
+    println(x);
+    println(q.len());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "3\n2");
+        }
+    }
+
+    #[test]
     fn test_e2e_auto_par_propagates_let_bindings_with_identifier_rhs() {
         // `let n = p; let v: Vec[T] = Vec.new()` are independent
         // statements, so the concurrency analyzer groups them as

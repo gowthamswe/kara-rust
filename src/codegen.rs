@@ -1967,7 +1967,14 @@ impl<'ctx> Codegen<'ctx> {
     fn extract_vec_elem_type(&self, te: &TypeExpr) -> Option<BasicTypeEnum<'ctx>> {
         if let TypeKind::Path(path) = &te.kind {
             let name = path.segments.first().map(|s| s.as_str()).unwrap_or("");
-            if name == "Vec" {
+            // `VecDeque[T]` shares `Vec[T]`'s `{ptr, len, cap}` codegen
+            // layout — front-end ops (`push_front` / `pop_front`)
+            // translate to memmove-shifted insert/remove at index 0
+            // inside `compile_vec_method`. The mirror means a
+            // `let q: VecDeque[i64] = ...` binding registers under
+            // `vec_elem_types` and dispatches through the existing
+            // Vec method-call surface unchanged.
+            if name == "Vec" || name == "VecDeque" {
                 if let Some(args) = &path.generic_args {
                     if let Some(GenericArg::Type(elem_te)) = args.first() {
                         return Some(self.llvm_type_for_type_expr(elem_te));
@@ -7052,7 +7059,12 @@ impl<'ctx> Codegen<'ctx> {
             };
         }
 
-        if type_name == "Vec" && method == "new" {
+        if (type_name == "Vec" || type_name == "VecDeque") && method == "new" {
+            // `VecDeque.new()` lowers to the same zero-initialized
+            // `{ptr=null, len=0, cap=0}` aggregate as `Vec.new()` —
+            // codegen aliases VecDeque onto Vec's storage layout, with
+            // `push_front` / `pop_front` translating to memmove-shifted
+            // insert/remove at index 0 inside `compile_vec_method`.
             let vec_ty = self.vec_struct_type();
             let null_ptr = self.context.ptr_type(AddressSpace::default()).const_null();
             let zero = self.context.i64_type().const_int(0, false);
@@ -7719,7 +7731,11 @@ impl<'ctx> Codegen<'ctx> {
                 let len = self.builder.build_load(i64_t, len_ptr, "vec.len").unwrap();
                 Ok(len)
             }
-            "push" => {
+            // VecDeque codegen alias: `push_back` is identical to Vec
+            // `push` (append at index `len`); the VecDeque interpreter
+            // ship at `4227e21` documented this front/back-shared
+            // storage shape, and codegen mirrors it.
+            "push" | "push_back" => {
                 if args.is_empty() {
                     return Err("Vec.push requires an argument".to_string());
                 }
@@ -7835,7 +7851,142 @@ impl<'ctx> Codegen<'ctx> {
 
                 Ok(self.context.i64_type().const_int(0, false).into())
             }
-            "pop" => {
+            // VecDeque codegen — `push_front` inserts at index 0,
+            // shifting all existing elements right by 1. The
+            // interpreter ship at `4227e21` translates to
+            // `Vec::insert(0, …)`; codegen does the same via an
+            // `llvm.memmove` over `len * sizeof(elem)` bytes from
+            // `data` to `data + sizeof(elem)`. Growth path is
+            // identical to `push` (max(4, cap * 2)).
+            "push_front" => {
+                if args.is_empty() {
+                    return Err("VecDeque.push_front requires an argument".to_string());
+                }
+                let elem_val = self.compile_expr(&args[0].value)?;
+
+                let data_ptr_ptr = self
+                    .builder
+                    .build_struct_gep(vec_ty, data_ptr, 0, "vd.data.ptr")
+                    .unwrap();
+                let len_ptr = self
+                    .builder
+                    .build_struct_gep(vec_ty, data_ptr, 1, "vd.len.ptr")
+                    .unwrap();
+                let cap_ptr = self
+                    .builder
+                    .build_struct_gep(vec_ty, data_ptr, 2, "vd.cap.ptr")
+                    .unwrap();
+                let data = self
+                    .builder
+                    .build_load(ptr_ty, data_ptr_ptr, "data")
+                    .unwrap()
+                    .into_pointer_value();
+                let len = self
+                    .builder
+                    .build_load(i64_t, len_ptr, "len")
+                    .unwrap()
+                    .into_int_value();
+                let cap = self
+                    .builder
+                    .build_load(i64_t, cap_ptr, "cap")
+                    .unwrap()
+                    .into_int_value();
+
+                // Growth check: if len == cap, grow (same shape as push).
+                let fn_val = self.current_fn.unwrap();
+                let grow_bb = self.context.append_basic_block(fn_val, "pushf.grow");
+                let shift_bb = self.context.append_basic_block(fn_val, "pushf.shift");
+                let needs_grow = self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::EQ, len, cap, "needs_grow")
+                    .unwrap();
+                self.builder
+                    .build_conditional_branch(needs_grow, grow_bb, shift_bb)
+                    .unwrap();
+
+                // Grow: new_cap = max(4, cap * 2); malloc; memcpy old; free old.
+                self.builder.position_at_end(grow_bb);
+                let two = i64_t.const_int(2, false);
+                let four = i64_t.const_int(4, false);
+                let doubled = self.builder.build_int_mul(cap, two, "doubled").unwrap();
+                let cmp = self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::UGT, doubled, four, "cmp")
+                    .unwrap();
+                let new_cap = self
+                    .builder
+                    .build_select(cmp, doubled, four, "new_cap")
+                    .unwrap()
+                    .into_int_value();
+                let elem_size = elem_ty.size_of().unwrap();
+                let alloc_bytes = self
+                    .builder
+                    .build_int_mul(new_cap, elem_size, "alloc_bytes")
+                    .unwrap();
+                let new_data = self
+                    .builder
+                    .build_call(self.malloc_fn, &[alloc_bytes.into()], "new_data")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_pointer_value();
+                let old_bytes = self
+                    .builder
+                    .build_int_mul(len, elem_size, "old_bytes")
+                    .unwrap();
+                self.builder
+                    .build_memcpy(new_data, 8, data, 8, old_bytes)
+                    .unwrap();
+                self.builder
+                    .build_call(self.free_fn, &[data.into()], "")
+                    .unwrap();
+                self.builder.build_store(data_ptr_ptr, new_data).unwrap();
+                self.builder.build_store(cap_ptr, new_cap).unwrap();
+                self.builder.build_unconditional_branch(shift_bb).unwrap();
+
+                // Shift existing [0..len) elements right by 1 — memmove
+                // (overlapping ranges, so memmove not memcpy). Then
+                // store the new element at index 0 and increment len.
+                self.builder.position_at_end(shift_bb);
+                let cur_data = self
+                    .builder
+                    .build_load(ptr_ty, data_ptr_ptr, "cur_data")
+                    .unwrap()
+                    .into_pointer_value();
+                let shifted_dst = unsafe {
+                    self.builder
+                        .build_gep(elem_ty, cur_data, &[i64_t.const_int(1, false)], "shift.dst")
+                        .unwrap()
+                };
+                let shift_bytes = self
+                    .builder
+                    .build_int_mul(len, elem_size, "shift_bytes")
+                    .unwrap();
+                self.builder
+                    .build_memmove(shifted_dst, 8, cur_data, 8, shift_bytes)
+                    .unwrap();
+                self.builder.build_store(cur_data, elem_val).unwrap();
+                let one = i64_t.const_int(1, false);
+                let new_len = self.builder.build_int_add(len, one, "new_len").unwrap();
+                self.builder.build_store(len_ptr, new_len).unwrap();
+
+                Ok(self.context.i64_type().const_int(0, false).into())
+            }
+            // `pop_back` aliases `pop`; `pop_front` is deferred until
+            // the existing Vec.pop returns Option (it currently
+            // returns the raw element value — see `test_e2e_vec_pop`
+            // which expects `20` not `Some(20)`). Both `pop_back` and
+            // `pop_front` should return `Option[T]` per design.md, but
+            // shipping that requires Option construction for arbitrary
+            // payload widths (compound-payload Option) — a broader
+            // codegen slice tracked separately.
+            "pop_front" => Err(format!(
+                "codegen: `{method}` on VecDeque[T] is not yet supported \
+                 (depends on Option-returning pop — same gap as existing \
+                 Vec.pop). Use `pop` / `pop_back` (returns raw value) \
+                 for now, or run through `karac run` (interpreter)."
+            )),
+            "pop" | "pop_back" => {
                 let len_ptr = self
                     .builder
                     .build_struct_gep(vec_ty, data_ptr, 1, "vec.len.ptr")
@@ -18268,7 +18419,10 @@ impl<'ctx> Codegen<'ctx> {
 /// non-Vec shapes or when generic args aren't a single type.
 fn vec_inner_type_expr(te: &TypeExpr) -> Option<TypeExpr> {
     if let TypeKind::Path(path) = &te.kind {
-        if path.segments.first().map(|s| s.as_str()) == Some("Vec") {
+        let name = path.segments.first().map(|s| s.as_str());
+        // Same `Vec[T]` / `VecDeque[T]` codegen alias as
+        // `extract_vec_elem_type`: VecDeque rides on Vec's struct shape.
+        if name == Some("Vec") || name == Some("VecDeque") {
             if let Some(args) = &path.generic_args {
                 if let Some(GenericArg::Type(elem)) = args.first() {
                     return Some(elem.clone());
