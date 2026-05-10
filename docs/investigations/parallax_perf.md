@@ -535,3 +535,122 @@ var, zero-LoC change, gives us instant signal on whether the
 `ACTIVE_FRAMES` mutex is the next bottleneck. If yes, the fix is
 either to make frame tracking lock-free or to gate it on a more
 selective signal (debug builds only, off in `--release`).
+
+### 2026-05-10 — Probe sweep rules out runtime, points to codegen
+
+Three quick probes, all on the same hardware + bench config, ran
+sequentially:
+
+| Probe | Config | req/s | p50 | p99 | What it tells us |
+|---|---|---|---|---|---|
+| Baseline post-fix | Pool fix, auto-par on, frame tracking on | 1,054 | 90 ms | 238 ms | (reference) |
+| Frame tracking off | `KARAC_RUNTIME_DEBUG_METADATA=0` | 1,074 | 90 ms | 237 ms | `ACTIVE_FRAMES` mutex is **NOT** the bottleneck |
+| Auto-par off | `KARAC_AUTO_PAR=0` (compile-time, sequential fan-out) | 1,077 | 85 ms | 258 ms | Fan-out provides **zero** throughput benefit at this load |
+| No-op handler | Removed `get_dashboard(1)` call from handler | **108,415** | **554 µs** | **55 ms** | Trampoline + HTTP path can do 108 K req/s — over 2× Rust's measured rate |
+
+**Two conclusions, one bigger than the other.**
+
+**(a) The pool fix's expected throughput improvement was always
+unreachable for this bench.** Sequential and parallel fan-out give
+the *same* throughput (1,074 vs 1,054 — within noise). At 100
+concurrent connections × 18 cores, the cores are fully utilized
+serving sequential requests; fan-out *within* a request doesn't add
+throughput because there's no spare CPU for it to use. (This is the
+classic Amdahl/Gustafson saturation case.) The pool fix was correct
+to ship — eliminating thread-creation overhead and improving p99 are
+real wins — but the auto-par mechanism itself is invisible at
+saturated load. Auto-par's value is at lower load (latency under
+N < num_cpus connections, where intra-request parallelism *can* find
+spare cores), or under workloads where individual branches block on
+real I/O instead of CPU-bound busy loops.
+
+**(b) Kāra's codegen for the busy loop runs ~25× slower than
+optimal — and that single fact accounts for the entire Kāra-vs-Rust
+gap.** Disassembly of `_busy_loop` in the kara binary
+(`otool -tV examples/parallax/bench/kara/.bin/server`):
+
+```
+_busy_loop:
+  sub  sp, sp, #0x20
+  stp  x0, xzr, [sp, #0x8]   ; spill n, init i = 0
+  str  xzr, [sp, #0x18]      ; init sum = 0
+.L:
+  ldp  x0, x8, [sp, #0x10]   ; reload sum, i  ← 2 stack loads
+  ldr  x9, [sp, #0x8]        ; reload n      ← 1 stack load
+  cmp  x8, x9                ; i < n ?
+  b.ge .exit
+  ldr  x8, [sp, #0x18]       ; redundant reload of i ← 1 stack load
+  add  x9, x0, x8            ; sum += i
+  add  x8, x8, #1            ; i += 1
+  stp  x9, x8, [sp, #0x10]   ; spill sum, i  ← 2 stack stores
+  b    .L
+.exit: ...
+```
+
+12 instructions per iter, all serialized through the stack-spill
+chain (every iter loads `i` and `sum` from memory, computes, stores
+back). On M5 P-core's ~4 GHz, that's ~3 ns/iter best-case — and
+measured 9.3 ns/iter (1077 req/s × 4 fetches × 2.275M average
+iterations × 9.3 ns ≈ 91 ms p50, matches measurement) suggests
+~12-15 cycles per iter, consistent with 1 inst/cycle dispatch
+through the stack-aliasing dependency chain.
+
+**Optimal codegen** keeps `i` and `sum` in registers for the
+duration of the loop, hoisting the load + final-store outside —
+LLVM's `mem2reg` + `loop-rotate` + `instcombine` passes do this
+trivially. The optimal inner loop is 4 instructions:
+
+```
+.L:
+  add sum, sum, i        ; 1 cycle
+  add i,   i,   #1       ; 1 cycle
+  cmp i,   n             ; 1 cycle (issue parallel with add)
+  b.lt .L                ; 1 cycle (predicted)
+```
+
+≈ 1-2 cycles per iter via macro-op fusion + branch prediction →
+0.25-0.5 ns/iter → 9.1 M iters in 2.3-4.5 ms. Rust's release-mode
+codegen runs the loops at this speed (`get_dashboard` got fully
+inlined into a single tokio-task closure; the busy-loop calls
+disappear into register-only inner loops we can't even isolate
+in the disassembly).
+
+**Diagnosis.** Kāra's codegen is producing what looks like `-O0`
+output for this kernel — local variables stay in stack slots, no
+mem2reg promotion, no redundant-load elimination, no loop-invariant
+code motion, no instruction-level scheduling. Either karac is not
+running LLVM optimization passes at all, or it's running them with
+metadata that prevents promotion (unlikely — these are standard
+mid-end passes that should fire trivially on this IR).
+
+**This subsumes H2 / H3 / H4 entirely.** The "Out of scope —
+closing the Kāra-vs-Rust gap" path enumerated in
+[`docs/demo_ideas.md § Slice E`](../demo_ideas.md) — borrowed
+accessors → inline trampoline → `#[repr(C)]` Request — would not
+have moved the needle in this configuration. The probes show:
+
+- The trampoline can already do 108 K req/s. It is **not** the
+  bottleneck.
+- The handler-fan-out / auto-par dispatch isn't the bottleneck
+  either (sequential and parallel are the same speed).
+- Frame tracking (the `ACTIVE_FRAMES` mutex) isn't the bottleneck.
+
+The bottleneck is **plain ARM codegen quality for tight integer
+loops**. Until that's fixed, the Kāra row is bound at ~1 K req/s on
+this bench regardless of any HTTP-path or runtime work.
+
+**Recommended next step.** Confirm the codegen-passes hypothesis at
+the source: read `src/codegen.rs` for the LLVM module construction
+and look for an explicit pass-pipeline configuration. If passes
+aren't being run, enabling `-O2`-equivalent (mem2reg, instcombine,
+loop-rotate, LICM, indvars, deadcode-elim) should be a small
+contained change. If passes *are* running, dump the pre-pass IR for
+`busy_loop` (`karac build` with an LLVM-IR-emit flag if one exists,
+or hack one in temporarily) and check what the IR looks like —
+maybe the IR has a feature that defeats `mem2reg` (e.g., taking
+addresses of locals).
+
+Bench validation criterion for the codegen fix: the Kāra row
+should jump to **20-40 K req/s** (within striking distance of
+Rust's 47 K), since the codegen overhead currently dominates and
+the trampoline ceiling is already 108 K.
