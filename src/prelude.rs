@@ -69,6 +69,7 @@ pub const PRELUDE_TYPES: &[&str] = &[
     "Option",
     "Result",
     "Vec",
+    "VecDeque",
     "Array",
     "Slice",
     "Map",
@@ -301,6 +302,10 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
     ("option.kara", include_str!("../runtime/stdlib/option.kara")),
     ("result.kara", include_str!("../runtime/stdlib/result.kara")),
     ("vec.kara", include_str!("../runtime/stdlib/vec.kara")),
+    (
+        "vec_deque.kara",
+        include_str!("../runtime/stdlib/vec_deque.kara"),
+    ),
     ("map.kara", include_str!("../runtime/stdlib/map.kara")),
     (
         "sorted_set.kara",
@@ -571,8 +576,8 @@ fn stub_struct(name: &str, span: &Span) -> Item {
 /// participates in type inference.
 fn stub_generics(name: &str, span: &Span) -> Option<GenericParams> {
     let params: &[&str] = match name {
-        "Option" | "Vec" | "Slice" | "Array" | "Set" | "Atomic" | "SortedSet" | "Channel"
-        | "Sender" | "Receiver" => &["T"],
+        "Option" | "Vec" | "VecDeque" | "Slice" | "Array" | "Set" | "Atomic" | "SortedSet"
+        | "Channel" | "Sender" | "Receiver" => &["T"],
         "Result" => &["T", "E"],
         "Map" | "Entry" => &["K", "V"],
         _ => return None,

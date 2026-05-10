@@ -3728,7 +3728,7 @@ impl<'a> TypeChecker<'a> {
         // Iterator-element-type (`Item`) mappings for baked collection
         // types. The structs themselves are baked; the assoc-type
         // mapping has no syntactic representation in baked source.
-        for name in &["Vec", "SortedSet", "Set", "Peekable", "Slice"] {
+        for name in &["Vec", "VecDeque", "SortedSet", "Set", "Peekable", "Slice"] {
             self.env
                 .impl_assoc_types
                 .insert((name.to_string(), "Item".to_string()), t());

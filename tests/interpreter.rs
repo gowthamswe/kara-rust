@@ -132,6 +132,132 @@ fn test_or_evaluates_rhs_when_lhs_false() {
     assert_eq!(out, "called\nelse\n");
 }
 
+// ── `VecDeque[T]` (design.md) ───────────────────────────────────
+
+#[test]
+fn test_vec_deque_new_and_push_back() {
+    let out = run(r#"
+        fn main() {
+            let mut q: VecDeque[i64] = VecDeque.new();
+            q.push_back(1);
+            q.push_back(2);
+            q.push_back(3);
+            println(q.len());
+            println(q.is_empty());
+        }
+    "#);
+    assert_eq!(out, "3\nfalse\n");
+}
+
+#[test]
+fn test_vec_deque_push_front_then_pop_back_observes_correct_order() {
+    // Mixed push_front/push_back with full pop_front/pop_back drain —
+    // pins the front/back distinction under the shared `Vec[Value]`
+    // storage that the interpreter uses internally.
+    let out = run(r#"
+        fn main() {
+            let mut q: VecDeque[i64] = VecDeque.new();
+            q.push_back(2);
+            q.push_back(3);
+            q.push_front(1);
+            let f = q.pop_front();
+            let b = q.pop_back();
+            let m = q.pop_front();
+            println(f);
+            println(b);
+            println(m);
+        }
+    "#);
+    assert_eq!(out, "Some(1)\nSome(3)\nSome(2)\n");
+}
+
+#[test]
+fn test_vec_deque_pop_empty_returns_none() {
+    let out = run(r#"
+        fn main() {
+            let mut q: VecDeque[i64] = VecDeque.new();
+            let f = q.pop_front();
+            let b = q.pop_back();
+            println(f);
+            println(b);
+        }
+    "#);
+    assert_eq!(out, "None\nNone\n");
+}
+
+#[test]
+fn test_vec_deque_iter_yields_in_front_to_back_order() {
+    // `iter()` must yield items front-to-back. The runtime is
+    // `Value::Array` so iter routes through the existing eager-
+    // snapshot Iterator path; this pins the order against shape
+    // changes.
+    let out = run(r#"
+        fn main() {
+            let mut q: VecDeque[i64] = VecDeque.new();
+            q.push_back(20);
+            q.push_back(30);
+            q.push_front(10);
+            for x in q.iter() {
+                println(x);
+            }
+        }
+    "#);
+    assert_eq!(out, "10\n20\n30\n");
+}
+
+#[test]
+fn test_vec_deque_string_elements() {
+    // Non-Copy element type flows through unchanged.
+    let out = run(r#"
+        fn main() {
+            let mut q: VecDeque[String] = VecDeque.new();
+            q.push_back("first");
+            q.push_back("second");
+            q.push_front("zero");
+            let f = q.pop_front();
+            let b = q.pop_back();
+            println(f);
+            println(b);
+        }
+    "#);
+    assert_eq!(out, "Some(zero)\nSome(second)\n");
+}
+
+#[test]
+fn test_vec_deque_bfs_frontier_pattern() {
+    // The kata's actual workflow shape: a BFS frontier with
+    // push_back at the producer side and pop_front at the consumer
+    // side. Verifies FIFO order with mixed enqueue/dequeue.
+    let out = run(r#"
+        fn main() {
+            let mut frontier: VecDeque[i64] = VecDeque.new();
+            frontier.push_back(1);
+            let mut count = 0;
+            loop {
+                let next = frontier.pop_front();
+                match next {
+                    Some(node) => {
+                        count = count + 1;
+                        if node < 3 {
+                            frontier.push_back(node + 1);
+                            frontier.push_back(node + 2);
+                        }
+                    },
+                    None => { break; },
+                }
+            }
+            println(count);
+        }
+    "#);
+    // Frontier: [1] → pop 1 (1), push 2,3 → [2,3]
+    //               → pop 2 (2), push 3,4 → [3,3,4]
+    //               → pop 3 (3), no push     → [3,4]
+    //               → pop 3 (4), no push     → [4]
+    //               → pop 4 (5), no push     → []
+    //               → pop None, break. count=5.
+    assert_eq!(out, "5\n");
+}
+
 // ── `Vec.filled(n, val)` (design.md:1631) ───────────────────────
 
 #[test]

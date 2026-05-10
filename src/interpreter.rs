@@ -1061,6 +1061,25 @@ fn upgrade_weak_to_option(weak: &std::sync::Weak<SharedStructInner>) -> Value {
     }
 }
 
+/// Wrap a `Some(Value)` / `None` Rust option in the corresponding
+/// Kāra `Option[T]` enum variant. Used by `pop_back` / `pop_front` —
+/// any method whose return type is `Option[T]` and whose Rust impl
+/// already produces an `Option<Value>`.
+fn option_value_from(v: Option<Value>) -> Value {
+    match v {
+        Some(inner) => Value::EnumVariant {
+            enum_name: "Option".to_string(),
+            variant: "Some".to_string(),
+            data: EnumData::Tuple(vec![inner]),
+        },
+        None => Value::EnumVariant {
+            enum_name: "Option".to_string(),
+            variant: "None".to_string(),
+            data: EnumData::Unit,
+        },
+    }
+}
+
 /// Sentinel value bound to `errdefer(e)` in cancelled `par {}` siblings.
 /// Per design.md § Drop ordering within a branch, the real value should
 /// come from `E::cancelled()` where `E` is the function's `Err` type and
@@ -3916,6 +3935,18 @@ impl<'a> Interpreter<'a> {
                 "Vec.new" => {
                     return Value::array_of(Vec::new());
                 }
+                // `VecDeque.new() -> VecDeque[T]` — runtime shape mirrors
+                // `Vec.new`'s shared `Arc<RwLock<Vec<Value>>>` storage.
+                // Front-end ops (`push_front`/`pop_front`) translate to
+                // `Vec::insert(0, …)` / `Vec::remove(0)` at the
+                // method-dispatch layer (see `eval_method_call`'s `_front`
+                // arms). The asymptotic O(n) cost is acceptable for the
+                // tree-walk interpreter — perf-relevant workloads run
+                // through codegen, where a real `VecDeque` lowering lands
+                // as a peer slice.
+                "VecDeque.new" => {
+                    return Value::array_of(Vec::new());
+                }
                 // `Vec.filled(n: i64, val: T) -> Vec[T] where T: Clone` —
                 // spec at design.md:1631. Routed through a helper so
                 // its locals don't bloat the surrounding `eval_call`
@@ -6404,6 +6435,19 @@ impl<'a> Interpreter<'a> {
                     };
                     try_write_or_panic(rc, &label).push(val);
                     return Value::Unit;
+                }
+            }
+            // ── VecDeque[T] surface (design.md). The runtime shape is
+            //    the same `Value::Array` storage as `Vec[T]`; front-end
+            //    ops translate to `Vec::insert(0, …)` / `Vec::remove(0)`
+            //    (O(n) — acceptable for the tree-walk interpreter). The
+            //    typechecker is permissive, so `Vec[T]` receivers can
+            //    also reach these arms; valid Kāra source guards via
+            //    receiver type. Routed through helpers to keep
+            //    `eval_method_call`'s debug-mode stack frame compact.
+            "push_back" | "push_front" | "pop_back" | "pop_front" => {
+                if matches!(&obj, Value::Array(_)) {
+                    return self.eval_vec_deque_method(method, &obj, object, args);
                 }
             }
             "is_some" => {
@@ -8943,6 +8987,58 @@ impl<'a> Interpreter<'a> {
             items.push(val.clone());
         }
         Value::array_of(items)
+    }
+
+    /// `VecDeque[T]` mutation methods — `push_back` / `push_front` /
+    /// `pop_back` / `pop_front`. Caller already verified the receiver
+    /// is `Value::Array`. Extracted so its locals don't bloat
+    /// `eval_method_call`'s stack frame.
+    fn eval_vec_deque_method(
+        &mut self,
+        method: &str,
+        obj: &Value,
+        object: &Expr,
+        args: &[CallArg],
+    ) -> Value {
+        let Value::Array(rc) = obj else {
+            return Value::Unit;
+        };
+        let label = match &object.kind {
+            ExprKind::Identifier(n) => n.clone(),
+            _ => "<value>".to_string(),
+        };
+        match method {
+            "push_back" => {
+                let val = args
+                    .first()
+                    .map(|a| self.eval_expr_inner(&a.value))
+                    .unwrap_or(Value::Unit);
+                try_write_or_panic(rc, &label).push(val);
+                Value::Unit
+            }
+            "push_front" => {
+                let val = args
+                    .first()
+                    .map(|a| self.eval_expr_inner(&a.value))
+                    .unwrap_or(Value::Unit);
+                try_write_or_panic(rc, &label).insert(0, val);
+                Value::Unit
+            }
+            "pop_back" => {
+                let popped = try_write_or_panic(rc, &label).pop();
+                option_value_from(popped)
+            }
+            "pop_front" => {
+                let mut guard = try_write_or_panic(rc, &label);
+                let popped = if guard.is_empty() {
+                    None
+                } else {
+                    Some(guard.remove(0))
+                };
+                option_value_from(popped)
+            }
+            _ => Value::Unit,
+        }
     }
 
     fn eval_binary(&mut self, op: &BinOp, left: Value, right: Value, span: &Span) -> Value {

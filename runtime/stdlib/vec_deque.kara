@@ -1,0 +1,10 @@
+// runtime/stdlib/vec_deque.kara
+//
+// `VecDeque[T]` — double-ended queue. Method surface
+// (`new`, `push_front`, `push_back`, `pop_front`, `pop_back`,
+// `len`, `is_empty`, `iter`) dispatches through the interpreter's
+// hardcoded `eval_call` / `eval_method_call` paths today (codegen
+// is a peer follow-up). Mirrors the `vec.kara` shape: opaque
+// in-memory representation, no public fields, no `#[derive(...)]`.
+
+struct VecDeque[T] { }
