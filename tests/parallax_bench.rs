@@ -243,7 +243,18 @@ mod parallax_bench_tests {
                 last_err
             ),
         };
-        assert_eq!(status, 200, "expected 200 status; body={body:?}");
+        // 2xx success — exact status is bench-impl choice. Post-G1
+        // (`5ef2ea6`), `handle()` folds three Dashboard i64 fields
+        // into the response status (`200 + ((order ^ notif ^ rec) &
+        // 1)`) so DCE can't elide the busy_loop calls. Status is
+        // deterministically 200 or 201 depending on the kernel's
+        // output for fixed user_id=1; both are valid for the smoke
+        // test's purpose (server responded with a JSON body that
+        // includes the expected fields).
+        assert!(
+            (200..300).contains(&status),
+            "expected 2xx status; got={status}; body={body:?}"
+        );
         assert!(
             body.contains("\"profile\""),
             "body should contain `\"profile\"` field; got: {body:?}"

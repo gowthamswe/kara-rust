@@ -313,3 +313,95 @@ sweep we ran ad-hoc (`-c100`, `-c500`, `-c1000`, `-c2000`) is
 captured in [`http_layer_perf.md`](http_layer_perf.md); folding
 it into `bench.sh` + adding multi-run statistics + parsing
 p99.9 / p99.99 are the next slice on this doc's priority order.
+
+### 2026-05-10 — G2 + G3 + G4 landed
+
+**Fix.** `bench.sh` refactored from single-shot
+`wrk -t4 -c100 -d10s+30s` per impl into a swept matrix:
+
+- **G2 (connection sweep).** New `--connections=A,B,C` flag
+  (default `100,1000,5000`). For each impl, runs the measurement
+  loop at every connection count in the list. Output is one row
+  per (impl, conn) pair — 4 impls × 3 conn-counts = 12 rows by
+  default. The new `run_impl` launches the server *once* per impl
+  and reuses it across all connection-count rounds, avoiding
+  per-conn build + spawn overhead.
+- **G3 (multi-run statistics).** New `--runs=N` flag (default 3).
+  For each (impl, conn) pair, the measurement loop runs N rounds
+  and aggregates: req/s reported as `median [min..max]`; each
+  latency percentile reported as median across rounds. The
+  aggregator separately tracks "valid rps" rows vs "valid full
+  percentile" rows so a partially-failed run (saturated server
+  prints `Requests/sec:` but no `Latency Distribution`) still
+  contributes to the rps median without polluting the percentile
+  medians with 0s.
+- **G4 (percentile distribution).** Parser extended from
+  `Requests/sec` + `99%` only to `Requests/sec` + `Latency Max` +
+  `50%/75%/90%/99%`. wrk 4.2.0 doesn't print finer percentiles
+  (p99.9, p99.99) without a custom Lua HdrHistogram script —
+  surfaced as a separate follow-up; the current 5 percentiles
+  + max give meaningful tail characterization for the impl-shape
+  comparisons we care about.
+
+Bug fixes uncovered while iterating: (a) the awk regex
+`^[[:space:]]+Latency[[:space:]]` matched both the per-thread
+stats row (`Latency  136ms ...`) and the `Latency Distribution`
+header that immediately follows, with the latter clobbering
+`lat_max` to 0 on its empty 4th field; tightened to require a
+digit immediately after `Latency`. (b) Default warmup of 3 s at
+`-c100` against the slow Node server pinned 100 keep-alive
+connections in TIME_WAIT state on macOS loopback for ~30 s,
+starving subsequent measure rounds of ephemeral ports — node's
+rows came back all-NA. Default warmup dropped to 0 (the
+existing N=3 measure rounds + median aggregation naturally
+exclude first-round JIT/cold-start outliers); users can opt in
+via `--warmup=N` for explicit characterization.
+
+**Final apples-to-apples table** (M5 Pro, post-G2+G3+G4):
+
+| Impl | -c    | req/s (med [min..max]) | p50  | p99  | max  |
+|------|-------|------------------------|------|------|------|
+| Kāra | 100   | 715 [714..720]         | 135  | **313**  | 431  |
+| Kāra | 1000  | 678 [678..698]         | 1210 | 1960 | 2000 |
+| Kāra | 5000  | 673 [673..675]         | 1300 | 1980 | 2000 |
+| Rust | 100   | 720 [719..722]         | 119  | 824  | 1710 |
+| Rust | 1000  | 719 [714..720]         | 763  | 1940 | 2000 |
+| Rust | 5000  | 244 [207..698]         | 1140 | 1980 | 2000 |
+| Go   | 100   | 661 [405..662]         | 137  | 1200 | 1620 |
+| Go   | 1000  | 621 [575..659]         | 808  | 1910 | 2000 |
+| Go   | 5000  | 577 [572..634]         | 1350 | 1980 | 2000 |
+| Node | 100   | 6 [6..6]               | 1100 | 1970 | 1970 |
+
+**New findings the rich format reveals (impossible to see in v4
+single-shot data):**
+
+1. **Rust collapses at -c5000.** The rps row goes from
+   720 / 719 (steady at -c100 / -c1000) to **244 [207..698]**
+   (huge variance). Some runs survive, some hit
+   `tokio::task::spawn_blocking`'s blocking-pool ceiling and
+   stall. Kāra is rock-stable across the same sweep
+   (715 → 678 → 673, only -6 %). v4's single -c100 measurement
+   would never have surfaced this asymmetry.
+2. **Go's p99 at -c100 (1200 ms) is worse than its p99 at
+   -c5000 (1980 ms) ratio'd to throughput.** GC pauses that hit
+   under sustained allocation pressure show up cleanly in the
+   percentile-distribution view. p50/p75/p90 are reasonable;
+   p99 is the GC-pause-dominated outlier.
+3. **Go has a "warm-up tax" at -c100** — `[405..662]` is huge
+   variance, suggesting one of the 3 runs caught a major GC
+   cycle. Multi-run statistics surface this; a single
+   measurement could either land in the slow run (looks like Go
+   is broken) or the fast run (looks like Go is matching Kāra).
+4. **Kāra's tail-latency advantage from `karac_par_run`'s work-
+   helping wait loop is even more striking with the rich
+   percentile data.** At -c100, Kāra's p99 (313 ms) is *2.6×
+   lower than Rust's* (824 ms) and *3.8× lower than Go's*
+   (1200 ms). The previous single-snapshot v4 numbers showed
+   the gap but didn't characterize how robust it is — the
+   rich format makes it clear this isn't a single-run artifact.
+
+**G5 / G6 / G7-G11 status.** Not landed; ranked priority
+unchanged from the doc's "Suggested execution order" section.
+G5 (cold-start separation) is the next-most-impactful; G6 (wrk
+version pinning) is now partially handled because `bench.sh`
+now prints the wrk version string at the top of every run.

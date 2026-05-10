@@ -1,15 +1,30 @@
 #!/bin/sh
-# Slice E (2026-05-09) — Three-language Parallax bench driver.
+# Slice E (2026-05-09) — Parallax bench driver. Updated 2026-05-10
+# (G2 + G3 + G4) to sweep connection counts, run multiple measurement
+# rounds per (impl, conn) pair, and report a richer percentile spectrum.
 #
 # Builds + runs the four reference impls (kara, rust, go, node) and
-# probes each with `wrk` for throughput + p99 latency. Sequential runs
-# on the same machine — F4 fairness control.
+# probes each with `wrk` for throughput + latency-distribution.
+# Sequential per-impl runs on the same machine — F4 fairness control.
 #
 # Usage:
-#   bench.sh                 # build all impls, run wrk against each
-#   bench.sh --dry-run       # print what would run; touch nothing
-#   bench.sh --impls=k,r     # comma-separated subset (k=kara, r=rust,
-#                            # g=go, n=node). Default: k,r,g,n.
+#   bench.sh                          # full bench, all four impls
+#   bench.sh --dry-run                # print what would run; touch nothing
+#   bench.sh --impls=k,r              # comma-separated subset
+#                                     # (k=kara, r=rust, g=go, n=node)
+#   bench.sh --connections=100,1000   # connection-count sweep (default
+#                                     # 100,1000,5000). One row per
+#                                     # (impl, conn) pair in the output.
+#   bench.sh --runs=5                 # measurement rounds per
+#                                     # (impl, conn) pair (default 3).
+#                                     # Output reports median req/s with
+#                                     # min..max range across rounds.
+#   bench.sh --warmup=5               # one-time per-server warmup
+#                                     # before any measurement (default
+#                                     # 3s). Per-(conn,run) fresh
+#                                     # warmup is implicit in wrk.
+#   bench.sh --measure=15             # measure-window length per
+#                                     # round (default 10s).
 #
 # **Toolchain probing.** Each impl checks for its required toolchain
 # (cargo for kara + rust; go for go; node for node; wrk always
@@ -17,10 +32,14 @@
 # installed` to stderr; the impl is skipped, the bench continues for
 # the others.
 #
-# **Throughput parser.** `wrk -d30s` output has the form
-# `Requests/sec: 1234.56` and `99% <latency-with-units>`. The parser
-# extracts those two lines verbatim. Tested against `wrk` 4.x; if a
-# future major rev changes the format, update PARSE_RPS / PARSE_P99.
+# **Output format.** wrk's `--latency` produces fixed percentiles
+# (p50/p75/p90/p99) plus a `Latency ... Max` line. We parse all five
+# (p50, p75, p90, p99, max) plus `Requests/sec:`. Per `(impl, conn)`
+# pair, N runs produce N values per metric; we report median req/s
+# with [min..max] range, and the median of each percentile across
+# the N rounds. Higher percentiles (p99.9, p99.99) require wrk2 or
+# a Lua HdrHistogram script — out of scope here; tracked at
+# `docs/investigations/bench_robustness.md § G4`.
 #
 # **No throughput-number assertions in CI.** Per the slice plan, the
 # numbers are the artifact, not a regression gate. `tests/parallax_
@@ -37,10 +56,20 @@ REPO_ROOT=$(CDPATH= cd -- "$BENCH_DIR/../../.." && pwd)
 # ── Defaults ───────────────────────────────────────────────────────
 DRY_RUN=0
 IMPLS_FILTER="k,r,g,n"
-WARMUP_SEC=10
-MEASURE_SEC=30
+# Default warmup = 0 (no warmup). With $RUNS=3 measure rounds and
+# median-of-runs aggregation, the first-round JIT/cold-start outlier
+# is naturally excluded — warmup adds time without improving the
+# reported median. Also avoids a Node-specific failure mode: at
+# -c100, a 3 s warmup pins 100 keep-alive connections in TIME_WAIT
+# on the macOS loopback for ~30 s after closing, starving the
+# subsequent measure rounds of ephemeral ports for fresh
+# connections. Users who want explicit warmup characterization can
+# pass --warmup=N.
+WARMUP_SEC=0
+MEASURE_SEC=10
 WRK_THREADS=4
-WRK_CONNS=100
+CONNECTIONS_LIST="100,1000,5000"
+RUNS=3
 PORT_TIMEOUT_SEC=30
 
 # ── Parse args ─────────────────────────────────────────────────────
@@ -50,8 +79,10 @@ for arg in "$@"; do
     --impls=*) IMPLS_FILTER="${arg#--impls=}" ;;
     --warmup=*) WARMUP_SEC="${arg#--warmup=}" ;;
     --measure=*) MEASURE_SEC="${arg#--measure=}" ;;
+    --connections=*) CONNECTIONS_LIST="${arg#--connections=}" ;;
+    --runs=*) RUNS="${arg#--runs=}" ;;
     -h|--help)
-      sed -n '3,28p' "$0"
+      sed -n '3,49p' "$0"
       exit 0
       ;;
     *)
@@ -74,11 +105,9 @@ have() {
 }
 
 # ── Per-impl runners ────────────────────────────────────────────────
-# Each runner echoes a single line on success: `<name>|<rps>|<p99>`.
-# On skip, echoes `<name>|skip|<reason>` to stderr and returns 0 so the
-# loop continues. Builds happen at the start of each runner, then the
-# server is launched in the background, the wrk warmup + measurement
-# fire, and the server is killed.
+# Each runner builds its impl and returns 0 on success, non-zero on
+# skip. The actual server launch + wrk loop happens after the runner
+# returns — see run_impl.
 
 prepare_kara() {
   if ! have cargo; then
@@ -106,7 +135,6 @@ prepare_kara() {
     echo "skip: kara compile failed (karac build server.kara)" >&2
     return 1
   }
-  # `karac build` writes `./server` next to the cwd; move it to .bin/.
   if [ -f "$REPO_ROOT/server" ]; then
     mv "$REPO_ROOT/server" "$KARA_EXE"
   elif [ -f "./server" ]; then
@@ -180,9 +208,6 @@ prepare_node() {
 }
 
 # ── Server launcher + port discovery ────────────────────────────────
-# Spawn $1 in the background; capture stdout into $2; wait up to
-# $PORT_TIMEOUT_SEC for `BOUND_PORT=<n>` line; echo port to stdout.
-# The PID is left in $SERVER_PID for the caller to kill after wrk.
 SERVER_PID=""
 launch_and_get_port() {
   cmd="$1"
@@ -212,30 +237,115 @@ kill_server() {
   fi
 }
 
-# ── wrk runner + parser ─────────────────────────────────────────────
-# Run wrk twice (warmup, then measure). Echoes `<rps>|<p99>` on
-# stdout. wrk's `Requests/sec:` line is the throughput; the latency
-# distribution row whose first column is `99%` is the p99.
-run_wrk() {
+# ── wrk runner + percentile parser ──────────────────────────────────
+# Runs one wrk measurement round. Echoes a single space-separated row:
+#   `<rps> <p50_ms> <p75_ms> <p90_ms> <p99_ms> <max_ms>`
+# (latencies normalized to milliseconds — wrk's output uses us/ms/s
+# suffixes, we convert to ms in awk.) On parse failure echoes
+# `NA NA NA NA NA NA` so the aggregator's `awk` math doesn't choke.
+run_wrk_one() {
   port="$1"
-  if ! have wrk; then
-    echo "skip: wrk not installed" >&2
-    return 1
-  fi
+  conns="$2"
   url="http://127.0.0.1:$port/dashboard/1"
-  # warmup
-  wrk -t"$WRK_THREADS" -c"$WRK_CONNS" -d"${WARMUP_SEC}s" "$url" >/dev/null 2>&1 || true
-  # measure
-  out=$(wrk -t"$WRK_THREADS" -c"$WRK_CONNS" -d"${MEASURE_SEC}s" --latency "$url" 2>&1) || true
-  rps=$(echo "$out" | awk '/^Requests\/sec:/ { print $2 }')
-  p99=$(echo "$out" | awk '/^[[:space:]]+99%/ { print $2 }')
-  echo "${rps:-NA}|${p99:-NA}"
+  out=$(wrk -t"$WRK_THREADS" -c"$conns" -d"${MEASURE_SEC}s" --latency "$url" 2>&1) || true
+  echo "$out" | awk '
+    function to_ms(v,    n, u) {
+      n = v + 0
+      u = v
+      sub(/^[0-9.]+/, "", u)
+      if (u == "us") return n / 1000.0
+      if (u == "ms") return n
+      if (u == "s")  return n * 1000.0
+      if (u == "m")  return n * 60000.0
+      return n  # unitless or unrecognized — treat as ms-equivalent
+    }
+    /^Requests\/sec:/ { rps = $2 + 0 }
+    # Match the per-thread `Latency` *stats* row (fields are Avg, Stdev,
+    # Max, +/- Stdev), not the `Latency Distribution` header that
+    # immediately follows. The trailing `[0-9]` rules out the header
+    # case which has `Distribution` in field 2.
+    /^[[:space:]]+Latency[[:space:]]+[0-9]/ { lat_max = to_ms($4) }
+    /^[[:space:]]+50%[[:space:]]/  { p50 = to_ms($2) }
+    /^[[:space:]]+75%[[:space:]]/  { p75 = to_ms($2) }
+    /^[[:space:]]+90%[[:space:]]/  { p90 = to_ms($2) }
+    /^[[:space:]]+99%[[:space:]]/  { p99 = to_ms($2) }
+    END {
+      printf "%s %s %s %s %s %s\n",
+        (rps    ? rps    : "NA"),
+        (p50    ? p50    : "NA"),
+        (p75    ? p75    : "NA"),
+        (p90    ? p90    : "NA"),
+        (p99    ? p99    : "NA"),
+        (lat_max ? lat_max : "NA")
+    }
+  '
 }
 
-# ── Run an impl end-to-end ──────────────────────────────────────────
+# ── Multi-run aggregator ────────────────────────────────────────────
+# Runs run_wrk_one $RUNS times for a (port, conns) pair; aggregates
+# across runs. Echoes a single row:
+#   `<conns> <rps_med> <rps_min> <rps_max> <p50_med> <p75_med> <p90_med> <p99_med> <max_med>`
+# All latencies in milliseconds.
+run_wrk_aggregated() {
+  port="$1"
+  conns="$2"
+  raw=""
+  i=0
+  while [ "$i" -lt "$RUNS" ]; do
+    line=$(run_wrk_one "$port" "$conns") || line="NA NA NA NA NA NA"
+    raw="${raw}${line}
+"
+    i=$((i + 1))
+  done
+  printf '%s' "$raw" | awk -v conns="$conns" '
+    function median(a, n,    i, j, t) {
+      for (i = 1; i <= n; i++)
+        for (j = i + 1; j <= n; j++)
+          if (a[i] > a[j]) { t = a[i]; a[i] = a[j]; a[j] = t }
+      if (n % 2 == 1) return a[(n + 1) / 2]
+      else return (a[n / 2] + a[n / 2 + 1]) / 2
+    }
+    function minof(a, n,    i, m) { m = a[1]; for (i = 2; i <= n; i++) if (a[i] < m) m = a[i]; return m }
+    function maxof(a, n,    i, m) { m = a[1]; for (i = 2; i <= n; i++) if (a[i] > m) m = a[i]; return m }
+    # Track valid runs separately for rps vs full-percentile data —
+    # at high connection counts wrk under load can return a
+    # `Requests/sec:` line without any Latency Distribution rows
+    # (server saturating, lots of socket errors, distribution table
+    # suppressed). Including those partial rows in percentile
+    # medians yields 0s that dominate the median; we keep them in
+    # the rps aggregate (the run still produced a throughput
+    # number) but exclude them from percentile aggregates.
+    $1 != "NA" {
+      rn++; rps[rn] = $1
+    }
+    $1 != "NA" && $2 != "NA" && $3 != "NA" && $4 != "NA" && $5 != "NA" && $6 != "NA" {
+      pn++
+      p50[pn] = $2; p75[pn] = $3; p90[pn] = $4; p99[pn] = $5; lmax[pn] = $6
+    }
+    END {
+      if (rn == 0) {
+        printf "%s NA NA NA NA NA NA NA NA\n", conns
+        exit
+      }
+      printf "%s %.2f %.2f %.2f", conns, median(rps, rn), minof(rps, rn), maxof(rps, rn)
+      if (pn == 0) {
+        printf " NA NA NA NA NA\n"
+      } else {
+        printf " %.2f %.2f %.2f %.2f %.2f\n",
+          median(p50, pn), median(p75, pn), median(p90, pn), median(p99, pn),
+          median(lmax, pn)
+      }
+    }
+  '
+}
+
+# ── Run one impl across all connection counts ───────────────────────
 # $1 = impl tag (k|r|g|n), $2 = display name, $3 = prepare fn,
-# $4 = run command (path to exe / interp). On dry-run, just announce
-# the impl name and return.
+# $4 = run command (path to exe / interp). Builds the impl, launches
+# the server once, runs a one-time warmup, then sweeps connection
+# counts × runs and emits one result row per (impl, conn) to stdout.
+# Rows have the form:
+#   `<name>|<conns>|<rps_med>|<rps_min>|<rps_max>|<p50>|<p75>|<p90>|<p99>|<max>`
 run_impl() {
   tag="$1"
   name="$2"
@@ -246,27 +356,55 @@ run_impl() {
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
     "$prepare" || true
-    echo "$name|DRY|DRY"
+    # Emit a placeholder row per connection count so --dry-run output
+    # exercises the same shape as the real output.
+    for c in $(echo "$CONNECTIONS_LIST" | tr ',' ' '); do
+      echo "$name|$c|DRY|DRY|DRY|DRY|DRY|DRY|DRY|DRY"
+    done
     return 0
   fi
   if ! "$prepare"; then
-    echo "$name|SKIP|SKIP"
+    for c in $(echo "$CONNECTIONS_LIST" | tr ',' ' '); do
+      echo "$name|$c|SKIP|SKIP|SKIP|SKIP|SKIP|SKIP|SKIP|SKIP"
+    done
     return 0
   fi
   log=$(mktemp)
   trap 'kill_server; rm -f "$log"' EXIT INT TERM
   port=$(launch_and_get_port "$cmd" "$log") || {
-    echo "$name|BIND_FAIL|BIND_FAIL" >&2
+    for c in $(echo "$CONNECTIONS_LIST" | tr ',' ' '); do
+      echo "$name|$c|BIND_FAIL|BIND_FAIL|BIND_FAIL|BIND_FAIL|BIND_FAIL|BIND_FAIL|BIND_FAIL|BIND_FAIL" >&2
+    done
     kill_server
     rm -f "$log"
     trap - EXIT INT TERM
     return 0
   }
-  result=$(run_wrk "$port") || result="WRK_FAIL|WRK_FAIL"
+  if ! have wrk; then
+    for c in $(echo "$CONNECTIONS_LIST" | tr ',' ' '); do
+      echo "$name|$c|WRK_MISSING|WRK_MISSING|WRK_MISSING|WRK_MISSING|WRK_MISSING|WRK_MISSING|WRK_MISSING|WRK_MISSING" >&2
+    done
+    kill_server
+    rm -f "$log"
+    trap - EXIT INT TERM
+    return 0
+  fi
+  # Optional one-time per-server warmup at the smallest connection
+  # count. Default WARMUP_SEC=0 (skipped); see DRY_RUN-section
+  # comment on default rationale.
+  if [ "$WARMUP_SEC" -gt 0 ]; then
+    first_conn=$(echo "$CONNECTIONS_LIST" | cut -d',' -f1)
+    url="http://127.0.0.1:$port/dashboard/1"
+    wrk -t"$WRK_THREADS" -c"$first_conn" -d"${WARMUP_SEC}s" "$url" >/dev/null 2>&1 || true
+  fi
+  for c in $(echo "$CONNECTIONS_LIST" | tr ',' ' '); do
+    agg=$(run_wrk_aggregated "$port" "$c") || agg="$c NA NA NA NA NA NA NA NA"
+    # Convert space-separated to pipe-separated and prepend impl name.
+    echo "$name|$(echo "$agg" | tr ' ' '|')"
+  done
   kill_server
   rm -f "$log"
   trap - EXIT INT TERM
-  echo "$name|$result"
 }
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -275,43 +413,54 @@ echo "  bench dir: $BENCH_DIR"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "  mode: DRY RUN (no servers spawned, no wrk)"
 fi
+if have wrk; then
+  echo "  wrk: $(wrk --version 2>&1 | head -1)"
+fi
 echo "  impls filter: $IMPLS_FILTER"
-echo "  warmup: ${WARMUP_SEC}s, measure: ${MEASURE_SEC}s, threads: $WRK_THREADS, conns: $WRK_CONNS"
+echo "  connections sweep: $CONNECTIONS_LIST"
+echo "  runs per (impl, conn): $RUNS"
+echo "  warmup: ${WARMUP_SEC}s (one-time per-server), measure: ${MEASURE_SEC}s × $RUNS rounds"
 echo
 
 results=""
 
-# kara
 KARA_EXE_HOLDER="$BENCH_DIR/kara/.bin/server"
-line=$(run_impl "k" "kara" prepare_kara "$KARA_EXE_HOLDER")
+out=$(run_impl "k" "kara" prepare_kara "$KARA_EXE_HOLDER")
 results="$results
-$line"
+$out"
 
-# rust
 RUST_EXE_HOLDER="$BENCH_DIR/rust/target/release/parallax-bench-rust"
-line=$(run_impl "r" "rust" prepare_rust "$RUST_EXE_HOLDER")
+out=$(run_impl "r" "rust" prepare_rust "$RUST_EXE_HOLDER")
 results="$results
-$line"
+$out"
 
-# go
 GO_EXE_HOLDER="$BENCH_DIR/go/parallax-bench-go"
-line=$(run_impl "g" "go" prepare_go "$GO_EXE_HOLDER")
+out=$(run_impl "g" "go" prepare_go "$GO_EXE_HOLDER")
 results="$results
-$line"
+$out"
 
-# node
 NODE_CMD_HOLDER="node $BENCH_DIR/node/server.js"
-line=$(run_impl "n" "node" prepare_node "$NODE_CMD_HOLDER")
+out=$(run_impl "n" "node" prepare_node "$NODE_CMD_HOLDER")
 results="$results
-$line"
+$out"
 
 echo
-echo "Results"
-echo "  impl     | req/s        | p99 latency"
-echo "  ---------+--------------+-------------"
-printf "%s\n" "$results" | while IFS='|' read -r name rps p99; do
+echo "Results — req/s reported as median across $RUNS rounds, [min..max] in brackets;"
+echo "          latencies are median across rounds in milliseconds."
+echo
+printf "  %-6s | %-6s | %-26s | %-8s | %-8s | %-8s | %-8s | %-9s\n" \
+  "impl" "-c" "req/s (med [min..max])" "p50 ms" "p75 ms" "p90 ms" "p99 ms" "max ms"
+printf "  %s\n" "------+--------+----------------------------+----------+----------+----------+----------+----------"
+printf "%s\n" "$results" | while IFS='|' read -r name conns rps_med rps_min rps_max p50 p75 p90 p99 lmax; do
   [ -z "$name" ] && continue
-  printf "  %-8s | %-12s | %-12s\n" "$name" "${rps:-NA}" "${p99:-NA}"
+  if [ "$rps_med" = "DRY" ] || [ "$rps_med" = "SKIP" ] || [ "$rps_med" = "NA" ]; then
+    printf "  %-6s | %-6s | %-26s | %-8s | %-8s | %-8s | %-8s | %-9s\n" \
+      "$name" "$conns" "$rps_med" "$rps_med" "$rps_med" "$rps_med" "$rps_med" "$rps_med"
+  else
+    rps_summary=$(printf "%.0f [%.0f..%.0f]" "$rps_med" "$rps_min" "$rps_max")
+    printf "  %-6s | %-6s | %-26s | %-8s | %-8s | %-8s | %-8s | %-9s\n" \
+      "$name" "$conns" "$rps_summary" "$p50" "$p75" "$p90" "$p99" "$lmax"
+  fi
 done
 
 echo

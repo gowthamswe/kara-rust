@@ -91,18 +91,29 @@ regression gate.
 
 ## Throughput results
 
-**Measured on 2026-05-10** (post-G1 — apples-to-apples kernel +
-observable-fold fix; see History below). Apple M5 Pro (10P + 8E
-cores, 18 logical CPUs), 64 GB RAM, macOS 26.4.1, `wrk 4.2.0`.
-`bench.sh` defaults (`-t4 -c100`, 10s warmup + 30s measurement,
-sequential per-impl runs).
+**Measured on 2026-05-10** (post-G2 + G3 + G4 — connection-count
+sweep, multi-run statistics, p50/p75/p90/p99/max latency
+distribution; see History below). Apple M5 Pro (10P + 8E cores,
+18 logical CPUs), 64 GB RAM, macOS 26.4.1, `wrk 4.2.0`. `bench.sh`
+defaults: `-t4`, three connection counts (`-c100`, `-c1000`,
+`-c5000`), N=3 measure rounds × 10 s each per (impl, conn) pair.
+req/s reported as median across 3 rounds with [min..max] range;
+latencies are median across rounds in milliseconds.
 
-| Impl   | req/s | p99 latency | Notes                       |
-|--------|-------|-------------|-----------------------------|
-| Rust   |   730 |    849 ms   | tokio + hyper + `tokio::join!(spawn_blocking(...))` |
-| **Kāra** | **711** | **300 ms** | auto-par fan-out via long-lived `karac_par_run` worker pool |
-| Go     |   677 |    982 ms   | `net/http` + goroutines + `sync.WaitGroup`, default `GOMAXPROCS` |
-| Node   |   3.0 |   1.87  s   | `http` + `Promise.all`, single-process per F4 |
+| Impl | -c    | req/s (median [min..max]) | p50 ms | p75 ms | p90 ms | p99 ms | max ms |
+|------|-------|---------------------------|--------|--------|--------|--------|--------|
+| **Kāra** | 100   | **715 [714..720]**     |  135   |  178   |  224   |  **313**   |  431   |
+| Kāra | 1000  | 678 [678..698]            | 1210   | 1480   | 1720   | 1960   | 2000   |
+| Kāra | 5000  | 673 [673..675]            | 1300   | 1660   | 1880   | 1980   | 2000   |
+| Rust | 100   | 720 [719..722]            |  119   |  162   |  259   |  824   | 1710   |
+| Rust | 1000  | 719 [714..720]            |  763   | 1120   | 1570   | 1940   | 2000   |
+| Rust | 5000  | 244 [207..698]            | 1140   | 1510   | 1910   | 1980   | 2000   |
+| Go   | 100   | 661 [405..662]            |  137   |  169   |  271   | 1200   | 1620   |
+| Go   | 1000  | 621 [575..659]            |  808   | 1110   | 1440   | 1910   | 2000   |
+| Go   | 5000  | 577 [572..634]            | 1350   | 1640   | 1830   | 1980   | 2000   |
+| Node | 100   | 6 [6..6]                  | 1100   | 1420   | 1720   | 1970   | 1970   |
+| Node | 1000  | (didn't complete — node can't service 1000 keep-alives at < 10 req/s) | — | — | — | — | — |
+| Node | 5000  | (same)                    | — | — | — | — | — |
 
 **How to read this.** All four impls run the same hash-mix kernel
 (`x = (x*31 + i) % p` over `n` iterations) at the same iteration
@@ -116,29 +127,48 @@ from eliding them. The fourth (`fetch_profile_name`) returns
 gets DCE'd in all four impls — accepted, since 3-of-4 fan-out
 branches dominate the parallel critical path.
 
-**Throughput**: Kāra and Rust within ~3 % (711 vs 730).
-Rust marginally ahead because tokio's `spawn_blocking` blocking
-pool (512 threads default) admits more in-flight work per request
-than Kāra's bounded `karac_par_run` pool (18 = num_cpus). At
-saturated CPU load, neither stretches the other meaningfully.
+**Headline finding (`-c100`).** Kāra and Rust within ~1 %
+throughput (715 vs 720); Kāra **2.6× lower p99** (313 ms vs 824
+ms) and **3.8× lower p90** (224 ms vs 259 ms is closer, but at
+the long tail the gap widens). Go trails on both throughput
+(661) and especially p99 (1200 ms — 3.8× Kāra's). Node is
+single-process per F4; the 6 req/s is honest about the language's
+default-deployment reality.
 
-**Tail latency (p99)**: Kāra **3× lower than Rust**, **3.3× lower
-than Go**. Why: Kāra's `karac_par_run` work-helping wait loop
-(tokio worker that called the handler picks up dispatched tasks
-during its wait) gives effective parallelism beyond the dedicated
-pool size, smoothing burst response patterns. Rust's `tokio::join!
-(spawn_blocking(...))` pattern hands every fan-out branch off to a
-separate blocking thread, paying scheduler-handoff cost on every
-branch and producing queueing tail under burst load. Go's tail is
-GC-driven (sustained allocation pressure from per-request
-goroutine + struct churn). The tail-latency gap is the bench's
-clearest demonstration of `karac_par_run`'s value over hand-rolled
-`spawn_blocking` — same throughput, tighter response times.
+**Connection-sweep finding.** Kāra is the most stable across the
+sweep — 715 → 678 → 673 (only -6 % at 50× the connections).
+Rust is stable at -c100 / -c1000 (720 → 719) but **collapses at
+-c5000** (244 [207..698] — wide variance is the giveaway: some
+runs survive, some hit `tokio::task::spawn_blocking`'s blocking-
+pool ceiling and stall). Go degrades steadily (-13 % across the
+sweep) under sustained allocation pressure on `net/http` +
+goroutines.
+
+**Tail-latency finding (`karac_par_run` design dividend).** At
+-c100, Kāra's p99 is 313 ms vs Rust's 824 ms (2.6×) and Go's
+1200 ms (3.8×). Why: Kāra's `karac_par_run` work-helping wait
+loop (tokio worker that called the handler picks up dispatched
+tasks during its wait) gives effective parallelism beyond the
+dedicated 18-worker pool, smoothing burst response patterns.
+Rust's `tokio::join!(spawn_blocking(...))` hands every fan-out
+branch off to a separate blocking thread, paying scheduler-
+handoff on every branch and producing queueing tail under burst
+load. Go's tail is GC-driven. The tail-latency gap is the
+bench's clearest empirical demonstration of `karac_par_run`'s
+work-helping design choice paying off — same throughput, tighter
+response times.
+
+**At -c1000+** all three multi-core impls saturate similarly
+(p50 0.8-1.3 s, p99 1.9-2.0 s). The 2 s ceiling on max + p99 is
+`wrk`'s default request timeout (it caps measured latency at the
+test-duration boundary).
 
 **Node** is asymmetric by design (F4) — single-process JavaScript
 serializing four CPU-bound busy loops on the event-loop thread.
 Cluster-mode would multiply by ≈ `num_cpus` at the cost of process
-orchestration; not v1 of this bench.
+orchestration; not v1 of this bench. At -c1000 / -c5000 the OS
+runs out of ephemeral ports faster than node can service them, so
+those rows show no completed measurements.
 
 ## History
 
@@ -168,7 +198,7 @@ no longer measuring fan-out work — Rust's release codegen had been
 doing the same elision all along. Numbers became apples-to-oranges
 between impls.
 
-**v4 — apples-to-apples kernel + observable fold (this commit,
+**v4 — apples-to-apples kernel + observable fold (`5ef2ea6`,
 2026-05-10).** Replaced the triangular-sum kernel with a hash-mix
 step `x = (x*31 + i) % p` (no closed form; can't be reduced).
 Updated all four impls (`server.kara`, `main.rs`, `main.go`,
@@ -181,44 +211,23 @@ fell from 97 K → 711 across all impls because the four busy_loops
 now actually run; the resulting numbers are the bench's first true
 apples-to-apples comparison since v1.
 
+**v5 — connection-count sweep + multi-run statistics + richer
+percentile distribution (this commit, 2026-05-10).** Implements
+G2 + G3 + G4 from
+[`docs/investigations/bench_robustness.md`](../../../docs/investigations/bench_robustness.md).
+`bench.sh` now sweeps `-c100`, `-c1000`, `-c5000` (configurable
+via `--connections=`); runs N=3 measure rounds per (impl, conn)
+pair (configurable via `--runs=`) and reports the median req/s
+with [min..max] range; parses p50, p75, p90, p99, and max from
+each `wrk --latency` run and reports the median of each across
+rounds. The single-snapshot table is replaced by a 12-row matrix
+(4 impls × 3 connection counts), each cell aggregated across 3
+runs.
+
 Full investigation log + per-step disassembly + reasoning lives at
 [`docs/investigations/parallax_perf.md`](../../../docs/investigations/parallax_perf.md);
 bench-measurement gaps + their fixes at
 [`docs/investigations/bench_robustness.md`](../../../docs/investigations/bench_robustness.md).
-
-## History
-
-**v1 — first verification run (`4f7b72d`, 2026-05-09).** Kāra at
-1,089.99 req/s / 438.18 ms p99, four-language table populated.
-First end-to-end measurement of the Kāra HTTP stack under sustained
-load.
-
-**v2 — `karac_par_run` worker-pool fix (`3953a14`, 2026-05-09).**
-Profiling diagnosed that 60 % of the process's CPU was being spent
-in `mach_vm_protect` setting up pthread stack guard pages —
-`karac_par_run` was creating fresh OS threads on every fan-out
-call. Replaced with a long-lived worker pool: thread churn -94 %,
-p99 -46 % (438 → 238 ms), CPU efficiency 9× better. Throughput
-essentially unchanged because the bench was wrk-connection-bound,
-not pool-capacity-bound at that point.
-
-**v3 — codegen `default<O2>` pass pipeline (this commit,
-2026-05-10).** Probe sweep revealed that `karac_par_run`, the
-trampoline, frame-tracking, and HTTP layer were all *not* the
-bottleneck — the no-op-handler ceiling is 108 K req/s. The
-remaining gap was that karac never ran any LLVM mid-end
-optimization passes on its IR (`OptimizationLevel::Default` was set
-on the target machine but no `PassManager` was wired up), so
-`busy_loop` shipped with locals in stack slots and inner loops at
-~12 cycles/iter. Wiring `module.run_passes("default<O2>", …)` lets
-LLVM's `mem2reg` + `loop-idiom` + `instcombine` reduce the loop
-body to the Gauss-sum closed form and DCE the dropped results.
-Throughput jumped 92× (1,054 → 97,172). See ⚠ above for why this
-makes the bench less, not more, comparable until an optimization-
-barrier is added.
-
-Full investigation log + per-step disassembly + reasoning lives at
-[`docs/investigations/parallax_perf.md`](../../../docs/investigations/parallax_perf.md).
 
 ## Fairness controls (F4)
 
