@@ -440,6 +440,27 @@ fn is_prelude_type_or_module_name(name: &str) -> bool {
         || crate::prelude::PRELUDE_TYPES.contains(&name)
 }
 
+/// Map a primitive-type associated constant value to its surface `Type`.
+/// Used by `infer_field_access` to resolve `i64.MAX` / `f64.INFINITY` /
+/// `usize.MAX` etc. to the correct numeric type. The interpreter and
+/// codegen consume the same `ConstValue` for the runtime / LLVM value.
+fn primitive_const_type(cv: &crate::prelude::ConstValue) -> Type {
+    use crate::prelude::ConstValue::*;
+    match cv {
+        I8(_) => Type::Int(IntSize::I8),
+        I16(_) => Type::Int(IntSize::I16),
+        I32(_) => Type::Int(IntSize::I32),
+        I64(_) => Type::Int(IntSize::I64),
+        U8(_) => Type::UInt(UIntSize::U8),
+        U16(_) => Type::UInt(UIntSize::U16),
+        U32(_) => Type::UInt(UIntSize::U32),
+        U64(_) => Type::UInt(UIntSize::U64),
+        Usize(_) => Type::UInt(UIntSize::Usize),
+        F32(_) => Type::Float(FloatSize::F32),
+        F64(_) => Type::Float(FloatSize::F64),
+    }
+}
+
 fn is_numeric(ty: &Type) -> bool {
     matches!(ty, Type::Int(_) | Type::UInt(_) | Type::Float(_))
 }
@@ -11901,6 +11922,18 @@ impl<'a> TypeChecker<'a> {
     // ── Field Access ────────────────────────────────────────────
 
     fn infer_field_access(&mut self, object: &Expr, field: &str, span: &Span) -> Type {
+        // Primitive-type associated constants — `i64.MAX`, `f64.INFINITY`,
+        // `usize.MAX`, etc. The parser emits these as
+        // `FieldAccess { object: Identifier("<primitive>"), field: "<NAME>" }`.
+        // Intercept here before `infer_expr(object)` would silently return
+        // `Type::Error` for the bare primitive identifier. The lookup
+        // returns the const's typed surface so downstream code (`let x =
+        // i64.MAX;`) sees the right `Type::Int(I64)` etc.
+        if let ExprKind::Identifier(name) = &object.kind {
+            if let Some(cv) = crate::prelude::lookup_primitive_const(name, field) {
+                return primitive_const_type(cv);
+            }
+        }
         let obj_ty = self.infer_expr(object);
         if obj_ty == Type::Error {
             return Type::Error;

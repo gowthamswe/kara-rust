@@ -10478,3 +10478,42 @@ fn test_server_serve_signature_typechecks() {
          }",
     );
 }
+
+// ── Primitive-type associated constants ──────────────────────
+//
+// Theme 7 (2026-05-10) — `i64.MAX` / `f64.INFINITY` / etc. are
+// recognised by the typechecker's `infer_field_access` early-intercept
+// against the shared `PRIMITIVE_CONSTS` table at `src/prelude.rs`.
+// Each constant resolves to its surface numeric type so downstream
+// type annotations and arithmetic check against the right integer /
+// float width.
+
+#[test]
+fn test_primitive_const_typechecks_as_correct_type() {
+    typecheck_ok("fn main() { let x: i64 = i64.MAX; let y: f64 = f64.INFINITY; }");
+}
+
+#[test]
+fn test_primitive_const_typechecks_in_arithmetic_position() {
+    // `i64.MAX + 1_i64` typechecks because both sides are i64. The
+    // checker rejecting `i64.MAX + 1_i32` would be the negative gate,
+    // but the implicit numeric-widening table at op-boundaries makes
+    // i32+i64 also legal (i32 widens to i64). Instead, verify the
+    // const flows through arithmetic without losing its type — proves
+    // `infer_field_access` returned the expected `Type::Int(I64)`,
+    // not silent `Type::Error` (which would propagate and let the +
+    // pass without type-checking either operand).
+    typecheck_ok("fn main() { let x = i64.MAX + 1_i64; let _y: i64 = x; }");
+}
+
+#[test]
+fn test_primitive_const_unknown_silent_fall_through() {
+    // `i64.NONEXISTENT` falls through the early-intercept; the rest of
+    // `infer_field_access` runs `infer_expr(Identifier("i64"))` which
+    // returns `Type::Error` silently, so the access yields
+    // `Type::Error` without a diagnostic. This matches the historical
+    // behaviour for any unrecognised access on a bare primitive
+    // identifier — tightening into a structured "unknown constant on
+    // primitive" diagnostic is a separate follow-up.
+    typecheck_ok("fn main() { let x = i64.NONEXISTENT; }");
+}

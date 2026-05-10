@@ -2520,6 +2520,73 @@ fn test_memory_ordering_variants() {
     assert!(output.contains("Release"));
 }
 
+// ── Primitive-type associated constants ──────────────────────
+//
+// Theme 7 (2026-05-10) — `i64.MAX` / `f64.INFINITY` / `usize.MAX` etc.
+// dispatch through the shared `PRIMITIVE_CONSTS` table at
+// `src/prelude.rs`. The interpreter intercepts the `FieldAccess` arm
+// before the bare-primitive identifier would panic; codegen mirrors
+// at `compile_field_access`. NaN tests assert the rendered string
+// matches `Value::Float`'s Display impl ("NaN").
+
+#[test]
+fn test_interp_primitive_const_i64_max() {
+    let output = run("fn main() { let x = i64.MAX; println(x); }");
+    assert_eq!(output, "9223372036854775807\n");
+}
+
+#[test]
+fn test_interp_primitive_const_i64_min() {
+    let output = run("fn main() { let x = i64.MIN; println(x); }");
+    assert_eq!(output, "-9223372036854775808\n");
+}
+
+#[test]
+fn test_interp_primitive_const_u64_max() {
+    // u64::MAX as i64 wraps to -1 in the type-erased interpreter
+    // (Value::Int(i64) carries the bit pattern; signed display flips
+    // sign). Codegen emits the unsigned i64 — interpreter parity is
+    // bit-pattern, not signed-display.
+    let output = run("fn main() { let x = u64.MAX; println(x); }");
+    assert_eq!(output, "-1\n");
+}
+
+#[test]
+fn test_interp_primitive_const_usize_max() {
+    let output = run("fn main() { let x = usize.MAX; println(x); }");
+    assert_eq!(output, "-1\n");
+}
+
+#[test]
+fn test_interp_primitive_const_f64_infinity() {
+    let output = run("fn main() { let x = f64.INFINITY; println(x); }");
+    assert_eq!(output.trim(), "inf");
+}
+
+#[test]
+fn test_interp_primitive_const_f64_neg_infinity() {
+    let output = run("fn main() { let x = f64.NEG_INFINITY; println(x); }");
+    assert_eq!(output.trim(), "-inf");
+}
+
+#[test]
+fn test_interp_primitive_const_f64_nan() {
+    let output = run("fn main() { let x = f64.NAN; println(x); }");
+    assert_eq!(output.trim(), "NaN");
+}
+
+#[test]
+fn test_interp_primitive_const_f32_epsilon() {
+    // f32::EPSILON is 1.1920929e-7. Tree-walk interpreter widens to
+    // f64 via `Value::Float`; round-trip through Display preserves
+    // enough precision that we can assert a substring.
+    let output = run("fn main() { let x = f32.EPSILON; println(x); }");
+    assert!(
+        output.starts_with("0.000000119"),
+        "expected f32.EPSILON to print as 0.000000119...; got {output:?}"
+    );
+}
+
 // ── Slice[T] end-to-end ────────────────────────────────────────
 
 #[test]

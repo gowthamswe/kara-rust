@@ -221,6 +221,79 @@ pub const PRELUDE_EFFECT_RESOURCES: &[&str] = &[
 // the synthetic prelude module's items list, replacing the stub
 // `StructDef` that lives in this file today.
 
+/// Primitive-type associated constant value. Stored as a single concrete
+/// type per variant so the table can carry both signed and unsigned ranges
+/// without lossy widening. The interpreter coerces to `Value::Int(i64)` /
+/// `Value::Float(f64)` at consumption; the codegen emits the matching
+/// LLVM constant width.
+#[derive(Debug, Clone, Copy)]
+pub enum ConstValue {
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    /// 64-bit only in v1 — when 32-bit targets land, swap to a target-
+    /// conditional table.
+    Usize(u64),
+    F32(f32),
+    F64(f64),
+}
+
+/// Primitive-type associated constants — `i64.MAX` / `f64.INFINITY` /
+/// `usize.MAX` etc. The same table feeds the typechecker (returns the
+/// correct numeric type for `let x = i64.MAX;`), the interpreter
+/// (returns `Value::Int` / `Value::Float` at runtime), and the codegen
+/// (emits the matching LLVM constant). Both `i64.MAX` and the
+/// theoretical `i64::MAX` syntactic form would dispatch through the
+/// same lookup, but only the `.` form parses today (probe 2026-05-10
+/// confirmed `::` produces a parser error).
+pub static PRIMITIVE_CONSTS: &[(&str, &str, ConstValue)] = &[
+    ("i8", "MAX", ConstValue::I8(i8::MAX)),
+    ("i8", "MIN", ConstValue::I8(i8::MIN)),
+    ("i16", "MAX", ConstValue::I16(i16::MAX)),
+    ("i16", "MIN", ConstValue::I16(i16::MIN)),
+    ("i32", "MAX", ConstValue::I32(i32::MAX)),
+    ("i32", "MIN", ConstValue::I32(i32::MIN)),
+    ("i64", "MAX", ConstValue::I64(i64::MAX)),
+    ("i64", "MIN", ConstValue::I64(i64::MIN)),
+    ("u8", "MAX", ConstValue::U8(u8::MAX)),
+    ("u16", "MAX", ConstValue::U16(u16::MAX)),
+    ("u32", "MAX", ConstValue::U32(u32::MAX)),
+    ("u64", "MAX", ConstValue::U64(u64::MAX)),
+    ("usize", "MAX", ConstValue::Usize(u64::MAX)),
+    ("f32", "INFINITY", ConstValue::F32(f32::INFINITY)),
+    ("f32", "NEG_INFINITY", ConstValue::F32(f32::NEG_INFINITY)),
+    ("f32", "MAX", ConstValue::F32(f32::MAX)),
+    ("f32", "MIN", ConstValue::F32(f32::MIN)),
+    ("f32", "MIN_POSITIVE", ConstValue::F32(f32::MIN_POSITIVE)),
+    ("f32", "NAN", ConstValue::F32(f32::NAN)),
+    ("f32", "EPSILON", ConstValue::F32(f32::EPSILON)),
+    ("f64", "INFINITY", ConstValue::F64(f64::INFINITY)),
+    ("f64", "NEG_INFINITY", ConstValue::F64(f64::NEG_INFINITY)),
+    ("f64", "MAX", ConstValue::F64(f64::MAX)),
+    ("f64", "MIN", ConstValue::F64(f64::MIN)),
+    ("f64", "MIN_POSITIVE", ConstValue::F64(f64::MIN_POSITIVE)),
+    ("f64", "NAN", ConstValue::F64(f64::NAN)),
+    ("f64", "EPSILON", ConstValue::F64(f64::EPSILON)),
+];
+
+/// Look up a primitive-type associated constant by `(type_name, const_name)`.
+/// Returns `None` when no entry exists — callers fall through to whatever
+/// default the surrounding dispatch site uses (typechecker silent
+/// `Type::Error`; interpreter / codegen panic with a "should be caught by
+/// resolver / typechecker" message under the existing field-access
+/// fallback).
+pub fn lookup_primitive_const(type_name: &str, const_name: &str) -> Option<&'static ConstValue> {
+    PRIMITIVE_CONSTS
+        .iter()
+        .find(|(t, c, _)| *t == type_name && *c == const_name)
+        .map(|(_, _, v)| v)
+}
+
 /// Embedded stdlib sources, keyed by their on-disk basename (relative to
 /// `runtime/stdlib/`). Sources are baked at compile time via `include_str!`
 /// so the resulting binary is self-contained.

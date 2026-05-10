@@ -1865,6 +1865,34 @@ impl<'ctx> Codegen<'ctx> {
         self.llvm_float_type_for_suffix(sfx).const_float(f)
     }
 
+    /// Lower a primitive-type associated constant (`i64.MAX`,
+    /// `f64.INFINITY`, `usize.MAX`, etc.) to an LLVM constant of the
+    /// matching width. The interpreter consumes the same `ConstValue`
+    /// table but coerces signed / unsigned to a single `Value::Int(i64)`;
+    /// codegen keeps the precise width so downstream arithmetic
+    /// type-checks correctly at the LLVM level.
+    fn compile_primitive_const(&self, cv: &crate::prelude::ConstValue) -> BasicValueEnum<'ctx> {
+        use crate::prelude::ConstValue::*;
+        match cv {
+            I8(v) => self.context.i8_type().const_int(*v as u64, true).into(),
+            I16(v) => self.context.i16_type().const_int(*v as u64, true).into(),
+            I32(v) => self.context.i32_type().const_int(*v as u64, true).into(),
+            I64(v) => self.context.i64_type().const_int(*v as u64, true).into(),
+            U8(v) => self.context.i8_type().const_int(*v as u64, false).into(),
+            U16(v) => self.context.i16_type().const_int(*v as u64, false).into(),
+            U32(v) => self.context.i32_type().const_int(*v as u64, false).into(),
+            U64(v) => self.context.i64_type().const_int(*v, false).into(),
+            // v1 is 64-bit only — usize is u64.
+            Usize(v) => self.context.i64_type().const_int(*v, false).into(),
+            // Float widths. `const_float` accepts an f64 input and
+            // narrows for f32; for INFINITY / NEG_INFINITY / NAN this
+            // round-trip is exact (the bit patterns survive the
+            // f64→f32 conversion).
+            F32(v) => self.context.f32_type().const_float(*v as f64).into(),
+            F64(v) => self.context.f64_type().const_float(*v).into(),
+        }
+    }
+
     /// Infer the slice element type from a let-binding RHS that produces
     /// a slice value. Recognizes `.as_slice()` / `.as_slice_mut()` on a
     /// known sequence variable and range-indexing `x[a..b]` on the same.
@@ -12814,6 +12842,19 @@ impl<'ctx> Codegen<'ctx> {
         object: &Expr,
         field: &str,
     ) -> Result<BasicValueEnum<'ctx>, String> {
+        // Primitive-type associated constants — `i64.MAX` /
+        // `f64.INFINITY` / `usize.MAX` etc. parse as
+        // `FieldAccess(Identifier("i64"), "MAX")`. Intercept before the
+        // normal field-access path so the bare primitive identifier
+        // doesn't fall through to a generic compile_expr that would
+        // either panic or produce wrong codegen. Mirrors the typechecker
+        // and interpreter early-intercepts for the same expression
+        // shape.
+        if let ExprKind::Identifier(name) = &object.kind {
+            if let Some(cv) = crate::prelude::lookup_primitive_const(name, field) {
+                return Ok(self.compile_primitive_const(cv));
+            }
+        }
         // Shared type: object compiles to a pointer; field access via GEP.
         if let Some((type_name, info)) = self.shared_type_for_expr(object) {
             if !info.is_enum {

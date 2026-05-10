@@ -789,6 +789,28 @@ fn try_write_or_panic<'a>(
     })
 }
 
+/// Coerce a primitive-type associated constant to the type-erased
+/// runtime value the interpreter uses. Signed and unsigned integer
+/// constants share `Value::Int(i64)`; both float widths share
+/// `Value::Float(f64)`. The codegen path uses the same `ConstValue`
+/// table but emits the correct LLVM constant width per variant.
+fn primitive_const_to_value(cv: &crate::prelude::ConstValue) -> Value {
+    use crate::prelude::ConstValue::*;
+    match cv {
+        I8(v) => Value::Int(*v as i64),
+        I16(v) => Value::Int(*v as i64),
+        I32(v) => Value::Int(*v as i64),
+        I64(v) => Value::Int(*v),
+        U8(v) => Value::Int(*v as i64),
+        U16(v) => Value::Int(*v as i64),
+        U32(v) => Value::Int(*v as i64),
+        U64(v) => Value::Int(*v as i64),
+        Usize(v) => Value::Int(*v as i64),
+        F32(v) => Value::Float(*v as f64),
+        F64(v) => Value::Float(*v),
+    }
+}
+
 impl Value {
     /// Slice 3 helper — wrap a fresh `Vec<Value>` in the shared
     /// `Arc<RwLock<>>` storage used for `Value::Array`. Every Array
@@ -2430,6 +2452,18 @@ impl<'a> Interpreter<'a> {
 
             // Field access
             ExprKind::FieldAccess { object, field } => {
+                // Primitive-type associated constants — `i64.MAX` /
+                // `f64.INFINITY` / etc. parse as `FieldAccess(Identifier("i64"),
+                // "MAX")`. Intercept before `eval_expr_inner(object)` would
+                // panic on the bare primitive identifier (which has no
+                // env binding). Falls through to the normal field-access
+                // path when the lookup misses (so a regular struct field
+                // with the same shape still resolves correctly).
+                if let ExprKind::Identifier(name) = &object.kind {
+                    if let Some(cv) = crate::prelude::lookup_primitive_const(name, field) {
+                        return primitive_const_to_value(cv);
+                    }
+                }
                 let obj = self.eval_expr_inner(object);
                 self.read_field(obj, field, &expr.span)
             }
