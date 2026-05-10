@@ -10300,6 +10300,28 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Unit
             }
+            // `Slice[T]` IS `Iterator[T]` — `.iter()` / `.into_iter()` route
+            // through the same Iterator dispatch as `Vec.iter()` so chained
+            // adaptors (`s.iter().map(f).filter(p).collect()`) compose. The
+            // receiver-type match in `infer_method_call` lands here before
+            // the generic `iter` / `into_iter` arm, so the registration
+            // duplicates that arm shape (no-args, returns `Iterator[T]`).
+            "iter" | "into_iter" => {
+                if !args.is_empty() {
+                    self.type_error(
+                        format!("Slice.{}() takes no arguments", method),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                }
+                Type::Named {
+                    name: "Iterator".to_string(),
+                    args: vec![elem],
+                }
+            }
             _ => self.require_known_method(
                 "Slice",
                 method,
@@ -10310,7 +10332,9 @@ impl<'a> TypeChecker<'a> {
                     "fill",
                     "first",
                     "get",
+                    "into_iter",
                     "is_empty",
+                    "iter",
                     "last",
                     "len",
                     "reverse",

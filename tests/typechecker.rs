@@ -10368,6 +10368,41 @@ fn test_range_unknown_method_rejects() {
     );
 }
 
+// ── Slice[T] Iterator impl ─────────────────────────────────────
+//
+// `Slice[T]` IS `Iterator[T]` — `s.iter()` returns `Iterator[T]` and
+// chained adaptors compose through the existing Iterator dispatch.
+// Sibling to the Range / RangeInclusive Iterator typechecker tests
+// above.
+
+#[test]
+fn test_slice_iter_returns_iterator_t() {
+    // `s.iter()` types as `Iterator[i64]` for `s: Slice[i64]`. The
+    // function-parameter sink pins the result type without leaning on
+    // collect's generic-arg inference.
+    typecheck_ok(
+        "fn sink(_it: Iterator[i64]) { }
+         fn main() {
+             let v = Vec[1, 2, 3];
+             let s: Slice[i64] = v.as_slice();
+             sink(s.iter());
+         }",
+    );
+}
+
+#[test]
+fn test_slice_iter_chain_typechecks() {
+    // `s.iter().map(|x| x.to_string()).collect()` types as `Vec[String]`.
+    typecheck_ok(
+        "fn main() {
+             let v = Vec[1, 2, 3];
+             let s: Slice[i64] = v.as_slice();
+             let xs: Vec[String] = s.iter().map(|x| x.to_string()).collect();
+             let _ = xs;
+         }",
+    );
+}
+
 // ── Slice B follow-up (2026-05-09) — `Server.serve(handler)` ─────
 //
 // Pins that the new `Server.serve(handler: Fn(Request) -> Response)

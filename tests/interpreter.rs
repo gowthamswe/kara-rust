@@ -8097,3 +8097,123 @@ fn main() {
     );
     assert_eq!(output, "0\n1\n2\n");
 }
+
+// ── Slice[T] Iterator impl ─────────────────────────────────────
+//
+// `Slice[T]` IS `Iterator[T]` — `s.iter()` and `s.into_iter()` route
+// through the same Iterator dispatch as `Vec.iter()`, so chained
+// adaptors compose. The for-loop iterable path drains `Value::Slice`
+// directly, so `for x in s { ... }` keeps working without `.iter()`.
+// Sibling to the Range / RangeInclusive Iterator entry above.
+
+#[test]
+fn test_interpreter_slice_iter_basic() {
+    // `s.iter()` over a borrowed slice yields each element; sums to 6.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = Vec[1, 2, 3];
+    let s: Slice[i64] = v.as_slice();
+    let mut sum = 0;
+    for x in s.iter() {
+        sum = sum + x;
+    }
+    println(sum);
+}
+"#,
+    );
+    assert_eq!(output, "6\n");
+}
+
+#[test]
+fn test_interpreter_slice_iter_chain_with_map_collect() {
+    // `s.iter().map(|x| x * 2).collect()` returns [2, 4, 6].
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = Vec[1, 2, 3];
+    let s: Slice[i64] = v.as_slice();
+    let xs: Vec[i64] = s.iter().map(|x| x * 2).collect();
+    for x in xs {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "2\n4\n6\n");
+}
+
+#[test]
+fn test_interpreter_slice_iter_chain_with_filter_sum() {
+    // `s.iter().filter(|x| x % 2 == 0).fold(0, |a, b| a + b)` returns 2.
+    // Sums via `fold` since `Iterator.sum` is not on the shipped terminal
+    // surface (`next` / `count` / `collect` / `fold` / `any` / `all`).
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = Vec[1, 2, 3];
+    let s: Slice[i64] = v.as_slice();
+    let total: i64 = s.iter().filter(|x| x % 2 == 0).fold(0, |a, b| a + b);
+    println(total);
+}
+"#,
+    );
+    assert_eq!(output, "2\n");
+}
+
+#[test]
+fn test_interpreter_slice_into_iter_works() {
+    // `s.into_iter()` round-trips identical to `s.iter()` at the
+    // tree-walk layer (the borrow-vs-consume distinction is a
+    // typechecker concern; sums 1+2+3 = 6).
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = Vec[1, 2, 3];
+    let s: Slice[i64] = v.as_slice();
+    let mut sum = 0;
+    for x in s.into_iter() {
+        sum = sum + x;
+    }
+    println(sum);
+}
+"#,
+    );
+    assert_eq!(output, "6\n");
+}
+
+#[test]
+fn test_interpreter_slice_for_loop_without_iter() {
+    // `for x in s { ... }` (no explicit `.iter()`) sums correctly via
+    // the for-loop iterable path's `Value::Slice` arm. Pins (SI3).
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v = Vec[10, 20, 30];
+    let s: Slice[i64] = v.as_slice();
+    let mut sum = 0;
+    for x in s {
+        sum = sum + x;
+    }
+    println(sum);
+}
+"#,
+    );
+    assert_eq!(output, "60\n");
+}
+
+#[test]
+fn test_interpreter_slice_iter_empty_slice() {
+    // Empty slice iterator yields no elements; `.collect()` returns [].
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let v: Vec[i64] = Vec.new();
+    let s: Slice[i64] = v.as_slice();
+    let xs: Vec[i64] = s.iter().collect();
+    println(xs.len());
+}
+"#,
+    );
+    assert_eq!(output, "0\n");
+}
