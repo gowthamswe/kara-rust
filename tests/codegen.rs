@@ -1849,6 +1849,56 @@ fn main() {
         }
     }
 
+    #[test]
+    fn test_e2e_for_vec_iter_propagates_outer_mutable_writes() {
+        // `for x in v.iter()` codegen previously fell through to the
+        // silent `_ =>` arm in `compile_for` — the body never ran,
+        // so writes to outer-scope mutables (e.g. `m = x`) had no
+        // effect and the loop appeared to be a no-op. Regression
+        // test: maxv on [1,2,4,6] must return 6, not the initial 0.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(1); v.push(2); v.push(4); v.push(6);
+    let mut m = 0i64;
+    for x in v.iter() {
+        if x > m { m = x; }
+    }
+    println(m);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "6");
+        }
+    }
+
+    #[test]
+    fn test_e2e_for_slice_iter_propagates_outer_mutable_writes() {
+        // Same shape as the Vec case but for `Slice[T].iter()` —
+        // sibling of the previous test; `compile_for`'s `_ =>` arm
+        // ate both shapes before the iter/into_iter peel-off landed.
+        let out = run_program(
+            r#"
+fn maxv(nums: Slice[i64]) -> i64 {
+    let mut m = 0i64;
+    for v in nums.iter() {
+        if v > m { m = v; }
+    }
+    m
+}
+fn main() {
+    let a: Array[i64, 4] = [1, 2, 4, 6];
+    println(maxv(a));
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "6");
+        }
+    }
+
     // ── Vec[T] indexed write (Slice Vb) ───────────────────────────
 
     #[test]

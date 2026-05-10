@@ -14276,6 +14276,25 @@ impl<'ctx> Codegen<'ctx> {
         iterable: &Expr,
         body: &Block,
     ) -> Result<BasicValueEnum<'ctx>, String> {
+        // `for x in coll.iter()` / `for x in coll.into_iter()` —
+        // codegen iterates the underlying storage directly via the
+        // existing `compile_for_*_var` paths (no `Value::Iterator`
+        // wrapper at this layer), so peel off a transparent `.iter()`
+        // / `.into_iter()` and recurse on the inner receiver. Without
+        // this, the method-call iterable falls through to the silent
+        // `_ =>` arm below — the body never executes and outer-scope
+        // mutables look unchanged.
+        if let ExprKind::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } = &iterable.kind
+        {
+            if args.is_empty() && (method == "iter" || method == "into_iter") {
+                return self.compile_for(label, pattern, object, body);
+            }
+        }
         match &iterable.kind {
             ExprKind::Range {
                 start,
