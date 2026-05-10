@@ -267,5 +267,111 @@ Request — and is the right next investment after H1.
 
 ## Findings
 
-_(empty — fill in as probes run; date each entry, link to commits
-or supporting artifacts.)_
+### 2026-05-10 — H1 partial-confirm: `block_in_place` is hurting under load, but isn't the headline bottleneck
+
+**Probe.** Added `KARAC_HTTP_BLOCK_IN_PLACE` env var (default `1`,
+preserves existing behavior; `0` skips the wrapper and runs the
+handler directly on the tokio worker). One-line conditional in
+`runtime/src/lib.rs:serve_request` so the impact can be A/B'd
+against the bench without rebuilding. Same hash-mix kernel +
+observable fold as the steady-state bench (G1+G5 baseline).
+
+**Bench results — Kāra row only, M5 Pro, `-t4`, N=3 measure
+rounds × 10 s, all values in milliseconds:**
+
+| -c    | mode             | rps              | p50  | p75  | p90  | p99  | max  |
+|-------|------------------|------------------|------|------|------|------|------|
+| cold  | `=1` (default)   | 86               | 11.2 | 11.3 | 11.5 | 17.7 | 17.7 |
+| cold  | `=0` (probe)     | 86               | 11.3 | 11.3 | 11.4 | 18.0 | 18.0 |
+| 100   | `=1`             | 731 [727..732]   |  133 |  172 |  213 |  289 |  411 |
+| 100   | `=0`             | 736 [735..737]   |  134 |  168 |  200 |  **257** |  360 |
+| 1000  | `=1`             | 687 [684..710]   | 1200 | 1470 | 1700 | 1950 | 2000 |
+| 1000  | `=0`             | **734 [717..735]** |  **707** | 1180 | 1630 | 1950 | 2000 |
+| 5000  | `=1`             | 679 [668..695]   | 1190 | 1590 | 1820 | 1980 | 2000 |
+| 5000  | `=0`             | **729 [722..732]** |  **769** | 1350 | 1710 | 1970 | 2000 |
+
+**What the data says.**
+
+- **Cold-start: unchanged.** 86 rps and ~17.8 ms p99 with or
+  without `block_in_place`. Makes sense — sequential `-t1 -c1`
+  has no concurrent work the worker-replacement dance could
+  unlock; the wrapper's cost equals zero benefit.
+- **At `-c100` (low contention):** Throughput unchanged (731 vs
+  736 — noise); p99 dropped **11 %** (289 → 257 ms). The
+  wrapper's per-request overhead (worker-replacement signaling)
+  is small when tokio isn't under saturation — but real.
+- **At `-c1000` and `-c5000` (saturated):** Throughput **+7 %**
+  (687 → 734, 679 → 729) and **p50 dropped 35-41 %** (1200 →
+  707, 1190 → 769). This is the real story. Under saturated
+  CPU load, removing `block_in_place` lets each request
+  complete faster on its worker because the worker stays on
+  task instead of paying the handoff round-trip. The p99 ceiling
+  doesn't move (saturated by wrk's request-timeout limit), but
+  the p50 cuts roughly in half.
+
+**H1 status: partially confirmed.** `block_in_place` is hurting
+under load — meaningfully on p50 and modestly on throughput.
+The hypothesis was that it would be the *dominant* bottleneck
+unlocking a path to 1M+ req/s. The data shows it's a
+contributing factor (~7 % throughput in the right direction)
+but not the unlock. To get to 500K+ req/s requires more than
+this single change.
+
+**Why it's not the unlock — order-of-magnitude check.** Even
+with `block_in_place` off, Kāra is at 736 rps at `-c100`. The
+no-op-handler probe (from the
+[`parallax_perf.md`](parallax_perf.md) ceiling investigation,
+2026-05-09) showed 108 K rps when the handler does nothing.
+The gap between 736 (with real CPU work) and 108 K (no-op) is
+**150×** — almost all of it is the actual fan-out CPU work
+(`busy_loop` × 4 with hash-mix kernel). Even removing every
+ounce of HTTP-layer overhead can't close that gap; it's
+inherent to the workload shape. The real path to higher
+throughput numbers under this bench is *more efficient
+busy_loop execution* (which we already maximized at codegen
+level via `default<O2>` in `280ce2d`) or *more cores running
+in parallel* — not HTTP-layer micro-optimizations.
+
+**Implication for the 1M+ aspiration.** The 1M+ ceiling is a
+*plaintext / no-work* benchmark territory — what Kāra hits
+when handlers do nothing. The Parallax bench inherently caps
+at ~720 rps because the four busy_loops × 18 cores ÷ 100
+in-flight = ~720 rps saturation, regardless of HTTP overhead.
+To approach 1M for the *no-work* shape, all of H1 + H2 + H3 +
+H4 in priority order — and even then, hyper's own per-request
+floor is ~10 µs, so the practical ceiling is more like
+500 K-1 M for HTTP/1 plaintext on this hardware. Tracked as
+the cohort goal; not a single-slice unlock.
+
+**Decision: keep `block_in_place` as default, expose env-var
+opt-out.** The probe shows the wrapper's cost is real but
+modest. Switching defaults runtime-wide is a design decision
+that affects every user (not just the bench) and warrants a
+thoughtful slice — including: what shape of handler is "typical"
+(CPU-bound? I/O-bound? mixed?), how does the answer interact
+with Phase 6.3 async-aware handlers, and is `spawn_blocking`
+(which moves work to tokio's blocking-thread pool) the better
+shape than direct invocation. For now: env var stays, default
+unchanged, bench can opt in via `KARAC_HTTP_BLOCK_IN_PLACE=0`
+when the workload's shape makes it the right call.
+
+**Next probe (H2).** Trampoline + value-type packing. The probe
+sweep in [`parallax_perf.md § Findings, 2026-05-09`](parallax_perf.md)
+showed `__karac_http_shim_handle` at 70 % inclusive in the
+post-pool-fix profile — much of that is the Request/Response
+packing + path-String alloc. The closure path (borrowed
+accessors → inline trampoline → `#[repr(C)]` Request) was
+deferred until H1 was probed; H1 is now probed and shows
+modest impact. Time to read the trampoline source + measure
+where the 70 % inclusive is actually spent (not all of it is
+overhead — some is the call to the user handler).
+
+**Why H1 was the right starting point even though it didn't
+unlock the headline.** Because we have the cold-start vs
+saturated data showing the gap closure is *under load only*,
+we now know: any future bottleneck-removal that targets *cold
+path* won't move the needle (cold-start floors at 11 ms p50,
+which is the busy_loop critical-path itself). The headline is
+made by *under-load behavior* — same place `karac_par_run`'s
+work-helping pays off. So the next H2 probe should also be
+A/B-tested with the connection sweep, not just cold-start.

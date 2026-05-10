@@ -2241,7 +2241,20 @@ async fn serve_request(
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    let (status, body_out, panicked) = tokio::task::block_in_place(move || {
+    // H1 probe surface (`docs/investigations/http_layer_perf.md`):
+    // `KARAC_HTTP_BLOCK_IN_PLACE=0` skips the `block_in_place`
+    // wrapper and runs the handler closure directly on the tokio
+    // worker. The wrapper's documented purpose is to let other
+    // concurrent async work progress while a CPU-bound handler is
+    // running (worker-replacement dance). Skipping it removes the
+    // per-request handoff cost but blocks the worker for the full
+    // handler duration. A/B-able via env var so the impact can be
+    // measured against the bench without rebuilding.
+    let skip_block_in_place = matches!(
+        std::env::var("KARAC_HTTP_BLOCK_IN_PLACE").as_deref(),
+        Ok("0")
+    );
+    let invoke = move || {
         let method_cstr = std::ffi::CString::new(method_str).unwrap_or_default();
         let path_cstr = std::ffi::CString::new(path_str).unwrap_or_default();
         let query_cstr = std::ffi::CString::new(query_str).unwrap_or_default();
@@ -2325,7 +2338,12 @@ async fn serve_request(
         );
 
         (resp_struct.status, body_out, panicked)
-    });
+    };
+    let (status, body_out, panicked) = if skip_block_in_place {
+        invoke()
+    } else {
+        tokio::task::block_in_place(invoke)
+    };
 
     if panicked {
         let msg = b"Internal Server Error\n";
