@@ -3916,6 +3916,13 @@ impl<'a> Interpreter<'a> {
                 "Vec.new" => {
                     return Value::array_of(Vec::new());
                 }
+                // `Vec.filled(n: i64, val: T) -> Vec[T] where T: Clone` —
+                // spec at design.md:1631. Routed through a helper so
+                // its locals don't bloat the surrounding `eval_call`
+                // match's debug-mode stack frame (the inline form
+                // overflowed `test_e2e_fibonacci`, same shape as the
+                // `and`/`or` short-circuit fix).
+                "Vec.filled" => return self.eval_vec_filled(args, span),
                 "SortedSet.new" => {
                     return Value::SortedSet(BTreeMap::new());
                 }
@@ -8905,6 +8912,37 @@ impl<'a> Interpreter<'a> {
             (BinOp::And, true) | (BinOp::Or, false) => self.eval_expr_inner(right),
             _ => unreachable!("eval_short_circuit only handles And/Or"),
         }
+    }
+
+    /// `Vec.filled(n, val)` — produce `n` clones of `val` per
+    /// design.md:1631. Extracted to its own frame so the surrounding
+    /// path-call match doesn't grow (debug-mode `eval_expr_inner`
+    /// recursive callers are stack-budget-tight). Per-slot clone
+    /// satisfies the spec's `T: Clone` requirement; negative length
+    /// is a runtime error (Kāra has no usize).
+    fn eval_vec_filled(&mut self, args: &[CallArg], span: &Span) -> Value {
+        let Some(n_arg) = args.first() else {
+            return self
+                .record_runtime_error("Vec.filled expects 2 arguments (n, val), found 0", span);
+        };
+        let Some(val_arg) = args.get(1) else {
+            return self
+                .record_runtime_error("Vec.filled expects 2 arguments (n, val), found 1", span);
+        };
+        let n_val = self.eval_expr_inner(&n_arg.value);
+        let val = self.eval_expr_inner(&val_arg.value);
+        let Value::Int(n) = n_val else {
+            return self.record_runtime_error("Vec.filled length must be i64", span);
+        };
+        if n < 0 {
+            return self.record_runtime_error("Vec.filled length must be non-negative", span);
+        }
+        let len = n as usize;
+        let mut items = Vec::with_capacity(len);
+        for _ in 0..len {
+            items.push(val.clone());
+        }
+        Value::array_of(items)
     }
 
     fn eval_binary(&mut self, op: &BinOp, left: Value, right: Value, span: &Span) -> Value {

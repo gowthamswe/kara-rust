@@ -132,6 +132,86 @@ fn test_or_evaluates_rhs_when_lhs_false() {
     assert_eq!(out, "called\nelse\n");
 }
 
+// ── `Vec.filled(n, val)` (design.md:1631) ───────────────────────
+
+#[test]
+fn test_vec_filled_i64() {
+    // `Vec.filled(3, 7)` → length 3, all 7s.
+    let out = run(r#"
+        fn main() {
+            let v: Vec[i64] = Vec.filled(3, 7);
+            println(v.len());
+            println(v[0]);
+            println(v[2]);
+        }
+    "#);
+    assert_eq!(out, "3\n7\n7\n");
+}
+
+#[test]
+fn test_vec_filled_bool() {
+    // Kata's actual usage shape: `Vec.filled(n, false)` for a
+    // visited bitset, then index-write through it.
+    let out = run(r#"
+        fn main() {
+            let mut visited: Vec[bool] = Vec.filled(5, false);
+            visited[2] = true;
+            println(visited.len());
+            println(visited[0]);
+            println(visited[2]);
+            println(visited[4]);
+        }
+    "#);
+    assert_eq!(out, "5\nfalse\ntrue\nfalse\n");
+}
+
+#[test]
+fn test_vec_filled_string() {
+    // Non-`Copy` element type — the per-slot clone in the dispatch
+    // arm satisfies the spec's `T: Clone` requirement.
+    let out = run(r#"
+        fn main() {
+            let v: Vec[String] = Vec.filled(2, "hi");
+            println(v.len());
+            println(v[0]);
+            println(v[1]);
+        }
+    "#);
+    assert_eq!(out, "2\nhi\nhi\n");
+}
+
+#[test]
+fn test_vec_filled_zero_length() {
+    // `Vec.filled(0, x)` is legal — produces an empty Vec.
+    let out = run(r#"
+        fn main() {
+            let v: Vec[i64] = Vec.filled(0, 99);
+            println(v.len());
+        }
+    "#);
+    assert_eq!(out, "0\n");
+}
+
+#[test]
+fn test_vec_filled_negative_length_runtime_error() {
+    // Negative length is a runtime error — Kāra has no usize,
+    // so the typechecker accepts `i64` and the interpreter
+    // guards at the call site.
+    let errs = runtime_errors(
+        r#"
+        fn main() {
+            let v: Vec[i64] = Vec.filled(-1, 0);
+            println(v.len());
+        }
+    "#,
+    );
+    assert!(
+        errs.iter()
+            .any(|e| format!("{e:?}").contains("Vec.filled length must be non-negative")),
+        "expected non-negative-length runtime error; got: {errs:?}"
+    );
+}
+
 #[test]
 fn test_comparison() {
     assert_eq!(run("fn main() { println(3 > 2); }"), "true\n");
