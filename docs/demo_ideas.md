@@ -95,9 +95,9 @@ the decision *visible and auditable*, which no other language offers.
 **Effort:** Medium. HTTP server layer needed (FFI or a thin Kāra wrapper).
 Benchmark harness is straightforward.
 
-#### Slice E — Three-language benchmark harness (design drafted 2026-05-09)
+#### Slice E — Three-language benchmark harness ✓ Landed 2026-05-09 (scaffolding `ea1d26d`; verification run `_pending_`)
 
-Demo 1's recordable artifact: side-by-side `GET /dashboard/:user_id` benchmark across Kāra, Rust, Go, and Node. Predecessor: HTTP handler ABI trampoline (`docs/implementation_checklist/phase-7-codegen.md` § "HTTP handler ABI trampoline"). Execution scaffolding in `docs/implementation_checklist/wip-list1.md` (`[BLOCKED on trampoline ship]`). Slices A (`ab611d3`), B (`3c3d87b`), C (`f5c7b31`), D (`502250a`), F (`91768f2`) all shipped 2026-05-09 — Slice E is the final piece that makes Demo 1 recordable.
+Demo 1's recordable artifact: side-by-side `GET /dashboard/:user_id` benchmark across Kāra, Rust, Go, and Node. Predecessor: HTTP handler ABI trampoline (`5f4cbcc`). Slices A (`ab611d3`), B (`3c3d87b`), C (`f5c7b31`), D (`502250a`), F (`91768f2`) all shipped 2026-05-09 — Slice E is the final piece that makes Demo 1 recordable. Sub-steps (a)–(f) shipped as scaffolding (`ea1d26d`) on 2026-05-09; sub-step (g) verification run executed on Apple M5 Pro 2026-05-09 — table at `examples/parallax/bench/README.md` populated with measured req/s + p99 across all four impls.
 
 **Settled design forks (2026-05-09).**
 

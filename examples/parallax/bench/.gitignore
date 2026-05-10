@@ -1,0 +1,4 @@
+# Build artifacts produced by `bench.sh`.
+kara/.bin/
+go/parallax-bench-go
+rust/Cargo.lock

@@ -91,18 +91,30 @@ regression gate.
 
 ## Throughput results
 
-> **Status: PLACEHOLDER — verification run pending.** Slice E sub-
-> step (g) "Verification run" is owned by the main session post-
-> implementation. The implementation slice (sub-steps a–f) lands the
-> harness; the verification slice runs `bench.sh` on dev hardware
-> and back-fills this table with measured numbers.
+**Measured on 2026-05-09**, Apple M5 Pro (10P + 8E cores, 18 logical
+CPUs), 64 GB RAM, macOS 26.4.1, `wrk 4.2.0`. `bench.sh` defaults
+(`-t4 -c100`, 10s warmup + 30s measurement, sequential per-impl
+runs).
 
-| Impl   | req/s    | p99 latency | Notes                       |
-|--------|----------|-------------|-----------------------------|
-| Kāra   | _TBD_    | _TBD_       | auto-par fan-out, default tokio workers |
-| Rust   | _TBD_    | _TBD_       | tokio + hyper + `tokio::join!` (perf ceiling reference) |
-| Go     | _TBD_    | _TBD_       | `net/http` + goroutines + `sync.WaitGroup`, default `GOMAXPROCS` |
-| Node   | _TBD_    | _TBD_       | `http` + `Promise.all`, single-process per F4 |
+| Impl   | req/s     | p99 latency | Notes                       |
+|--------|-----------|-------------|-----------------------------|
+| Rust   | 45,731.33 | 5.16 ms     | tokio + hyper + `tokio::join!` (perf ceiling reference) |
+| Go     |  7,695.31 | 58.58 ms    | `net/http` + goroutines + `sync.WaitGroup`, default `GOMAXPROCS` |
+| Kāra   |  1,089.99 | 438.18 ms   | auto-par fan-out, default tokio workers |
+| Node   |     92.55 | 1.10 s      | `http` + `Promise.all`, single-process per F4 |
+
+**How to read this.** The Rust row sets the cohort's perf ceiling
+because Kāra's runtime sits on the same tokio multi-thread scheduler.
+Rust ÷ Kāra ≈ 42×; that gap is what auto-par's value-type ABI +
+handler trampoline + monomorphization-conservative codegen cost
+relative to hand-written `tokio::join!`. The gap is large; it is also
+the *first* end-to-end measurement of this stack under sustained
+load, so most of it is recoverable headroom (see [`docs/demo_ideas.md
+§ Slice E`](../../../docs/demo_ideas.md) "Out of scope" — gap-closure
+path conditional on F3). Go's row reflects `net/http` + goroutines on
+default `GOMAXPROCS`; Node's row reflects single-process `Promise.all`
+serializing four CPU-bound busy loops on the event-loop thread (F4
+footnote — cluster-mode Node would multiply by ≈ `num_cpus`).
 
 ## Fairness controls (F4)
 
