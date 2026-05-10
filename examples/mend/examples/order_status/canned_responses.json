@@ -1,0 +1,16 @@
+{
+  "task": "order_status",
+  "description": "Two LLM iterations modeling the descriptive end of the Mend loop: pattern-exhaustiveness diagnostic with no machine-applicable fix. Iteration 0 is the LLM's initial attempt with the Cancelled arm missing; iteration 1 is the corrected version after the harness feeds the E0205 diagnostic back. The harness should NOT find a `replacement` field (no karac fix invocation) — convergence relies entirely on the LLM reading the message and adding the missing arm.",
+  "responses": [
+    {
+      "iteration": 0,
+      "note": "LLM's first attempt — Cancelled arm missing. E0205 fires from the typecheck phase naming the missing variant.",
+      "kara_source": "enum OrderStatus {\n    Pending,\n    Shipped,\n    Delivered,\n    Cancelled,\n}\n\nfn describe(status: OrderStatus) -> String {\n    match status {\n        Pending => \"awaiting payment\",\n        Shipped => \"in transit\",\n        Delivered => \"received by customer\",\n    }\n}\n\nfn main() {\n    let s: OrderStatus = Shipped;\n    let d: String = describe(s);\n    println(d);\n}\n"
+    },
+    {
+      "iteration": 1,
+      "note": "After receiving the E0205 diagnostic naming Cancelled as the missing variant, the LLM adds the arm with a sensible description string. Build clean.",
+      "kara_source": "enum OrderStatus {\n    Pending,\n    Shipped,\n    Delivered,\n    Cancelled,\n}\n\nfn describe(status: OrderStatus) -> String {\n    match status {\n        Pending => \"awaiting payment\",\n        Shipped => \"in transit\",\n        Delivered => \"received by customer\",\n        Cancelled => \"cancelled by customer or merchant\",\n    }\n}\n\nfn main() {\n    let s: OrderStatus = Shipped;\n    let d: String = describe(s);\n    println(d);\n}\n"
+    }
+  ]
+}

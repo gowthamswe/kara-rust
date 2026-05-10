@@ -1,0 +1,11 @@
+{
+  "task": "welcome_emails",
+  "description": "Two LLM iterations modeling the simplest end of the Mend loop: resolver-level typos auto-fixed by karac fix. Iteration 0 is the LLM's initial buggy completion; iteration 1 is a no-op acknowledgement after karac fix lands the replacements. The harness should converge to a clean build after applying iteration 0's response and running karac fix once.",
+  "responses": [
+    {
+      "iteration": 0,
+      "note": "LLM's first attempt — two typos: count_user instead of count_users, send_welcom instead of send_welcome. Both have machine-applicable did_you_mean replacements.",
+      "kara_source": "fn send_welcome(user_id: i64) {\n    println(\"welcome user\");\n}\n\nfn count_users(user_ids: Vec[i64]) -> i64 {\n    let mut total: i64 = 0;\n    for id in user_ids {\n        total = total + 1;\n    }\n    total\n}\n\npub fn send_all(user_ids: Vec[i64]) -> i64 {\n    let n = count_user(user_ids);\n    let mut i: i64 = 0;\n    while i < n {\n        send_welcom(i);\n        i = i + 1;\n    }\n    n\n}\n\nfn main() {\n    let mut ids: Vec[i64] = Vec.new();\n    ids.push(1);\n    ids.push(2);\n    ids.push(3);\n    let count = send_all(ids);\n    println(\"done\");\n}\n"
+    }
+  ]
+}

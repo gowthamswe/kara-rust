@@ -1,0 +1,21 @@
+enum OrderStatus {
+    Pending,
+    Shipped,
+    Delivered,
+    Cancelled,
+}
+
+fn describe(status: OrderStatus) -> String {
+    match status {
+        Pending => "awaiting payment",
+        Shipped => "in transit",
+        Delivered => "received by customer",
+        Cancelled => "cancelled by customer or merchant",
+    }
+}
+
+fn main() {
+    let s: OrderStatus = Shipped;
+    let d: String = describe(s);
+    println(d);
+}

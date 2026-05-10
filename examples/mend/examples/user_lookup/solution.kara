@@ -1,0 +1,15 @@
+fn get_display_name(users: Map[i64, String], user_id: i64) -> String {
+    match users.get(user_id) {
+        Some(name) => name,
+        None => "Unknown",
+    }
+}
+
+fn main() {
+    let mut users: Map[i64, String] = Map.new();
+    users.insert(1, "Alice");
+    users.insert(2, "Bob");
+
+    let name: String = get_display_name(users, 1);
+    println(name);
+}

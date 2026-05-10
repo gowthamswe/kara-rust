@@ -1,0 +1,16 @@
+{
+  "task": "user_lookup",
+  "description": "Two LLM iterations modeling the type-mismatch end of the Mend loop. Iteration 0 returns the Map.get result directly (the modal Python idiom), producing E0200 'expected String, found Option<String>'. Iteration 1 wraps the lookup in a match. No machine-applicable fixes — convergence is purely descriptive.",
+  "responses": [
+    {
+      "iteration": 0,
+      "note": "LLM's first attempt — returns users.get(user_id) directly as the function's tail. E0200 fires from typecheck because Map.get returns Option<String>, not String.",
+      "kara_source": "fn get_display_name(users: Map[i64, String], user_id: i64) -> String {\n    users.get(user_id)\n}\n\nfn main() {\n    let mut users: Map[i64, String] = Map.new();\n    users.insert(1, \"Alice\");\n    users.insert(2, \"Bob\");\n\n    let name: String = get_display_name(users, 1);\n    println(name);\n}\n"
+    },
+    {
+      "iteration": 1,
+      "note": "After receiving the type-mismatch diagnostic, the LLM wraps the lookup in a match with a None-arm fallback. Build clean.",
+      "kara_source": "fn get_display_name(users: Map[i64, String], user_id: i64) -> String {\n    match users.get(user_id) {\n        Some(name) => name,\n        None => \"Unknown\",\n    }\n}\n\nfn main() {\n    let mut users: Map[i64, String] = Map.new();\n    users.insert(1, \"Alice\");\n    users.insert(2, \"Bob\");\n\n    let name: String = get_display_name(users, 1);\n    println(name);\n}\n"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+fn send_welcome(user_id: i64) {
+    println("welcome user");
+}
+
+fn count_users(user_ids: Vec[i64]) -> i64 {
+    let mut total: i64 = 0;
+    for id in user_ids {
+        total = total + 1;
+    }
+    total
+}
+
+pub fn send_all(user_ids: Vec[i64]) -> i64 {
+    let n = count_users(user_ids);
+    let mut i: i64 = 0;
+    while i < n {
+        send_welcome(i);
+        i = i + 1;
+    }
+    n
+}
+
+fn main() {
+    let mut ids: Vec[i64] = Vec.new();
+    ids.push(1);
+    ids.push(2);
+    ids.push(3);
+    let count = send_all(ids);
+    println("done");
+}
