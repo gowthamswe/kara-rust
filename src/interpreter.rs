@@ -1061,6 +1061,82 @@ fn upgrade_weak_to_option(weak: &std::sync::Weak<SharedStructInner>) -> Value {
     }
 }
 
+/// Deep-clone a `Value`, materializing independent storage for the
+/// by-value collection variants (`Array`, `Map`, `Set`, `Tuple`,
+/// `Struct`, `EnumVariant`, `Slice`). The derived `Clone` on `Value`
+/// shallow-clones `Array` / `SortedSet` etc. (the `Arc<RwLock<...>>`
+/// is bumped, sharing storage) — that's the right default for most
+/// dispatch paths since slice tracking depends on the shared cell.
+/// But operations whose Kāra-spec semantics produce *independent*
+/// copies (e.g., `Vec.filled[T: Clone]`) must materialize fresh
+/// storage per slot, otherwise nested-collection element types alias
+/// across copies.
+///
+/// Reference-semantics types (`SharedStruct`, `Sender`, `Receiver`,
+/// `SharedCell`, `Atomic`) preserve aliasing — those types are
+/// shared-by-design per Kāra's `shared struct` and channel rules.
+fn deep_clone_value(v: &Value) -> Value {
+    match v {
+        Value::Array(rc) => {
+            let items: Vec<Value> = rc.read().unwrap().iter().map(deep_clone_value).collect();
+            Value::array_of(items)
+        }
+        Value::Slice {
+            storage,
+            start,
+            len,
+            ..
+        } => {
+            // A deep clone of a slice produces an independent owned
+            // snapshot — the original window's storage is left alone.
+            let snapshot: Vec<Value> = storage.read().unwrap()[*start..*start + *len]
+                .iter()
+                .map(deep_clone_value)
+                .collect();
+            Value::array_of(snapshot)
+        }
+        Value::Set(items) => Value::Set(items.iter().map(deep_clone_value).collect()),
+        Value::Map(entries) => Value::Map(
+            entries
+                .iter()
+                .map(|(k, val)| (deep_clone_value(k), deep_clone_value(val)))
+                .collect(),
+        ),
+        Value::Tuple(items) => Value::Tuple(items.iter().map(deep_clone_value).collect()),
+        Value::Struct { name, fields } => Value::Struct {
+            name: name.clone(),
+            fields: fields
+                .iter()
+                .map(|(k, val)| (k.clone(), deep_clone_value(val)))
+                .collect(),
+        },
+        Value::EnumVariant {
+            enum_name,
+            variant,
+            data,
+        } => Value::EnumVariant {
+            enum_name: enum_name.clone(),
+            variant: variant.clone(),
+            data: match data {
+                EnumData::Unit => EnumData::Unit,
+                EnumData::Tuple(vals) => {
+                    EnumData::Tuple(vals.iter().map(deep_clone_value).collect())
+                }
+                EnumData::Struct(fields) => EnumData::Struct(
+                    fields
+                        .iter()
+                        .map(|(k, val)| (k.clone(), deep_clone_value(val)))
+                        .collect(),
+                ),
+            },
+        },
+        // Primitives, String, SortedSet (primitive-keyed), and the
+        // reference-semantics types (SharedStruct, Sender, Receiver,
+        // SharedCell, Atomic) all clone correctly under the derive.
+        _ => v.clone(),
+    }
+}
+
 /// Wrap a `Some(Value)` / `None` Rust option in the corresponding
 /// Kāra `Option[T]` enum variant. Used by `pop_back` / `pop_front` —
 /// any method whose return type is `Option[T]` and whose Rust impl
@@ -8984,7 +9060,12 @@ impl<'a> Interpreter<'a> {
         let len = n as usize;
         let mut items = Vec::with_capacity(len);
         for _ in 0..len {
-            items.push(val.clone());
+            // `deep_clone_value` rather than `.clone()` so nested-
+            // collection element types (e.g., `Vec[Vec[i64]]`) get
+            // independent storage per slot — the derived `Value::Clone`
+            // bumps the `Arc<RwLock<...>>` for `Value::Array`, which
+            // would alias every entry to the same underlying Vec.
+            items.push(deep_clone_value(&val));
         }
         Value::array_of(items)
     }

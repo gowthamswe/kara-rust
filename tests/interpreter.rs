@@ -307,6 +307,26 @@ fn test_vec_filled_string() {
 }
 
 #[test]
+fn test_vec_filled_nested_vec_independent_storage() {
+    // `Vec.filled(n, Vec.new())` must produce n independent Vecs —
+    // a per-slot deep clone, not an `Arc`-bump (the interpreter's
+    // `Value::Array` storage is `Arc<RwLock<...>>`; the default
+    // `Value::Clone` would alias every slot to the same underlying
+    // Vec, so pushing into one would be visible in all). Spec says
+    // `Vec.filled[T: Clone]` — Clone semantics for `Vec[T]` are deep.
+    let out = run(r#"
+        fn main() {
+            let mut grid: Vec[Vec[i64]] = Vec.filled(3, Vec.new());
+            grid[0].push(99);
+            println(grid[0].len());
+            println(grid[1].len());
+            println(grid[2].len());
+        }
+    "#);
+    assert_eq!(out, "1\n0\n0\n");
+}
+
+#[test]
 fn test_vec_filled_zero_length() {
     // `Vec.filled(0, x)` is legal — produces an empty Vec.
     let out = run(r#"
