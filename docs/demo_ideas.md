@@ -95,6 +95,29 @@ the decision *visible and auditable*, which no other language offers.
 **Effort:** Medium. HTTP server layer needed (FFI or a thin Kāra wrapper).
 Benchmark harness is straightforward.
 
+#### Slice E — Three-language benchmark harness (design drafted 2026-05-09)
+
+Demo 1's recordable artifact: side-by-side `GET /dashboard/:user_id` benchmark across Kāra, Rust, Go, and Node. Predecessor: HTTP handler ABI trampoline (`docs/implementation_checklist/phase-7-codegen.md` § "HTTP handler ABI trampoline"). Execution scaffolding in `docs/implementation_checklist/wip-list1.md` (`[BLOCKED on trampoline ship]`). Slices A (`ab611d3`), B (`3c3d87b`), C (`f5c7b31`), D (`502250a`), F (`91768f2`) all shipped 2026-05-09 — Slice E is the final piece that makes Demo 1 recordable.
+
+**Settled design forks (2026-05-09).**
+
+- **F1 — Recording artifact.** Markdown throughput table at `examples/parallax/bench/README.md` + checked-in `bench.sh` reproducer. Engineers believe code, not videos; a rerunnable script is the highest-credibility artifact. Asciinema cast and video walkthrough are post-v1 polish — additive, not gating.
+- **F2 — Load distribution.** `wrk` Lua script generates random uniform user IDs in `1..1000`. Provides realistic-looking traffic in the recording without affecting throughput numbers (providers use `sleep_ms(n)`, not real lookups, so there's nothing to cache).
+- **F3 — Win condition.** Measure first; frame post-hoc based on actual numbers. No defensive bar pre-baked. If results disappoint, that's a diagnostic signal for follow-up perf investigation, not a story to pre-rationalize.
+- **F4 — Cross-language fairness controls.** Tokio worker count for Kāra and Rust matches `GOMAXPROCS` (= CPU count); Go uses default `GOMAXPROCS`; Node runs single-process (faithful to the language's default deployment reality); same hardware, sequential `wrk` runs (10s warmup + 30s measurement per impl). README footnotes Node's single-process choice and notes that cluster mode would scale ~Nx at the cost of process orchestration.
+- **F5 — Provider delays.** Asymmetric: 2/5/8/12 ms per provider. Total sequential ~27ms; total parallel ~12ms (waiting on the slowest). Asymmetry surfaces the "join waits on slowest provider" property in the trace narration.
+- **Rust added to comparison cohort 2026-05-09.** Extends the original Go+Node staging entry to a 4-way comparison. Rust (tokio + hyper + `tokio::join!()`) is the natural perf ceiling and uses the same runtime stack as Kāra, so the Kāra-vs-Rust gap measures Kāra's value-type ABI + trampoline overhead vs raw Rust. Single 4-way table per F3 — let the data tell the story rather than pre-splitting cross-paradigm vs implementation-overhead framings.
+- **Demo location.** `examples/parallax/bench/{kara,rust,go,node}/` with top-level `bench.sh` and `README.md`. Same compiler repo (matches the existing `examples/parallax_lite/` precedent). Reproduction is opt-in (not part of `cargo test`); `bench.sh` graceful-degrades when language toolchains are missing (skip-with-stderr-notice pattern from `tests/memory_sanitizer.rs::KARAC_SKIP_ASAN_TESTS`).
+
+**Out of scope (deferred to follow-ups).**
+
+- TLS, HTTP/2, WebSockets — Phase 11.
+- Real database FFI (Postgres / MySQL / Redis) — Phase 11 long-tail. Demo uses `sleep_ms(n)` providers + in-memory state.
+- Cluster-mode Node — footnoted in README; not implemented in v1 bench.
+- Asciinema cast / video walkthrough — post-v1 polish if shareability benefits warrant it.
+- Multi-user load patterns (Zipf, sticky-session) — random uniform is enough to exercise per-request fan-out; richer load shapes are a follow-up if perf investigation calls for it.
+- Splitting Parallax bench into a standalone repo (`parallax-bench/`) for shareable cloning — premature; same-repo until a real reason to split surfaces.
+
 ---
 
 ### Demo 2: Mend — AI Writes Kāra
