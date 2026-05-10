@@ -24,6 +24,9 @@
 // so we accumulate into a local variable instead and only consult the
 // `user_id` arg + the canned data when constructing the return value.
 
+import types.{Profile, Order, Notification, Recommendation};
+import traits.{UserDatabase, OrderDatabase, NotificationDatabase, RecommendationDatabase};
+
 // Per-provider iteration counts. ~75M total across the four fetches —
 // sized so a 3-4-core machine sees clean ~3x speedup signal in the
 // wall-clock benchmark, well above the relaxed 2.0x assertion floor.

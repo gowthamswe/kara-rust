@@ -1136,8 +1136,6 @@ impl<'a> Lexer<'a> {
             // Literals
             "true" => Token::True,
             "false" => Token::False,
-            // Providers
-            "providers" => Token::Providers,
             // Other
             "alias" => Token::Alias,
             "independent" => Token::Independent,

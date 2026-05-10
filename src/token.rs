@@ -137,8 +137,12 @@ pub enum Token {
     // Assembly
     Asm,
     GlobalAsm,
-    // Providers
-    Providers,
+    // `providers` is parsed as a contextual keyword: the lexer emits it
+    // as `Identifier { name: "providers" }`, and the parser dispatches to
+    // `parse_providers_block` when an identifier expression named
+    // "providers" is followed by `{`. This frees the bareword for module
+    // names, function names, variable bindings, etc. (e.g.,
+    // `examples/parallax/src/providers.kara`).
     // Other
     Distinct,
     Alias,

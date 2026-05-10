@@ -922,6 +922,52 @@ fn test_build_project_codegen_cross_module_collision_diagnostic() {
 
 #[cfg(feature = "llvm")]
 #[test]
+fn test_build_project_codegen_providers_as_module_name() {
+    // Theme 4 follow-up (2026-05-10): the lexer no longer reserves
+    // `providers` as a global keyword. The bareword now lexes as a
+    // regular identifier, so module names like `src/providers.kara`
+    // and import paths `import providers.{...}` parse cleanly. The
+    // parser dispatches to the `providers { R => e } in { body }`
+    // block contextually — only when `providers` (as an Identifier
+    // expression) is followed by `{`. This pins the demo path that
+    // motivated the contextual-keyword change (`examples/parallax/`).
+    let tmp = scratch_project("providers-module-name");
+    write(
+        &tmp.join("kara.toml"),
+        "[package]\nname = \"providers_module\"\n",
+    );
+    write(
+        &tmp.join("src/main.kara"),
+        "import providers.canned_value;\n\
+         fn main() { println(canned_value()); }\n",
+    );
+    write(
+        &tmp.join("src/providers.kara"),
+        "pub fn canned_value() -> i64 { 314 }\n",
+    );
+
+    let out = karac_bin().current_dir(&tmp).arg("build").output().unwrap();
+    assert!(
+        out.status.success(),
+        "build failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let exe_path = tmp.join("providers_module");
+    let run = std::process::Command::new(&exe_path).output();
+    let _ = std::fs::remove_dir_all(&tmp);
+    let run = run.expect("executable should be runnable");
+    assert!(
+        run.status.success(),
+        "executable failed: stderr={}",
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "314");
+}
+
+#[cfg(feature = "llvm")]
+#[test]
 fn test_build_project_codegen_manifest_name_becomes_binary_name() {
     let tmp = scratch_project("codegen-binname");
     write(

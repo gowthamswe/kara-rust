@@ -18,6 +18,8 @@
 // push calls in `main.kara` and the `R.fetch_*` lookup calls inside
 // the workload reference these IDs through the runtime ABI.
 
+import traits.{UserDatabase, OrderDatabase, NotificationDatabase, RecommendationDatabase};
+
 pub effect resource UserDB: UserDatabase;
 pub effect resource OrderDB: OrderDatabase;
 pub effect resource NotifDB: NotificationDatabase;

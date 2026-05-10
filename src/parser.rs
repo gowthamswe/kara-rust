@@ -2690,9 +2690,12 @@ impl Parser {
     /// pass). Trailing comma is accepted. Empty binding lists are
     /// rejected — an empty `providers { } in { body }` is semantically
     /// equivalent to just `body` and almost certainly a typo.
-    fn parse_providers_block(&mut self) -> Option<Expr> {
-        let start = self.current_span();
-        self.advance(); // consume `providers`
+    /// Parse `providers { R => e, ... } in { body }` — the keyword
+    /// `providers` is contextual and has already been consumed by the
+    /// caller (`parse_identifier_expr`'s "providers"-name dispatch).
+    /// `start` is the span of the consumed keyword for fidelity in the
+    /// resulting Expr.
+    fn parse_providers_block(&mut self, start: Span) -> Option<Expr> {
         self.expect(&Token::LeftBrace)?;
 
         let mut bindings: Vec<crate::ast::ProviderBinding> = Vec::new();
@@ -3895,11 +3898,12 @@ impl Parser {
                 })
             }
 
-            // Providers block: `providers { R => e, ... } in { body }`.
-            // Desugars to nested `with_provider[R](e, || body)` calls at
-            // evaluation time; see design.md § `providers { } in { }` Block.
-            Token::Providers => self.parse_providers_block(),
-
+            // `providers { R => e, ... } in { body }` is parsed as a
+            // contextual keyword: see `parse_identifier_expr`'s
+            // name == "providers" dispatch. The lexer no longer reserves
+            // `providers` as a token, so module names / function names /
+            // variable bindings can use the bareword freely.
+            //
             // Pipe placeholder: _ in expression position (for use in pipe argument lists)
             Token::Underscore => {
                 self.advance();
@@ -4322,6 +4326,18 @@ impl Parser {
     fn parse_identifier_expr(&mut self) -> Option<Expr> {
         let start = self.current_span();
         let name = self.expect_identifier()?;
+
+        // Contextual keyword: `providers { R => e, ... } in { body }`.
+        // The lexer emits `providers` as a regular identifier (so module
+        // names / functions / variable bindings can use the bareword);
+        // the parser dispatches on the `Identifier("providers")` + `{`
+        // shape. Unambiguous against other identifier-then-`{` forms in
+        // expression position because struct literals require uppercase
+        // leading and there's no other identifier-followed-by-block
+        // shape today. See design.md § `providers { } in { }` Block.
+        if name == "providers" && self.check(&Token::LeftBrace) {
+            return self.parse_providers_block(start);
+        }
 
         // Check for labeled loop / labeled block: `label: while/for/loop`
         // or `label: { ... }`. `is_loop_label` accepts both shapes.

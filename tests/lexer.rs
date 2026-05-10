@@ -657,9 +657,23 @@ fn test_effect_modifier_keywords() {
 }
 
 #[test]
-fn test_providers_keyword() {
+fn test_providers_is_contextual_identifier() {
+    // Theme 4 follow-up (2026-05-10): `providers` is no longer
+    // globally-reserved at the lexer level — it lexes as a regular
+    // identifier so module names / function names / variable bindings
+    // can use the bareword (e.g., `examples/parallax/src/providers.kara`
+    // imported via `import providers.{...}`). The parser dispatches to
+    // the `providers { R => e } in { body }` block shape contextually
+    // when an identifier expression named "providers" is followed by
+    // `{` — see `parse_identifier_expr`.
     let tokens = tokens_only("providers");
-    assert_eq!(tokens[0], Token::Providers);
+    assert_eq!(
+        tokens[0],
+        Token::Identifier {
+            name: "providers".to_string(),
+            raw: false,
+        }
+    );
 }
 
 // ── Compound assignment operators ───────────────────────────────

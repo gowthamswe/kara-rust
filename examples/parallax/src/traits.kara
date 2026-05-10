@@ -21,6 +21,8 @@
 // `panics`; the impl's effects flow back through the resource binding,
 // not the trait declaration).
 
+import types.{Profile, Order, Notification, Recommendation};
+
 pub trait UserDatabase {
     fn fetch_profile(ref self, user_id: i64) -> Profile;
 }

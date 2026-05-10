@@ -4327,6 +4327,24 @@ fn test_providers_block_without_trailing_comma_ok() {
     assert_eq!(bindings.len(), 2);
 }
 
+#[test]
+fn test_providers_is_contextual_keyword_usable_as_identifier() {
+    // Theme 4 follow-up (2026-05-10): the lexer no longer reserves
+    // `providers` as a keyword token. The bareword is usable as a
+    // module name (`src/providers.kara`), function name, parameter
+    // name, and variable binding. The parser dispatches to the
+    // `providers { R => e } in { body }` block shape contextually —
+    // only when an identifier expression named `providers` is
+    // immediately followed by `{`.
+    parse_ok(
+        "fn providers() -> i64 { 7 }\n\
+         fn main() {\n\
+             let providers: i64 = 1;\n\
+             let _ = providers + providers;\n\
+         }",
+    );
+}
+
 // ── Half-open range expressions ─────────────────────────────────────────────
 
 #[test]

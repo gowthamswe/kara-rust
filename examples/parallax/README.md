@@ -52,24 +52,20 @@ This one adds:
 ## How to run
 
 The project uses the multi-file layout (`kara.toml` + `src/*.kara`).
-Multi-file codegen isn't wired into `karac build` yet, so today the
-binary is built from a concatenated single-file source:
+Multi-file codegen ships in Theme 4 (2026-05-10) — `karac build` from
+the project root drives all six modules through resolve / typecheck
+per-module, then concatenates the items in topological order and
+runs effect / ownership / concurrency / codegen / link end-to-end:
 
 ```sh
-( cat examples/parallax/src/types.kara                       \
-       examples/parallax/src/traits.kara                     \
-       examples/parallax/src/resources.kara                  \
-       examples/parallax/src/providers.kara                  \
-  ; grep -v '^import ' examples/parallax/src/workload.kara   \
-  ; grep -v '^import ' examples/parallax/src/main.kara       \
-) > /tmp/parallax.kara
+cd examples/parallax/
 
 # auto-parallelized (default)
-karac build /tmp/parallax.kara
+karac build
 ./parallax
 
 # sequential baseline — same source, same binary, opt-out via env var
-KARAC_AUTO_PAR=0 karac build /tmp/parallax.kara
+KARAC_AUTO_PAR=0 karac build
 ./parallax
 ```
 
@@ -77,9 +73,9 @@ KARAC_AUTO_PAR=0 karac build /tmp/parallax.kara
 plain sequential execution at codegen time. A user-facing
 `--sequential` CLI flag is planned.
 
-`karac build --concurrency-report /tmp/parallax.kara` prints a
-storyboard of what auto-parallelized and why — the four-call group on
-`get_dashboard` is the headline output.
+`karac build --concurrency-report` prints a storyboard of what auto-
+parallelized and why — the four-call group on `get_dashboard` is the
+headline output.
 
 ## Files
 

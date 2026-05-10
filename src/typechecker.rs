@@ -3515,6 +3515,10 @@ impl<'a> TypeChecker<'a> {
         let Some(tree) = self.tree else {
             return;
         };
+        // Items collected for env_add_* registration. Done in two
+        // passes so the iteration borrow on `self.program.items` ends
+        // before the env_add_* methods take `&mut self`.
+        let mut imported_items: Vec<(String, crate::ast::Item)> = Vec::new();
         for item in &self.program.items {
             let Item::Import(imp) = item else { continue };
             for ii in &imp.items {
@@ -3534,8 +3538,86 @@ impl<'a> TypeChecker<'a> {
                 if let Some(vis) = find_item_visibility(origin_module, &origin_name) {
                     let bound = ii.alias.clone().unwrap_or_else(|| ii.name.clone());
                     self.type_origins
-                        .insert(bound, (origin_path, origin_name, vis));
+                        .insert(bound, (origin_path, origin_name.clone(), vis));
                 }
+                // Theme 4 follow-up (2026-05-10) — pull the imported
+                // item's full definition into the local env so per-
+                // module typecheck sees imported structs / enums /
+                // traits as first-class types. Without this, struct
+                // literals on imported types fired `E0207 NotAStruct`
+                // even though resolution succeeded. The original CR-24
+                // slice-6 surface only carried `(origin_path, name,
+                // vis)` in `type_origins`; the full definition is
+                // needed for struct-literal validation, variant
+                // construction, and trait-method dispatch.
+                for oitem in &origin_module.items {
+                    let matches = match oitem {
+                        Item::StructDef(s) => s.name == origin_name,
+                        Item::EnumDef(e) => e.name == origin_name,
+                        Item::TraitDef(t) => t.name == origin_name,
+                        Item::TraitAlias(t) => t.name == origin_name,
+                        Item::MarkerTrait(t) => t.name == origin_name,
+                        _ => false,
+                    };
+                    if matches {
+                        imported_items.push((
+                            ii.alias.clone().unwrap_or_else(|| ii.name.clone()),
+                            oitem.clone(),
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        for (bound_name, item) in imported_items {
+            // Skip when an item with the bound name is already registered
+            // — local definitions and stdlib bakeds win over imports.
+            match &item {
+                Item::StructDef(s) => {
+                    if self.env.structs.contains_key(&bound_name) {
+                        continue;
+                    }
+                    // Re-bind the struct under its locally-bound name so
+                    // `infer_struct_literal`'s lookup succeeds. The
+                    // canonical name is preserved in `type_origins` for
+                    // visibility / canonicalization checks.
+                    let mut local_def = s.clone();
+                    local_def.name = bound_name;
+                    self.env_add_struct(&local_def);
+                }
+                Item::EnumDef(e) => {
+                    if self.env.enums.contains_key(&bound_name) {
+                        continue;
+                    }
+                    let mut local_def = e.clone();
+                    local_def.name = bound_name;
+                    self.env_add_enum(&local_def);
+                }
+                Item::TraitDef(t) => {
+                    if self.env.traits.contains_key(&bound_name) {
+                        continue;
+                    }
+                    let mut local_def = t.clone();
+                    local_def.name = bound_name;
+                    self.env_add_trait(&local_def);
+                }
+                Item::TraitAlias(t) => {
+                    if self.env.traits.contains_key(&bound_name) {
+                        continue;
+                    }
+                    let mut local_def = t.clone();
+                    local_def.name = bound_name;
+                    self.env_add_trait_alias(&local_def);
+                }
+                Item::MarkerTrait(t) => {
+                    if self.env.traits.contains_key(&bound_name) {
+                        continue;
+                    }
+                    let mut local_def = t.clone();
+                    local_def.name = bound_name;
+                    self.env_add_marker_trait(&local_def);
+                }
+                _ => {}
             }
         }
     }
