@@ -720,6 +720,60 @@ fn main() {
         );
     }
 
+    /// Bug fix: when an auto-par group's bindings are consumed only
+    /// via an f-string in the tail position (e.g.
+    /// `f"{a}-{b}-{c}-{d}"`), `compute_return_slots`'s `refs_in_expr`
+    /// walk previously didn't recurse into
+    /// `ExprKind::InterpolatedStringLit`'s segment list, so the four
+    /// names were missed by the outside-group reads set, no slots
+    /// were materialized, and codegen errored "Undefined variable"
+    /// at the f-string's load sites (the workaround applied in
+    /// Slice E `ea1d26d` was returning a fixed JSON literal).
+    ///
+    /// Fixed in `src/codegen.rs::refs_in_expr`: added an
+    /// `InterpolatedStringLit` arm that walks each
+    /// `ParsedInterpolationPart::Expr`. This test mirrors the
+    /// four-reads-with-join shape above but routes the captures
+    /// through an f-string instead of a direct fn call.
+    #[test]
+    fn test_auto_par_fstring_tail_captures_par_group_bindings() {
+        let ir = ir_for_with_concurrency(
+            r#"
+effect resource Net;
+effect resource Disk;
+effect resource Db;
+effect resource Cache;
+
+fn fetch_net() -> i64 reads(Net) { 1 }
+fn fetch_disk() -> i64 reads(Disk) { 2 }
+fn fetch_db() -> i64 reads(Db) { 3 }
+fn fetch_cache() -> i64 reads(Cache) { 4 }
+
+fn main() {
+    let result_1 = fetch_net();
+    let result_2 = fetch_disk();
+    let result_3 = fetch_db();
+    let result_4 = fetch_cache();
+    println(f"{result_1}-{result_2}-{result_3}-{result_4}");
+}
+"#,
+        );
+        let calls = ir.matches("call void @karac_par_run").count();
+        assert_eq!(calls, 1, "expected one karac_par_run dispatch; IR:\n{ir}");
+        assert!(
+            ir.contains("__karac_ParGroup_0_Returns"),
+            "expected return struct; pre-fix the f-string segments \
+             weren't walked so no slots were materialized; IR:\n{ir}"
+        );
+        for name in ["result_1", "result_2", "result_3", "result_4"] {
+            let needle = format!("__par_slot_{name}_ptr");
+            assert!(
+                ir.contains(&needle),
+                "expected slot-pointer GEP {needle}; IR:\n{ir}"
+            );
+        }
+    }
+
     /// Three independent `writes(R_i)` calls on disjoint resources
     /// with no joined return — the parallax-lite microbenchmark
     /// shape. The auto-par dispatch fires (one `karac_par_run`, three

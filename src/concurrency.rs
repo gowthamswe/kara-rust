@@ -698,13 +698,19 @@ impl<'a> ConcurrencyChecker<'a> {
                 }
                 self.collect_block_reads(body, reads);
             }
+            ExprKind::InterpolatedStringLit(parts) => {
+                for part in parts {
+                    if let ParsedInterpolationPart::Expr(inner) = part {
+                        self.collect_expr_reads(inner, reads);
+                    }
+                }
+            }
             // Leaf expressions that don't read variables
             ExprKind::Integer(_, _)
             | ExprKind::Float(_, _)
             | ExprKind::CharLit(_)
             | ExprKind::StringLit(_)
             | ExprKind::MultiStringLit(_)
-            | ExprKind::InterpolatedStringLit(_)
             | ExprKind::Bool(_)
             | ExprKind::SelfValue
             | ExprKind::SelfType
@@ -924,6 +930,13 @@ impl<'a> ConcurrencyChecker<'a> {
                 }
                 self.collect_block_effects(body, info);
             }
+            ExprKind::InterpolatedStringLit(parts) => {
+                for part in parts {
+                    if let ParsedInterpolationPart::Expr(inner) = part {
+                        self.collect_expr_effects(inner, info);
+                    }
+                }
+            }
             // Leaf expressions — no effects
             ExprKind::Identifier(_)
             | ExprKind::Path { .. }
@@ -934,7 +947,6 @@ impl<'a> ConcurrencyChecker<'a> {
             | ExprKind::CharLit(_)
             | ExprKind::StringLit(_)
             | ExprKind::MultiStringLit(_)
-            | ExprKind::InterpolatedStringLit(_)
             | ExprKind::Bool(_)
             | ExprKind::Continue { .. }
             | ExprKind::Return(None)

@@ -17366,6 +17366,13 @@ impl<'ctx> Codegen<'ctx> {
                     self.refs_in_expr(e, refs, defs);
                 }
             }
+            ExprKind::InterpolatedStringLit(parts) => {
+                for part in parts {
+                    if let ParsedInterpolationPart::Expr(inner) = part {
+                        self.refs_in_expr(inner, refs, defs);
+                    }
+                }
+            }
             _ => {}
         }
     }
