@@ -513,6 +513,9 @@ fn iterator_item_type_for(ty: &Type) -> Option<Type> {
         Type::Named { name, args } => match name.as_str() {
             "Vec" | "Set" | "SortedSet" | "VecDeque" if args.len() == 1 => Some(args[0].clone()),
             "Map" if args.len() == 2 => Some(Type::Tuple(vec![args[0].clone(), args[1].clone()])),
+            // `Range` / `RangeInclusive` are Iterators — `(0..n).iter()` is
+            // a redundant pass-through that yields the bound element type.
+            "Range" | "RangeInclusive" if args.len() == 1 => Some(args[0].clone()),
             _ => None,
         },
         Type::Ref(inner) | Type::MutRef(inner) => iterator_item_type_for(inner),
@@ -9789,12 +9792,19 @@ impl<'a> TypeChecker<'a> {
         // Iterator method dispatch — `Iterator[Item = T].next()` and the
         // adaptor surface (added in subtask 3+). Keyed on the receiver's
         // outer Type::Named name; the Item type is at args[0].
+        // `Range` / `RangeInclusive` are also Iterators (matches Rust),
+        // routed through the same dispatch so `(0..10).step_by(2)` works
+        // without a redundant `.iter()` call.
         if let Type::Named {
             name,
             args: type_args,
         } = &obj_ty
         {
-            if name == "Iterator" || name == "Peekable" {
+            if name == "Iterator"
+                || name == "Peekable"
+                || name == "Range"
+                || name == "RangeInclusive"
+            {
                 let item_ty = type_args.first().cloned().unwrap_or(Type::Error);
                 let is_peekable = name == "Peekable";
                 return self.infer_iterator_method(&item_ty, method, args, span, is_peekable);

@@ -2892,8 +2892,13 @@ impl<'a> Interpreter<'a> {
                 self.eval_expr_inner(inner)
             }
 
-            // Range — evaluates to an Array of integers for bounded ranges,
-            // or a runtime error for unbounded forms used as values.
+            // Range — evaluates to a `Value::Iterator` for bounded ranges
+            // (so `(0..10).step_by(2)` and the rest of the adaptor surface
+            // dispatch through the same path as `xs.iter()`), or a runtime
+            // error for unbounded forms used as values. The for-loop iterable
+            // path drains `Value::Iterator` via `iterator_step` (see the
+            // `ExprKind::For` arm above), so `for x in 0..n { ... }` keeps
+            // working unchanged.
             ExprKind::Range {
                 start,
                 end,
@@ -2908,7 +2913,10 @@ impl<'a> Interpreter<'a> {
                         } else {
                             (a..b).map(Value::Int).collect()
                         };
-                        Value::array_of(items)
+                        Value::Iterator {
+                            source: IteratorSource::Eager { items, cursor: 0 },
+                            steps: Vec::new(),
+                        }
                     }
                     (None, None) => {
                         // RangeFull used as a value — only valid as a slice index
@@ -5750,6 +5758,14 @@ impl<'a> Interpreter<'a> {
                 // tree-walk interpreter is type-erased so iter() and
                 // into_iter() are identical at this layer — the design.md
                 // borrow-vs-consume distinction is a typechecker concern.
+                //
+                // Iterator receivers (e.g. the redundant `(0..10).iter()`
+                // call shape now that Range evaluates to `Value::Iterator`)
+                // pass through unchanged — calling iter() on an iterator
+                // returns the iterator itself.
+                if matches!(&obj, Value::Iterator { .. }) {
+                    return obj;
+                }
                 let items = match &obj {
                     Value::Array(rc) => rc.read().unwrap().clone(),
                     Value::Slice {

@@ -7982,3 +7982,118 @@ fn test_dbg_returns_its_argument() {
     assert_eq!(stdout.join(""), "7\n");
     assert_eq!(dbg.len(), 2);
 }
+
+// ── Range / RangeInclusive as Iterator ─────────────────────────
+//
+// Range and RangeInclusive evaluate to `Value::Iterator` so the adaptor
+// surface (`step_by`, `map`, `filter`, `take`, `collect`, ...) dispatches
+// directly without a redundant `.iter()` layer. The for-loop iterable
+// path drains `Value::Iterator` via `iterator_step`, so for-loop
+// semantics are preserved.
+
+#[test]
+fn test_range_iter_step_by_collect() {
+    // `(0..10).step_by(2).collect()` — half-open Range as Iterator.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let xs: Vec[i64] = (0..10).step_by(2).collect();
+    for x in xs {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "0\n2\n4\n6\n8\n");
+}
+
+#[test]
+fn test_range_inclusive_step_by_collect() {
+    // `(1..=10).step_by(2).collect()` — RangeInclusive as Iterator pins
+    // the inclusive-end semantics (10 is reachable but the stride
+    // skips it).
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let xs: Vec[i64] = (1..=10).step_by(2).collect();
+    for x in xs {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "1\n3\n5\n7\n9\n");
+}
+
+#[test]
+fn test_range_redundant_iter() {
+    // `(0..5).iter().collect()` — the redundant iter() call on a Range
+    // is a no-op pass-through. Pins the iter/into_iter early-return
+    // guard (sub-step (d)) — without it, this hits an `unreachable!`
+    // because Range now produces `Value::Iterator` rather than
+    // `Value::Array`.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let xs: Vec[i64] = (0..5).iter().collect();
+    for x in xs {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "0\n1\n2\n3\n4\n");
+}
+
+#[test]
+fn test_range_chained_adaptors() {
+    // Multi-step adaptor composition through the new entry surface:
+    // map doubles each element, filter keeps those > 5.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let xs: Vec[i64] = (0..10).map(|x| x * 2).filter(|x| x > 5).collect();
+    for x in xs {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "6\n8\n10\n12\n14\n16\n18\n");
+}
+
+#[test]
+fn test_range_for_loop_unchanged() {
+    // Regression — for-loop semantics must survive the Range → Iterator
+    // eval change. Sums 0+1+2+3+4 = 10.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let mut s = 0;
+    for x in 0..5 {
+        s = s + x;
+    }
+    println(s);
+}
+"#,
+    );
+    assert_eq!(output, "10\n");
+}
+
+#[test]
+fn test_range_inclusive_take() {
+    // `(0..=100).take(3).collect()` pins the eager-snapshot truncation
+    // under `take` — the source pre-materialises 101 items but the
+    // step-layer adaptor pulls only the first three.
+    let output = run_no_errors(
+        r#"
+fn main() {
+    let xs: Vec[i64] = (0..=100).take(3).collect();
+    for x in xs {
+        println(x);
+    }
+}
+"#,
+    );
+    assert_eq!(output, "0\n1\n2\n");
+}

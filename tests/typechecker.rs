@@ -10324,3 +10324,46 @@ fn test_ufcs_typeparam_form_unchanged() {
             .collect::<Vec<_>>()
     );
 }
+
+// ── Range / RangeInclusive as Iterator (typechecker) ───────────
+//
+// Range and RangeInclusive route through the Iterator-method
+// dispatch surface, so adaptors typecheck directly on a Range
+// receiver and unknown methods report against the Iterator type.
+
+#[test]
+fn test_range_step_by_typechecks() {
+    // `(0..10).step_by(2)` — the receiver enters the Iterator dispatch
+    // arm; `step_by` returns `Iterator[i64]`. Use a function-parameter
+    // sink to pin the result type without leaning on struct-literal
+    // generic-arg inference.
+    typecheck_ok(
+        "fn sink(_it: Iterator[i64]) { }
+         fn main() {
+             sink((0..10).step_by(2));
+         }",
+    );
+}
+
+#[test]
+fn test_range_unknown_method_rejects() {
+    // `(0..10).bogus()` — Range promotes to Iterator at the
+    // adaptor-dispatch surface, so the method-not-found diagnostic
+    // names `Iterator` (not `Range`).
+    let errors = typecheck_errors(
+        "fn main() {
+             let _ = (0..10).bogus();
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NoMethodFound,)
+                && e.message.contains("Iterator")),
+        "expected NoMethodFound naming 'Iterator', got: {:?}",
+        errors
+            .iter()
+            .map(|e| (&e.kind, &e.message))
+            .collect::<Vec<_>>()
+    );
+}
