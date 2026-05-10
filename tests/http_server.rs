@@ -331,4 +331,127 @@ mod http_server_tests {
     fn test_http_server_handler_effects_propagate() {
         // Placeholder — see doc comment.
     }
+
+    /// Slice B follow-up (2026-05-09) — `Server.serve(handler)` smoke.
+    ///
+    /// Compiles a Kāra program that calls `Server.serve(handle)` with a
+    /// free-fn handler, runs the resulting binary, reads `BOUND_PORT`
+    /// from stdout, performs a `GET /`, and asserts the runtime side
+    /// of the handler-dispatch entry comes up cleanly. Sibling to
+    /// `test_http_server_serves_hardcoded_handler` (the `serve_static`
+    /// equivalent above).
+    ///
+    /// **Why this is `#[ignore]`'d at landing.** v1 ships the codegen
+    /// path that lowers `Server.serve(handle)` to a call into
+    /// `karac_runtime_serve_http(addr_cstr, handler_fn_ptr,
+    /// bound_port_out)` — verified by `tests/codegen.rs ::
+    /// test_server_serve_with_free_fn_handler_compiles`. The runtime-
+    /// side contract is that the handler is an `extern "C" fn(*const
+    /// KaracHttpRequest, *mut KaracHttpResponse)` taking two raw
+    /// pointers, but the Kāra-side `fn handle(req: Request) ->
+    /// Response` declaration lowers to a lowering-incompatible
+    /// signature (Kāra's empty-struct `Request` collapses to `i64`
+    /// at the LLVM layer; `Response` is returned by value, not
+    /// written through `*mut KaracHttpResponse`). Per the slice's
+    /// hard-stop trigger 2 fallback, codegen still emits the call —
+    /// LLVM's indirect-call boundary is structurally `ptr` so the
+    /// build succeeds — but invoking the handler at runtime with
+    /// mismatched ABI is undefined behavior. Wiring up the
+    /// trampoline / glue that translates between the FFI struct
+    /// pointers and the Kāra-side `Request` / `Response` value types
+    /// is a separate codegen track (Phase 7.2 § "HTTP handler ABI
+    /// trampoline").
+    ///
+    /// The test stays in-tree as documentation of the missing piece;
+    /// once the trampoline lands, flip the `#[ignore]` and the test
+    /// pins the end-to-end handler-dispatch contract.
+    #[test]
+    #[ignore]
+    fn test_server_serve_handler_smoke() {
+        let Some(rt) = runtime_path() else {
+            eprintln!(
+                "skip: libkarac_runtime.a not built \
+                 (run `cargo build -p karac-runtime --release`)"
+            );
+            return;
+        };
+        std::env::set_var("KARAC_RUNTIME", &rt);
+
+        let src = r#"
+            fn handle(req: Request) -> Response {
+                Response { status: 200, body: "{}" }
+            }
+
+            fn main() {
+                let _result = Server.serve(handle);
+                println("server exited unexpectedly");
+            }
+        "#;
+
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let exe_path = PathBuf::from(format!("/tmp/karac_http_handler_{pid}_{nanos}"));
+
+        if let Err(e) = compile_and_link(src, &exe_path) {
+            panic!("compile/link failed: {e}");
+        }
+
+        let mut child = Command::new(&exe_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn server binary");
+
+        let stdout = child.stdout.take().expect("child stdout missing");
+        let (port_opt, _join) = await_bound_port(stdout, Duration::from_secs(15));
+
+        let port = match port_opt {
+            Some(p) => p,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&exe_path);
+                panic!("server did not emit BOUND_PORT line within timeout");
+            }
+        };
+        assert!(port > 0, "BOUND_PORT must be a non-zero ephemeral port");
+
+        let started = Instant::now();
+        let mut last_err: Option<String> = None;
+        let mut response: Option<(u16, String)> = None;
+        for _ in 0..10 {
+            match http_get(port, "/") {
+                Ok(r) => {
+                    response = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&exe_path);
+
+        let (status, body) = match response {
+            Some(r) => r,
+            None => panic!(
+                "GET / against 127.0.0.1:{port} never succeeded; \
+                 last error: {:?}",
+                last_err
+            ),
+        };
+        assert_eq!(status, 200, "expected 200 status; body={body:?}");
+        assert_eq!(body.trim(), "{}", "expected `{{}}` body; got: {body:?}");
+    }
 }

@@ -10367,3 +10367,22 @@ fn test_range_unknown_method_rejects() {
             .collect::<Vec<_>>()
     );
 }
+
+// ── Slice B follow-up (2026-05-09) — `Server.serve(handler)` ─────
+//
+// Pins that the new `Server.serve(handler: Fn(Request) -> Response)
+// -> Result[Unit, HttpError] with sends(Network) receives(Network)`
+// declaration in `runtime/stdlib/http.kara` typechecks against a
+// free-fn handler whose declared effect set matches the slot.
+
+#[test]
+fn test_server_serve_signature_typechecks() {
+    typecheck_ok(
+        "fn get_dashboard(req: Request) -> Response with sends(Network) receives(Network) {
+             Response { status: 200, body: \"{}\" }
+         }
+         fn main() {
+             let _result = Server.serve(get_dashboard);
+         }",
+    );
+}

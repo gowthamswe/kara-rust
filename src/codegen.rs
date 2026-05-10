@@ -1181,6 +1181,35 @@ impl<'ctx> Codegen<'ctx> {
             Some(Linkage::External),
         );
 
+        // Slice B follow-up (2026-05-09): full handler-dispatch entry.
+        // `karac_runtime_serve_http(addr_cstr: *const c_char, handler:
+        // extern "C" fn(*const KaracHttpRequest, *mut KaracHttpResponse),
+        // bound_port_out: *mut u16) -> i32`. v1 always passes a null
+        // `bound_port_out` — the smoke test reads the port from the
+        // runtime's `BOUND_PORT=<n>\n` stdout line per Slice B's
+        // convention. The handler is a free-fn pointer (sub-step (b) of
+        // the Slice B follow-up); closures with captures are rejected
+        // upstream with `E_CLOSURE_AS_FN_PTR_NOT_YET`. The LLVM
+        // function-pointer types of the user handler and this extern's
+        // `handler` slot don't have to match structurally — LLVM
+        // function-pointer-typed parameters are just `ptr`s at the
+        // indirect-call boundary; the runtime invokes the handler with
+        // the documented `extern "C"` signature regardless of the user
+        // handler's lowered Kāra signature.
+        let karac_runtime_serve_http_type = context.i32_type().fn_type(
+            &[
+                ptr_type.into(), // addr_cstr
+                ptr_type.into(), // handler fn-ptr (just `ptr` at LLVM level)
+                ptr_type.into(), // bound_port_out
+            ],
+            false,
+        );
+        let _karac_runtime_serve_http_fn = module.add_function(
+            "karac_runtime_serve_http",
+            karac_runtime_serve_http_type,
+            Some(Linkage::External),
+        );
+
         // ── Map runtime extern declarations ──────────────────────────────
         // All map methods use opaque ptr for the map handle and key/value
         // pointers. Sizes and fn-pointers are passed as i64 / ptr.
@@ -5381,15 +5410,31 @@ impl<'ctx> Codegen<'ctx> {
                 // Resolution order: local variable (may shadow a const),
                 // then unit enum variant, then top-level `const` (re-compile
                 // the stored value expression at this use site so LLVM
-                // folds it), and finally `load_variable` so the existing
-                // "Undefined variable" diagnostic still fires for genuinely
-                // unbound names.
+                // folds it), then free-fn-name-as-value (Slice B follow-up
+                // 2026-05-09 — `let f = my_free_fn;` lowers to the fn's
+                // global pointer; consumers that take fn-pointer slots use
+                // it as a typed indirect-call target), and finally
+                // `load_variable` so the existing "Undefined variable"
+                // diagnostic still fires for genuinely unbound names.
                 if self.variables.contains_key(name.as_str()) {
                     self.load_variable(name)
                 } else if let Some(ev) = self.try_unit_enum_variant(name) {
                     Ok(ev)
                 } else if let Some(const_value) = self.consts.get(name).cloned() {
                     self.compile_expr(&const_value)
+                } else if let Some(fv) = self.module.get_function(name) {
+                    // Free fn name → fn pointer. The LLVM type is
+                    // `ptr` at this layer; downstream consumers (FFI
+                    // dispatchers like `Server.serve`) use it as a
+                    // typed indirect-call target. v1 doesn't yet track
+                    // the fn's source-level signature on the resulting
+                    // value — direct calls through such a binding (e.g.
+                    // `let f = target; f()`) are not supported and
+                    // would fall through to the generic call path's
+                    // unknown-callee branch. The intended consumer is
+                    // free-fn-as-`Fn`-arg dispatch (Server.serve and
+                    // similar FFI extern hookups).
+                    Ok(fv.as_global_value().as_pointer_value().into())
                 } else {
                     self.load_variable(name)
                 }
@@ -6500,6 +6545,180 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap();
                 return Ok(result);
             }
+        }
+
+        // Slice B follow-up (2026-05-09): `Server.serve(handler)` —
+        // hyper-backed handler-dispatch entry. Mirrors `serve_static`'s
+        // shape:
+        //   - Arg 0: address String → null-terminated C string.
+        //   - Arg 1: handler — free-fn name → fn-pointer LLVM value
+        //     via `module.get_function`. Closures-with-captures and
+        //     other non-free-fn shapes reject with
+        //     `E_CLOSURE_AS_FN_PTR_NOT_YET` (sub-step (d)).
+        //   - The runtime extern's `bound_port_out` slot is null in v1
+        //     — the smoke test reads the bound port from the runtime's
+        //     `BOUND_PORT=<n>\n` stdout line per Slice B's convention.
+        //
+        // Returns `Result[Unit, HttpError]`; rc=0 → Ok(()), rc≠0 →
+        // Err(HttpError { message: "http: serve failed" }). Reuses the
+        // `serve_static` Result-layout machinery verbatim — the
+        // handler-dispatch and static-body entries differ only in arg
+        // 1 + the extern they target, not in the return-value
+        // translation.
+        if type_name == "Server" && method == "serve" && _args.len() == 1 {
+            // Hard-coded address — the Kāra-side `Server.serve(handler)`
+            // declaration takes only the handler. Per locked design (SB3),
+            // v1 omits the address parameter; user code that needs a
+            // specific bind address will surface the gap and we'll lift
+            // to a 2-arg `Server.serve(addr, handler)` shape in a
+            // follow-up. For v1, default to `"127.0.0.1:0"` so the smoke
+            // test's `BOUND_PORT=<n>` stdout convention is the entry
+            // point. This keeps the v1 declaration short while still
+            // exercising the bind+serve+dispatch path end-to-end.
+            //
+            // **Caveat.** This means user code calling `Server.serve(h)`
+            // today always binds on `127.0.0.1:0`. The address argument
+            // lifts to the user surface when (a) a real consumer has a
+            // fixed bind requirement, or (b) the polymorphic `serve[E]`
+            // declaration update lands. Tracked at the slice's
+            // close-out paragraph in `phase-7-codegen.md`.
+            let handler_arg = &_args[0];
+            let handler_fn = self.resolve_free_fn_for_handler_arg(&handler_arg.value)?;
+            let handler_ptr = handler_fn.as_global_value().as_pointer_value();
+
+            // Build the address C string.
+            let addr_str = "127.0.0.1:0";
+            let addr_global = self
+                .builder
+                .build_global_string_ptr(addr_str, "http.serve.addr.cstr")
+                .unwrap();
+            let addr_ptr = addr_global.as_pointer_value();
+
+            let serve_fn = self
+                .module
+                .get_function("karac_runtime_serve_http")
+                .expect("karac_runtime_serve_http declared in Codegen::new");
+            let null_port_out = self.context.ptr_type(AddressSpace::default()).const_null();
+            let call = self
+                .builder
+                .build_call(
+                    serve_fn,
+                    &[addr_ptr.into(), handler_ptr.into(), null_port_out.into()],
+                    "http.serve.call",
+                )
+                .unwrap();
+            let rc_i32 = call.try_as_basic_value().unwrap_basic().into_int_value();
+
+            // Build `Result[Unit, HttpError]` from the i32 return code.
+            // Identical machinery to `Server.serve_static` — see the
+            // long comment around lines 6375-6500 above.
+            let result_layout = self
+                .enum_layouts
+                .get("Result")
+                .expect("Result layout registered before Server.serve dispatch");
+            let result_ty = result_layout.llvm_type;
+            let total_fields = result_ty.count_fields() as u64;
+            let i64_ty = self.context.i64_type();
+            let fn_val = self
+                .current_fn
+                .ok_or_else(|| "Server.serve called outside fn".to_string())?;
+            let result_slot =
+                self.create_entry_alloca(fn_val, "http.serve.result", result_ty.into());
+
+            let rc_zero = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::EQ,
+                    rc_i32,
+                    self.context.i32_type().const_int(0, false),
+                    "rc.is_zero",
+                )
+                .unwrap();
+            let ok_bb = self.context.append_basic_block(fn_val, "serve.h.ok");
+            let err_bb = self.context.append_basic_block(fn_val, "serve.h.err");
+            let cont_bb = self.context.append_basic_block(fn_val, "serve.h.cont");
+            self.builder
+                .build_conditional_branch(rc_zero, ok_bb, err_bb)
+                .unwrap();
+
+            // Ok arm.
+            self.builder.position_at_end(ok_bb);
+            let zero_w = i64_ty.const_int(0, false);
+            for w in 0..total_fields {
+                let elem_ptr = self
+                    .builder
+                    .build_struct_gep(result_ty, result_slot, w as u32, &format!("ok.w{w}"))
+                    .unwrap();
+                self.builder.build_store(elem_ptr, zero_w).unwrap();
+            }
+            self.builder.build_unconditional_branch(cont_bb).unwrap();
+
+            // Err arm.
+            self.builder.position_at_end(err_bb);
+            let one_w = i64_ty.const_int(1, false);
+            let tag_ptr = self
+                .builder
+                .build_struct_gep(result_ty, result_slot, 0, "err.tag")
+                .unwrap();
+            self.builder.build_store(tag_ptr, one_w).unwrap();
+
+            let msg = "http: serve failed";
+            let msg_global = self
+                .builder
+                .build_global_string_ptr(msg, "http.serve.h.err.msg")
+                .unwrap();
+            let msg_len = i64_ty.const_int(msg.len() as u64, false);
+            let msg_buf = self
+                .builder
+                .build_call(self.malloc_fn, &[msg_len.into()], "err.msg.buf")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_pointer_value();
+            self.builder
+                .build_memcpy(msg_buf, 1, msg_global.as_pointer_value(), 1, msg_len)
+                .unwrap();
+            let msg_ptr_buf_int = self
+                .builder
+                .build_ptr_to_int(msg_buf, i64_ty, "err.msg.ptr.i64")
+                .unwrap();
+            if total_fields > 1 {
+                let p1 = self
+                    .builder
+                    .build_struct_gep(result_ty, result_slot, 1, "err.payload.ptr")
+                    .unwrap();
+                self.builder.build_store(p1, msg_ptr_buf_int).unwrap();
+            }
+            if total_fields > 2 {
+                let p2 = self
+                    .builder
+                    .build_struct_gep(result_ty, result_slot, 2, "err.payload.len")
+                    .unwrap();
+                self.builder.build_store(p2, msg_len).unwrap();
+            }
+            if total_fields > 3 {
+                let p3 = self
+                    .builder
+                    .build_struct_gep(result_ty, result_slot, 3, "err.payload.cap")
+                    .unwrap();
+                self.builder.build_store(p3, msg_len).unwrap();
+            }
+            for w in 4..total_fields {
+                let elem_ptr = self
+                    .builder
+                    .build_struct_gep(result_ty, result_slot, w as u32, &format!("err.w{w}"))
+                    .unwrap();
+                self.builder.build_store(elem_ptr, zero_w).unwrap();
+            }
+            self.builder.build_unconditional_branch(cont_bb).unwrap();
+
+            // Cont.
+            self.builder.position_at_end(cont_bb);
+            let result = self
+                .builder
+                .build_load(result_ty, result_slot, "http.serve.result.val")
+                .unwrap();
+            return Ok(result);
         }
 
         if type_name == "String" && method == "new" {
@@ -17098,6 +17317,76 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     // ── Helpers ─────────────────────────────────────────────────
+
+    /// Slice B follow-up (2026-05-09) — sub-steps (b)+(d).
+    ///
+    /// Resolve a `Server.serve(handler)` argument expression to the
+    /// LLVM `FunctionValue` of a free fn, or emit a structured
+    /// rejection diagnostic when the argument shape isn't a free-fn-
+    /// name reference. Closures-with-captures, indirect-call values,
+    /// and other identifier-as-value shapes that don't resolve to a
+    /// `module.get_function(name)` hit get the same rejection — the
+    /// `extern "C" fn(*const KaracHttpRequest, *mut KaracHttpResponse)`
+    /// FFI slot only accepts a bare fn pointer (the closure-pair
+    /// `{ fn_ptr, env_ptr }` ABI is incompatible at the indirect-call
+    /// boundary), so the v1 surface is "free fn or rejection."
+    ///
+    /// **Sub-step (d) framing.** The diagnostic carries the
+    /// `E_CLOSURE_AS_FN_PTR_NOT_YET` code so user-side tooling
+    /// (`karac build --json`) can recognize it; the code is emitted
+    /// inside the codegen error string rather than registered as a
+    /// separate enum variant in `cli.rs` because all codegen errors
+    /// flow through the single `error: codegen failed: {e}` path
+    /// (see `src/cli.rs:2374`).
+    fn resolve_free_fn_for_handler_arg(
+        &self,
+        arg: &Expr,
+    ) -> Result<inkwell::values::FunctionValue<'ctx>, String> {
+        match &arg.kind {
+            ExprKind::Identifier(name) => {
+                // Resolution order mirrors `compile_expr`'s Identifier
+                // arm: a local binding shadows; otherwise look up as a
+                // free fn registered in the LLVM module. We refuse to
+                // accept a local binding even if it would resolve —
+                // that path is for closure-fat-pointer values which
+                // don't match the FFI slot.
+                if self.variables.contains_key(name.as_str()) {
+                    return Err(format!(
+                        "error[E_CLOSURE_AS_FN_PTR_NOT_YET]: cannot pass local binding `{name}` \
+                         as the handler argument to `Server.serve` — only free fn names are \
+                         supported in v1. Closures with captures (and other indirect-call \
+                         values) cannot match the `extern \"C\" fn(*const Request, *mut \
+                         Response)` ABI at the FFI boundary; pass a free fn instead. The \
+                         closure-as-`Fn`-arg ABI fix is a separate codegen track."
+                    ));
+                }
+                if let Some(fv) = self.module.get_function(name) {
+                    return Ok(fv);
+                }
+                Err(format!(
+                    "error[E_CLOSURE_AS_FN_PTR_NOT_YET]: cannot resolve `{name}` to a free fn \
+                     for the handler argument to `Server.serve`. Only free fn names are \
+                     supported in v1; closures-with-captures and other identifier shapes \
+                     are rejected. Pass a top-level `fn` declaration instead."
+                ))
+            }
+            ExprKind::Closure { .. } => Err(
+                "error[E_CLOSURE_AS_FN_PTR_NOT_YET]: closures with captures cannot be \
+                 passed where a fn-pointer is expected. The handler argument to \
+                 `Server.serve` must be a free fn name (e.g. `Server.serve(handle)`); \
+                 the closure-pair `{ fn_ptr, env_ptr }` ABI does not match the FFI \
+                 extern's bare-pointer parameter slot. Closure-as-`Fn`-arg is a \
+                 separate codegen track."
+                    .to_string(),
+            ),
+            _ => Err(format!(
+                "error[E_CLOSURE_AS_FN_PTR_NOT_YET]: handler argument to `Server.serve` \
+                 must be a free fn name; got expression shape `{:?}` which is not \
+                 supported in v1.",
+                std::mem::discriminant(&arg.kind)
+            )),
+        }
+    }
 
     fn load_variable(&self, name: &str) -> Result<BasicValueEnum<'ctx>, String> {
         if let Some(slot) = self.variables.get(name) {

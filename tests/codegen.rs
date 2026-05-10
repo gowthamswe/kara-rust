@@ -8395,4 +8395,115 @@ fn main() {
             assert_eq!(out.trim(), "1");
         }
     }
+
+    // ── Slice B follow-up (2026-05-09): fn-pointer-as-free-fn-arg + ──
+    //                       Server.serve(handler) dispatch
+    //
+    // Sub-step (b): free-fn-name-as-value codegen path.
+    // Sub-step (c): `Server.serve(handler)` dispatcher arm.
+    // Sub-step (d): closure-as-handler-arg structured rejection.
+
+    /// Sub-step (b) pin — `let f = target;` lowers without the
+    /// "Undefined variable 'target'" diagnostic that fired before this
+    /// slice. Uses the free-fn name as a value; v1 doesn't track a
+    /// fn-pointer type for direct calls through the binding, so the
+    /// test stays at the "binds and compiles" assertion.
+    #[test]
+    fn test_free_fn_as_value_emits_fn_ptr() {
+        let src = r#"
+fn target() -> i64 { 42 }
+
+fn main() {
+    let _f = target;
+    println(target());
+}
+"#;
+        let mut parsed = karac::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        let ir = compile_to_ir(&parsed.program, None, None);
+        assert!(
+            ir.is_ok(),
+            "expected free-fn-name-as-value to compile cleanly; got: {:?}",
+            ir.err()
+        );
+    }
+
+    /// Sub-step (c) pin — `Server.serve(handle)` with a free-fn handler
+    /// builds end-to-end. The runtime ABI mismatch between the user
+    /// `fn handle(req: Request) -> Response` shape and the FFI extern's
+    /// `extern "C" fn(*const KaracHttpRequest, *mut KaracHttpResponse)`
+    /// is acknowledged in the slice plan's hard-stop trigger 2 fallback —
+    /// LLVM's indirect-call boundary is structurally `ptr`, so codegen
+    /// passes the user fn-pointer through and the build succeeds. End-
+    /// to-end runtime invocation needs trampoline glue tracked
+    /// separately; this test pins the codegen path itself.
+    #[test]
+    fn test_server_serve_with_free_fn_handler_compiles() {
+        let src = r#"
+fn handle(req: Request) -> Response {
+    Response { status: 200, body: "{}" }
+}
+
+fn main() {
+    let _result = Server.serve(handle);
+}
+"#;
+        let mut parsed = karac::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        let ir = compile_to_ir(&parsed.program, None, None);
+        assert!(
+            ir.is_ok(),
+            "expected Server.serve(handle) to compile cleanly; got: {:?}",
+            ir.err()
+        );
+        let ir_text = ir.unwrap();
+        assert!(
+            ir_text.contains("karac_runtime_serve_http"),
+            "expected the IR to call `karac_runtime_serve_http`; not found"
+        );
+    }
+
+    /// Sub-step (d) pin — passing a closure to `Server.serve(...)` is
+    /// rejected with the structured `E_CLOSURE_AS_FN_PTR_NOT_YET`
+    /// diagnostic. Defense-in-depth at the codegen layer; the closure
+    /// `{ fn_ptr, env_ptr }` ABI doesn't match the FFI extern's bare-
+    /// pointer parameter slot.
+    #[test]
+    fn test_server_serve_rejects_closure_handler() {
+        let src = r#"
+fn main() {
+    let _result = Server.serve(|req| Response { status: 200, body: "{}" });
+}
+"#;
+        let mut parsed = karac::parse(src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let resolved = karac::resolve(&parsed.program);
+        let typed = karac::typecheck(&parsed.program, &resolved);
+        karac::lower(&mut parsed.program, &typed);
+        let err = compile_to_ir(&parsed.program, None, None)
+            .expect_err("expected closure-as-handler to be rejected");
+        assert!(
+            err.contains("E_CLOSURE_AS_FN_PTR_NOT_YET"),
+            "expected diagnostic to carry E_CLOSURE_AS_FN_PTR_NOT_YET; got: {}",
+            err
+        );
+    }
 }

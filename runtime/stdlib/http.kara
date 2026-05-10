@@ -72,6 +72,14 @@ impl HttpError {
 
 // ── Server surface (Slice B, 2026-05-09) ──────────────────────────────
 
+// `Network` — effect resource for inbound + outbound HTTP traffic. v1
+// unifies sends and receives under one resource (no separate
+// `NetworkSend` / `NetworkReceive`); mirrors the `Stdin` / `Stdout` /
+// `FileSystem` shape declared elsewhere in the stdlib. Used by
+// `Server.serve(handler)` to express the per-request `sends(Network)
+// receives(Network)` effect set.
+effect resource Network;
+
 // `Server` is an opaque marker; v1 has no per-server state because
 // `Server.serve_static` is a "bind + serve until process exit"
 // operation that takes the address as an argument rather than holding
@@ -109,6 +117,29 @@ impl Server {
     // a thin wrapper over the handler form.
     #[compiler_builtin]
     fn serve_static(addr: String, body: String) -> Result[Unit, HttpError] {
+        Err(HttpError { message: "" })
+    }
+
+    // Bind to `addr` and dispatch every request through the user-
+    // supplied free-fn handler. The handler receives a `Request` and
+    // returns a `Response`; the runtime translates between hyper's
+    // request/response types and the Kāra-side struct on each call.
+    //
+    // **v1 codegen scope.** Free fns only — `Server.serve(get_dashboard)`
+    // resolves the identifier to a fn pointer at the call site.
+    // Closures with non-empty captures (e.g. `|req| {...}`) are
+    // rejected with `error[E_CLOSURE_AS_FN_PTR_NOT_YET]`; the
+    // closure-pair `{ ptr, ptr }` ABI doesn't match the FFI extern's
+    // bare-pointer parameter slot, and a trampoline-based fix lives
+    // in a separate codegen track.
+    //
+    // **Effect set.** Non-polymorphic in v1 — fixed as
+    // `sends(Network), receives(Network)`. Lifting to `serve[E](handler:
+    // Fn(Request) -> Response with E)` is a one-line declaration
+    // change once a real consumer needs it; the typechecker side is
+    // already shipped via Theme 6's `with E` machinery.
+    #[compiler_builtin]
+    fn serve(handler: Fn(Request) -> Response) -> Result[Unit, HttpError] with sends(Network) receives(Network) {
         Err(HttpError { message: "" })
     }
 }
