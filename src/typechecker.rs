@@ -6,6 +6,13 @@
 //! top-level definitions, then type-checks function bodies. Produces
 //! typed expression info and diagnostics.
 
+// The const-expression evaluator's `Result<ConstValue, ConstEvalError>`
+// shape carries `Type` / `ConstValue` payloads in the error variants,
+// pushing the Err variant size above clippy's default threshold. Boxing
+// every error site would clutter the eval-and-emit happy path; the
+// extra stack width is acceptable since const-eval Results don't fan out.
+#![allow(clippy::result_large_err)]
+
 use crate::ast::*;
 use crate::resolver::{ResolveResult, SpanKey, SymbolKind};
 use crate::token::{FloatSuffix, IntSuffix, Span};
@@ -156,6 +163,511 @@ impl SubstValue {
             SubstValue::Type(t) => Some(t),
             SubstValue::Const(_) => None,
         }
+    }
+}
+
+// ── Const-expression evaluator ──────────────────────────────────
+//
+// Const generics slice 2 (2026-05-11). `eval_const_expr` evaluates a
+// const-expression `Expr` against a target `Type`, returning either a
+// `ConstValue` (the resolved compile-time value) or a `ConstEvalError`
+// describing why evaluation failed. Used by:
+// - `lower_array_type` for non-literal `Array[T, N + 1]` const-args
+// - default-parameter-value validation (retires `find_non_const_span`)
+// - slice 3's where-clause discharge engine (entry point only at this
+//   slice; the actual call lands when slice 3 ships)
+
+/// Failure modes for `eval_const_expr`. Each variant carries enough
+/// context for `emit_const_eval_error` to render a focused diagnostic
+/// at the spec-mandated span.
+#[derive(Debug, Clone)]
+pub enum ConstEvalError {
+    /// Expression shape isn't recognized as constant-evaluable (e.g. a
+    /// function call, closure, method call, or a non-literal Path).
+    NonConstShape(Span),
+    /// `checked_*` returned `None` for a binary integer operation.
+    Overflow {
+        op: BinOp,
+        lhs: crate::prelude::ConstValue,
+        rhs: crate::prelude::ConstValue,
+        span: Span,
+    },
+    /// `checked_neg` returned `None` for a unary operation.
+    UnaryOverflow {
+        op: UnaryOp,
+        operand: crate::prelude::ConstValue,
+        span: Span,
+    },
+    /// `/` or `%` with a literal-zero right-hand operand.
+    DivByZero { span: Span },
+    /// Integer literal doesn't fit in the inferred target type.
+    OutOfRange {
+        value: i128,
+        target_ty: Type,
+        span: Span,
+    },
+    /// A `ConstDecl` reference whose value type doesn't match the
+    /// surrounding context.
+    TypeMismatch {
+        expected: Type,
+        found: Type,
+        span: Span,
+    },
+    /// Identifier reference that didn't resolve to a const-param,
+    /// `ConstDecl`, or known fieldless-enum variant.
+    UndefinedConst { name: String, span: Span },
+    /// Arithmetic operator applied to a non-integer operand (e.g.
+    /// `'a' + 'b'`, `true + false`).
+    ArithOnNonInt { ty: Type, op: BinOp, span: Span },
+    /// Logical operator (`and` / `or` / `!`) applied to a non-bool
+    /// operand.
+    LogicalOnNonBool { ty: Type, op: BinOp, span: Span },
+    /// Comparison between two values whose `ConstValue` discriminants
+    /// don't share a comparable family (int/int, bool/bool, char/char,
+    /// enum/enum from the same enum type).
+    CompareIncomparable {
+        lhs_ty: Type,
+        rhs_ty: Type,
+        span: Span,
+    },
+    /// `ConstDecl` self-reference cycle: `const A: i64 = B; const B: i64 = A;`
+    CyclicConstDef { chain: Vec<String>, span: Span },
+}
+
+/// Extract a non-negative array size from a `ConstValue`. Returns `None`
+/// for non-integer variants, negative integers, or values that would
+/// exceed `usize` range. Used by `lower_array_type` when routing
+/// non-literal const-arg expressions through the const-expression
+/// evaluator (slice 2).
+fn const_value_to_array_size(cv: &crate::prelude::ConstValue) -> Option<usize> {
+    use crate::prelude::ConstValue::*;
+    let n: i128 = match cv {
+        I8(v) => *v as i128,
+        I16(v) => *v as i128,
+        I32(v) => *v as i128,
+        I64(v) => *v as i128,
+        U8(v) => *v as i128,
+        U16(v) => *v as i128,
+        U32(v) => *v as i128,
+        U64(v) => *v as i128,
+        Usize(v) => *v as i128,
+        Bool(_) | Char(_) | EnumVariant { .. } | F32(_) | F64(_) => return None,
+    };
+    if n < 0 {
+        return None;
+    }
+    usize::try_from(n).ok()
+}
+
+/// User-facing rendering of a `ConstValue` for diagnostic messages.
+/// Integer variants include their suffix (`120i8`), booleans render as
+/// `true`/`false`, char as `'c'`, enum variants as `EnumName.Variant`.
+fn format_const_value(cv: &crate::prelude::ConstValue) -> String {
+    use crate::prelude::ConstValue::*;
+    match cv {
+        I8(v) => format!("{}i8", v),
+        I16(v) => format!("{}i16", v),
+        I32(v) => format!("{}i32", v),
+        I64(v) => format!("{}i64", v),
+        U8(v) => format!("{}u8", v),
+        U16(v) => format!("{}u16", v),
+        U32(v) => format!("{}u32", v),
+        U64(v) => format!("{}u64", v),
+        Usize(v) => format!("{}usize", v),
+        F32(v) => format!("{}f32", v),
+        F64(v) => format!("{}f64", v),
+        Bool(b) => b.to_string(),
+        Char(c) => format!("'{}'", c),
+        EnumVariant {
+            enum_name,
+            variant_name,
+            ..
+        } => format!("{}.{}", enum_name, variant_name),
+    }
+}
+
+/// Source-text glyph for a `BinOp` (`Add` → `+`, `Eq` → `==`, etc.).
+fn binop_glyph(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Eq => "==",
+        BinOp::NotEq => "!=",
+        BinOp::Lt => "<",
+        BinOp::LtEq => "<=",
+        BinOp::Gt => ">",
+        BinOp::GtEq => ">=",
+        BinOp::And => "and",
+        BinOp::Or => "or",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+        BinOp::Range => "..",
+        BinOp::RangeInclusive => "..=",
+    }
+}
+
+/// Source-text glyph for a `UnaryOp`.
+fn unaryop_glyph(op: &UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Neg => "-",
+        UnaryOp::Not => "!",
+        UnaryOp::BitNot => "~",
+        UnaryOp::Deref => "*",
+    }
+}
+
+/// Type-tag for a `ConstValue` payload. Mirrors `primitive_const_type` for
+/// the const-eval path so error diagnostics carry the right surface type.
+fn const_value_type(cv: &crate::prelude::ConstValue) -> Type {
+    use crate::prelude::ConstValue::*;
+    match cv {
+        I8(_) => Type::Int(IntSize::I8),
+        I16(_) => Type::Int(IntSize::I16),
+        I32(_) => Type::Int(IntSize::I32),
+        I64(_) => Type::Int(IntSize::I64),
+        U8(_) => Type::UInt(UIntSize::U8),
+        U16(_) => Type::UInt(UIntSize::U16),
+        U32(_) => Type::UInt(UIntSize::U32),
+        U64(_) => Type::UInt(UIntSize::U64),
+        Usize(_) => Type::UInt(UIntSize::Usize),
+        F32(_) => Type::Float(FloatSize::F32),
+        F64(_) => Type::Float(FloatSize::F64),
+        Bool(_) => Type::Bool,
+        Char(_) => Type::Char,
+        EnumVariant { enum_name, .. } => Type::Named {
+            name: enum_name.clone(),
+            args: Vec::new(),
+        },
+    }
+}
+
+/// Best-effort target-type inference for a binary comparison's operands.
+/// Looks at literal suffixes and returns the first explicit suffix found
+/// (left wins over right). Returns `None` when neither operand carries an
+/// explicit suffix — the caller falls back to a default (typically i64).
+fn infer_operand_target_ty(left: &Expr, right: &Expr) -> Option<Type> {
+    fn from_literal(e: &Expr) -> Option<Type> {
+        match &e.kind {
+            ExprKind::Integer(_, Some(IntSuffix::I8)) => Some(Type::Int(IntSize::I8)),
+            ExprKind::Integer(_, Some(IntSuffix::I16)) => Some(Type::Int(IntSize::I16)),
+            ExprKind::Integer(_, Some(IntSuffix::I32)) => Some(Type::Int(IntSize::I32)),
+            ExprKind::Integer(_, Some(IntSuffix::I64)) => Some(Type::Int(IntSize::I64)),
+            ExprKind::Integer(_, Some(IntSuffix::U8)) => Some(Type::UInt(UIntSize::U8)),
+            ExprKind::Integer(_, Some(IntSuffix::U16)) => Some(Type::UInt(UIntSize::U16)),
+            ExprKind::Integer(_, Some(IntSuffix::U32)) => Some(Type::UInt(UIntSize::U32)),
+            ExprKind::Integer(_, Some(IntSuffix::U64)) => Some(Type::UInt(UIntSize::U64)),
+            ExprKind::Bool(_) => Some(Type::Bool),
+            ExprKind::CharLit(_) => Some(Type::Char),
+            _ => None,
+        }
+    }
+    from_literal(left).or_else(|| from_literal(right))
+}
+
+/// Pack a literal integer `n` into a `ConstValue` of `target_ty`, returning
+/// `OutOfRange` if the value doesn't fit the target's bit width.
+fn integer_to_const_value(
+    n: i64,
+    target_ty: &Type,
+    span: &Span,
+) -> Result<crate::prelude::ConstValue, ConstEvalError> {
+    use crate::prelude::ConstValue;
+    let out_of_range = |target: &Type| ConstEvalError::OutOfRange {
+        value: n as i128,
+        target_ty: target.clone(),
+        span: span.clone(),
+    };
+    match target_ty {
+        Type::Int(IntSize::I8) => i8::try_from(n)
+            .map(ConstValue::I8)
+            .map_err(|_| out_of_range(target_ty)),
+        Type::Int(IntSize::I16) => i16::try_from(n)
+            .map(ConstValue::I16)
+            .map_err(|_| out_of_range(target_ty)),
+        Type::Int(IntSize::I32) => i32::try_from(n)
+            .map(ConstValue::I32)
+            .map_err(|_| out_of_range(target_ty)),
+        Type::Int(IntSize::I64) => Ok(ConstValue::I64(n)),
+        Type::UInt(UIntSize::U8) => u8::try_from(n)
+            .map(ConstValue::U8)
+            .map_err(|_| out_of_range(target_ty)),
+        Type::UInt(UIntSize::U16) => u16::try_from(n)
+            .map(ConstValue::U16)
+            .map_err(|_| out_of_range(target_ty)),
+        Type::UInt(UIntSize::U32) => u32::try_from(n)
+            .map(ConstValue::U32)
+            .map_err(|_| out_of_range(target_ty)),
+        Type::UInt(UIntSize::U64) => u64::try_from(n)
+            .map(ConstValue::U64)
+            .map_err(|_| out_of_range(target_ty)),
+        Type::UInt(UIntSize::Usize) => u64::try_from(n)
+            .map(ConstValue::Usize)
+            .map_err(|_| out_of_range(target_ty)),
+        // Non-integer target — caller's responsibility; the evaluator's
+        // dispatch should never route a non-int target here, but be safe.
+        _ => Ok(ConstValue::I64(n)),
+    }
+}
+
+/// Apply a unary operator to a `ConstValue`, returning `UnaryOverflow` on
+/// `checked_neg` failure or a focused diagnostic on type mismatch.
+fn apply_unary(
+    op: UnaryOp,
+    val: crate::prelude::ConstValue,
+    span: &Span,
+) -> Result<crate::prelude::ConstValue, ConstEvalError> {
+    use crate::prelude::ConstValue::*;
+    match op {
+        UnaryOp::Neg => match val {
+            I8(v) => v
+                .checked_neg()
+                .map(I8)
+                .ok_or(ConstEvalError::UnaryOverflow {
+                    op,
+                    operand: I8(v),
+                    span: span.clone(),
+                }),
+            I16(v) => v
+                .checked_neg()
+                .map(I16)
+                .ok_or(ConstEvalError::UnaryOverflow {
+                    op,
+                    operand: I16(v),
+                    span: span.clone(),
+                }),
+            I32(v) => v
+                .checked_neg()
+                .map(I32)
+                .ok_or(ConstEvalError::UnaryOverflow {
+                    op,
+                    operand: I32(v),
+                    span: span.clone(),
+                }),
+            I64(v) => v
+                .checked_neg()
+                .map(I64)
+                .ok_or(ConstEvalError::UnaryOverflow {
+                    op,
+                    operand: I64(v),
+                    span: span.clone(),
+                }),
+            // Unsigned negation isn't meaningful; reject as ArithOnNonInt
+            // would be misleading — these are integers, just not negatable.
+            // Use UnaryOverflow with a clear span pointing at the operand.
+            other => Err(ConstEvalError::UnaryOverflow {
+                op,
+                operand: other,
+                span: span.clone(),
+            }),
+        },
+        UnaryOp::Not => match val {
+            Bool(b) => Ok(Bool(!b)),
+            I8(v) => Ok(I8(!v)),
+            I16(v) => Ok(I16(!v)),
+            I32(v) => Ok(I32(!v)),
+            I64(v) => Ok(I64(!v)),
+            U8(v) => Ok(U8(!v)),
+            U16(v) => Ok(U16(!v)),
+            U32(v) => Ok(U32(!v)),
+            U64(v) => Ok(U64(!v)),
+            Usize(v) => Ok(Usize(!v)),
+            other => Err(ConstEvalError::LogicalOnNonBool {
+                ty: const_value_type(&other),
+                // `Not` is a UnaryOp; we reuse the LogicalOnNonBool error
+                // with `BinOp::And` as a sentinel so the diagnostic shape
+                // matches the binary case. The renderer keys on `ty` and
+                // mentions the unary site via `span`.
+                op: BinOp::And,
+                span: span.clone(),
+            }),
+        },
+        // Other unary ops (BitNot, future extensions) — not in scope for
+        // const-eval at slice 2.
+        _ => Err(ConstEvalError::NonConstShape(span.clone())),
+    }
+}
+
+/// Apply a binary operator. Operand `ConstValue` variants must match for
+/// arithmetic / bitwise / shift / comparison; logical operators require
+/// `Bool`.
+fn apply_binary(
+    op: BinOp,
+    lhs: crate::prelude::ConstValue,
+    rhs: crate::prelude::ConstValue,
+    span: &Span,
+) -> Result<crate::prelude::ConstValue, ConstEvalError> {
+    use crate::prelude::ConstValue::*;
+    // Logical operators — operands must both be Bool.
+    match op {
+        BinOp::And => {
+            return match (lhs, rhs) {
+                (Bool(a), Bool(b)) => Ok(Bool(a && b)),
+                (l, _) => Err(ConstEvalError::LogicalOnNonBool {
+                    ty: const_value_type(&l),
+                    op,
+                    span: span.clone(),
+                }),
+            };
+        }
+        BinOp::Or => {
+            return match (lhs, rhs) {
+                (Bool(a), Bool(b)) => Ok(Bool(a || b)),
+                (l, _) => Err(ConstEvalError::LogicalOnNonBool {
+                    ty: const_value_type(&l),
+                    op,
+                    span: span.clone(),
+                }),
+            };
+        }
+        _ => {}
+    }
+    // Comparison operators — both operands must share a comparable family.
+    if matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+    ) {
+        return apply_comparison(op, lhs, rhs, span);
+    }
+    // Arithmetic / bitwise / shift — operands must have matching int variants.
+    apply_arithmetic(op, lhs, rhs, span)
+}
+
+fn apply_comparison(
+    op: BinOp,
+    lhs: crate::prelude::ConstValue,
+    rhs: crate::prelude::ConstValue,
+    span: &Span,
+) -> Result<crate::prelude::ConstValue, ConstEvalError> {
+    use crate::prelude::ConstValue::*;
+    let cmp = |a: std::cmp::Ordering| -> bool {
+        use std::cmp::Ordering::*;
+        match op {
+            BinOp::Eq => a == Equal,
+            BinOp::NotEq => a != Equal,
+            BinOp::Lt => a == Less,
+            BinOp::LtEq => a != Greater,
+            BinOp::Gt => a == Greater,
+            BinOp::GtEq => a != Less,
+            _ => unreachable!(),
+        }
+    };
+    let incomparable = |l: &crate::prelude::ConstValue, r: &crate::prelude::ConstValue| {
+        ConstEvalError::CompareIncomparable {
+            lhs_ty: const_value_type(l),
+            rhs_ty: const_value_type(r),
+            span: span.clone(),
+        }
+    };
+    let result = match (&lhs, &rhs) {
+        (I8(a), I8(b)) => cmp(a.cmp(b)),
+        (I16(a), I16(b)) => cmp(a.cmp(b)),
+        (I32(a), I32(b)) => cmp(a.cmp(b)),
+        (I64(a), I64(b)) => cmp(a.cmp(b)),
+        (U8(a), U8(b)) => cmp(a.cmp(b)),
+        (U16(a), U16(b)) => cmp(a.cmp(b)),
+        (U32(a), U32(b)) => cmp(a.cmp(b)),
+        (U64(a), U64(b)) => cmp(a.cmp(b)),
+        (Usize(a), Usize(b)) => cmp(a.cmp(b)),
+        (Bool(a), Bool(b)) => cmp(a.cmp(b)),
+        (Char(a), Char(b)) => cmp(a.cmp(b)),
+        (
+            EnumVariant {
+                enum_name: e1,
+                discriminant: d1,
+                ..
+            },
+            EnumVariant {
+                enum_name: e2,
+                discriminant: d2,
+                ..
+            },
+        ) if e1 == e2 => cmp(d1.cmp(d2)),
+        _ => return Err(incomparable(&lhs, &rhs)),
+    };
+    Ok(Bool(result))
+}
+
+fn apply_arithmetic(
+    op: BinOp,
+    lhs: crate::prelude::ConstValue,
+    rhs: crate::prelude::ConstValue,
+    span: &Span,
+) -> Result<crate::prelude::ConstValue, ConstEvalError> {
+    use crate::prelude::ConstValue::*;
+    // Macro-style dispatch: for each matching pair (Ix, Ix) / (Ux, Ux) /
+    // (Usize, Usize), apply the right `checked_*` op (or a panic-free bitwise
+    // / shift fallback) and emit Overflow / DivByZero on `None`.
+    macro_rules! apply_int {
+        ($lv:ident, $rv:ident, $variant:ident, $ty:ty) => {{
+            let result: Option<$ty> = match op {
+                BinOp::Add => $lv.checked_add(*$rv),
+                BinOp::Sub => $lv.checked_sub(*$rv),
+                BinOp::Mul => $lv.checked_mul(*$rv),
+                BinOp::Div => {
+                    if *$rv == 0 {
+                        return Err(ConstEvalError::DivByZero { span: span.clone() });
+                    }
+                    $lv.checked_div(*$rv)
+                }
+                BinOp::Mod => {
+                    if *$rv == 0 {
+                        return Err(ConstEvalError::DivByZero { span: span.clone() });
+                    }
+                    $lv.checked_rem(*$rv)
+                }
+                BinOp::Shl => {
+                    let shift = u32::try_from(*$rv).ok();
+                    shift.and_then(|s| $lv.checked_shl(s))
+                }
+                BinOp::Shr => {
+                    let shift = u32::try_from(*$rv).ok();
+                    shift.and_then(|s| $lv.checked_shr(s))
+                }
+                BinOp::BitAnd => Some($lv & $rv),
+                BinOp::BitOr => Some($lv | $rv),
+                BinOp::BitXor => Some($lv ^ $rv),
+                _ => return Err(ConstEvalError::NonConstShape(span.clone())),
+            };
+            match result {
+                Some(v) => Ok($variant(v)),
+                None => Err(ConstEvalError::Overflow {
+                    op,
+                    lhs: $variant(*$lv),
+                    rhs: $variant(*$rv),
+                    span: span.clone(),
+                }),
+            }
+        }};
+    }
+    match (&lhs, &rhs) {
+        (I8(a), I8(b)) => apply_int!(a, b, I8, i8),
+        (I16(a), I16(b)) => apply_int!(a, b, I16, i16),
+        (I32(a), I32(b)) => apply_int!(a, b, I32, i32),
+        (I64(a), I64(b)) => apply_int!(a, b, I64, i64),
+        (U8(a), U8(b)) => apply_int!(a, b, U8, u8),
+        (U16(a), U16(b)) => apply_int!(a, b, U16, u16),
+        (U32(a), U32(b)) => apply_int!(a, b, U32, u32),
+        (U64(a), U64(b)) => apply_int!(a, b, U64, u64),
+        (Usize(a), Usize(b)) => apply_int!(a, b, Usize, u64),
+        // Mismatched int widths or non-int operands.
+        (l, _) if matches!(l, Bool(_) | Char(_) | EnumVariant { .. }) => {
+            Err(ConstEvalError::ArithOnNonInt {
+                ty: const_value_type(l),
+                op,
+                span: span.clone(),
+            })
+        }
+        _ => Err(ConstEvalError::ArithOnNonInt {
+            ty: const_value_type(&lhs),
+            op,
+            span: span.clone(),
+        }),
     }
 }
 
@@ -483,6 +995,12 @@ fn primitive_const_type(cv: &crate::prelude::ConstValue) -> Type {
         Usize(_) => Type::UInt(UIntSize::Usize),
         F32(_) => Type::Float(FloatSize::F32),
         F64(_) => Type::Float(FloatSize::F64),
+        Bool(_) => Type::Bool,
+        Char(_) => Type::Char,
+        EnumVariant { enum_name, .. } => Type::Named {
+            name: enum_name.clone(),
+            args: Vec::new(),
+        },
     }
 }
 
@@ -2453,6 +2971,110 @@ impl<'a> TypeChecker<'a> {
         });
     }
 
+    /// Render a `ConstEvalError` from the const-expression evaluator
+    /// (slice 2) as a focused `type_error` diagnostic. Reuses
+    /// `TypeErrorKind::TypeMismatch` as the kind for surface-level
+    /// const-eval errors — a dedicated kind isn't introduced at slice 2;
+    /// future work may split if downstream consumers (`karac explain`)
+    /// need to distinguish const-eval failures from other type errors.
+    pub(crate) fn emit_const_eval_error(&mut self, err: ConstEvalError) {
+        use ConstEvalError::*;
+        let (msg, span) = match err {
+            NonConstShape(s) => (
+                "expression is not a valid const expression \
+                 (no function calls, closures, method calls, or runtime-only shapes)"
+                    .to_string(),
+                s,
+            ),
+            Overflow { op, lhs, rhs, span } => (
+                format!(
+                    "const expression overflow: {} {} {} overflows {}",
+                    format_const_value(&lhs),
+                    binop_glyph(&op),
+                    format_const_value(&rhs),
+                    type_display(&const_value_type(&lhs))
+                ),
+                span,
+            ),
+            UnaryOverflow { op, operand, span } => (
+                format!(
+                    "const expression overflow: {}{} overflows {}",
+                    unaryop_glyph(&op),
+                    format_const_value(&operand),
+                    type_display(&const_value_type(&operand))
+                ),
+                span,
+            ),
+            DivByZero { span } => ("const expression: division by zero".to_string(), span),
+            OutOfRange {
+                value,
+                target_ty,
+                span,
+            } => (
+                format!(
+                    "const expression: literal {} does not fit in {}",
+                    value,
+                    type_display(&target_ty)
+                ),
+                span,
+            ),
+            TypeMismatch {
+                expected,
+                found,
+                span,
+            } => (
+                format!(
+                    "const expression type mismatch: expected {}, found {}",
+                    type_display(&expected),
+                    type_display(&found)
+                ),
+                span,
+            ),
+            UndefinedConst { name, span } => (
+                format!("const expression: '{}' is not a known const", name),
+                span,
+            ),
+            ArithOnNonInt { ty, op, span } => (
+                format!(
+                    "arithmetic operator '{}' is not supported on {} \
+                     (only integer types)",
+                    binop_glyph(&op),
+                    type_display(&ty)
+                ),
+                span,
+            ),
+            LogicalOnNonBool { ty, op, span } => (
+                format!(
+                    "logical operator '{}' is not supported on {} (only bool)",
+                    binop_glyph(&op),
+                    type_display(&ty)
+                ),
+                span,
+            ),
+            CompareIncomparable {
+                lhs_ty,
+                rhs_ty,
+                span,
+            } => (
+                format!(
+                    "cannot compare {} with {} in const expression \
+                     — both sides must have the same type",
+                    type_display(&lhs_ty),
+                    type_display(&rhs_ty)
+                ),
+                span,
+            ),
+            CyclicConstDef { chain, span } => (
+                format!(
+                    "const expression: cyclic const definition ({})",
+                    chain.join(" -> ")
+                ),
+                span,
+            ),
+        };
+        self.type_error(msg, span, TypeErrorKind::TypeMismatch);
+    }
+
     fn type_warning(&mut self, message: String, span: Span, kind: TypeErrorKind) {
         self.warnings.push(TypeError {
             message,
@@ -3088,7 +3710,7 @@ impl<'a> TypeChecker<'a> {
 
     // ── lower_type_expr ─────────────────────────────────────────
 
-    fn lower_type_expr(&self, ty: &TypeExpr, generic_scope: &[String]) -> Type {
+    fn lower_type_expr(&mut self, ty: &TypeExpr, generic_scope: &[String]) -> Type {
         match &ty.kind {
             TypeKind::Path(path) => self.lower_path_type(path, generic_scope),
             TypeKind::Tuple(types) => Type::Tuple(
@@ -3150,7 +3772,7 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn lower_generic_args(
-        &self,
+        &mut self,
         generic_args: &Option<Vec<GenericArg>>,
         generic_scope: &[String],
     ) -> Vec<Type> {
@@ -3167,7 +3789,7 @@ impl<'a> TypeChecker<'a> {
             .unwrap_or_default()
     }
 
-    fn lower_path_type(&self, path: &PathExpr, generic_scope: &[String]) -> Type {
+    fn lower_path_type(&mut self, path: &PathExpr, generic_scope: &[String]) -> Type {
         if path.segments.len() == 1 {
             let name = &path.segments[0];
             // Built-in `Array[T, N]` — fixed-size array with const-generic size
@@ -3241,7 +3863,7 @@ impl<'a> TypeChecker<'a> {
     /// Lower `Array[T, N]` to `Type::Array { element, size }`.
     /// N must be a positive integer literal (const-eval of arithmetic expressions deferred).
     fn lower_array_type(
-        &self,
+        &mut self,
         generic_args: &Option<Vec<GenericArg>>,
         generic_scope: &[String],
     ) -> Option<Type> {
@@ -3256,7 +3878,34 @@ impl<'a> TypeChecker<'a> {
         let size = match &args[1] {
             GenericArg::Const(expr) => match &expr.kind {
                 ExprKind::Integer(n, _) if *n >= 0 => *n as usize,
-                _ => return None,
+                // Const generics slice 2: route non-literal const-args
+                // through the const-expression evaluator. A successful
+                // evaluation to a non-negative integer yields the size;
+                // anything else (non-int, negative, eval error) emits a
+                // focused diagnostic and falls back to a size-0 array
+                // (matching the legacy "const eval deferred" placeholder
+                // so downstream codegen / interp don't crash).
+                _ => match self.eval_const_expr(expr, &Type::UInt(UIntSize::Usize)) {
+                    Ok(cv) => match const_value_to_array_size(&cv) {
+                        Some(n) => n,
+                        None => {
+                            self.type_error(
+                                format!(
+                                    "Array size const-arg must evaluate to a \
+                                     non-negative integer; got {}",
+                                    type_display(&const_value_type(&cv))
+                                ),
+                                expr.span.clone(),
+                                TypeErrorKind::TypeMismatch,
+                            );
+                            return None;
+                        }
+                    },
+                    Err(e) => {
+                        self.emit_const_eval_error(e);
+                        return None;
+                    }
+                },
             },
             GenericArg::Type(_) => return None,
         };
@@ -3297,7 +3946,7 @@ impl<'a> TypeChecker<'a> {
     /// The `mut Slice[T]` form is produced by the parser when it sees the
     /// `mut` modifier; path-type lowering always yields the read-only form.
     fn lower_slice_type(
-        &self,
+        &mut self,
         generic_args: &Option<Vec<GenericArg>>,
         generic_scope: &[String],
     ) -> Option<Type> {
@@ -5585,9 +6234,15 @@ impl<'a> TypeChecker<'a> {
                     self.lower_type_expr(ty, generic_scope);
                 }
                 WhereConstraint::ConstPredicate { .. } => {
-                    // Const-predicate validation lands with slice 2's evaluator;
-                    // slice 1 parses + resolves but does not type-check the
-                    // predicate body. Discharge engine lands at slice 3.
+                    // TODO(const generics slice 3): bound-discharge engine.
+                    // Slice 2 builds `eval_const_expr` (above); slice 3
+                    // wires it into per-call-site predicate evaluation
+                    // here, emitting `const constraint violated` with the
+                    // concrete const-arg values when the predicate is
+                    // `false`. Slice 2 intentionally does not evaluate the
+                    // predicate at the declaration site — evaluation
+                    // requires the const-args bound in scope, which only
+                    // exist at call sites.
                 }
             }
         }
@@ -5609,6 +6264,36 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Verify `expr` is a valid constant for a default-parameter
+    /// position. Tuple and array literals recurse element-wise; other
+    /// shapes route through `eval_const_expr`. The composite recursion
+    /// uses an i64 placeholder for sub-element target types — sub-element
+    /// arithmetic overflow still surfaces (against i64's range) even
+    /// when the actual surface type is narrower.
+    fn validate_default_value_is_const(&mut self, expr: &Expr, target_ty: &Type) {
+        match &expr.kind {
+            ExprKind::Tuple(elems) | ExprKind::ArrayLiteral(elems) => {
+                for e in elems {
+                    self.validate_default_value_is_const(e, &Type::Int(IntSize::I64));
+                }
+            }
+            _ => {
+                if let Err(err) = self.eval_const_expr(expr, target_ty) {
+                    match err {
+                        ConstEvalError::NonConstShape(span) => self.type_error(
+                            "default parameter value must be a constant expression \
+                             (no function calls, closures, or runtime-only values)"
+                                .to_string(),
+                            span,
+                            TypeErrorKind::TypeMismatch,
+                        ),
+                        other => self.emit_const_eval_error(other),
+                    }
+                }
+            }
+        }
+    }
+
     /// Validate default parameter values: trailing-only, type-compatible.
     fn validate_default_params(&mut self, params: &[Param], generic_scope: &[String]) {
         // Collect all sibling parameter names for the "no cross-param reference" check.
@@ -5625,16 +6310,14 @@ impl<'a> TypeChecker<'a> {
                 let param_ty = self.lower_type_expr(&param.ty, generic_scope);
                 let default_ty = self.infer_expr(default_expr);
                 self.check_assignable(&param_ty, &default_ty, default_expr.span.clone());
-                // Verify the default is a constant expression
-                if let Some(bad_span) = self.find_non_const_span(default_expr) {
-                    self.type_error(
-                        "default parameter value must be a constant expression \
-                         (no function calls, closures, or runtime-only values)"
-                            .to_string(),
-                        bad_span,
-                        TypeErrorKind::TypeMismatch,
-                    );
-                }
+                // Verify the default is a constant expression. Route
+                // through the const-expression evaluator (slice 2) for
+                // leaf expressions; recurse on tuple / array-literal
+                // shapes (which the evaluator rejects as `NonConstShape`
+                // because it has no single-`ConstValue` representation
+                // for composites — but default-param validation is a
+                // shape check, not a value resolution).
+                self.validate_default_value_is_const(default_expr, &param_ty);
                 // Verify the default does not reference sibling parameters
                 let own_names: Vec<String> = param.pattern.binding_names();
                 for sibling in &sibling_names {
@@ -5663,51 +6346,169 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    /// Returns the span of the first sub-expression that makes `expr`
-    /// non-constant, or `None` if the whole expression is a valid constant.
+    /// Const-expression evaluator (const generics slice 2). Walks `expr`
+    /// against a target `Type`, returning either a resolved `ConstValue`
+    /// or a `ConstEvalError`.
     ///
-    /// Constant expressions: literals, unary negation of a literal, named
-    /// constants (`ConstDecl`), tuples and arrays of constant expressions,
-    /// and binary arithmetic / comparison on constants.
-    fn find_non_const_span(&self, expr: &Expr) -> Option<Span> {
+    /// Operand-type propagation: arithmetic / bitwise / shift ops propagate
+    /// `target_ty` to both operands (recursing with the same target ensures
+    /// `2 + 3` against `target_ty=i8` walks both literals as i8). Comparison
+    /// and logical ops infer their operand target type from the operand
+    /// expressions themselves (a comparison's result is `Bool`; the operand
+    /// type comes from their literal suffixes / `ConstDecl` types). For
+    /// comparisons, both sides must produce `ConstValue` variants from the
+    /// same comparable family (int/int, bool/bool, char/char,
+    /// enum-variant/enum-variant from the same enum).
+    ///
+    /// Identifier resolution at slice 2: tries `ConstDecl` lookup in
+    /// `program.items`. Const-generic parameters via slice 1's `SubstValue`
+    /// substitution context are not threaded here yet (slice 3 wires the
+    /// inference solver to pass `SubstValue` through to the evaluator).
+    pub(crate) fn eval_const_expr(
+        &mut self,
+        expr: &Expr,
+        target_ty: &Type,
+    ) -> Result<crate::prelude::ConstValue, ConstEvalError> {
+        self.eval_const_expr_with_chain(expr, target_ty, &mut Vec::new())
+    }
+
+    fn eval_const_expr_with_chain(
+        &mut self,
+        expr: &Expr,
+        target_ty: &Type,
+        chain: &mut Vec<String>,
+    ) -> Result<crate::prelude::ConstValue, ConstEvalError> {
+        use crate::prelude::ConstValue;
         match &expr.kind {
-            // Always constant
-            ExprKind::Integer(..)
-            | ExprKind::Float(..)
-            | ExprKind::Bool(_)
-            | ExprKind::CharLit(_)
-            | ExprKind::StringLit(_)
-            | ExprKind::MultiStringLit(_) => None,
-
-            // Negation of a constant is constant
-            ExprKind::Unary { operand: inner, .. } => self.find_non_const_span(inner),
-
-            // Binary op on two constants is constant
-            ExprKind::Binary { left, right, .. } => self
-                .find_non_const_span(left)
-                .or_else(|| self.find_non_const_span(right)),
-
-            // Named identifier: constant iff it refers to a ConstDecl
+            ExprKind::Integer(n, sfx) => {
+                let ty = match sfx {
+                    Some(IntSuffix::I8) => Type::Int(IntSize::I8),
+                    Some(IntSuffix::I16) => Type::Int(IntSize::I16),
+                    Some(IntSuffix::I32) => Type::Int(IntSize::I32),
+                    Some(IntSuffix::I64) => Type::Int(IntSize::I64),
+                    Some(IntSuffix::U8) => Type::UInt(UIntSize::U8),
+                    Some(IntSuffix::U16) => Type::UInt(UIntSize::U16),
+                    Some(IntSuffix::U32) => Type::UInt(UIntSize::U32),
+                    Some(IntSuffix::U64) => Type::UInt(UIntSize::U64),
+                    Some(IntSuffix::I128) | Some(IntSuffix::U128) => {
+                        // i128/u128 require IntSize/UIntSize extension —
+                        // slice 2b deferred. Treat as unsupported shape.
+                        return Err(ConstEvalError::NonConstShape(expr.span.clone()));
+                    }
+                    None => {
+                        if matches!(target_ty, Type::Int(_) | Type::UInt(_)) {
+                            target_ty.clone()
+                        } else {
+                            Type::Int(IntSize::I64)
+                        }
+                    }
+                };
+                integer_to_const_value(*n, &ty, &expr.span)
+            }
+            ExprKind::Bool(b) => Ok(ConstValue::Bool(*b)),
+            ExprKind::CharLit(c) => Ok(ConstValue::Char(*c)),
             ExprKind::Identifier(name) => {
-                let is_const = self
-                    .program
-                    .items
-                    .iter()
-                    .any(|item| matches!(item, Item::ConstDecl(c) if c.name == *name));
-                if is_const {
-                    None
-                } else {
-                    Some(expr.span.clone())
+                if chain.iter().any(|n| n == name) {
+                    let mut chain_with_self = chain.clone();
+                    chain_with_self.push(name.clone());
+                    return Err(ConstEvalError::CyclicConstDef {
+                        chain: chain_with_self,
+                        span: expr.span.clone(),
+                    });
                 }
+                for item in &self.program.items {
+                    if let Item::ConstDecl(c) = item {
+                        if c.name == *name {
+                            // Evaluate the const's value against the
+                            // surrounding context's target type rather
+                            // than the const's own declared type so
+                            // `const TEN: i64 = 10` used in an Array
+                            // size position (target = usize) flows as
+                            // Usize(10), not I64(10) — preventing a
+                            // spurious cross-width mismatch in the
+                            // surrounding binary op (`TEN + 1`). The
+                            // const's declared-type vs use-site
+                            // compatibility is enforced by the regular
+                            // typechecker elsewhere; here we just
+                            // produce the value at the use site's
+                            // width.
+                            chain.push(name.clone());
+                            let res = self.eval_const_expr_with_chain(&c.value, target_ty, chain);
+                            chain.pop();
+                            return res;
+                        }
+                    }
+                }
+                Err(ConstEvalError::UndefinedConst {
+                    name: name.clone(),
+                    span: expr.span.clone(),
+                })
             }
-
-            // Tuple/array of constants is constant
-            ExprKind::Tuple(elems) | ExprKind::ArrayLiteral(elems) => {
-                elems.iter().find_map(|e| self.find_non_const_span(e))
+            ExprKind::Path { segments, .. } if segments.len() == 2 => {
+                let enum_name = &segments[0];
+                let variant_name = &segments[1];
+                if let Some(info) = self.env.enums.get(enum_name) {
+                    for (discriminant, (vname, vkind)) in info.variants.iter().enumerate() {
+                        if vname == variant_name {
+                            if !matches!(vkind, VariantTypeInfo::Unit) {
+                                return Err(ConstEvalError::NonConstShape(expr.span.clone()));
+                            }
+                            return Ok(ConstValue::EnumVariant {
+                                enum_name: enum_name.clone(),
+                                variant_name: variant_name.clone(),
+                                discriminant: discriminant as i64,
+                            });
+                        }
+                    }
+                }
+                Err(ConstEvalError::UndefinedConst {
+                    name: format!("{}.{}", enum_name, variant_name),
+                    span: expr.span.clone(),
+                })
             }
-
-            // Everything else (calls, closures, method calls, etc.) is non-constant
-            _ => Some(expr.span.clone()),
+            ExprKind::Unary { op, operand } => {
+                let val = self.eval_const_expr_with_chain(operand, target_ty, chain)?;
+                apply_unary(op.clone(), val, &expr.span)
+            }
+            ExprKind::Binary { op, left, right } => {
+                let operand_target = match op {
+                    BinOp::And | BinOp::Or => Type::Bool,
+                    BinOp::Eq
+                    | BinOp::NotEq
+                    | BinOp::Lt
+                    | BinOp::LtEq
+                    | BinOp::Gt
+                    | BinOp::GtEq => {
+                        infer_operand_target_ty(left, right).unwrap_or(Type::Int(IntSize::I64))
+                    }
+                    _ => target_ty.clone(),
+                };
+                // Short-circuit at evaluator level for And/Or so
+                // `false && (1 / 0 == 1)` doesn't fire DivByZero.
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let lhs = self.eval_const_expr_with_chain(left, &operand_target, chain)?;
+                    match (&lhs, op) {
+                        (ConstValue::Bool(false), BinOp::And) => {
+                            return Ok(ConstValue::Bool(false))
+                        }
+                        (ConstValue::Bool(true), BinOp::Or) => return Ok(ConstValue::Bool(true)),
+                        (ConstValue::Bool(_), _) => {}
+                        _ => {
+                            return Err(ConstEvalError::LogicalOnNonBool {
+                                ty: const_value_type(&lhs),
+                                op: op.clone(),
+                                span: left.span.clone(),
+                            });
+                        }
+                    }
+                    let rhs = self.eval_const_expr_with_chain(right, &operand_target, chain)?;
+                    return apply_binary(op.clone(), lhs, rhs, &expr.span);
+                }
+                let lhs = self.eval_const_expr_with_chain(left, &operand_target, chain)?;
+                let rhs = self.eval_const_expr_with_chain(right, &operand_target, chain)?;
+                apply_binary(op.clone(), lhs, rhs, &expr.span)
+            }
+            _ => Err(ConstEvalError::NonConstShape(expr.span.clone())),
         }
     }
 
@@ -13338,7 +14139,7 @@ mod once_function_carrier_tests {
 
     #[test]
     fn test_lower_rc_path_type_produces_rc_variant() {
-        let tc = build_typechecker("");
+        let mut tc = build_typechecker("");
         let path = path_with_args("Rc", vec![type_path("i64")]);
         let lowered = tc.lower_path_type(&path, &[]);
         assert_eq!(lowered, Type::Rc(Box::new(Type::Int(IntSize::I64))));
@@ -13346,7 +14147,7 @@ mod once_function_carrier_tests {
 
     #[test]
     fn test_lower_arc_path_type_produces_arc_variant() {
-        let tc = build_typechecker("");
+        let mut tc = build_typechecker("");
         let path = path_with_args("Arc", vec![type_path("String")]);
         let lowered = tc.lower_path_type(&path, &[]);
         assert_eq!(lowered, Type::Arc(Box::new(Type::Str)));
@@ -13354,7 +14155,7 @@ mod once_function_carrier_tests {
 
     #[test]
     fn test_lower_shared_struct_path_type_produces_shared_variant() {
-        let tc = build_typechecker("shared struct S { val: i64 }");
+        let mut tc = build_typechecker("shared struct S { val: i64 }");
         let path = path_with_args("S", vec![]);
         let lowered = tc.lower_path_type(&path, &[]);
         assert_eq!(lowered, Type::Shared("S".to_string()));
@@ -13364,7 +14165,7 @@ mod once_function_carrier_tests {
     fn test_lower_nonshared_struct_path_type_stays_named() {
         // Cross-check: the shared-struct intercept must not fire for plain
         // structs — sub-item 2's behavior-preserving promise hinges on this.
-        let tc = build_typechecker("struct P { val: i64 }");
+        let mut tc = build_typechecker("struct P { val: i64 }");
         let path = path_with_args("P", vec![]);
         let lowered = tc.lower_path_type(&path, &[]);
         assert_eq!(

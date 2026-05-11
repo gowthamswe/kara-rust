@@ -808,6 +808,20 @@ fn primitive_const_to_value(cv: &crate::prelude::ConstValue) -> Value {
         Usize(v) => Value::Int(*v as i64),
         F32(v) => Value::Float(*v as f64),
         F64(v) => Value::Float(*v),
+        Bool(b) => Value::Bool(*b),
+        Char(c) => Value::Char(*c),
+        // Fieldless-enum constants surface as a unit variant; the
+        // interpreter's enum-variant representation carries the parent
+        // enum + variant name as strings.
+        EnumVariant {
+            enum_name,
+            variant_name,
+            ..
+        } => Value::EnumVariant {
+            enum_name: enum_name.clone(),
+            variant: variant_name.clone(),
+            data: EnumData::Unit,
+        },
     }
 }
 

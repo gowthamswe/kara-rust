@@ -227,7 +227,15 @@ pub const PRELUDE_EFFECT_RESOURCES: &[&str] = &[
 /// without lossy widening. The interpreter coerces to `Value::Int(i64)` /
 /// `Value::Float(f64)` at consumption; the codegen emits the matching
 /// LLVM constant width.
-#[derive(Debug, Clone, Copy)]
+///
+/// Const generics slice 2 (2026-05-11) added `Bool`, `Char`, and
+/// `EnumVariant` so the const-expression evaluator can carry bool, char,
+/// and fieldless-enum literal results. The `Copy` derive is dropped
+/// (`EnumVariant`'s `String` payloads break Copy); callers `.clone()`
+/// when needed. `I128`/`U128` are not in this slice — they require
+/// `IntSize`/`UIntSize` extensions (see phase-5-diagnostics.md § Const
+/// generics slice 2b).
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConstValue {
     I8(i8),
     I16(i16),
@@ -242,6 +250,21 @@ pub enum ConstValue {
     Usize(u64),
     F32(f32),
     F64(f64),
+    /// `true` / `false` — produced by the const-expression evaluator
+    /// for `ExprKind::Bool` and as the result of every comparison /
+    /// logical operator. Permitted as a const-generic param type.
+    Bool(bool),
+    /// `'a'` — produced by the const-expression evaluator for
+    /// `ExprKind::CharLit`. Permitted as a const-generic param type.
+    Char(char),
+    /// A fieldless-enum variant captured at compile time. `discriminant`
+    /// is the variant's declared or auto-assigned tag; the typechecker's
+    /// enum registry is the source of truth.
+    EnumVariant {
+        enum_name: String,
+        variant_name: String,
+        discriminant: i64,
+    },
 }
 
 /// Primitive-type associated constants — `i64.MAX` / `f64.INFINITY` /

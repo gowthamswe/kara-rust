@@ -1890,6 +1890,20 @@ impl<'ctx> Codegen<'ctx> {
             // f64→f32 conversion).
             F32(v) => self.context.f32_type().const_float(*v as f64).into(),
             F64(v) => self.context.f64_type().const_float(*v).into(),
+            // Const generics slice 2 — Bool / Char / EnumVariant flow
+            // through here only when a primitive-table constant uses
+            // one of these variants (none do today). Slice 4 wires
+            // const-param identifier lowering to call `compile_primitive_const`
+            // for const-args at use sites; this arm prepares the surface.
+            Bool(b) => self.context.bool_type().const_int(*b as u64, false).into(),
+            Char(c) => self.context.i32_type().const_int(*c as u64, false).into(),
+            // Fieldless-enum variant: tag-only payload as `i64` (matches
+            // the existing enum-variant tag width).
+            EnumVariant { discriminant, .. } => self
+                .context
+                .i64_type()
+                .const_int(*discriminant as u64, true)
+                .into(),
         }
     }
 

@@ -2347,13 +2347,17 @@ impl Parser {
                 break;
             }
             // Const expression args: integer literals, negative integers, bool literals,
-            // and `Identifier OP ...` shapes (e.g. `Array[T, N + 1]`) where the
-            // operator following the identifier disambiguates a const-arg
+            // character literals, and `Identifier OP ...` shapes (e.g. `Array[T, N + 1]`)
+            // where the operator following the identifier disambiguates a const-arg
             // expression from a type-arg. Plain `Identifier` (no trailing op)
             // continues to parse as a type — `Vec[Map[K, V]]` and similar
             // type-position shapes are preserved.
             let is_const_arg_expr = match self.peek_token() {
-                Token::Integer(_, _) | Token::True | Token::False | Token::Minus => true,
+                Token::Integer(_, _)
+                | Token::True
+                | Token::False
+                | Token::Minus
+                | Token::CharLiteral(_) => true,
                 Token::Identifier { .. } => {
                     let next = self.tokens.get(self.pos + 1).map(|t| &t.token);
                     matches!(

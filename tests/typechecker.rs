@@ -10596,3 +10596,151 @@ fn test_typechecker_const_param_rejects_fieldful_enum() {
         errs.iter().map(|e| &e.message).collect::<Vec<_>>()
     );
 }
+
+// ── Const expression evaluation (slice 2) ───────────────────────
+//
+// `eval_const_expr` walks a const-expression `Expr` against a target
+// `Type`, producing either a `ConstValue` or a focused
+// `ConstEvalError` diagnostic. The evaluator is wired into
+// `lower_array_type` (Array size const-args) and
+// `validate_default_params` (retired `find_non_const_span`) at this
+// slice; slice 3 will wire it into where-clause discharge.
+//
+// Tests that exercise the evaluator's Bool / Char / EnumVariant
+// branches via the `Array[T, ...]` size position rely on the size
+// being a non-negative integer; non-integer ConstValue results emit
+// a focused "Array size must evaluate to a non-negative integer"
+// rejection rather than the underlying type-mismatch. Direct unit
+// tests of those branches via `pub(crate) eval_const_expr` live in
+// `src/typechecker.rs` inline tests; the integration tests below
+// cover what surfaces through the Array path.
+
+#[test]
+fn test_const_eval_overflow_i8() {
+    let errs = typecheck_errors("fn f[T](xs: Array[T, 120i8 + 10i8]) { }");
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("const expression overflow")),
+        "expected const expression overflow for 120i8 + 10i8, got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_const_eval_overflow_u8() {
+    let errs = typecheck_errors("fn f[T](xs: Array[T, 250u8 + 10u8]) { }");
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("const expression overflow")),
+        "expected const expression overflow for 250u8 + 10u8, got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_const_eval_overflow_i32() {
+    // 2_000_000_000_i32 + 2_000_000_000_i32 overflows i32::MAX (~2.14e9).
+    let errs = typecheck_errors("fn f[T](xs: Array[T, 2000000000i32 + 200000000i32]) { }");
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("const expression overflow")),
+        "expected i32 overflow diagnostic, got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_const_eval_div_by_zero() {
+    let errs = typecheck_errors("fn f[T](xs: Array[T, 5 / 0]) { }");
+    assert!(
+        errs.iter().any(|e| e.message.contains("division by zero")),
+        "expected DivByZero diagnostic distinct from overflow, got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    // And NOT an overflow message.
+    assert!(
+        !errs
+            .iter()
+            .any(|e| e.message.contains("const expression overflow")),
+        "DivByZero should not also surface an Overflow diagnostic"
+    );
+}
+
+#[test]
+fn test_const_eval_shift_overshift() {
+    let errs = typecheck_errors("fn f[T](xs: Array[T, 1u8 << 8u8]) { }");
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("const expression overflow")),
+        "expected shift-overshift overflow diagnostic, got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_const_eval_char_arith_rejected() {
+    let errs = typecheck_errors("fn f[T](xs: Array[T, 'a' + 'b']) { }");
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("not supported on char")
+                || e.message.contains("only integer types")),
+        "expected ArithOnNonInt diagnostic for char + char, got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_const_eval_const_arg_arithmetic() {
+    // `Array[T, 2 + 3]` evaluates to size 5 and type-checks.
+    typecheck_ok("fn f[T](xs: Array[T, 2 + 3]) { }");
+}
+
+#[test]
+fn test_const_eval_const_decl_reference() {
+    // `const TEN: i64 = 10;` then `Array[i64, TEN + 1]` resolves to
+    // size 11 via the evaluator's ConstDecl lookup.
+    typecheck_ok(
+        "const TEN: i64 = 10;\n\
+         fn f(xs: Array[i64, TEN + 1]) { }",
+    );
+}
+
+#[test]
+fn test_const_eval_default_param_overflow_caught() {
+    // Retired-`find_non_const_span` pure-improvement test: overflow
+    // in a default-parameter value used to slip through (the legacy
+    // predicate only checked shape, not arithmetic). After retiring
+    // and routing through `eval_const_expr`, overflow surfaces at
+    // compile time.
+    let errs = typecheck_errors("fn f(x: i8 = 120i8 + 10i8) { }");
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("const expression overflow")),
+        "expected overflow diagnostic for default-param literal arithmetic, got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_const_eval_default_param_call_still_rejected() {
+    // Regression: function calls in default values continue to be
+    // rejected as non-constant (the legacy predicate's primary
+    // surface). Verifies the retired-predicate diagnostic message
+    // still fires correctly through the new shape walk.
+    let errs = typecheck_errors("fn get() -> i64 { 42 }\nfn f(x: i64 = get()) { }");
+    assert!(
+        errs.iter().any(|e| e
+            .message
+            .contains("default parameter value must be a constant expression")),
+        "expected legacy non-const-shape diagnostic for default fn-call, got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_const_eval_default_param_tuple_literal_still_ok() {
+    // Regression: tuple-of-literals continues to type-check as a
+    // valid default-param value (the helper recurses into composite
+    // shapes rather than rejecting them as `NonConstShape`).
+    typecheck_ok("fn f(x: (i64, i64) = (1, 2)) { }");
+}
