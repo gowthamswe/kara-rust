@@ -4,11 +4,9 @@
   <img src="docs/img/wip.png" alt="Work In Progress" width="150">
 </p>
 
-**A language where the programmer declares *what* and *why*, and the compiler decides *how* and *where*.**
-
 ```
-  compiling the compiler
-  [▓▓▓▓▓▓▓▓▓▓▒▒▒▒░░░░░░]
+ compiling the compiler...
+  [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]
 ```
 
 Kāra is a systems programming language designed for the AI era. The compiler handles memory layout and concurrency; the programmer handles intent — and hardware targets, like GPU, when they matter.
@@ -122,7 +120,7 @@ We took a **tree-walk interpreter first** approach: language semantics were vali
 cargo build                          # build the compiler (no LLVM backend)
 cargo test                           # run the front-end tests (lexer, parser, resolver, typechecker, effect, ownership, interpreter)
 cargo test --features llvm           # also run codegen E2E and memory-sanitizer tests
-cargo clippy --all --tests -- -D warnings   # lint
+cargo clippy --all --all-targets -- -D warnings   # lint
 cargo fmt                            # format
 ```
 
