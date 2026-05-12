@@ -417,6 +417,7 @@ impl<'a> EffectChecker<'a> {
         // Path-call constructors: `Type.new()` form.
         for stdlib_fn in [
             "Vec.new",
+            "Vec.from_slice",
             "Vec.push",
             "String.new",
             "String.push_str",

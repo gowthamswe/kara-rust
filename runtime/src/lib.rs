@@ -2375,6 +2375,86 @@ async fn serve_request(
     Ok(response)
 }
 
+/// In-place sort of a raw byte buffer (`len` elements of `elem_size` bytes).
+/// The compiler emits a per-call-site bridge thunk that loads two elements
+/// through their pointers, invokes the user closure, and reports the
+/// resulting `Ordering` tag as `-1` / `0` / `+1`.
+///
+/// Fast paths for `elem_size == 8` and `elem_size == 16` reinterpret the
+/// buffer as `&mut [[u8; N]]` and call Rust's `sort_by` directly — the most
+/// common element layouts (`Vec[i64]`, `Vec[(i64, i64)]`) skip the indirect
+/// permute. The general fallback sorts a Vec of indices and permutes through
+/// a single uninitialised scratch buffer; this stays correct for any element
+/// size without needing a typed Rust view.
+///
+/// Backs `Vec.sort_by` codegen. See `src/codegen.rs` `compile_vec_method`
+/// `"sort_by"` arm and the matching interpreter arm in `src/interpreter.rs`.
+///
+/// # Safety
+///
+/// `data` must point to `len * elem_size` initialized, contiguous bytes that
+/// the caller exclusively owns for the duration of the call. `cmp` must be a
+/// valid function pointer whose only side effect is reading through the two
+/// element pointers it is given, returning a `-1 / 0 / +1` tag; spurious
+/// orderings (returning the same sign for both `(a, b)` and `(b, a)` calls)
+/// produce an arbitrary permutation but never undefined behavior. `ctx` is
+/// passed back to `cmp` opaquely and may be null only if `cmp` does not
+/// dereference it. `len < 2` or `elem_size <= 0` are accepted and produce a
+/// no-op.
+#[no_mangle]
+pub unsafe extern "C" fn karac_vec_sort_by(
+    data: *mut u8,
+    len: i64,
+    elem_size: i64,
+    cmp: extern "C" fn(*mut u8, *const u8, *const u8) -> i64,
+    ctx: *mut u8,
+) {
+    if data.is_null() || len < 2 || elem_size <= 0 {
+        return;
+    }
+    let n = len as usize;
+    let sz = elem_size as usize;
+
+    // Typed-slice fast paths for the two element widths that cover the bulk
+    // of real workloads: `i64` and `(i64, i64)`. Sorting `&mut [[u8; N]]`
+    // in-place is dramatically cheaper than indices+permute (no extra
+    // allocation, no second memory pass, and the comparator's load through
+    // the element pointer hits warm cache).
+    match sz {
+        8 => {
+            let slice = std::slice::from_raw_parts_mut(data as *mut [u8; 8], n);
+            slice.sort_by(|a, b| cmp(ctx, a.as_ptr(), b.as_ptr()).cmp(&0));
+            return;
+        }
+        16 => {
+            let slice = std::slice::from_raw_parts_mut(data as *mut [u8; 16], n);
+            slice.sort_by(|a, b| cmp(ctx, a.as_ptr(), b.as_ptr()).cmp(&0));
+            return;
+        }
+        _ => {}
+    }
+
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_by(|&a, &b| {
+        let ap = data.add(a * sz);
+        let bp = data.add(b * sz);
+        let ord = cmp(ctx, ap, bp);
+        ord.cmp(&0)
+    });
+    // Scratch buffer for the permute. Every byte is overwritten by the loop
+    // below; the `vec![0u8; _]` zero-fill is wasted work but matters only on
+    // the fallback path (element sizes other than 8 / 16), and avoids the
+    // `clippy::uninit_vec` footgun of `set_len` on `Vec::with_capacity`.
+    let total_bytes = n * sz;
+    let mut tmp: Vec<u8> = vec![0u8; total_bytes];
+    for (new_i, &old_i) in indices.iter().enumerate() {
+        let src = data.add(old_i * sz);
+        let dst = tmp.as_mut_ptr().add(new_i * sz);
+        ptr::copy_nonoverlapping(src, dst, sz);
+    }
+    ptr::copy_nonoverlapping(tmp.as_ptr(), data, total_bytes);
+}
+
 // ── Slice 5 test stand-ins for slice 3 globals ─────────────────────────────
 //
 // The runtime crate's `cargo test -p karac-runtime` binary has its own

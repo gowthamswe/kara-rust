@@ -4056,6 +4056,28 @@ impl<'a> Interpreter<'a> {
                 // overflowed `test_e2e_fibonacci`, same shape as the
                 // `and`/`or` short-circuit fix).
                 "Vec.filled" => return self.eval_vec_filled(args, span),
+                // `Vec.from_slice(src) -> Vec[T]` — clone the source's
+                // elements into a fresh Vec. Mirrors codegen's bulk-copy
+                // shape; here the storage isn't shared so a fresh clone
+                // of the inner Vec<Value> is correct (matches what the
+                // `push_loop_from_iter` shape produces semantically).
+                "Vec.from_slice" => {
+                    let src = args
+                        .first()
+                        .map(|a| self.eval_expr_inner(&a.value))
+                        .unwrap_or(Value::Unit);
+                    let elements: Vec<Value> = match src {
+                        Value::Array(rc) => rc.read().unwrap().clone(),
+                        Value::Slice {
+                            storage,
+                            start,
+                            len,
+                            ..
+                        } => storage.read().unwrap()[start..start + len].to_vec(),
+                        _ => Vec::new(),
+                    };
+                    return Value::array_of(elements);
+                }
                 "SortedSet.new" => {
                     return Value::SortedSet(BTreeMap::new());
                 }

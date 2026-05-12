@@ -836,6 +836,12 @@ struct Codegen<'ctx> {
     /// Staging slot — set by `compile_closure` so the surrounding `let` binding can record
     /// the function type under the newly bound name.
     pending_closure_fn_type: Option<FunctionType<'ctx>>,
+    /// Staging slot — caller-supplied LLVM types for a closure's parameters,
+    /// consulted by `compile_closure` when the source has no type annotation
+    /// to refine. Used by `Vec.sort_by` to push the element type into
+    /// `|a, b|` closures so tuple receivers don't collapse to bare `i64`.
+    /// Taken once and cleared on entry to `compile_closure`.
+    pending_closure_param_hints: Option<Vec<BasicTypeEnum<'ctx>>>,
     // ── Shared types (RC) ─────────────────────────────────────────
     /// Shared type metadata (struct/enum name → heap layout info).
     shared_types: HashMap<String, SharedTypeInfo<'ctx>>,
@@ -1619,6 +1625,7 @@ impl<'ctx> Codegen<'ctx> {
             indexed_elem_counter: 0,
             closure_fn_types: HashMap::new(),
             pending_closure_fn_type: None,
+            pending_closure_param_hints: None,
             shared_types: HashMap::new(),
             malloc_fn,
             free_fn,
@@ -7386,6 +7393,111 @@ impl<'ctx> Codegen<'ctx> {
             return Ok(agg.into());
         }
 
+        // `Vec.from_slice(src: Slice[T]) -> Vec[T]` — bulk-copy a slice
+        // (also accepts Array / Vec via the existing `coerce_to_slice`
+        // shape recognition) into a freshly-allocated Vec. One malloc +
+        // one memcpy, vs the `Vec.new() + push-in-loop` shape which
+        // grow-and-reallocs ~log2(n) times. Element type comes from the
+        // source's compile-time element registry, so the arg must be a
+        // named local (slice / vec / array binding); arbitrary expression
+        // args are deferred to a follow-up since we'd need to consult the
+        // typechecker's expr-type table to recover the element type.
+        if type_name == "Vec" && method == "from_slice" {
+            if args.len() != 1 {
+                return Err(format!(
+                    "Vec.from_slice expects 1 argument (source slice / vec / array), got {}",
+                    args.len()
+                ));
+            }
+            let arg = &args[0].value;
+            let ExprKind::Identifier(src_name) = &arg.kind else {
+                return Err(
+                    "Vec.from_slice: source must currently be a named slice / vec / array variable"
+                        .to_string(),
+                );
+            };
+
+            // Recover element LLVM type from the source's binding.
+            let elem_ty: BasicTypeEnum<'ctx> =
+                if let Some(&t) = self.slice_elem_types.get(src_name.as_str()) {
+                    t
+                } else if let Some(&t) = self.vec_elem_types.get(src_name.as_str()) {
+                    t
+                } else if let Some(slot) = self.variables.get(src_name.as_str()).copied() {
+                    if let BasicTypeEnum::ArrayType(at) = slot.ty {
+                        at.get_element_type()
+                    } else {
+                        return Err(format!(
+                            "Vec.from_slice: source '{}' is not a slice / vec / array",
+                            src_name
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "Vec.from_slice: source '{}' not found in scope",
+                        src_name
+                    ));
+                };
+
+            // Coerce arg into a slice header `{data, len}` — reuses the same
+            // path-mapping that the rest of codegen uses for slice-typed
+            // params (Array → slice header with stack-pointer + array len,
+            // Vec → slice header with data-ptr + len field, Slice →
+            // passthrough load).
+            let slice_val = self.coerce_to_slice(arg, elem_ty)?.ok_or_else(|| {
+                format!(
+                    "Vec.from_slice: could not coerce '{}' to a slice header",
+                    src_name
+                )
+            })?;
+            let slice_sv = slice_val.into_struct_value();
+            let src_data = self
+                .builder
+                .build_extract_value(slice_sv, 0, "from_slice.src.data")
+                .unwrap()
+                .into_pointer_value();
+            let src_len = self
+                .builder
+                .build_extract_value(slice_sv, 1, "from_slice.src.len")
+                .unwrap()
+                .into_int_value();
+
+            let elem_size = elem_ty.size_of().unwrap();
+            let alloc_bytes = self
+                .builder
+                .build_int_mul(src_len, elem_size, "from_slice.bytes")
+                .unwrap();
+            let new_buf = self
+                .builder
+                .build_call(self.malloc_fn, &[alloc_bytes.into()], "from_slice.buf")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_pointer_value();
+            self.builder
+                .build_memcpy(new_buf, 8, src_data, 8, alloc_bytes)
+                .unwrap();
+
+            let vec_ty = self.vec_struct_type();
+            let mut agg = vec_ty.get_undef();
+            agg = self
+                .builder
+                .build_insert_value(agg, new_buf, 0, "vec.data")
+                .unwrap()
+                .into_struct_value();
+            agg = self
+                .builder
+                .build_insert_value(agg, src_len, 1, "vec.len")
+                .unwrap()
+                .into_struct_value();
+            agg = self
+                .builder
+                .build_insert_value(agg, src_len, 2, "vec.cap")
+                .unwrap()
+                .into_struct_value();
+            return Ok(agg.into());
+        }
+
         if (type_name == "Vec" || type_name == "VecDeque") && method == "new" {
             // `VecDeque.new()` lowers to the same zero-initialized
             // `{ptr=null, len=0, cap=0}` aggregate as `Vec.new()` —
@@ -7516,6 +7628,52 @@ impl<'ctx> Codegen<'ctx> {
                 if OP_METHODS.contains(&method) {
                     return self.compile_assoc_call(type_name.as_str(), method, args);
                 }
+            }
+        }
+
+        // Receiver-form `lhs.cmp(rhs)` — synthesizes an `Ordering` enum
+        // value from a signed-integer comparison. The receiver may be an
+        // identifier (closure param or local) or an arbitrary expression
+        // (e.g., `(b.1 - b.0).cmp(...)`), so we evaluate both sides and
+        // dispatch on the LLVM value kind. Tag layout matches the
+        // declaration order in `runtime/stdlib/ordering.kara` (Less=0,
+        // Equal=1, Greater=2); the `Vec.sort_by` bridge thunk relies on
+        // that ordering to turn the tag into a `-1 / 0 / +1` comparator
+        // via `tag - 1`.
+        if method == "cmp" && args.len() == 1 {
+            let lhs = self.compile_expr(object)?;
+            let rhs = self.compile_expr(&args[0].value)?;
+            if let (BasicValueEnum::IntValue(l), BasicValueEnum::IntValue(r)) = (lhs, rhs) {
+                let i64_t = self.context.i64_type();
+                let lt = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, l, r, "cmp.lt")
+                    .unwrap();
+                let gt = self
+                    .builder
+                    .build_int_compare(IntPredicate::SGT, l, r, "cmp.gt")
+                    .unwrap();
+                let zero = i64_t.const_zero();
+                let one = i64_t.const_int(1, false);
+                let two = i64_t.const_int(2, false);
+                let tag_gt = self
+                    .builder
+                    .build_select(gt, two, one, "cmp.tag.gt")
+                    .unwrap()
+                    .into_int_value();
+                let tag = self
+                    .builder
+                    .build_select(lt, zero, tag_gt, "cmp.tag")
+                    .unwrap()
+                    .into_int_value();
+                let ord_struct_ty = self
+                    .enum_layouts
+                    .get("Ordering")
+                    .map(|l| l.llvm_type)
+                    .unwrap_or_else(|| self.context.struct_type(&[i64_t.into()], false));
+                let agg = ord_struct_ty.get_undef();
+                let agg = self.builder.build_insert_value(agg, tag, 0, "ord").unwrap();
+                return Ok(agg.into_struct_value().into());
             }
         }
 
@@ -9096,8 +9254,353 @@ impl<'ctx> Codegen<'ctx> {
                 );
                 Ok(agg)
             }
+            "sort_by" => {
+                if args.len() != 1 {
+                    return Err(format!(
+                        "Vec.sort_by expects 1 argument (comparator closure), got {}",
+                        args.len()
+                    ));
+                }
+
+                // Two thunk shapes:
+                //   (a) inline closure expression — fuse the closure body
+                //       into the bridge thunk, so each comparison is a
+                //       single direct function call from the runtime helper
+                //       (LLVM can then inline it freely);
+                //   (b) named callee / closure-typed value — fall back to
+                //       compile_expr → fat pointer → indirect-call thunk.
+                let (thunk, ctx_alloca): (FunctionValue<'ctx>, PointerValue<'ctx>) =
+                    if let ExprKind::Closure { params, body, .. } = &args[0].value.kind {
+                        self.emit_sort_by_inline_thunk(params, body, elem_ty)?
+                    } else {
+                        self.pending_closure_param_hints = Some(vec![elem_ty, elem_ty]);
+                        let closure_val = self.compile_expr(&args[0].value)?;
+                        self.pending_closure_param_hints = None;
+                        let closure_fn_type = self
+                            .pending_closure_fn_type
+                            .take()
+                            .ok_or_else(|| "Vec.sort_by: closure missing fn_type".to_string())?;
+                        let outer_fn = self.current_fn.unwrap();
+                        let fat_ty = self.closure_value_type();
+                        let cls_alloca =
+                            self.create_entry_alloca(outer_fn, "sort_by.cls", fat_ty.into());
+                        self.builder.build_store(cls_alloca, closure_val).unwrap();
+                        (
+                            self.emit_sort_by_thunk(elem_ty, closure_fn_type),
+                            cls_alloca,
+                        )
+                    };
+
+                let data_ptr_ptr = self
+                    .builder
+                    .build_struct_gep(vec_ty, data_ptr, 0, "vec.data.ptr")
+                    .unwrap();
+                let len_ptr = self
+                    .builder
+                    .build_struct_gep(vec_ty, data_ptr, 1, "vec.len.ptr")
+                    .unwrap();
+                let data = self
+                    .builder
+                    .build_load(ptr_ty, data_ptr_ptr, "data")
+                    .unwrap()
+                    .into_pointer_value();
+                let len = self
+                    .builder
+                    .build_load(i64_t, len_ptr, "len")
+                    .unwrap()
+                    .into_int_value();
+                let elem_size = elem_ty.size_of().unwrap();
+
+                let runtime_fn = self
+                    .module
+                    .get_function("karac_vec_sort_by")
+                    .unwrap_or_else(|| {
+                        let void_t = self.context.void_type();
+                        let fn_ty = void_t.fn_type(
+                            &[
+                                ptr_ty.into(),
+                                i64_t.into(),
+                                i64_t.into(),
+                                ptr_ty.into(),
+                                ptr_ty.into(),
+                            ],
+                            false,
+                        );
+                        self.module.add_function(
+                            "karac_vec_sort_by",
+                            fn_ty,
+                            Some(Linkage::External),
+                        )
+                    });
+
+                let thunk_ptr = thunk.as_global_value().as_pointer_value();
+                self.builder
+                    .build_call(
+                        runtime_fn,
+                        &[
+                            BasicMetadataValueEnum::from(data),
+                            BasicMetadataValueEnum::from(len),
+                            BasicMetadataValueEnum::from(elem_size),
+                            BasicMetadataValueEnum::from(thunk_ptr),
+                            BasicMetadataValueEnum::from(ctx_alloca),
+                        ],
+                        "",
+                    )
+                    .unwrap();
+
+                Ok(self.context.i64_type().const_int(0, false).into())
+            }
             _ => Ok(self.context.i64_type().const_int(0, false).into()),
         }
+    }
+
+    /// Inline-closure fast path for `Vec.sort_by`. Fuses the closure body
+    /// into a single `(ctx, *a, *b) -> i64` thunk: the runtime helper calls
+    /// directly into a function whose body IS the user comparator, so LLVM
+    /// can inline the body across the call (the previous shape went through
+    /// a separately-emitted `__closure_N` and an indirect call through the
+    /// fat-pointer's fn-pointer field, which the optimiser cannot see
+    /// through). Captures are stashed in a stack-allocated env struct in
+    /// the outer frame, the alloca is handed to the runtime as `ctx`, and
+    /// the thunk re-loads them on entry — same shape `compile_closure` uses
+    /// for its `env_ptr`, just with the closure call elided.
+    ///
+    /// Returns `(thunk_fn, ctx_alloca)`. Caller threads `ctx_alloca` into
+    /// `karac_vec_sort_by` as the comparator context.
+    #[allow(clippy::too_many_lines)]
+    fn emit_sort_by_inline_thunk(
+        &mut self,
+        params: &[ClosureParam],
+        body: &Expr,
+        elem_ty: BasicTypeEnum<'ctx>,
+    ) -> Result<(FunctionValue<'ctx>, PointerValue<'ctx>), String> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+
+        // 1. Captures (mirrors `compile_closure` step 1+2).
+        let free_vars = self.collect_closure_free_vars(params, body);
+        let env_field_types: Vec<BasicTypeEnum<'ctx>> = if free_vars.is_empty() {
+            vec![self.context.i8_type().into()]
+        } else {
+            free_vars.iter().map(|n| self.variables[n].ty).collect()
+        };
+        let env_struct_ty = self.context.struct_type(&env_field_types, false);
+
+        // 2. Stack-allocate + populate env in the outer frame.
+        let outer_fn = self.current_fn.unwrap();
+        let env_alloca = self.create_entry_alloca(outer_fn, "sort_by.env", env_struct_ty.into());
+        if !free_vars.is_empty() {
+            let mut env_agg = env_struct_ty.get_undef();
+            for (i, var_name) in free_vars.iter().enumerate() {
+                let slot = self.variables[var_name];
+                let val = self
+                    .builder
+                    .build_load(slot.ty, slot.ptr, var_name)
+                    .unwrap();
+                env_agg = self
+                    .builder
+                    .build_insert_value(env_agg, val, i as u32, "env.field")
+                    .unwrap()
+                    .into_struct_value();
+            }
+            self.builder.build_store(env_alloca, env_agg).unwrap();
+        }
+
+        // 3. Declare thunk: extern "C" fn(ctx, *a, *b) -> i64.
+        let id = self.closure_counter;
+        self.closure_counter += 1;
+        let name = format!("__sort_by_inline_{}", id);
+        let thunk_ty = i64_t.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false);
+        let thunk_fn = self
+            .module
+            .add_function(&name, thunk_ty, Some(Linkage::Internal));
+
+        // 4. Save outer codegen state — we're about to compile into a new fn.
+        let saved_bb = self.builder.get_insert_block();
+        let saved_fn = self.current_fn;
+        let saved_vars = std::mem::take(&mut self.variables);
+        let saved_var_types = std::mem::take(&mut self.var_type_names);
+        let saved_loop_stack = std::mem::take(&mut self.loop_stack);
+        let saved_subst = std::mem::take(&mut self.type_subst);
+        let saved_cfn = std::mem::take(&mut self.closure_fn_types);
+        let saved_pct = self.pending_closure_fn_type.take();
+
+        // 5. Build thunk body.
+        self.current_fn = Some(thunk_fn);
+        let entry = self.context.append_basic_block(thunk_fn, "entry");
+        self.builder.position_at_end(entry);
+
+        let ctx_ptr = thunk_fn.get_nth_param(0).unwrap().into_pointer_value();
+        let a_ptr = thunk_fn.get_nth_param(1).unwrap().into_pointer_value();
+        let b_ptr = thunk_fn.get_nth_param(2).unwrap().into_pointer_value();
+
+        if !free_vars.is_empty() {
+            let env_val = self
+                .builder
+                .build_load(env_struct_ty, ctx_ptr, "env")
+                .unwrap()
+                .into_struct_value();
+            for (i, var_name) in free_vars.iter().enumerate() {
+                let cap_ty = env_field_types[i];
+                let field_val = self
+                    .builder
+                    .build_extract_value(env_val, i as u32, var_name)
+                    .unwrap();
+                let alloca = self.create_entry_alloca(thunk_fn, var_name, cap_ty);
+                self.builder.build_store(alloca, field_val).unwrap();
+                self.variables.insert(
+                    var_name.clone(),
+                    VarSlot {
+                        ptr: alloca,
+                        ty: cap_ty,
+                    },
+                );
+                if let Some(type_name) = saved_var_types.get(var_name) {
+                    self.var_type_names
+                        .insert(var_name.clone(), type_name.clone());
+                }
+            }
+        }
+
+        // 6. Bind closure params to typed loads through a_ptr / b_ptr.
+        let a_val = self.builder.build_load(elem_ty, a_ptr, "a.val").unwrap();
+        let b_val = self.builder.build_load(elem_ty, b_ptr, "b.val").unwrap();
+        let param_vals = [a_val, b_val];
+        for (i, cp) in params.iter().enumerate().take(2) {
+            let val = param_vals[i];
+            let param_name = match &cp.pattern.kind {
+                PatternKind::Binding(n) => n.clone(),
+                _ => format!("_cp{}", i),
+            };
+            let ty = val.get_type();
+            let alloca = self.create_entry_alloca(thunk_fn, &param_name, ty);
+            self.builder.build_store(alloca, val).unwrap();
+            self.variables
+                .insert(param_name, VarSlot { ptr: alloca, ty });
+        }
+
+        // 7. Compile body, transform Ordering result → signed `tag - 1`.
+        let result = self.compile_expr(body)?;
+        let tag = if result.is_struct_value() {
+            self.builder
+                .build_extract_value(result.into_struct_value(), 0, "tag")
+                .unwrap()
+                .into_int_value()
+        } else {
+            result.into_int_value()
+        };
+        let one = i64_t.const_int(1, false);
+        let final_result = self.builder.build_int_sub(tag, one, "result").unwrap();
+        self.builder.build_return(Some(&final_result)).unwrap();
+
+        // 8. Restore outer state.
+        self.type_subst = saved_subst;
+        self.loop_stack = saved_loop_stack;
+        self.var_type_names = saved_var_types;
+        self.variables = saved_vars;
+        self.current_fn = saved_fn;
+        self.closure_fn_types = saved_cfn;
+        self.pending_closure_fn_type = saved_pct;
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        Ok((thunk_fn, env_alloca))
+    }
+
+    /// Emit a per-call-site bridge thunk for `Vec.sort_by`. Signature:
+    /// `extern "C" fn(ctx: *mut u8, a_ptr: *const u8, b_ptr: *const u8) -> i64`,
+    /// where `ctx` is a pointer to the user closure's spilled fat-pointer
+    /// (`{ fn_ptr, env_ptr }`). The thunk loads each element through the
+    /// element-type-specific `load`, calls the closure to get an `Ordering`
+    /// struct `{ i64 tag }`, and returns `tag - 1` — which yields
+    /// `-1 / 0 / +1` for `Less / Equal / Greater` since tags are assigned in
+    /// declaration order (see `declare_enums`). The runtime helper
+    /// `karac_vec_sort_by` uses that signed value with `Ord::cmp(&0)`.
+    /// This is the slow-path fallback for non-inline-closure arguments to
+    /// `Vec.sort_by` (e.g. a named function or a closure-typed local);
+    /// inline closures route through `emit_sort_by_inline_thunk` above.
+    fn emit_sort_by_thunk(
+        &mut self,
+        elem_ty: BasicTypeEnum<'ctx>,
+        closure_fn_type: FunctionType<'ctx>,
+    ) -> FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+
+        let id = self.closure_counter;
+        self.closure_counter += 1;
+        let name = format!("__sort_by_thunk_{}", id);
+
+        let thunk_ty = i64_t.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false);
+        let thunk_fn = self
+            .module
+            .add_function(&name, thunk_ty, Some(Linkage::Internal));
+
+        let saved_bb = self.builder.get_insert_block();
+        let saved_fn = self.current_fn;
+        self.current_fn = Some(thunk_fn);
+
+        let entry = self.context.append_basic_block(thunk_fn, "entry");
+        self.builder.position_at_end(entry);
+
+        let ctx = thunk_fn.get_nth_param(0).unwrap().into_pointer_value();
+        let a_ptr = thunk_fn.get_nth_param(1).unwrap().into_pointer_value();
+        let b_ptr = thunk_fn.get_nth_param(2).unwrap().into_pointer_value();
+
+        let fat_ty = self.closure_value_type();
+        let fat = self
+            .builder
+            .build_load(fat_ty, ctx, "fat")
+            .unwrap()
+            .into_struct_value();
+        let cls_fn = self
+            .builder
+            .build_extract_value(fat, 0, "cls.fn")
+            .unwrap()
+            .into_pointer_value();
+        let cls_env = self
+            .builder
+            .build_extract_value(fat, 1, "cls.env")
+            .unwrap()
+            .into_pointer_value();
+
+        let a_val = self.builder.build_load(elem_ty, a_ptr, "a").unwrap();
+        let b_val = self.builder.build_load(elem_ty, b_ptr, "b").unwrap();
+
+        let call_args: Vec<BasicMetadataValueEnum<'ctx>> = vec![
+            BasicMetadataValueEnum::from(cls_env),
+            BasicMetadataValueEnum::from(a_val),
+            BasicMetadataValueEnum::from(b_val),
+        ];
+        let call = self
+            .builder
+            .build_indirect_call(closure_fn_type, cls_fn, &call_args, "ord")
+            .unwrap();
+        let ord_val = call.try_as_basic_value().unwrap_basic();
+
+        // Ordering lowers to `{ i64 tag }` (unit-only enum with three variants).
+        // Extract field 0, defaulting to the raw int if the closure already
+        // returns a bare i64 — robust to any future reshape.
+        let tag = if ord_val.is_struct_value() {
+            self.builder
+                .build_extract_value(ord_val.into_struct_value(), 0, "tag")
+                .unwrap()
+                .into_int_value()
+        } else {
+            ord_val.into_int_value()
+        };
+
+        let one = i64_t.const_int(1, false);
+        let result = self.builder.build_int_sub(tag, one, "result").unwrap();
+        self.builder.build_return(Some(&result)).unwrap();
+
+        self.current_fn = saved_fn;
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        thunk_fn
     }
 
     // ── Map codegen ───────────────────────────────────────────────
@@ -18178,13 +18681,24 @@ impl<'ctx> Codegen<'ctx> {
         };
         let env_struct_ty = self.context.struct_type(&env_field_types, false);
 
-        // 3. Determine param types from annotations (default to i64).
+        // 3. Determine param types. Source annotation wins, otherwise consult
+        //    `pending_closure_param_hints` (caller pushdown — e.g. `Vec.sort_by`
+        //    handing the element type to a `|a, b|` comparator), otherwise
+        //    fall back to i64.
+        let param_hints = self.pending_closure_param_hints.take();
         let param_llvm_types: Vec<BasicTypeEnum<'ctx>> = params
             .iter()
-            .map(|p| {
-                p.ty.as_ref()
-                    .map(|te| self.llvm_type_for_type_expr(te))
-                    .unwrap_or_else(|| self.context.i64_type().into())
+            .enumerate()
+            .map(|(i, p)| {
+                if let Some(te) = p.ty.as_ref() {
+                    return self.llvm_type_for_type_expr(te);
+                }
+                if let Some(hints) = param_hints.as_ref() {
+                    if let Some(&hinted) = hints.get(i) {
+                        return hinted;
+                    }
+                }
+                self.context.i64_type().into()
             })
             .collect();
 
@@ -18443,6 +18957,15 @@ impl<'ctx> Codegen<'ctx> {
                 }
             },
             ExprKind::Unary { operand, .. } => self.infer_closure_return_type(operand, param_types),
+            ExprKind::MethodCall { method, .. } if method == "cmp" => self
+                .enum_layouts
+                .get("Ordering")
+                .map(|l| BasicTypeEnum::StructType(l.llvm_type))
+                .unwrap_or_else(|| {
+                    self.context
+                        .struct_type(&[self.context.i64_type().into()], false)
+                        .into()
+                }),
             ExprKind::Cast { ty, .. } => self.llvm_type_for_type_expr(ty),
             ExprKind::Block(block) | ExprKind::Seq(block) => {
                 if let Some(final_expr) = &block.final_expr {
