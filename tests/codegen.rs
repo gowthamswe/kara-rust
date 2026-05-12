@@ -2125,6 +2125,96 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_struct_field_move_no_double_free() {
+        // Move-aware suppression at struct-construction sites. When
+        // a struct field's initializer is an Identifier naming a
+        // tracked Vec / String, the field captures the binding's
+        // data pointer — but the source's let-site `track_vec_var`
+        // unconditionally schedules a scope-exit free that would
+        // free the buffer the caller now reads through the struct.
+        // This is the shape Parallax/HTTP hits via
+        // `Response { body: my_string }` — without suppression,
+        // the caller reads NUL bytes (or SIGSEGVs) downstream of
+        // FFI consumption.
+        let out = run_program(
+            r#"
+struct Holder {
+    tag: i64,
+    body: String,
+}
+fn build() -> Holder {
+    let mut s: String = String.new();
+    s.push_str("hello, world");
+    Holder { tag: 7, body: s }
+}
+fn main() {
+    let h: Holder = build();
+    println(h.tag);
+    println(h.body);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "7\nhello, world");
+        }
+    }
+
+    #[test]
+    fn test_e2e_let_rebind_move_no_double_free() {
+        // `let outer = inner;` where `inner` is a tracked Vec /
+        // String is a move — both slots end up holding the same
+        // {ptr, len, cap}. Without source-cap suppression at the
+        // let-rebind site, both `track_vec_var`-queued cleanups
+        // fire and double-free the heap buffer. The LHS's track
+        // becomes the unique cleanup owner.
+        let out = run_program(
+            r#"
+fn build() -> String {
+    let mut inner: String = String.new();
+    inner.push_str("relayed");
+    let outer: String = inner;
+    outer
+}
+fn main() {
+    let s: String = build();
+    println(s);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "relayed");
+        }
+    }
+
+    #[test]
+    fn test_e2e_assign_rebind_move_no_double_free() {
+        // `acc = extra;` where both `acc` and `extra` are tracked
+        // Vec / String bindings is an assign-rebind. The old
+        // `acc` buffer leaks (no RAII drop in v1), but without
+        // source-cap suppression on `extra`, both queued cleanups
+        // fire against the same post-assign buffer → double-free.
+        let out = run_program(
+            r#"
+fn build() -> String {
+    let mut acc: String = String.new();
+    acc.push_str("first");
+    let mut extra: String = String.new();
+    extra.push_str("second");
+    acc = extra;
+    acc
+}
+fn main() {
+    let s: String = build();
+    println(s);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "second");
+        }
+    }
+
+    #[test]
     fn test_e2e_for_range_step_by_codegen() {
         // `for j in (start..=end).step_by(n)` — the iterator-adaptor
         // chain previously fell through `compile_for`'s match to the

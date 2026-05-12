@@ -5603,6 +5603,17 @@ impl<'ctx> Codegen<'ctx> {
                         if let Some(slot) = self.variables.get(var_name.as_str()) {
                             self.track_vec_var(slot.ptr);
                         }
+                        // Move-aware suppression for `let outer = inner;`
+                        // when `inner` is a tracked Vec / String. Both
+                        // slots end up pointing at the same heap buffer;
+                        // without this, both cleanups fire and double-
+                        // free. Zeroing the source's `cap` makes the
+                        // source's `FreeVecBuffer` a no-op (the `cap > 0`
+                        // guard in `emit_scope_cleanup` skips). The new
+                        // `outer` binding's track stays the unique owner.
+                        // No-op for non-Identifier RHS (fresh-value
+                        // constructors / call results / literals).
+                        self.suppress_source_vec_cleanup_for_arg(value);
                     }
                 }
                 // Phase 7.2 Slice DP — track value-type enum bindings
@@ -5689,6 +5700,19 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     if let Some(slot) = self.variables.get(name).copied() {
                         self.builder.build_store(slot.ptr, val).unwrap();
+                    }
+                    // Move-aware suppression for `outer = inner;` when
+                    // the LHS is a tracked Vec / String and the RHS is
+                    // an Identifier to another tracked binding. Both
+                    // slots end up holding the same {ptr, len, cap};
+                    // without this, both scope-exit `FreeVecBuffer`
+                    // cleanups fire and double-free. The LHS's track
+                    // (registered at LHS's original let-site) stays
+                    // the unique cleanup owner. No-op for non-
+                    // Identifier RHS — fresh-value RHS shapes can't
+                    // alias an existing tracked binding.
+                    if self.vec_elem_types.contains_key(name.as_str()) {
+                        self.suppress_source_vec_cleanup_for_arg(value);
                     }
                 } else if let ExprKind::FieldAccess { object, field } = &target.kind {
                     self.compile_field_store(object, field, val)?;
@@ -6315,6 +6339,16 @@ impl<'ctx> Codegen<'ctx> {
                         )
                         .unwrap();
                     self.builder.build_store(field_ptr, val).unwrap();
+                    // Move-aware suppression for `Foo { ..., body: body }`
+                    // when the field expr is an Identifier naming a
+                    // tracked Vec / String. The struct field now owns
+                    // the heap buffer; without this, the source's
+                    // scope-exit `FreeVecBuffer` frees the buffer the
+                    // struct value carries downstream, producing UAF
+                    // when the consumer reads through the struct.
+                    // Mirrors the enum-variant constructor pattern
+                    // already wired at `try_compile_enum_variant`.
+                    self.suppress_source_vec_cleanup_for_arg(&field_init.value);
                 }
                 return Ok(ptr.into());
             }
@@ -6329,6 +6363,11 @@ impl<'ctx> Codegen<'ctx> {
                     .build_insert_value(agg, val, idx as u32, "field")
                     .unwrap()
                     .into_struct_value();
+                // Move-aware suppression — same shape as the shared-
+                // struct branch above. The new struct aggregate carries
+                // the source's data pointer; suppress the source's
+                // scope-exit free so the consumer can read through.
+                self.suppress_source_vec_cleanup_for_arg(&field_init.value);
             }
             Ok(agg.into())
         } else {
