@@ -5158,10 +5158,41 @@ fn test_string_sorted_empty() {
     assert_eq!(output, "\n");
 }
 
+// String chars `sorted_by` end-to-end coverage is blocked on a separate
+// interpreter gap: char comparison operators (`<`, `>`, `==`) and the
+// builtin `cmp` method aren't wired for `Value::Char` — every reasonable
+// comparator body panics with "type mismatch in binary operation" or
+// "method 'cmp' not found on type 'char'". The interpreter's `sorted_by`
+// arm correctly invokes the user closure with `Value::Char(a),
+// Value::Char(b)` after this slice; the gap is downstream of the
+// comparator hand-off. Tracked separately in wip-staging.
+
 #[test]
-fn test_string_sorted_by_fallback() {
-    let output = run(r#"fn main() { let s = "dcba"; println(s.sorted_by(|a, b| a < b)); }"#);
-    assert_eq!(output, "abcd\n");
+fn test_vec_sort_by_closure_descending() {
+    let output = run(
+        "fn main() {
+            let mut xs: Vec[i64] = Vec.new();
+            xs.push(3i64); xs.push(1i64); xs.push(4i64); xs.push(1i64); xs.push(5i64);
+            xs.sort_by(|a, b| if a < b { Ordering.Greater } else if a > b { Ordering.Less } else { Ordering.Equal });
+            for x in xs.iter() { println(x); }
+        }",
+    );
+    assert_eq!(output, "5\n4\n3\n1\n1\n");
+}
+
+#[test]
+fn test_vec_sorted_by_closure_returns_new() {
+    let output = run(
+        "fn main() {
+            let mut xs: Vec[i64] = Vec.new();
+            xs.push(3i64); xs.push(1i64); xs.push(2i64);
+            let ys = xs.sorted_by(|a, b| if a < b { Ordering.Less } else if a > b { Ordering.Greater } else { Ordering.Equal });
+            for y in ys.iter() { println(y); }
+            for x in xs.iter() { println(x); }
+        }",
+    );
+    // sorted_by returns ascending; original retains insertion order
+    assert_eq!(output, "1\n2\n3\n3\n1\n2\n");
 }
 
 // ── Prefix dereference operator ───────────────────────────────────────────────

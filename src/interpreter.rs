@@ -5696,6 +5696,45 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// Invoke a comparator closure (a `Value::Function` produced by an
+    /// `ExprKind::Closure`) on two values and translate the returned
+    /// `Ordering` enum variant into `std::cmp::Ordering`. Used by the
+    /// closure-taking sort methods (`sort_by`, `sorted_by`) to bridge
+    /// the user's `|a, b| ... -> Ordering` to Rust's `Vec::sort_by`.
+    ///
+    /// **Caller invariant — no `RwLock` held.** `std::sync::RwLock` is
+    /// non-reentrant on the same thread; the user closure body may
+    /// re-enter the interpreter on the same array (e.g. an inner
+    /// `.len()` call), which would deadlock or panic against a held
+    /// write guard. Each call site snapshots the source vector before
+    /// invoking sort so no lock is live during the comparator callbacks.
+    fn invoke_value_comparator(
+        &mut self,
+        cmp_val: &Value,
+        a: Value,
+        b: Value,
+        method_label: &str,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let result = self.invoke_function_value(cmp_val.clone(), vec![a, b]);
+        match &result {
+            Value::EnumVariant {
+                enum_name, variant, ..
+            } if enum_name == "Ordering" => match variant.as_str() {
+                "Less" => Ordering::Less,
+                "Equal" => Ordering::Equal,
+                "Greater" => Ordering::Greater,
+                other => panic!(
+                    "{method_label}: comparator returned Ordering.{other} \
+                     which is not one of Less/Equal/Greater"
+                ),
+            },
+            _ => panic!(
+                "{method_label}: comparator must return Ordering, returned a different value"
+            ),
+        }
+    }
+
     fn eval_method_call(
         &mut self,
         object: &Expr,
@@ -6938,15 +6977,27 @@ impl<'a> Interpreter<'a> {
                 }
             }
             "sort_by" => {
-                // sort_by(|a, b| ...) — interpreter uses natural value ordering
-                // as a fallback since closure invocation inside a comparator
-                // requires re-entrancy unsupported at this call site.
+                // sort_by(|a, b| -> Ordering) — snapshot the vec so the user
+                // closure can re-enter the interpreter freely (std::sync::RwLock
+                // is non-reentrant on the same thread), sort the snapshot via
+                // the user comparator, then write the result back.
+                if args.len() != 1 {
+                    panic!(
+                        "sort_by expects 1 argument (comparator closure), got {}",
+                        args.len()
+                    );
+                }
+                let cmp_val = self.eval_expr_inner(&args[0].value);
                 if let Value::Array(ref rc) = obj {
                     let label = match &object.kind {
                         ExprKind::Identifier(n) => n.clone(),
                         _ => "<value>".to_string(),
                     };
-                    try_write_or_panic(rc, &label).sort_by(value_compare);
+                    let mut snapshot = rc.read().unwrap().clone();
+                    snapshot.sort_by(|a, b| {
+                        self.invoke_value_comparator(&cmp_val, a.clone(), b.clone(), "sort_by")
+                    });
+                    *try_write_or_panic(rc, &label) = snapshot;
                     return Value::Unit;
                 }
             }
@@ -6963,16 +7014,35 @@ impl<'a> Interpreter<'a> {
                 }
             }
             "sorted_by" => {
-                // Closure comparators require re-entrancy not yet supported;
-                // fall back to natural ordering for both strings and arrays.
+                // sorted_by(|a, b| -> Ordering) — same snapshot-then-sort
+                // pattern as `sort_by`, but returns a new collection instead
+                // of mutating in place. The `.clone()` releases the read
+                // guard before the comparator runs, so the user closure can
+                // re-enter the interpreter freely.
+                if args.len() != 1 {
+                    panic!(
+                        "sorted_by expects 1 argument (comparator closure), got {}",
+                        args.len()
+                    );
+                }
+                let cmp_val = self.eval_expr_inner(&args[0].value);
                 if let Value::String(ref s) = obj {
                     let mut chars: Vec<char> = s.chars().collect();
-                    chars.sort_unstable();
+                    chars.sort_by(|a, b| {
+                        self.invoke_value_comparator(
+                            &cmp_val,
+                            Value::Char(*a),
+                            Value::Char(*b),
+                            "sorted_by",
+                        )
+                    });
                     return Value::String(chars.into_iter().collect());
                 }
                 if let Value::Array(ref rc) = obj {
                     let mut v = rc.read().unwrap().clone();
-                    v.sort_by(value_compare);
+                    v.sort_by(|a, b| {
+                        self.invoke_value_comparator(&cmp_val, a.clone(), b.clone(), "sorted_by")
+                    });
                     return Value::array_of(v);
                 }
             }
