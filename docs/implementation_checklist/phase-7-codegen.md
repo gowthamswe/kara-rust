@@ -180,7 +180,7 @@ Layout-related user-visible rules live in [design.md § Layout Rules](design.md#
 
   *Out of scope (deferred to follow-ups).*
   - Closures-with-captures handlers — `E_CLOSURE_AS_FN_PTR_NOT_YET` keeps firing at `src/codegen.rs:17383`. Closure `{fn_ptr, env_ptr}` ABI doesn't fit a single-ptr slot regardless of trampoline approach.
-  - `Server.serve(addr, handler)` 2-arg form — separate slice; lifts when a real consumer needs fixed-port bind. Tracked in [`wip-staging.md`](wip-staging.md) carry-forward sub-item (ii).
+  - `Server.serve(addr, handler)` 2-arg form. ✓ Closed 2026-05-12. Addr lifts to the user surface; codegen mirrors `serve_static`'s `String → null-terminated C string` packing pattern.
   - Per-request `headers` round-trip — v1 hardcodes `content-type: application/json` (`runtime/src/lib.rs:2187`).
   - Structured panic recovery on the handler path — gated on `std.panic` (separate Phase 8 item).
 

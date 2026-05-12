@@ -10560,7 +10560,7 @@ fn test_server_serve_signature_typechecks() {
              Response { status: 200, body: \"{}\" }
          }
          fn main() {
-             let _result = Server.serve(get_dashboard);
+             let _result = Server.serve(\"127.0.0.1:0\", get_dashboard);
          }",
     );
 }

@@ -9597,7 +9597,7 @@ fn handle(req: Request) -> Response {
 }
 
 fn main() {
-    let _result = Server.serve(handle);
+    let _result = Server.serve("127.0.0.1:0", handle);
 }
 "#;
         let mut parsed = karac::parse(src);
@@ -9612,7 +9612,7 @@ fn main() {
         let ir = compile_to_ir(&parsed.program, None, None);
         assert!(
             ir.is_ok(),
-            "expected Server.serve(handle) to compile cleanly; got: {:?}",
+            "expected Server.serve(addr, handle) to compile cleanly; got: {:?}",
             ir.err()
         );
         let ir_text = ir.unwrap();
@@ -9638,8 +9638,8 @@ fn handle(req: Request) -> Response {
 }
 
 fn main() {
-    let _r1 = Server.serve(handle);
-    let _r2 = Server.serve(handle);
+    let _r1 = Server.serve("127.0.0.1:0", handle);
+    let _r2 = Server.serve("127.0.0.1:0", handle);
 }
 "#;
         let mut parsed = karac::parse(src);
@@ -9652,7 +9652,7 @@ fn main() {
         let typed = karac::typecheck(&parsed.program, &resolved);
         karac::lower(&mut parsed.program, &typed);
         let ir = compile_to_ir(&parsed.program, None, None)
-            .expect("expected dual Server.serve(handle) calls to compile cleanly");
+            .expect("expected dual Server.serve(addr, handle) calls to compile cleanly");
         let define_count = ir
             .lines()
             .filter(|l| l.contains("_karac_http_shim_handle") && l.contains("define"))
@@ -9672,7 +9672,7 @@ fn main() {
     fn test_server_serve_rejects_closure_handler() {
         let src = r#"
 fn main() {
-    let _result = Server.serve(|req| Response { status: 200, body: "{}" });
+    let _result = Server.serve("127.0.0.1:0", |req| Response { status: 200, body: "{}" });
 }
 "#;
         let mut parsed = karac::parse(src);

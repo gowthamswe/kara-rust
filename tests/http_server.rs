@@ -374,7 +374,7 @@ mod http_server_tests {
             }
 
             fn main() {
-                let _result = Server.serve(handle);
+                let _result = Server.serve("127.0.0.1:0", handle);
                 println("server exited unexpectedly");
             }
         "#;
@@ -530,7 +530,7 @@ mod http_server_tests {
             }
 
             fn main() {
-                let _result = Server.serve(handle);
+                let _result = Server.serve("127.0.0.1:0", handle);
                 println("server exited unexpectedly");
             }
         "#;
@@ -558,7 +558,7 @@ mod http_server_tests {
             }
 
             fn main() {
-                let _result = Server.serve(handle);
+                let _result = Server.serve("127.0.0.1:0", handle);
                 println("server exited unexpectedly");
             }
         "#;

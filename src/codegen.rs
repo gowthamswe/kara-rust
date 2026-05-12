@@ -7075,24 +7075,49 @@ impl<'ctx> Codegen<'ctx> {
         // handler-dispatch and static-body entries differ only in arg
         // 1 + the extern they target, not in the return-value
         // translation.
-        if type_name == "Server" && method == "serve" && _args.len() == 1 {
-            // Hard-coded address — the Kāra-side `Server.serve(handler)`
-            // declaration takes only the handler. Per locked design (SB3),
-            // v1 omits the address parameter; user code that needs a
-            // specific bind address will surface the gap and we'll lift
-            // to a 2-arg `Server.serve(addr, handler)` shape in a
-            // follow-up. For v1, default to `"127.0.0.1:0"` so the smoke
-            // test's `BOUND_PORT=<n>` stdout convention is the entry
-            // point. This keeps the v1 declaration short while still
-            // exercising the bind+serve+dispatch path end-to-end.
-            //
-            // **Caveat.** This means user code calling `Server.serve(h)`
-            // today always binds on `127.0.0.1:0`. The address argument
-            // lifts to the user surface when (a) a real consumer has a
-            // fixed bind requirement, or (b) the polymorphic `serve[E]`
-            // declaration update lands. Tracked at the slice's
-            // close-out paragraph in `phase-7-codegen.md`.
-            let handler_arg = &_args[0];
+        if type_name == "Server" && method == "serve" && _args.len() == 2 {
+            // Address handling mirrors `Server.serve_static`'s shape:
+            // the Kāra `String` is `{ptr, len, cap}`, but hyper's bind
+            // path needs a null-terminated C string — allocate
+            // `len + 1` bytes, memcpy, null-terminate.
+            let addr_val = self.compile_expr(&_args[0].value)?;
+            let addr_sv = addr_val.into_struct_value();
+            let addr_ptr_raw = self
+                .builder
+                .build_extract_value(addr_sv, 0, "http.serve.addr.data")
+                .unwrap()
+                .into_pointer_value();
+            let addr_len = self
+                .builder
+                .build_extract_value(addr_sv, 1, "http.serve.addr.len")
+                .unwrap()
+                .into_int_value();
+            let one = self.context.i64_type().const_int(1, false);
+            let needed = self
+                .builder
+                .build_int_add(addr_len, one, "http.serve.addr.cstr.len")
+                .unwrap();
+            let addr_cstr = self
+                .builder
+                .build_call(self.malloc_fn, &[needed.into()], "http.serve.addr.cstr.buf")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic()
+                .into_pointer_value();
+            self.builder
+                .build_memcpy(addr_cstr, 1, addr_ptr_raw, 1, addr_len)
+                .unwrap();
+            let i8_ty = self.context.i8_type();
+            let zero_byte = i8_ty.const_int(0, false);
+            let term_ptr = unsafe {
+                self.builder
+                    .build_in_bounds_gep(i8_ty, addr_cstr, &[addr_len], "http.serve.addr.cstr.term")
+                    .unwrap()
+            };
+            self.builder.build_store(term_ptr, zero_byte).unwrap();
+            let addr_ptr = addr_cstr;
+
+            let handler_arg = &_args[1];
             let handler_fn = self.resolve_free_fn_for_handler_arg(&handler_arg.value)?;
             // HTTP handler ABI trampoline (2026-05-09): pass the per-handler
             // shim's address rather than the user fn's directly. The user fn
@@ -7102,14 +7127,6 @@ impl<'ctx> Codegen<'ctx> {
             // The shim adapts between the two ABIs (cached per-handler).
             let shim_fn = self.emit_http_handler_shim(handler_fn);
             let handler_ptr = shim_fn.as_global_value().as_pointer_value();
-
-            // Build the address C string.
-            let addr_str = "127.0.0.1:0";
-            let addr_global = self
-                .builder
-                .build_global_string_ptr(addr_str, "http.serve.addr.cstr")
-                .unwrap();
-            let addr_ptr = addr_global.as_pointer_value();
 
             let serve_fn = self
                 .module
@@ -19648,7 +19665,7 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::Closure { .. } => Err(
                 "error[E_CLOSURE_AS_FN_PTR_NOT_YET]: closures with captures cannot be \
                  passed where a fn-pointer is expected. The handler argument to \
-                 `Server.serve` must be a free fn name (e.g. `Server.serve(handle)`); \
+                 `Server.serve` must be a free fn name (e.g. `Server.serve(addr, handle)`); \
                  the closure-pair `{ fn_ptr, env_ptr }` ABI does not match the FFI \
                  extern's bare-pointer parameter slot. Closure-as-`Fn`-arg is a \
                  separate codegen track."

@@ -140,12 +140,19 @@ impl Server {
         Err(HttpError { message: "" })
     }
 
-    // Bind to `addr` and dispatch every request through the user-
-    // supplied free-fn handler. The handler receives a `Request` and
-    // returns a `Response`; the runtime translates between hyper's
-    // request/response types and the Kāra-side struct on each call.
+    // Bind to `addr` (e.g. `"127.0.0.1:0"` for ephemeral-port binding,
+    // or `"127.0.0.1:8080"` for a fixed port) and dispatch every
+    // request through the user-supplied free-fn handler. The handler
+    // receives a `Request` and returns a `Response`; the runtime
+    // translates between hyper's request/response types and the
+    // Kāra-side struct on each call.
     //
-    // **v1 codegen scope.** Free fns only — `Server.serve(get_dashboard)`
+    // **Smoke-test convention.** When `addr` ends in `:0` (or any
+    // other ephemeral-port form), the runtime emits a
+    // `BOUND_PORT=<n>\n` line to stdout before entering the accept
+    // loop — same convention as `serve_static`.
+    //
+    // **v1 codegen scope.** Free fns only — `Server.serve(addr, get_dashboard)`
     // resolves the identifier to a fn pointer at the call site.
     // Closures with non-empty captures (e.g. `|req| {...}`) are
     // rejected with `error[E_CLOSURE_AS_FN_PTR_NOT_YET]`; the
@@ -154,10 +161,11 @@ impl Server {
     // in a separate codegen track.
     //
     // **Effect set.** Non-polymorphic in v1 — fixed as
-    // `sends(Network), receives(Network)`. Lifting to `serve[E](handler:
-    // Fn(Request) -> Response with E)` is a one-line declaration
-    // change once a real consumer needs it; the typechecker side is
-    // already shipped via Theme 6's `with E` machinery.
+    // `sends(Network), receives(Network)`. Lifting to `serve[E](addr,
+    // handler: Fn(Request) -> Response with E)` is a one-line
+    // declaration change once a real consumer needs it; the
+    // typechecker side is already shipped via Theme 6's `with E`
+    // machinery.
     //
     // **Panic semantics (v1 limitation).** A handler panic terminates
     // the server process. Kāra's panic lowers to `printf + exit(1)` —
@@ -168,7 +176,7 @@ impl Server {
     // item); v1 surfaces the abort to operators via a non-zero exit
     // code on the server binary.
     #[compiler_builtin]
-    fn serve(handler: Fn(Request) -> Response) -> Result[Unit, HttpError] with sends(Network) receives(Network) {
+    fn serve(addr: String, handler: Fn(Request) -> Response) -> Result[Unit, HttpError] with sends(Network) receives(Network) {
         Err(HttpError { message: "" })
     }
 }

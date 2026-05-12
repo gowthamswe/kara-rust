@@ -201,7 +201,7 @@ pub const PRELUDE_EFFECT_RESOURCES: &[&str] = &[
     "Stderr",
     "FileSystem",
     // Slice B follow-up (2026-05-09): `Network` registered alongside
-    // the `Server.serve(handler)` declaration in
+    // the `Server.serve(addr, handler)` declaration in
     // `runtime/stdlib/http.kara`. v1 unifies sends and receives under
     // one resource; surfaced here so user code can write
     // `with sends(Network) receives(Network)` without an explicit
