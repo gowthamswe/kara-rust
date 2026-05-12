@@ -7026,6 +7026,42 @@ fn test_vec_sort_by_accepts_ordering_returning_comparator() {
 }
 
 #[test]
+fn test_vec_sort_by_key_accepts_integer_key() {
+    let result = typecheck_ok(
+        r#"fn main() { let mut xs: Vec[i64] = Vec.new(); xs.push(1i64); xs.sort_by_key(|x| x); }"#,
+    );
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_vec_sort_by_key_accepts_negated_key() {
+    // The LeetCode #1665 idiom — descending via key negation.
+    let result = typecheck_ok(
+        r#"fn main() { let mut xs: Vec[i64] = Vec.new(); xs.push(1i64); xs.sort_by_key(|x| -x); }"#,
+    );
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_vec_sort_by_key_rejects_wrong_arity_closure() {
+    let errors = typecheck_errors(
+        r#"fn main() { let mut xs: Vec[i64] = Vec.new(); xs.push(1i64); xs.sort_by_key(|a, b| a); }"#,
+    );
+    assert!(
+        !errors.is_empty(),
+        "expected diagnostic for wrong-arity key closure"
+    );
+}
+
+#[test]
+fn test_vec_sorted_by_key_returns_vec() {
+    let result = typecheck_ok(
+        r#"fn main() -> Vec[i64] { let mut xs: Vec[i64] = Vec.new(); xs.push(1i64); xs.sorted_by_key(|x| x) }"#,
+    );
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+}
+
+#[test]
 fn test_string_sorted_wrong_arity_rejects() {
     let errors = typecheck_errors(r#"fn f() { let s = "hello"; s.sorted("extra"); }"#);
     assert!(

@@ -5259,6 +5259,43 @@ fn test_i64_cmp_method() {
     assert_eq!(output, "less\n");
 }
 
+#[test]
+fn test_vec_sort_by_key_ascending() {
+    // Idiomatic ascending sort by computed key.
+    let output = run("fn main() {
+            let mut xs: Vec[i64] = Vec.new();
+            xs.push(3i64); xs.push(1i64); xs.push(4i64); xs.push(1i64); xs.push(5i64);
+            xs.sort_by_key(|x| x);
+            for x in xs.iter() { println(x); }
+        }");
+    assert_eq!(output, "1\n1\n3\n4\n5\n");
+}
+
+#[test]
+fn test_vec_sort_by_key_descending_via_negation() {
+    // LeetCode #1665 idiom — descending sort via key negation.
+    let output = run("fn main() {
+            let mut xs: Vec[i64] = Vec.new();
+            xs.push(3i64); xs.push(1i64); xs.push(4i64); xs.push(1i64); xs.push(5i64);
+            xs.sort_by_key(|x| -x);
+            for x in xs.iter() { println(x); }
+        }");
+    assert_eq!(output, "5\n4\n3\n1\n1\n");
+}
+
+#[test]
+fn test_vec_sorted_by_key_returns_new() {
+    // sorted_by_key returns a new Vec; original retains insertion order.
+    let output = run("fn main() {
+            let mut xs: Vec[i64] = Vec.new();
+            xs.push(3i64); xs.push(1i64); xs.push(2i64);
+            let ys = xs.sorted_by_key(|x| x);
+            for y in ys.iter() { println(y); }
+            for x in xs.iter() { println(x); }
+        }");
+    assert_eq!(output, "1\n2\n3\n3\n1\n2\n");
+}
+
 // ── Prefix dereference operator ───────────────────────────────────────────────
 
 #[test]

@@ -7046,6 +7046,64 @@ impl<'a> Interpreter<'a> {
                     return Value::array_of(v);
                 }
             }
+            "sort_by_key" => {
+                // sort_by_key(|t| -> K) where K: Ord — precompute keys once
+                // (Rust's `sort_by_key` semantics: each element's key is
+                // computed exactly once, not on every comparator invocation),
+                // sort the (key, value) pairs by key via `value_compare`, write
+                // the values back. Snapshot-then-replace mirrors `sort_by` to
+                // keep the user closure free to re-enter the interpreter.
+                if args.len() != 1 {
+                    panic!(
+                        "sort_by_key expects 1 argument (key closure), got {}",
+                        args.len()
+                    );
+                }
+                let key_val = self.eval_expr_inner(&args[0].value);
+                if let Value::Array(ref rc) = obj {
+                    let label = match &object.kind {
+                        ExprKind::Identifier(n) => n.clone(),
+                        _ => "<value>".to_string(),
+                    };
+                    let snapshot = rc.read().unwrap().clone();
+                    let mut keyed: Vec<(Value, Value)> = snapshot
+                        .into_iter()
+                        .map(|v| {
+                            let k = self.invoke_function_value(key_val.clone(), vec![v.clone()]);
+                            (k, v)
+                        })
+                        .collect();
+                    keyed.sort_by(|(k1, _), (k2, _)| value_compare(k1, k2));
+                    let sorted: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
+                    *try_write_or_panic(rc, &label) = sorted;
+                    return Value::Unit;
+                }
+            }
+            "sorted_by_key" => {
+                // sorted_by_key(|t| -> K) where K: Ord — same precompute-keys
+                // pattern as `sort_by_key`, but returns a new Vec instead of
+                // mutating in place.
+                if args.len() != 1 {
+                    panic!(
+                        "sorted_by_key expects 1 argument (key closure), got {}",
+                        args.len()
+                    );
+                }
+                let key_val = self.eval_expr_inner(&args[0].value);
+                if let Value::Array(ref rc) = obj {
+                    let snapshot = rc.read().unwrap().clone();
+                    let mut keyed: Vec<(Value, Value)> = snapshot
+                        .into_iter()
+                        .map(|v| {
+                            let k = self.invoke_function_value(key_val.clone(), vec![v.clone()]);
+                            (k, v)
+                        })
+                        .collect();
+                    keyed.sort_by(|(k1, _), (k2, _)| value_compare(k1, k2));
+                    let sorted: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
+                    return Value::array_of(sorted);
+                }
+            }
             "reverse" => {
                 if let Value::Array(ref rc) = obj {
                     let label = match &object.kind {

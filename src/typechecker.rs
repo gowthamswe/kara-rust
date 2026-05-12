@@ -11917,19 +11917,22 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
-        // `Vec[T].sort_by` / `Vec[T].sorted_by` — closure-shape validation.
-        // Vec has no stdlib impl block; without this intercept the call
-        // falls through to the silent-no-method path below, leaving the
-        // closure arg synth-typed with fresh metavars (no pushdown into
-        // params, no check on the body's return type). A wrong-shape
-        // comparator (`xs.sort_by(|a| a)`, `xs.sort_by(|a, b| a + b)`)
-        // would typecheck and runtime-panic in the interpreter's
-        // closure-honoring `sort_by`. Mirrors the slice arm above —
-        // `sorted_by` returns a new Vec, `sort_by` mutates in place.
-        // Receiver mutability is enforced at the binding layer (calling
-        // `.sort_by` on a non-`mut` binding errors there), so no
-        // explicit mutability gate is duplicated here.
-        if matches!(method, "sort_by" | "sorted_by") {
+        // `Vec[T].sort_by` / `Vec[T].sorted_by` / `Vec[T].sort_by_key` /
+        // `Vec[T].sorted_by_key` — closure-shape validation. Vec has no
+        // stdlib impl block; without this intercept the call falls through
+        // to the silent-no-method path below, leaving the closure arg
+        // synth-typed with fresh metavars (no pushdown into params, no
+        // check on the body's return type). A wrong-shape closure would
+        // typecheck and runtime-panic in the interpreter's closure-honoring
+        // sort paths. `sort_by` / `sort_by_key` mutate in place and return
+        // Unit; `sorted_by` / `sorted_by_key` return a new Vec. Receiver
+        // mutability is enforced at the binding layer (calling `.sort_by`
+        // on a non-`mut` binding errors there), so no explicit mutability
+        // gate is duplicated here.
+        if matches!(
+            method,
+            "sort_by" | "sorted_by" | "sort_by_key" | "sorted_by_key"
+        ) {
             let elem_for_vec: Option<Type> = match &obj_ty {
                 Type::Named { name, args } if name == "Vec" && args.len() == 1 => {
                     Some(args[0].clone())
@@ -11943,11 +11946,14 @@ impl<'a> TypeChecker<'a> {
                 _ => None,
             };
             if let Some(elem) = elem_for_vec {
+                let is_key = method.ends_with("_key");
+                let arg_label = if is_key { "key" } else { "comparator" };
                 if args.len() != 1 {
                     self.type_error(
                         format!(
-                            "Vec.{}() expects 1 argument (comparator closure), found {}",
+                            "Vec.{}() expects 1 argument ({} closure), found {}",
                             method,
+                            arg_label,
                             args.len()
                         ),
                         span.clone(),
@@ -11956,10 +11962,13 @@ impl<'a> TypeChecker<'a> {
                     for arg in args {
                         self.infer_expr(&arg.value);
                     }
+                } else if is_key {
+                    self.check_sort_key_closure(&elem, &args[0], method, span);
                 } else {
                     self.check_sort_comparator(&elem, &args[0], method, span);
                 }
-                return if method == "sort_by" {
+                let mutates_in_place = method == "sort_by" || method == "sort_by_key";
+                return if mutates_in_place {
                     Type::Unit
                 } else {
                     Type::Named {
@@ -12188,6 +12197,51 @@ impl<'a> TypeChecker<'a> {
         self.check_expr(&arg.value, &expected);
     }
 
+    /// Validate a `sort_by_key` / `sorted_by_key` key-function argument
+    /// against `Fn(elem) -> K` and verify the inferred `K` satisfies `Ord`.
+    /// `K` is a fresh metavar pushed down through `check_expr`; once the
+    /// closure body unifies it to a concrete type, an Ord bound check
+    /// rejects key types (raw floats, function values, etc.) that lack
+    /// total ordering. Generic `K` (still a TypeVar after resolution)
+    /// flows through without an Ord assertion — the bound will be
+    /// rechecked at monomorphization.
+    fn check_sort_key_closure(&mut self, elem: &Type, arg: &CallArg, method: &str, span: &Span) {
+        // `Fn(elem) -> K` where K is a placeholder the closure body solves.
+        // Use `Type::TypeParam` not `Type::TypeVar`: `types_compatible` treats
+        // TypeParam permissively so the `check_assignable` step doesn't fire
+        // a spurious "expected K, found <body_ty>" diagnostic. After
+        // `check_expr` returns the inferred closure type, read the resolved
+        // body type out of the Function shape and check the Ord bound on it.
+        // Pattern lifted from `Iterator.map`'s pushdown at infer_iterator_method.
+        let placeholder = Type::TypeParam("__sort_by_key_K".to_string());
+        let expected = Type::Function {
+            params: vec![elem.clone()],
+            return_type: Box::new(placeholder),
+        };
+        let actual_ty = self.check_expr(&arg.value, &expected);
+        let resolved_k = match actual_ty {
+            Type::Function { return_type, .. } | Type::OnceFunction { return_type, .. } => {
+                *return_type
+            }
+            _ => return,
+        };
+        if !matches!(
+            resolved_k,
+            Type::TypeParam(_) | Type::TypeVar(_) | Type::Error
+        ) && !self.type_supports_ord(&resolved_k)
+        {
+            self.type_error(
+                format!(
+                    "{}: key closure return type '{}' does not implement Ord",
+                    method,
+                    type_display(&resolved_k)
+                ),
+                span.clone(),
+                TypeErrorKind::TraitBoundNotSatisfied,
+            );
+        }
+    }
+
     /// Infer the return type of a method call on `String` (`Type::Str`).
     /// Called from `infer_method_call` when the object type is `Type::Str`.
     fn infer_str_method(&mut self, method: &str, args: &[CallArg], span: &Span) -> Type {
@@ -12371,6 +12425,31 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Unit
             }
+            "sort_by_key" => {
+                if !mutable {
+                    self.type_error(
+                        "Slice.sort_by_key() requires a mutable slice (`mut Slice[T]`)".to_string(),
+                        span.clone(),
+                        TypeErrorKind::TypeMismatch,
+                    );
+                }
+                if args.len() != 1 {
+                    self.type_error(
+                        format!(
+                            "Slice.sort_by_key() expects 1 argument (key closure), found {}",
+                            args.len()
+                        ),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                } else {
+                    self.check_sort_key_closure(&elem, &args[0], "sort_by_key", span);
+                }
+                Type::Unit
+            }
             "fill" => {
                 if !mutable {
                     self.type_error(
@@ -12439,6 +12518,7 @@ impl<'a> TypeChecker<'a> {
                     "reverse",
                     "sort",
                     "sort_by",
+                    "sort_by_key",
                     "split_at",
                     "swap",
                     "windows",
