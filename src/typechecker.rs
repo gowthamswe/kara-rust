@@ -11917,6 +11917,59 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // `Vec[T].sort_by` / `Vec[T].sorted_by` — closure-shape validation.
+        // Vec has no stdlib impl block; without this intercept the call
+        // falls through to the silent-no-method path below, leaving the
+        // closure arg synth-typed with fresh metavars (no pushdown into
+        // params, no check on the body's return type). A wrong-shape
+        // comparator (`xs.sort_by(|a| a)`, `xs.sort_by(|a, b| a + b)`)
+        // would typecheck and runtime-panic in the interpreter's
+        // closure-honoring `sort_by`. Mirrors the slice arm above —
+        // `sorted_by` returns a new Vec, `sort_by` mutates in place.
+        // Receiver mutability is enforced at the binding layer (calling
+        // `.sort_by` on a non-`mut` binding errors there), so no
+        // explicit mutability gate is duplicated here.
+        if matches!(method, "sort_by" | "sorted_by") {
+            let elem_for_vec: Option<Type> = match &obj_ty {
+                Type::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                    Some(args[0].clone())
+                }
+                Type::Ref(inner) | Type::MutRef(inner) => match inner.as_ref() {
+                    Type::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                        Some(args[0].clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(elem) = elem_for_vec {
+                if args.len() != 1 {
+                    self.type_error(
+                        format!(
+                            "Vec.{}() expects 1 argument (comparator closure), found {}",
+                            method,
+                            args.len()
+                        ),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                } else {
+                    self.check_sort_comparator(&elem, &args[0], method, span);
+                }
+                return if method == "sort_by" {
+                    Type::Unit
+                } else {
+                    Type::Named {
+                        name: "Vec".to_string(),
+                        args: vec![elem],
+                    }
+                };
+            }
+        }
+
         // Strip outer `ref` / `mut ref` to get the named receiver per
         // design.md § Method Resolution Step 1 (autoref candidates `T`,
         // `ref T`, `mut ref T` collapse to the same name lookup; the
@@ -12113,6 +12166,28 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Validate a `sort_by` / `sorted_by` comparator argument against the
+    /// `Fn(elem, elem) -> Ordering` shape. Pushes the expected function
+    /// type down into the closure via `check_expr` so closure-parameter
+    /// types are inferred from the element type rather than left as fresh
+    /// metavars (today's silent-fall-through path) — a wrong-shape
+    /// comparator (`xs.sort_by(|a| a)`, `xs.sort_by(|a, b| a)`, or a
+    /// `Fn` value of the wrong arity / return type) now produces a
+    /// TypeMismatch at the closure expression instead of runtime-panicking
+    /// when the interpreter invokes it with two args / consumes the
+    /// non-Ordering return.
+    fn check_sort_comparator(&mut self, elem: &Type, arg: &CallArg, method: &str, span: &Span) {
+        let expected = Type::Function {
+            params: vec![elem.clone(), elem.clone()],
+            return_type: Box::new(Type::Named {
+                name: "Ordering".to_string(),
+                args: Vec::new(),
+            }),
+        };
+        let _ = (method, span); // method / span carried for future diagnostic refinement
+        self.check_expr(&arg.value, &expected);
+    }
+
     /// Infer the return type of a method call on `String` (`Type::Str`).
     /// Called from `infer_method_call` when the object type is `Type::Str`.
     fn infer_str_method(&mut self, method: &str, args: &[CallArg], span: &Span) -> Type {
@@ -12135,8 +12210,11 @@ impl<'a> TypeChecker<'a> {
                         span.clone(),
                         TypeErrorKind::WrongNumberOfArgs,
                     );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
                 } else {
-                    self.infer_expr(&args[0].value);
+                    self.check_sort_comparator(&Type::Char, &args[0], "sorted_by", span);
                 }
                 Type::Str
             }
@@ -12276,8 +12354,20 @@ impl<'a> TypeChecker<'a> {
                         TypeErrorKind::TypeMismatch,
                     );
                 }
-                for arg in args {
-                    self.infer_expr(&arg.value);
+                if args.len() != 1 {
+                    self.type_error(
+                        format!(
+                            "Slice.sort_by() expects 1 argument (comparator closure), found {}",
+                            args.len()
+                        ),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    for arg in args {
+                        self.infer_expr(&arg.value);
+                    }
+                } else {
+                    self.check_sort_comparator(&elem, &args[0], "sort_by", span);
                 }
                 Type::Unit
             }

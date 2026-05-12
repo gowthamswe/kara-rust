@@ -6970,11 +6970,59 @@ fn test_string_sorted_returns_string() {
 
 #[test]
 fn test_string_sorted_by_returns_string() {
+    // Comparator shape is `Fn(char, char) -> Ordering` per design.md;
+    // the typechecker enforces this via `check_sort_comparator`.
     let result = typecheck_ok(
+        r#"fn cmp(a: char, b: char) -> Ordering { a.cmp(b) }
+           fn f() -> String { let s = "hello"; s.sorted_by(cmp) }"#,
+    );
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_string_sorted_by_rejects_bool_returning_comparator() {
+    // Negative pin: pre-validation this silently passed and the
+    // interpreter ran the bool-returning body as `is_less`.
+    let errors = typecheck_errors(
         r#"fn cmp(a: char, b: char) -> bool { a < b }
            fn f() -> String { let s = "hello"; s.sorted_by(cmp) }"#,
     );
-    assert!(result.errors.is_empty());
+    assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_vec_sort_by_rejects_wrong_arity_closure() {
+    let errors = typecheck_errors(
+        r#"fn main() { let mut xs: Vec[i64] = Vec.new(); xs.push(1i64); xs.sort_by(|a| a); }"#,
+    );
+    assert!(
+        !errors.is_empty(),
+        "expected diagnostic for wrong-arity comparator"
+    );
+}
+
+#[test]
+fn test_vec_sort_by_rejects_wrong_return_type() {
+    let errors = typecheck_errors(
+        r#"fn main() { let mut xs: Vec[i64] = Vec.new(); xs.push(1i64); xs.sort_by(|a, b| a < b); }"#,
+    );
+    assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch),
+        "expected TypeMismatch on bool-returning comparator, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_vec_sort_by_accepts_ordering_returning_comparator() {
+    let result = typecheck_ok(
+        r#"fn main() { let mut xs: Vec[i64] = Vec.new(); xs.push(1i64); xs.sort_by(|a, b| a.cmp(b)); }"#,
+    );
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
 }
 
 #[test]
