@@ -1896,8 +1896,7 @@ impl<'ctx> Codegen<'ctx> {
                 // `const_subst` and recover the integer width.
                 ExprKind::Identifier(name) => {
                     let cv = self.const_subst.get(name)?;
-                    let v = const_value_as_u32(cv)?;
-                    v
+                    const_value_as_u32(cv)?
                 }
                 _ => return None,
             },
