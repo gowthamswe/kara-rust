@@ -134,16 +134,18 @@ fn test_float_suffix_f32_ok() {
 }
 
 #[test]
-fn test_integer_suffix_i128_rejected() {
-    let errors = typecheck_errors("fn main() { let x = 1i128; }");
-    assert!(errors[0].kind == TypeErrorKind::UnsupportedNumericSuffix);
-    assert!(errors[0].message.contains("128"));
+fn test_integer_suffix_i128_accepted() {
+    // 2026-05-11: `IntSize` extended with `I128` to unblock const
+    // generics slice 2b. `1i128` now type-checks; the previous
+    // `UnsupportedNumericSuffix` rejection is retired.
+    typecheck_ok("fn main() { let x: i128 = 1i128; }");
 }
 
 #[test]
-fn test_integer_suffix_u128_rejected() {
-    let errors = typecheck_errors("fn main() { let x = 1u128; }");
-    assert!(errors[0].kind == TypeErrorKind::UnsupportedNumericSuffix);
+fn test_integer_suffix_u128_accepted() {
+    // 2026-05-11: `UIntSize::U128` extension matches the slice-2b
+    // surface. `1u128` type-checks.
+    typecheck_ok("fn main() { let x: u128 = 1u128; }");
 }
 
 #[test]
@@ -10614,6 +10616,31 @@ fn test_typechecker_const_param_rejects_fieldful_enum() {
 // tests of those branches via `pub(crate) eval_const_expr` live in
 // `src/typechecker.rs` inline tests; the integration tests below
 // cover what surfaces through the Array path.
+
+#[test]
+fn test_const_eval_i128_arithmetic_resolves() {
+    // Const generics slice 2b (2026-05-11). The slice 2 plan
+    // originally listed `test_const_eval_overflow_i128` but deferred
+    // it because `IntSize::I128` / `ConstValue::I128` didn't exist.
+    // The `IntSize` extension (alongside slice 2b) unblocks the
+    // i128 surface; we verify it via a positive case here — i128
+    // arithmetic flows through `eval_const_expr`, `apply_arithmetic`'s
+    // `(I128, I128)` arm computes the sum, and the Array-size
+    // extraction coerces the resolved `ConstValue::I128(300)` to
+    // `usize` via `const_value_to_array_size`. (Pre-2b: the
+    // typechecker rejected the `i128` suffix outright.)
+    typecheck_ok("fn f[T](xs: Array[T, 100i128 + 200i128]) { }");
+}
+
+#[test]
+fn test_const_eval_u128_literal_typechecks() {
+    // Const generics slice 2b: `u128` literals type-check now (pre-
+    // 2b rejected with E0220). Verifies the type lowering path
+    // (`primitive_type` → `Type::UInt(UIntSize::U128)`) and the
+    // const-eval integer literal handling (`I128` /`U128` arms in
+    // `integer_to_const_value`).
+    typecheck_ok("fn main() { let x: u128 = 42u128; }");
+}
 
 #[test]
 fn test_const_eval_overflow_i8() {

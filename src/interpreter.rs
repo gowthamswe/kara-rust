@@ -801,10 +801,22 @@ fn primitive_const_to_value(cv: &crate::prelude::ConstValue) -> Value {
         I16(v) => Value::Int(*v as i64),
         I32(v) => Value::Int(*v as i64),
         I64(v) => Value::Int(*v),
+        // Const generics slice 2b: i128 / u128 coercion to Value::Int(i64)
+        // is lossy — values that overflow i64 are silently truncated.
+        // The slice 2 plan's hard-stop fallback acknowledged this:
+        // i128 const-args evaluate cleanly at the typechecker (compile-
+        // time fold) but the interpreter's runtime Value can't hold
+        // 128-bit values. A future Value::Int128 widening replaces this
+        // truncation; today the only path that reaches here is the
+        // primitive-table coercion for `i128.MAX` / `i128.MIN` style
+        // associated constants — none are defined in PRIMITIVE_CONSTS
+        // for the 128-bit widths.
+        I128(v) => Value::Int(*v as i64),
         U8(v) => Value::Int(*v as i64),
         U16(v) => Value::Int(*v as i64),
         U32(v) => Value::Int(*v as i64),
         U64(v) => Value::Int(*v as i64),
+        U128(v) => Value::Int(*v as i64),
         Usize(v) => Value::Int(*v as i64),
         F32(v) => Value::Float(*v as f64),
         F64(v) => Value::Float(*v),

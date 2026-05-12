@@ -57,8 +57,8 @@ pub fn prelude_path() -> Vec<String> {
 /// subsets for their own purposes (numeric widths, etc.); this list is the
 /// canonical surface every module sees.
 pub const PRELUDE_PRIMITIVES: &[&str] = &[
-    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool", "char",
-    "String",
+    "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64",
+    "bool", "char", "String",
 ];
 
 /// Stdlib type names visible without import. These are the placeholder
@@ -241,10 +241,19 @@ pub enum ConstValue {
     I16(i16),
     I32(i32),
     I64(i64),
+    /// 128-bit signed integer (const generics slice 2b, 2026-05-11).
+    /// Unlocked by the `IntSize::I128` extension landed alongside.
+    /// AST `ExprKind::Integer(i64, _)` literals are bounded to i64
+    /// at parse time, so today's source surface produces `I128`
+    /// values that fit in i64; larger values land when the lexer /
+    /// AST is widened to carry i128 literal bits directly.
+    I128(i128),
     U8(u8),
     U16(u16),
     U32(u32),
     U64(u64),
+    /// 128-bit unsigned integer (const generics slice 2b).
+    U128(u128),
     /// 64-bit only in v1 — when 32-bit targets land, swap to a target-
     /// conditional table.
     Usize(u64),

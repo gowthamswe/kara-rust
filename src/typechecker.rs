@@ -121,6 +121,7 @@ pub enum IntSize {
     I16,
     I32,
     I64,
+    I128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +130,7 @@ pub enum UIntSize {
     U16,
     U32,
     U64,
+    U128,
     Usize,
 }
 
@@ -218,10 +220,12 @@ fn const_value_to_i64(cv: &crate::prelude::ConstValue) -> Option<i64> {
         I16(v) => Some(*v as i64),
         I32(v) => Some(*v as i64),
         I64(v) => Some(*v),
+        I128(v) => i64::try_from(*v).ok(),
         U8(v) => Some(*v as i64),
         U16(v) => Some(*v as i64),
         U32(v) => Some(*v as i64),
         U64(v) => i64::try_from(*v).ok(),
+        U128(v) => i64::try_from(*v).ok(),
         Usize(v) => i64::try_from(*v).ok(),
         Bool(b) => Some(*b as i64),
         Char(c) => Some(*c as i64),
@@ -353,10 +357,12 @@ fn const_value_to_array_size(cv: &crate::prelude::ConstValue) -> Option<usize> {
         I16(v) => *v as i128,
         I32(v) => *v as i128,
         I64(v) => *v as i128,
+        I128(v) => *v,
         U8(v) => *v as i128,
         U16(v) => *v as i128,
         U32(v) => *v as i128,
         U64(v) => *v as i128,
+        U128(v) => *v as i128,
         Usize(v) => *v as i128,
         Bool(_) | Char(_) | EnumVariant { .. } | F32(_) | F64(_) => return None,
     };
@@ -376,10 +382,12 @@ fn format_const_value(cv: &crate::prelude::ConstValue) -> String {
         I16(v) => format!("{}i16", v),
         I32(v) => format!("{}i32", v),
         I64(v) => format!("{}i64", v),
+        I128(v) => format!("{}i128", v),
         U8(v) => format!("{}u8", v),
         U16(v) => format!("{}u16", v),
         U32(v) => format!("{}u32", v),
         U64(v) => format!("{}u64", v),
+        U128(v) => format!("{}u128", v),
         Usize(v) => format!("{}usize", v),
         F32(v) => format!("{}f32", v),
         F64(v) => format!("{}f64", v),
@@ -438,10 +446,12 @@ fn const_value_type(cv: &crate::prelude::ConstValue) -> Type {
         I16(_) => Type::Int(IntSize::I16),
         I32(_) => Type::Int(IntSize::I32),
         I64(_) => Type::Int(IntSize::I64),
+        I128(_) => Type::Int(IntSize::I128),
         U8(_) => Type::UInt(UIntSize::U8),
         U16(_) => Type::UInt(UIntSize::U16),
         U32(_) => Type::UInt(UIntSize::U32),
         U64(_) => Type::UInt(UIntSize::U64),
+        U128(_) => Type::UInt(UIntSize::U128),
         Usize(_) => Type::UInt(UIntSize::Usize),
         F32(_) => Type::Float(FloatSize::F32),
         F64(_) => Type::Float(FloatSize::F64),
@@ -465,10 +475,12 @@ fn infer_operand_target_ty(left: &Expr, right: &Expr) -> Option<Type> {
             ExprKind::Integer(_, Some(IntSuffix::I16)) => Some(Type::Int(IntSize::I16)),
             ExprKind::Integer(_, Some(IntSuffix::I32)) => Some(Type::Int(IntSize::I32)),
             ExprKind::Integer(_, Some(IntSuffix::I64)) => Some(Type::Int(IntSize::I64)),
+            ExprKind::Integer(_, Some(IntSuffix::I128)) => Some(Type::Int(IntSize::I128)),
             ExprKind::Integer(_, Some(IntSuffix::U8)) => Some(Type::UInt(UIntSize::U8)),
             ExprKind::Integer(_, Some(IntSuffix::U16)) => Some(Type::UInt(UIntSize::U16)),
             ExprKind::Integer(_, Some(IntSuffix::U32)) => Some(Type::UInt(UIntSize::U32)),
             ExprKind::Integer(_, Some(IntSuffix::U64)) => Some(Type::UInt(UIntSize::U64)),
+            ExprKind::Integer(_, Some(IntSuffix::U128)) => Some(Type::UInt(UIntSize::U128)),
             ExprKind::Bool(_) => Some(Type::Bool),
             ExprKind::CharLit(_) => Some(Type::Char),
             _ => None,
@@ -501,6 +513,12 @@ fn integer_to_const_value(
             .map(ConstValue::I32)
             .map_err(|_| out_of_range(target_ty)),
         Type::Int(IntSize::I64) => Ok(ConstValue::I64(n)),
+        // Const generics slice 2b: AST `ExprKind::Integer(i64, _)`
+        // already bounds the literal to i64 at parse time, so `n as
+        // i128` is the full source-level value. Widening of the
+        // `Integer` carrier to i128 bits is future work; pre-widening
+        // this is exact for all current source-level literals.
+        Type::Int(IntSize::I128) => Ok(ConstValue::I128(n as i128)),
         Type::UInt(UIntSize::U8) => u8::try_from(n)
             .map(ConstValue::U8)
             .map_err(|_| out_of_range(target_ty)),
@@ -512,6 +530,9 @@ fn integer_to_const_value(
             .map_err(|_| out_of_range(target_ty)),
         Type::UInt(UIntSize::U64) => u64::try_from(n)
             .map(ConstValue::U64)
+            .map_err(|_| out_of_range(target_ty)),
+        Type::UInt(UIntSize::U128) => u128::try_from(n)
+            .map(ConstValue::U128)
             .map_err(|_| out_of_range(target_ty)),
         Type::UInt(UIntSize::Usize) => u64::try_from(n)
             .map(ConstValue::Usize)
@@ -564,6 +585,14 @@ fn apply_unary(
                     operand: I64(v),
                     span: span.clone(),
                 }),
+            I128(v) => v
+                .checked_neg()
+                .map(I128)
+                .ok_or(ConstEvalError::UnaryOverflow {
+                    op,
+                    operand: I128(v),
+                    span: span.clone(),
+                }),
             // Unsigned negation isn't meaningful; reject as ArithOnNonInt
             // would be misleading — these are integers, just not negatable.
             // Use UnaryOverflow with a clear span pointing at the operand.
@@ -579,10 +608,12 @@ fn apply_unary(
             I16(v) => Ok(I16(!v)),
             I32(v) => Ok(I32(!v)),
             I64(v) => Ok(I64(!v)),
+            I128(v) => Ok(I128(!v)),
             U8(v) => Ok(U8(!v)),
             U16(v) => Ok(U16(!v)),
             U32(v) => Ok(U32(!v)),
             U64(v) => Ok(U64(!v)),
+            U128(v) => Ok(U128(!v)),
             Usize(v) => Ok(Usize(!v)),
             other => Err(ConstEvalError::LogicalOnNonBool {
                 ty: const_value_type(&other),
@@ -676,10 +707,12 @@ fn apply_comparison(
         (I16(a), I16(b)) => cmp(a.cmp(b)),
         (I32(a), I32(b)) => cmp(a.cmp(b)),
         (I64(a), I64(b)) => cmp(a.cmp(b)),
+        (I128(a), I128(b)) => cmp(a.cmp(b)),
         (U8(a), U8(b)) => cmp(a.cmp(b)),
         (U16(a), U16(b)) => cmp(a.cmp(b)),
         (U32(a), U32(b)) => cmp(a.cmp(b)),
         (U64(a), U64(b)) => cmp(a.cmp(b)),
+        (U128(a), U128(b)) => cmp(a.cmp(b)),
         (Usize(a), Usize(b)) => cmp(a.cmp(b)),
         (Bool(a), Bool(b)) => cmp(a.cmp(b)),
         (Char(a), Char(b)) => cmp(a.cmp(b)),
@@ -757,10 +790,12 @@ fn apply_arithmetic(
         (I16(a), I16(b)) => apply_int!(a, b, I16, i16),
         (I32(a), I32(b)) => apply_int!(a, b, I32, i32),
         (I64(a), I64(b)) => apply_int!(a, b, I64, i64),
+        (I128(a), I128(b)) => apply_int!(a, b, I128, i128),
         (U8(a), U8(b)) => apply_int!(a, b, U8, u8),
         (U16(a), U16(b)) => apply_int!(a, b, U16, u16),
         (U32(a), U32(b)) => apply_int!(a, b, U32, u32),
         (U64(a), U64(b)) => apply_int!(a, b, U64, u64),
+        (U128(a), U128(b)) => apply_int!(a, b, U128, u128),
         (Usize(a), Usize(b)) => apply_int!(a, b, Usize, u64),
         // Mismatched int widths or non-int operands.
         (l, _) if matches!(l, Bool(_) | Char(_) | EnumVariant { .. }) => {
@@ -887,6 +922,7 @@ fn impl_table_key(ty: &Type) -> Option<(String, Vec<Type>)> {
                 IntSize::I16 => "i16",
                 IntSize::I32 => "i32",
                 IntSize::I64 => "i64",
+                IntSize::I128 => "i128",
             }
             .to_string(),
             Vec::new(),
@@ -897,6 +933,7 @@ fn impl_table_key(ty: &Type) -> Option<(String, Vec<Type>)> {
                 UIntSize::U16 => "u16",
                 UIntSize::U32 => "u32",
                 UIntSize::U64 => "u64",
+                UIntSize::U128 => "u128",
                 UIntSize::Usize => "usize",
             }
             .to_string(),
@@ -993,6 +1030,7 @@ pub fn type_display(ty: &Type) -> String {
             IntSize::I16 => "i16",
             IntSize::I32 => "i32",
             IntSize::I64 => "i64",
+            IntSize::I128 => "i128",
         }
         .to_string(),
         Type::UInt(s) => match s {
@@ -1000,6 +1038,7 @@ pub fn type_display(ty: &Type) -> String {
             UIntSize::U16 => "u16",
             UIntSize::U32 => "u32",
             UIntSize::U64 => "u64",
+            UIntSize::U128 => "u128",
             UIntSize::Usize => "usize",
         }
         .to_string(),
@@ -1099,10 +1138,12 @@ fn primitive_const_type(cv: &crate::prelude::ConstValue) -> Type {
         I16(_) => Type::Int(IntSize::I16),
         I32(_) => Type::Int(IntSize::I32),
         I64(_) => Type::Int(IntSize::I64),
+        I128(_) => Type::Int(IntSize::I128),
         U8(_) => Type::UInt(UIntSize::U8),
         U16(_) => Type::UInt(UIntSize::U16),
         U32(_) => Type::UInt(UIntSize::U32),
         U64(_) => Type::UInt(UIntSize::U64),
+        U128(_) => Type::UInt(UIntSize::U128),
         Usize(_) => Type::UInt(UIntSize::Usize),
         F32(_) => Type::Float(FloatSize::F32),
         F64(_) => Type::Float(FloatSize::F64),
@@ -3760,28 +3801,24 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Map a lexer-provided integer suffix to the concrete `Type` it denotes.
-    /// `None` defaults to `i64`. `I128` / `U128` are not yet supported —
-    /// emit a structured diagnostic and fall back to `i64` to keep inference
-    /// going.
-    fn type_from_int_suffix(&mut self, sfx: Option<IntSuffix>, span: Span) -> Type {
+    /// `None` defaults to `i64`. `I128` / `U128` route to
+    /// `IntSize::I128` / `UIntSize::U128` (added 2026-05-11 alongside
+    /// const generics slice 2b — `IntSize`/`UIntSize` carry the 128-bit
+    /// variants now; downstream consumers should handle them through
+    /// the standard arms).
+    fn type_from_int_suffix(&mut self, sfx: Option<IntSuffix>, _span: Span) -> Type {
         match sfx {
             None => Type::Int(IntSize::I64),
             Some(IntSuffix::I8) => Type::Int(IntSize::I8),
             Some(IntSuffix::I16) => Type::Int(IntSize::I16),
             Some(IntSuffix::I32) => Type::Int(IntSize::I32),
             Some(IntSuffix::I64) => Type::Int(IntSize::I64),
+            Some(IntSuffix::I128) => Type::Int(IntSize::I128),
             Some(IntSuffix::U8) => Type::UInt(UIntSize::U8),
             Some(IntSuffix::U16) => Type::UInt(UIntSize::U16),
             Some(IntSuffix::U32) => Type::UInt(UIntSize::U32),
             Some(IntSuffix::U64) => Type::UInt(UIntSize::U64),
-            Some(IntSuffix::I128) | Some(IntSuffix::U128) => {
-                self.type_error(
-                    "128-bit integer literals are not yet supported".to_string(),
-                    span,
-                    TypeErrorKind::UnsupportedNumericSuffix,
-                );
-                Type::Int(IntSize::I64)
-            }
+            Some(IntSuffix::U128) => Type::UInt(UIntSize::U128),
         }
     }
 
@@ -4468,10 +4505,12 @@ impl<'a> TypeChecker<'a> {
             "i16" => Some(Type::Int(IntSize::I16)),
             "i32" => Some(Type::Int(IntSize::I32)),
             "i64" => Some(Type::Int(IntSize::I64)),
+            "i128" => Some(Type::Int(IntSize::I128)),
             "u8" => Some(Type::UInt(UIntSize::U8)),
             "u16" => Some(Type::UInt(UIntSize::U16)),
             "u32" => Some(Type::UInt(UIntSize::U32)),
             "u64" => Some(Type::UInt(UIntSize::U64)),
+            "u128" => Some(Type::UInt(UIntSize::U128)),
             "usize" => Some(Type::UInt(UIntSize::Usize)),
             "f32" => Some(Type::Float(FloatSize::F32)),
             "f64" => Some(Type::Float(FloatSize::F64)),
@@ -6900,11 +6939,8 @@ impl<'a> TypeChecker<'a> {
                     Some(IntSuffix::U16) => Type::UInt(UIntSize::U16),
                     Some(IntSuffix::U32) => Type::UInt(UIntSize::U32),
                     Some(IntSuffix::U64) => Type::UInt(UIntSize::U64),
-                    Some(IntSuffix::I128) | Some(IntSuffix::U128) => {
-                        // i128/u128 require IntSize/UIntSize extension —
-                        // slice 2b deferred. Treat as unsupported shape.
-                        return Err(ConstEvalError::NonConstShape(expr.span.clone()));
-                    }
+                    Some(IntSuffix::I128) => Type::Int(IntSize::I128),
+                    Some(IntSuffix::U128) => Type::UInt(UIntSize::U128),
                     None => {
                         if matches!(target_ty, Type::Int(_) | Type::UInt(_)) {
                             target_ty.clone()

@@ -68,10 +68,12 @@ fn const_value_as_u32(cv: &crate::prelude::ConstValue) -> Option<u32> {
         I16(v) => *v as i64,
         I32(v) => *v as i64,
         I64(v) => *v,
+        I128(v) => i64::try_from(*v).ok()?,
         U8(v) => *v as i64,
         U16(v) => *v as i64,
         U32(v) => *v as i64,
         U64(v) => i64::try_from(*v).ok()?,
+        U128(v) => i64::try_from(*v).ok()?,
         Usize(v) => i64::try_from(*v).ok()?,
         Bool(_) | Char(_) | EnumVariant { .. } | F32(_) | F64(_) => return None,
     };
@@ -92,10 +94,12 @@ fn const_value_to_mangle_str(cv: &crate::prelude::ConstValue) -> String {
         I16(v) => format!("{}i16", v),
         I32(v) => format!("{}i32", v),
         I64(v) => format!("{}i64", v),
+        I128(v) => format!("{}i128", v),
         U8(v) => format!("{}u8", v),
         U16(v) => format!("{}u16", v),
         U32(v) => format!("{}u32", v),
         U64(v) => format!("{}u64", v),
+        U128(v) => format!("{}u128", v),
         Usize(v) => format!("{}usize", v),
         F32(v) => format!("{}f32", v),
         F64(v) => format!("{}f64", v),
@@ -1940,9 +1944,9 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Produce an LLVM integer type matching the source-level suffix.
-    /// `None` defaults to `i64`. `I128`/`U128` are not supported and fall
-    /// back to `i64` — the typechecker emits a diagnostic on the literal,
-    /// so codegen never needs to reach a correct 128-bit representation.
+    /// `None` defaults to `i64`. `I128`/`U128` map to LLVM `i128_type`
+    /// (added 2026-05-11 alongside the `IntSize::I128`/`UIntSize::U128`
+    /// typechecker extension that unblocks const generics slice 2b).
     fn llvm_int_type_for_suffix(&self, sfx: Option<IntSuffix>) -> inkwell::types::IntType<'ctx> {
         match sfx {
             None => self.context.i64_type(),
@@ -1950,7 +1954,7 @@ impl<'ctx> Codegen<'ctx> {
             Some(IntSuffix::I16) | Some(IntSuffix::U16) => self.context.i16_type(),
             Some(IntSuffix::I32) | Some(IntSuffix::U32) => self.context.i32_type(),
             Some(IntSuffix::I64) | Some(IntSuffix::U64) => self.context.i64_type(),
-            Some(IntSuffix::I128) | Some(IntSuffix::U128) => self.context.i64_type(),
+            Some(IntSuffix::I128) | Some(IntSuffix::U128) => self.context.i128_type(),
         }
     }
 
@@ -2002,10 +2006,19 @@ impl<'ctx> Codegen<'ctx> {
             I16(v) => self.context.i16_type().const_int(*v as u64, true).into(),
             I32(v) => self.context.i32_type().const_int(*v as u64, true).into(),
             I64(v) => self.context.i64_type().const_int(*v as u64, true).into(),
+            // const generics slice 2b — i128 / u128 use LLVM's native
+            // i128 type. The const_int builder takes a u64; for 128-bit
+            // values we lose the high bits — acceptable for v1's source
+            // surface (parser literals are bounded to i64 / u64), and
+            // round-trips clean for values that fit. A future widening
+            // of `ExprKind::Integer` to carry i128 bits replaces this
+            // truncation with `const_int_arbitrary_precision`.
+            I128(v) => self.context.i128_type().const_int(*v as u64, true).into(),
             U8(v) => self.context.i8_type().const_int(*v as u64, false).into(),
             U16(v) => self.context.i16_type().const_int(*v as u64, false).into(),
             U32(v) => self.context.i32_type().const_int(*v as u64, false).into(),
             U64(v) => self.context.i64_type().const_int(*v, false).into(),
+            U128(v) => self.context.i128_type().const_int(*v as u64, false).into(),
             // v1 is 64-bit only — usize is u64.
             Usize(v) => self.context.i64_type().const_int(*v, false).into(),
             // Float widths. `const_float` accepts an f64 input and
