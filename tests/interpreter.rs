@@ -1648,18 +1648,32 @@ fn test_e2e_fizzbuzz() {
 
 #[test]
 fn test_e2e_fibonacci() {
-    assert_eq!(
-        run("fn fib(n: i64) -> i64 {\n\
-                 if n <= 1 { n }\n\
-                 else { fib(n - 1) + fib(n - 2) }\n\
-             }\n\
-             fn main() {\n\
-                 println(fib(0));\n\
-                 println(fib(1));\n\
-                 println(fib(10));\n\
-             }"),
-        "0\n1\n55\n"
-    );
+    // The tree-walk interpreter's eval_expr_inner / eval_call match
+    // statements have grown wide; in debug builds on Windows the per-
+    // frame allocation exceeds the libtest worker thread's 2 MB stack
+    // for the ~10-deep recursion fib(10) produces (90+ Rust frames).
+    // Linux/macOS debug frames are smaller and fit, but Windows CI
+    // overflows even after prior helper extractions (eval_short_circuit
+    // / eval_vec_filled). Spawn the body on a fresh 8 MB thread, same
+    // pattern as test_error_trace_truncation_at_64.
+    let handle = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            assert_eq!(
+                run("fn fib(n: i64) -> i64 {\n\
+                         if n <= 1 { n }\n\
+                         else { fib(n - 1) + fib(n - 2) }\n\
+                     }\n\
+                     fn main() {\n\
+                         println(fib(0));\n\
+                         println(fib(1));\n\
+                         println(fib(10));\n\
+                     }"),
+                "0\n1\n55\n"
+            );
+        })
+        .unwrap();
+    handle.join().unwrap();
 }
 
 #[test]
