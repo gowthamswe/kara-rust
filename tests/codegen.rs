@@ -932,6 +932,77 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_const_generic_param_in_body() {
+        // Const generics slice 4: const-param identifier reference
+        // resolves at codegen body lowering. `fn f[const N: i64](x: i64) -> i64 { x + N }`
+        // called with `f[3](10)` returns 13; `f[7](10)` returns 17.
+        // The compile_expr Identifier branch consults `const_subst`
+        // and emits the matching LLVM constant via
+        // `compile_primitive_const`.
+        let out = run_program(
+            r#"
+fn f[const N: i64](x: i64) -> i64 { x + N }
+fn main() {
+    println(f[3](10));
+    println(f[7](10));
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "13\n17");
+        }
+    }
+
+    #[test]
+    fn test_e2e_const_generic_param_in_larger_expression() {
+        // Const generics slice 4: const-param embedded in a larger
+        // expression. `fn g[const N: i64]() -> i64 { N * 2 + 1 }`
+        // called with `g[7]()` returns 15.
+        let out = run_program(
+            r#"
+fn g[const N: i64]() -> i64 { N * 2 + 1 }
+fn main() {
+    println(g[7]());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "15");
+        }
+    }
+
+    #[test]
+    fn test_ir_const_generic_param_distinct_monos_in_body() {
+        // Slice 4 + slice 1b: each distinct const-arg produces a
+        // distinct compiled mono symbol AND the body of each mono
+        // emits a different LLVM constant for the const-param. The
+        // IR for `f[3]` should contain the literal 3 in its body;
+        // the IR for `f[7]` should contain 7.
+        let ir = ir_for(
+            r#"
+fn f[const N: i64](x: i64) -> i64 { x + N }
+fn main() {
+    let _ = f[3](10);
+    let _ = f[7](10);
+}
+"#,
+        );
+        // `f` has only the const-param `N` as a generic (no T), so
+        // the mangled symbol is `f$<const-N-value>` — no type-arg
+        // token in the middle.
+        assert!(
+            ir.contains("f$3i64"),
+            "expected `f$3i64` mono symbol, IR:\n{}",
+            ir
+        );
+        assert!(
+            ir.contains("f$7i64"),
+            "expected `f$7i64` mono symbol, IR:\n{}",
+            ir
+        );
+    }
+
+    #[test]
     fn test_ir_const_generic_mono_key_disambiguation() {
         // Const generics slice 1b (2026-05-11). Two calls to the same
         // generic function with the same type-arg but distinct

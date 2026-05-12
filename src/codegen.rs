@@ -55,6 +55,32 @@ fn const_value_from_literal_expr(expr: &Expr) -> Option<crate::prelude::ConstVal
     }
 }
 
+/// Extract a non-negative integer from a `ConstValue` and coerce to
+/// `u32` (used by codegen Array-size extraction sites). Returns
+/// `None` for negative integers, floats, bool / char / enum-variant,
+/// or values that exceed `u32::MAX`. Const generics slice 4 — used to
+/// recover the runtime array length from a const-param binding when
+/// the type expression carries `Array[T, N]` with `N` a const-param.
+fn const_value_as_u32(cv: &crate::prelude::ConstValue) -> Option<u32> {
+    use crate::prelude::ConstValue::*;
+    let n: i64 = match cv {
+        I8(v) => *v as i64,
+        I16(v) => *v as i64,
+        I32(v) => *v as i64,
+        I64(v) => *v,
+        U8(v) => *v as i64,
+        U16(v) => *v as i64,
+        U32(v) => *v as i64,
+        U64(v) => i64::try_from(*v).ok()?,
+        Usize(v) => i64::try_from(*v).ok()?,
+        Bool(_) | Char(_) | EnumVariant { .. } | F32(_) | F64(_) => return None,
+    };
+    if n < 0 {
+        return None;
+    }
+    u32::try_from(n).ok()
+}
+
 /// Render a `ConstValue` as a name-mangle token. Integers carry their
 /// concrete-width suffix so `make_arr[i64, 4i64]` and `make_arr[i64, 4i32]`
 /// produce distinct symbols; bool renders as `true` / `false`; char as
@@ -778,6 +804,18 @@ struct Codegen<'ctx> {
     /// Active type-parameter substitution during a monomorphization pass.
     /// Maps generic param name (e.g. `"T"`) → concrete LLVM type.
     type_subst: HashMap<String, BasicTypeEnum<'ctx>>,
+    /// Active const-parameter substitution during a monomorphization
+    /// pass (const generics slice 4). Maps const-generic param name
+    /// (e.g. `"N"`) → its bound `ConstValue`. Used by
+    /// `compile_expr ExprKind::Identifier` to lower const-param
+    /// references in generic bodies to LLVM constants of the matching
+    /// width via `compile_primitive_const`, and by `Array[T, N]`
+    /// element-size extraction sites to recover the size from a
+    /// const-param reference. Slice 1b populates this map during
+    /// `compile_generic_call`'s mango-key mango step; slice 4
+    /// extends the save/restore around `compile_mono_function` so the
+    /// body lowering sees the same bindings.
+    const_subst: HashMap<String, crate::prelude::ConstValue>,
     // ── Closure compilation ────────────────────────────────────────
     /// Monotonic counter used to generate unique closure function names.
     closure_counter: u32,
@@ -1572,6 +1610,7 @@ impl<'ctx> Codegen<'ctx> {
             generic_fns: HashMap::new(),
             generated_monos: HashSet::new(),
             type_subst: HashMap::new(),
+            const_subst: HashMap::new(),
             closure_counter: 0,
             indexed_elem_counter: 0,
             closure_fn_types: HashMap::new(),
@@ -1847,9 +1886,38 @@ impl<'ctx> Codegen<'ctx> {
         let size = match &args[1] {
             GenericArg::Const(expr) => match &expr.kind {
                 ExprKind::Integer(n, _) if *n >= 0 => *n as u32,
+                // Const generics slice 4: const-param identifier ref
+                // (`Array[T, N]` where `N` is a const-generic param
+                // bound at the active monomorphization). Look up in
+                // `const_subst` and recover the integer width.
+                ExprKind::Identifier(name) => {
+                    let cv = self.const_subst.get(name)?;
+                    let v = const_value_as_u32(cv)?;
+                    v
+                }
                 _ => return None,
             },
-            GenericArg::Type(_) => return None,
+            // Slice 1c parser disambiguation: the generic-args parser
+            // can't distinguish a type-param ref from a const-param
+            // ref at parse time (no scope info), so `Array[T, N]`
+            // routes N as `GenericArg::Type(Path(N))`. Recover the
+            // const-param at codegen extraction.
+            GenericArg::Type(te) => {
+                if let TypeKind::Path(p) = &te.kind {
+                    if p.segments.len() == 1 && p.generic_args.is_none() {
+                        let name = &p.segments[0];
+                        if let Some(cv) = self.const_subst.get(name) {
+                            const_value_as_u32(cv)?
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
         };
         let elem_ty = self.llvm_type_for_type_expr(elem_ty_expr);
         Some(elem_ty.array_type(size).into())
@@ -5780,15 +5848,23 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(result)
             }
             ExprKind::Identifier(name) => {
-                // Resolution order: local variable (may shadow a const),
-                // then unit enum variant, then top-level `const` (re-compile
+                // Resolution order: const-generic param (slice 4 — when
+                // an active monomorphization's `const_subst` binds the
+                // name, lower to the LLVM constant of the matching
+                // width); local variable (may shadow a const), then
+                // unit enum variant, then top-level `const` (re-compile
                 // the stored value expression at this use site so LLVM
-                // folds it), then free-fn-name-as-value (Slice B follow-up
-                // 2026-05-09 — `let f = my_free_fn;` lowers to the fn's
-                // global pointer; consumers that take fn-pointer slots use
-                // it as a typed indirect-call target), and finally
-                // `load_variable` so the existing "Undefined variable"
-                // diagnostic still fires for genuinely unbound names.
+                // folds it), then free-fn-name-as-value (Slice B
+                // follow-up 2026-05-09 — `let f = my_free_fn;` lowers
+                // to the fn's global pointer; consumers that take
+                // fn-pointer slots use it as a typed indirect-call
+                // target), and finally `load_variable` so the existing
+                // "Undefined variable" diagnostic still fires for
+                // genuinely unbound names.
+                if let Some(cv) = self.const_subst.get(name) {
+                    let cv = cv.clone();
+                    return Ok(self.compile_primitive_const(&cv));
+                }
                 if self.variables.contains_key(name.as_str()) {
                     self.load_variable(name)
                 } else if let Some(ev) = self.try_unit_enum_variant(name) {
@@ -18714,12 +18790,18 @@ impl<'ctx> Codegen<'ctx> {
             let saved_var_types = std::mem::take(&mut self.var_type_names);
             let saved_loop_stack = std::mem::take(&mut self.loop_stack);
             let saved_subst = std::mem::replace(&mut self.type_subst, subst.clone());
+            // Const generics slice 4: thread the const-arg substitution
+            // into the body-lowering pass so `compile_expr Identifier`
+            // can resolve const-param refs against it. Parallel to
+            // `type_subst`'s save/restore.
+            let saved_const_subst = std::mem::replace(&mut self.const_subst, const_subst.clone());
 
             // Declare then compile the specialization.
             self.declare_mono_function(&generic_fn, &mangled)?;
             self.compile_mono_function(&generic_fn, &mangled)?;
 
             // Restore state.
+            self.const_subst = saved_const_subst;
             self.type_subst = saved_subst;
             self.loop_stack = saved_loop_stack;
             self.var_type_names = saved_var_types;
