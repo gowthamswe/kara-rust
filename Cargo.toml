@@ -54,20 +54,29 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # See `docs/implementation_checklist/phase-7-codegen.md § "Phase 1
 # binary-size optimization"` close-out for measured size deltas.
 #
-# Binary-size phase 2: thin LTO so the link-time DCE pass
+# Binary-size phase 2: fat LTO so the link-time DCE pass
 # (`-Wl,-dead_strip` on Mach-O / `-Wl,--gc-sections` on ELF, applied at the
 # cc-line in `link_executable_impl`) can see across the runtime's
 # transitively-imported tokio / hyper / serde_json dep graph. Without LTO,
 # rustc emits each crate as opaque object files and the linker can only
 # DCE at object granularity — most useful symbols sit in the same object as
-# their dependents and survive. With thin LTO, the bitcode pass inlines
-# and devirtualizes across crate boundaries, exposing the actual call
-# graph, then `-dead_strip` drops everything unreached from the entry
-# point. Cargo does not permit `lto` in a per-package profile (same
-# constraint as `panic`), so this applies to every workspace member's
-# release build. The karac compiler's release builds pay a modest
-# compile-time cost; for v1 the runtime-archive size win on every Kāra
-# program more than offsets it.
+# their dependents and survive. LTO's bitcode pass inlines and devirtualizes
+# across crate boundaries, exposing the actual call graph, then `-dead_strip`
+# drops everything unreached from the entry point. Cargo does not permit
+# `lto` in a per-package profile (same constraint as `panic`), so this
+# applies to every workspace member's release build.
+#
+# Upgraded `thin` → `fat` on 2026-05-12 after measuring across four LeetCode
+# benches: workloads that pull in runtime subsystems (`Vec.sort_by`, `Map`)
+# shrink another -16.8% / -17.9% under fat vs thin; workloads at the post-DCE
+# runtime floor (~33 KB) are unchanged. Fat LTO merges all runtime-crate
+# bitcode into one module before optimization, exposing more dead code than
+# thin's per-module summaries can reach. Cost: runtime-archive rebuild ~4–9 s
+# (thin: ~2 s) — paid per `cargo build -p karac-runtime --release`, not per
+# `karac build`. Downstream `karac build` link is unaffected (it's a normal
+# `cc <obj> libkarac_runtime.a` invocation, not LTO). See `bench/bench.sh`
+# binary-size pass in `kata-katas/leetcode/1601-1700/1665-...` for the
+# measurement harness.
 [profile.release]
 panic = "abort"
-lto = "thin"
+lto = "fat"

@@ -11292,6 +11292,33 @@ fn test_slice_pattern_array_rest_irrefutable_in_let() {
 }
 
 #[test]
+fn test_let_binding_on_large_array_typechecks_cheaply() {
+    // Regression: `let name: Array[T, N] = ...` with large N used to hit a
+    // pathological O(N²) memory blowup in the Maranget irrefutability check
+    // (`exhaustive::usefulness` Wildcard arm specialized via PatCtor::Array(N),
+    // materializing N wildcards at each of N recursion levels). At N=50_000
+    // the karac frontend OOM'd at >41 GB RSS. Fixed by short-circuiting the
+    // Wildcard arm when the matrix head column is all wildcards (the head
+    // carries no constraint — go straight to the default matrix). This test
+    // exercises the irrefutability path on a large Array[i64, N] binding;
+    // a regression would manifest as multi-GB allocation / multi-minute hang
+    // rather than a wrong answer, so the bar is "completes promptly."
+    let start = std::time::Instant::now();
+    typecheck_ok(
+        "fn f() -> i64 { \
+         let data: Array[i64, 50000] = [0; 50000]; \
+         data[0] \
+         }",
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "let-binding on Array[i64, 50000] took {:?} — regression of the O(N²) Maranget blowup?",
+        elapsed
+    );
+}
+
+#[test]
 fn test_slice_pattern_array_rest_covers_to_exhaustiveness() {
     // `[_, ..]` covers Array[i64, 5] exhaustively without a wildcard arm.
     typecheck_ok(
@@ -11331,5 +11358,202 @@ fn test_slice_pattern_on_int_rejected() {
             .any(|e| e.message.contains("slice patterns apply to") && e.message.contains("i64")),
         "expected scrutinee-mismatch diagnostic for non-collection type, got: {:?}",
         errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+// ── Match Ergonomics: ref-scrutinee binding propagation ─────────────
+//
+// design.md § Match Arm Binding Modes — under a `ref T` / `mut ref T`
+// scrutinee, every arm binding's type is wrapped in the matching
+// borrow form so `match ref Foo { Foo { name } => ... }` binds
+// `name: ref FieldType` without any per-binding `ref` annotation.
+// `ScrutineeMode::classify` strips the outer borrow once for
+// variant / struct / tuple dispatch; `wrap_binding_ty` re-wraps
+// each leaf binding's type at scope insertion.
+
+#[test]
+fn test_match_ref_struct_scrutinee_field_binding_is_borrow() {
+    // Field binding `name` carries `ref String`; calling a function
+    // declared with `ref String` succeeds.
+    typecheck_ok(
+        "struct Foo { name: String }
+         fn use_str(s: ref String) -> i64 { 0 }
+         fn g(val: ref Foo) -> i64 {
+             match val { Foo { name } => use_str(name) }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_ref_struct_field_returned_as_ref_string() {
+    // The match expression's type is the arm body's type. The
+    // binding has type `ref String`, so returning the binding from
+    // a `-> ref String` function typechecks.
+    typecheck_ok(
+        "struct Foo { name: String }
+         fn g(val: ref Foo) -> ref String {
+             match val { Foo { name } => name }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_ref_option_payload_binding_is_borrow() {
+    // Enum variant payload bindings auto-borrow under a `ref` scrutinee
+    // exactly like struct fields.
+    typecheck_ok(
+        "fn use_str(s: ref String) -> i64 { 0 }
+         fn g(val: ref Option[String]) -> i64 {
+             match val {
+                 Option.Some(s) => use_str(s),
+                 Option.None => 0,
+             }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_owned_struct_scrutinee_binds_owned() {
+    // Sanity: owned scrutinees keep the prior owned-binding path; the
+    // bound field name has the field's declared type (not a borrow).
+    typecheck_ok(
+        "struct Foo { name: String }
+         fn use_owned(s: String) -> i64 { 0 }
+         fn g(val: Foo) -> i64 {
+             match val { Foo { name } => use_owned(name) }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_ref_nested_struct_in_option_propagates_borrow() {
+    // Transitive propagation: `ref Option[Person]` scrutinee binds
+    // the nested struct field `name` as `ref String` at any nesting
+    // depth (design.md § Match Arm Binding Modes — `ref` scrutinee
+    // propagation).
+    typecheck_ok(
+        "struct Person { name: String }
+         fn use_str(s: ref String) -> i64 { 0 }
+         fn g(val: ref Option[Person]) -> i64 {
+             match val {
+                 Option.Some(Person { name }) => use_str(name),
+                 Option.None => 0,
+             }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_ref_or_pattern_propagates_borrow_to_each_alternative() {
+    // Each or-pattern alternative observes the same scrutinee mode —
+    // both arms in `A(x) | B(x)` bind `x` as the same borrow form.
+    typecheck_ok(
+        "enum Pair { Left(i64), Right(i64) }
+         fn use_int_ref(n: ref i64) -> i64 { 0 }
+         fn g(val: ref Pair) -> i64 {
+             match val {
+                 Pair.Left(x) | Pair.Right(x) => use_int_ref(x),
+             }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_mut_ref_struct_scrutinee_field_binding_is_mut_ref() {
+    // `mut ref T` scrutinee → bindings are `mut ref FieldType`.
+    typecheck_ok(
+        "struct Foo { name: String }
+         fn use_mut(s: mut ref String) -> i64 { 0 }
+         fn g(val: mut ref Foo) -> i64 {
+             match val { Foo { name } => use_mut(name) }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_ref_scrutinee_propagates_through_tuple_variant() {
+    // Tuple variants under `ref` scrutinee — each positional binding
+    // is wrapped to the borrow form. `Result[String, MyErr]` exercises
+    // both the Ok-payload and Err-payload paths.
+    typecheck_ok(
+        "struct MyErr { msg: String }
+         fn read_s(s: ref String) -> i64 { 0 }
+         fn read_e(e: ref MyErr) -> i64 { 0 }
+         fn g(val: ref Result[String, MyErr]) -> i64 {
+             match val {
+                 Result.Ok(s) => read_s(s),
+                 Result.Err(e) => read_e(e),
+             }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_ref_vec_slice_rest_is_immutable_slice() {
+    // Slice-rest mutability propagation (design.md § Slice patterns
+    // > Mutability propagation): a `..rest` over a `ref Vec[T]` binds
+    // `Slice[T]` (immutable subslice).
+    typecheck_ok(
+        "fn use_slice(s: Slice[i64]) -> i64 { 0 }
+         fn g(v: ref Vec[i64]) -> i64 {
+             match v {
+                 [_, ..rest] => use_slice(rest),
+                 [] => 0,
+             }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_mut_ref_vec_slice_rest_is_mut_slice() {
+    // `mut ref Vec[T]` scrutinee → `..rest` binds `mut Slice[T]`.
+    typecheck_ok(
+        "fn use_mut_slice(s: mut Slice[i64]) -> i64 { 0 }
+         fn g(v: mut ref Vec[i64]) -> i64 {
+             match v {
+                 [_, ..rest] => use_mut_slice(rest),
+                 [] => 0,
+             }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_ref_array_slice_rest_is_ref_array() {
+    // `ref Array[T, N]` scrutinee → `..rest` binds `ref Array[T, K]`
+    // (K = N − head − tail).
+    typecheck_ok(
+        "fn use_ref_array(a: ref Array[i64, 3]) -> i64 { 0 }
+         fn g(a: ref Array[i64, 5]) -> i64 {
+             match a {
+                 [_, ..rest, _] => use_ref_array(rest),
+             }
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn test_match_owned_array_slice_rest_is_owned_array() {
+    // Sanity: owned `Array[T, N]` scrutinees keep the prior path —
+    // the rest stays `Array[T, K]`, not a ref.
+    typecheck_ok(
+        "fn use_owned_array(a: Array[i64, 3]) -> i64 { 0 }
+         fn g(a: Array[i64, 5]) -> i64 {
+             match a {
+                 [_, ..rest, _] => use_owned_array(rest),
+             }
+         }
+         fn main() { }",
     );
 }

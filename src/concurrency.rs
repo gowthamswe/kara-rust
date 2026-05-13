@@ -14,6 +14,95 @@ use crate::ast::*;
 use crate::effectchecker::{DeclaredEffects, EffectCheckResult};
 use std::collections::{HashMap, HashSet};
 
+/// `true` iff this statement contains a `return`, `break`, or
+/// `continue` that escapes a directly-nested expression's control flow
+/// — i.e., that would, at codegen time, emit a `ret X` (or branch to a
+/// loop's exit edge) bypassing the statement's "fall through" exit.
+/// Used by `find_parallel_groups` to keep such statements out of
+/// par groups; a par branch is lowered to a standalone `void` LLVM
+/// function and an embedded `return X` from the original body would
+/// produce `ret <T> X` inside the void branch and fail LLVM module
+/// verification.
+fn stmt_has_early_exit(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Let { value, .. }
+        | StmtKind::Assign { value, .. }
+        | StmtKind::CompoundAssign { value, .. }
+        | StmtKind::Expr(value) => expr_has_early_exit(value),
+        StmtKind::LetElse {
+            value, else_block, ..
+        } => expr_has_early_exit(value) || block_has_early_exit(else_block),
+        StmtKind::Defer { body } | StmtKind::ErrDefer { body, .. } => block_has_early_exit(body),
+        StmtKind::LetUninit { .. } => false,
+    }
+}
+
+fn block_has_early_exit(block: &Block) -> bool {
+    block.stmts.iter().any(stmt_has_early_exit)
+        || block
+            .final_expr
+            .as_ref()
+            .is_some_and(|e| expr_has_early_exit(e))
+}
+
+fn expr_has_early_exit(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Return(_) => true,
+        ExprKind::Break { .. } => true,
+        ExprKind::Continue { .. } => true,
+        ExprKind::Block(b) => block_has_early_exit(b),
+        ExprKind::If {
+            condition,
+            then_block,
+            else_branch,
+        } => {
+            expr_has_early_exit(condition)
+                || block_has_early_exit(then_block)
+                || else_branch.as_ref().is_some_and(|e| expr_has_early_exit(e))
+        }
+        ExprKind::IfLet {
+            value,
+            then_block,
+            else_branch,
+            ..
+        } => {
+            expr_has_early_exit(value)
+                || block_has_early_exit(then_block)
+                || else_branch.as_ref().is_some_and(|e| expr_has_early_exit(e))
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            expr_has_early_exit(scrutinee) || arms.iter().any(|a| expr_has_early_exit(&a.body))
+        }
+        ExprKind::While {
+            condition, body, ..
+        } => expr_has_early_exit(condition) || block_has_early_exit(body),
+        ExprKind::For { iterable, body, .. } => {
+            expr_has_early_exit(iterable) || block_has_early_exit(body)
+        }
+        ExprKind::Loop { body, .. } => block_has_early_exit(body),
+        ExprKind::Binary { left, right, .. }
+        | ExprKind::Pipe { left, right }
+        | ExprKind::NilCoalesce { left, right } => {
+            expr_has_early_exit(left) || expr_has_early_exit(right)
+        }
+        ExprKind::Unary { operand, .. } => expr_has_early_exit(operand),
+        ExprKind::Call { callee, args } => {
+            expr_has_early_exit(callee) || args.iter().any(|a| expr_has_early_exit(&a.value))
+        }
+        ExprKind::MethodCall { object, args, .. } => {
+            expr_has_early_exit(object) || args.iter().any(|a| expr_has_early_exit(&a.value))
+        }
+        ExprKind::FieldAccess { object, .. } | ExprKind::TupleIndex { object, .. } => {
+            expr_has_early_exit(object)
+        }
+        ExprKind::Index { object, index } => {
+            expr_has_early_exit(object) || expr_has_early_exit(index)
+        }
+        ExprKind::Tuple(elems) => elems.iter().any(expr_has_early_exit),
+        _ => false,
+    }
+}
+
 // ── Result Types ───────────────────────────────────────────────
 
 /// The full result of concurrency analysis across all functions.
@@ -62,6 +151,14 @@ struct StmtInfo {
     calls_polymorphic: bool,
     /// Whether this statement is inside a seq {} block.
     is_seq: bool,
+    /// Whether this statement may exit the enclosing function abnormally
+    /// (an `if` body / loop body / match arm reachable through this stmt
+    /// contains `return`, `break`, or `continue`). Such statements
+    /// cannot share a parallel group with siblings — par branches are
+    /// emitted as standalone `void` LLVM functions and a raw `ret X`
+    /// from inside the branch produces invalid IR ("return instr that
+    /// returns non-void in Function of void return type").
+    has_early_exit: bool,
 }
 
 /// An effect associated with a statement.
@@ -200,6 +297,7 @@ impl<'a> ConcurrencyChecker<'a> {
             effects: Vec::new(),
             calls_polymorphic: false,
             is_seq,
+            has_early_exit: stmt_has_early_exit(stmt),
         };
 
         match &stmt.kind {
@@ -386,6 +484,15 @@ impl<'a> ConcurrencyChecker<'a> {
                 continue;
             }
 
+            // A statement that may exit the function early (contains `return`,
+            // `break`, or `continue`) cannot share a par group with any
+            // sibling — the par branch's `void` LLVM signature can't carry
+            // the inner `ret X` and module verification fails.
+            if infos[start].has_early_exit {
+                assigned[start] = true;
+                continue;
+            }
+
             let mut group_indices = vec![start];
             assigned[start] = true;
 
@@ -405,6 +512,12 @@ impl<'a> ConcurrencyChecker<'a> {
             // candidate becomes the seed of its own group.
             for candidate in (start + 1)..n {
                 if assigned[candidate] {
+                    break;
+                }
+
+                // Same rule applied to candidates: an early-exit stmt
+                // ends the par group at its sibling boundary.
+                if infos[candidate].has_early_exit {
                     break;
                 }
 

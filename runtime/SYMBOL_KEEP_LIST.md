@@ -106,6 +106,7 @@ codegen-monomorphized and passed in at construction.
 |---|---|
 | `karac_map_new` | Construct a fresh map. |
 | `karac_map_free` | Destroy a map and free its storage. |
+| `karac_map_free_with_val_drop_vec` | Same as `karac_map_free` but walks live buckets first to free each value's `Vec[T]` / `String` inner data buffer. Selected when `V` is a Vec/String (`{ptr, len, cap}` layout); plain `karac_map_free` would leak those inner buffers. |
 | `karac_map_insert` | Insert without surfacing the displaced value. |
 | `karac_map_insert_old` | Insert + surface the displaced value (`Map.insert → Option[V]`). |
 | `karac_map_get` | Read a value by key. |

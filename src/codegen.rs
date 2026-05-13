@@ -644,11 +644,31 @@ enum CleanupAction<'ctx> {
     FreeVecBuffer {
         /// Alloca pointer of the Vec/String struct (`{ptr, len, cap}`).
         vec_alloca: PointerValue<'ctx>,
+        /// LLVM type of the element T. When this is itself a Vec struct
+        /// (`vec_struct_type`) or a Map handle pointer, the cleanup loop
+        /// recursively drops each live element's heap-owned content before
+        /// freeing the outer buffer. `None` for legacy/registration sites
+        /// that don't track element type — those degrade to the pre-fix
+        /// shape of freeing the outer buffer only, which is correct for
+        /// primitive / inline-tuple elements but leaks for nested-heap
+        /// element types. New code should always pass `Some(elem_ty)`.
+        /// Closes the 2026-05-13 leak documented in `deferred.md` §
+        /// *Recursive Drop for Heap-Owned Collection Elements*.
+        elem_ty: Option<BasicTypeEnum<'ctx>>,
     },
-    /// Free an owned `Map[K,V]` handle via `karac_map_free`.
+    /// Free an owned `Map[K,V]` handle via `karac_map_free` (or
+    /// `karac_map_free_with_val_drop_vec` when V is itself a heap-owning
+    /// Vec/String). `val_is_vec` captures whether the per-value cleanup
+    /// path is needed; key drop is currently not recurseable (v1 Map keys
+    /// are restricted to comparable types that don't own heap — i64,
+    /// String-by-value, etc.; String key drop is a follow-up slice).
     FreeMapHandle {
         /// Alloca that holds the opaque map ptr.
         map_alloca: PointerValue<'ctx>,
+        /// Whether the value type is itself a Vec/String that needs per-
+        /// entry buffer cleanup before the bucket array is deallocated.
+        /// `false` routes to plain `karac_map_free` (the pre-fix shape).
+        val_is_vec: bool,
     },
     /// Run a per-enum drop function on a value-type (non-shared) enum
     /// alloca at scope exit. The drop function is synthesized once per
@@ -1176,6 +1196,15 @@ struct Codegen<'ctx> {
     http_shim_cache: HashMap<String, FunctionValue<'ctx>>,
     karac_map_new_fn: FunctionValue<'ctx>,
     karac_map_free_fn: FunctionValue<'ctx>,
+    /// `karac_map_free_with_val_drop_vec(map: ptr)` — same shape as
+    /// `karac_map_free`, but iterates each live entry and frees the
+    /// per-entry `Vec[T]` value's data buffer before deallocating the
+    /// bucket storage. Used when the Map's value type is itself a
+    /// `Vec[T]` / `String` (`{ptr, len, cap}` layout) — plain
+    /// `karac_map_free` would leak those inner buffers. Selected by the
+    /// `FreeMapHandle { val_is_vec: true }` cleanup arm. Added
+    /// 2026-05-13 to close the LeetCode #3629 `Map[i64, Vec[i64]]` leak.
+    karac_map_free_with_val_drop_vec_fn: FunctionValue<'ctx>,
     karac_map_insert_old_fn: FunctionValue<'ctx>,
     karac_map_get_fn: FunctionValue<'ctx>,
     karac_map_remove_old_fn: FunctionValue<'ctx>,
@@ -1517,6 +1546,17 @@ impl<'ctx> Codegen<'ctx> {
         let karac_map_free_fn =
             module.add_function("karac_map_free", map_free_ty, Some(Linkage::External));
 
+        // karac_map_free_with_val_drop_vec(map: ptr) -> void — variant of
+        // karac_map_free that iterates the bucket array and frees each live
+        // entry's `Vec[T]` value's data pointer (3-word `{ptr, i64, i64}`
+        // value layout, free when cap > 0) before deallocating the bucket
+        // storage. Selected when the Map's value type is itself Vec/String.
+        let karac_map_free_with_val_drop_vec_fn = module.add_function(
+            "karac_map_free_with_val_drop_vec",
+            map_free_ty,
+            Some(Linkage::External),
+        );
+
         // karac_map_insert_old(map: ptr, key: ptr, val: ptr, out_old_val: ptr) -> i1
         let map_insert_old_ty = context
             .bool_type()
@@ -1718,6 +1758,7 @@ impl<'ctx> Codegen<'ctx> {
             http_shim_cache: HashMap::new(),
             karac_map_new_fn,
             karac_map_free_fn,
+            karac_map_free_with_val_drop_vec_fn,
             karac_map_insert_old_fn,
             karac_map_get_fn,
             karac_map_remove_old_fn,
@@ -1973,6 +2014,20 @@ impl<'ctx> Codegen<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default()).into();
         let i64_ty = self.context.i64_type().into();
         self.context.struct_type(&[ptr_ty, i64_ty, i64_ty], false)
+    }
+
+    /// True when `ty` is the runtime `{ptr, i64, i64}` shape used for
+    /// `Vec[T]` and `String`. Used by the recursive-drop cleanup path to
+    /// decide whether each element of an outer `Vec[Vec[…]]` needs its
+    /// own data buffer freed before the outer buffer is released.
+    /// Comparison is by LLVM type identity — every codegen call to
+    /// `vec_struct_type()` returns the same context-uniqued struct, so
+    /// pointer equality on the structs is sound.
+    fn llvm_ty_is_vec_struct(&self, ty: BasicTypeEnum<'ctx>) -> bool {
+        match ty {
+            BasicTypeEnum::StructType(st) => st == self.vec_struct_type(),
+            _ => false,
+        }
     }
 
     /// Slice[T] and `mut Slice[T]` runtime layout: `{ ptr data, i64 len }`.
@@ -2751,17 +2806,34 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Track a Vec/String alloca for scope-exit buffer free.
-    fn track_vec_var(&mut self, vec_alloca: PointerValue<'ctx>) {
+    /// Track a Vec/String alloca for scope-exit buffer free. Pass the
+    /// element LLVM type (`vec_elem_types[var_name]`) so the cleanup loop
+    /// can recursively drop nested heap-owning element types — critical
+    /// for `Vec[Vec[T]]`, `Vec[String]`, `Vec[Map[K, V]]`, etc., where the
+    /// outer buffer's free does not reach the inner allocations.
+    fn track_vec_var(
+        &mut self,
+        vec_alloca: PointerValue<'ctx>,
+        elem_ty: Option<BasicTypeEnum<'ctx>>,
+    ) {
         if let Some(frame) = self.scope_cleanup_actions.last_mut() {
-            frame.push(CleanupAction::FreeVecBuffer { vec_alloca });
+            frame.push(CleanupAction::FreeVecBuffer {
+                vec_alloca,
+                elem_ty,
+            });
         }
     }
 
-    /// Track a Map alloca for scope-exit `karac_map_free` call.
-    fn track_map_var(&mut self, map_alloca: PointerValue<'ctx>) {
+    /// Track a Map alloca for scope-exit `karac_map_free` call. When the
+    /// value type is itself a Vec/String, the cleanup routes to
+    /// `karac_map_free_with_val_drop_vec` so each live entry's value
+    /// buffer is freed before the bucket array is deallocated.
+    fn track_map_var(&mut self, map_alloca: PointerValue<'ctx>, val_is_vec: bool) {
         if let Some(frame) = self.scope_cleanup_actions.last_mut() {
-            frame.push(CleanupAction::FreeMapHandle { map_alloca });
+            frame.push(CleanupAction::FreeMapHandle {
+                map_alloca,
+                val_is_vec,
+            });
         }
     }
 
@@ -2905,7 +2977,10 @@ impl<'ctx> Codegen<'ctx> {
                         };
                         self.emit_refcount_dec(name, *heap_type, current_ptr);
                     }
-                    CleanupAction::FreeVecBuffer { vec_alloca } => {
+                    CleanupAction::FreeVecBuffer {
+                        vec_alloca,
+                        elem_ty,
+                    } => {
                         let cap_ptr = self
                             .builder
                             .build_struct_gep(vec_ty, *vec_alloca, 2, "cleanup.cap.ptr")
@@ -2935,20 +3010,187 @@ impl<'ctx> Codegen<'ctx> {
                             .build_load(ptr_ty, data_ptr_ptr, "cleanup.data")
                             .unwrap()
                             .into_pointer_value();
+
+                        // Recursive-drop fast path: when the element type is
+                        // itself a Vec/String struct, each live element owns
+                        // a separate data buffer. Iterate `len` elements and
+                        // free each one's `data` pointer before releasing
+                        // the outer buffer; otherwise those inner buffers
+                        // leak. Closes the 2026-05-13 cumulative-retention
+                        // bug measured on LeetCode #3629 bfs_sieve, where
+                        // `Vec[Vec[i64]]` leaked ~32 MB per `min_jumps`
+                        // call. One-level recursion handles the bench
+                        // workloads and the documented common case
+                        // (`Vec[Vec[T]]`, `Vec[String]`); deeper nesting
+                        // (`Vec[Vec[Vec[T]]]`) still leaks the innermost
+                        // buffers — tracked as a follow-up in `deferred.md`
+                        // § *Recursive Drop for Heap-Owned Collection
+                        // Elements > deeper-nesting limitation*.
+                        if let Some(et) = elem_ty {
+                            if self.llvm_ty_is_vec_struct(*et) {
+                                let len_ptr = self
+                                    .builder
+                                    .build_struct_gep(vec_ty, *vec_alloca, 1, "cleanup.len.ptr")
+                                    .unwrap();
+                                let len = self
+                                    .builder
+                                    .build_load(i64_t, len_ptr, "cleanup.len")
+                                    .unwrap()
+                                    .into_int_value();
+                                let counter = self.create_entry_alloca(
+                                    fn_val,
+                                    "cleanup.drop.i",
+                                    i64_t.into(),
+                                );
+                                self.builder.build_store(counter, zero).unwrap();
+                                let drop_cond_bb =
+                                    self.context.append_basic_block(fn_val, "cleanup.drop.cond");
+                                let drop_body_bb =
+                                    self.context.append_basic_block(fn_val, "cleanup.drop.body");
+                                let drop_after_bb = self
+                                    .context
+                                    .append_basic_block(fn_val, "cleanup.drop.after");
+                                self.builder
+                                    .build_unconditional_branch(drop_cond_bb)
+                                    .unwrap();
+
+                                self.builder.position_at_end(drop_cond_bb);
+                                let cur = self
+                                    .builder
+                                    .build_load(i64_t, counter, "cleanup.drop.cur")
+                                    .unwrap()
+                                    .into_int_value();
+                                let lt = self
+                                    .builder
+                                    .build_int_compare(
+                                        IntPredicate::ULT,
+                                        cur,
+                                        len,
+                                        "cleanup.drop.lt",
+                                    )
+                                    .unwrap();
+                                self.builder
+                                    .build_conditional_branch(lt, drop_body_bb, drop_after_bb)
+                                    .unwrap();
+
+                                self.builder.position_at_end(drop_body_bb);
+                                // Each element is a Vec struct `{ptr, len,
+                                // cap}` at `data + i * sizeof(VecStruct)`.
+                                // Check inner cap > 0, then free inner ptr.
+                                let inner_struct_ptr = unsafe {
+                                    self.builder
+                                        .build_gep(
+                                            self.vec_struct_type(),
+                                            data,
+                                            &[cur],
+                                            "cleanup.drop.elem",
+                                        )
+                                        .unwrap()
+                                };
+                                let inner_cap_ptr = self
+                                    .builder
+                                    .build_struct_gep(
+                                        self.vec_struct_type(),
+                                        inner_struct_ptr,
+                                        2,
+                                        "cleanup.drop.inner.cap.ptr",
+                                    )
+                                    .unwrap();
+                                let inner_cap = self
+                                    .builder
+                                    .build_load(i64_t, inner_cap_ptr, "cleanup.drop.inner.cap")
+                                    .unwrap()
+                                    .into_int_value();
+                                let inner_is_heap = self
+                                    .builder
+                                    .build_int_compare(
+                                        IntPredicate::UGT,
+                                        inner_cap,
+                                        zero,
+                                        "cleanup.drop.inner.is_heap",
+                                    )
+                                    .unwrap();
+                                let inner_free_bb = self
+                                    .context
+                                    .append_basic_block(fn_val, "cleanup.drop.inner.free");
+                                let inner_skip_bb = self
+                                    .context
+                                    .append_basic_block(fn_val, "cleanup.drop.inner.skip");
+                                self.builder
+                                    .build_conditional_branch(
+                                        inner_is_heap,
+                                        inner_free_bb,
+                                        inner_skip_bb,
+                                    )
+                                    .unwrap();
+
+                                self.builder.position_at_end(inner_free_bb);
+                                let inner_data_ptr = self
+                                    .builder
+                                    .build_struct_gep(
+                                        self.vec_struct_type(),
+                                        inner_struct_ptr,
+                                        0,
+                                        "cleanup.drop.inner.data.ptr",
+                                    )
+                                    .unwrap();
+                                let inner_data = self
+                                    .builder
+                                    .build_load(ptr_ty, inner_data_ptr, "cleanup.drop.inner.data")
+                                    .unwrap()
+                                    .into_pointer_value();
+                                self.builder
+                                    .build_call(self.free_fn, &[inner_data.into()], "")
+                                    .unwrap();
+                                self.builder
+                                    .build_unconditional_branch(inner_skip_bb)
+                                    .unwrap();
+
+                                self.builder.position_at_end(inner_skip_bb);
+                                let one = i64_t.const_int(1, false);
+                                let next = self
+                                    .builder
+                                    .build_int_add(cur, one, "cleanup.drop.next")
+                                    .unwrap();
+                                self.builder.build_store(counter, next).unwrap();
+                                self.builder
+                                    .build_unconditional_branch(drop_cond_bb)
+                                    .unwrap();
+
+                                self.builder.position_at_end(drop_after_bb);
+                            }
+                        }
+
                         self.builder
                             .build_call(self.free_fn, &[data.into()], "")
                             .unwrap();
                         self.builder.build_unconditional_branch(skip_bb).unwrap();
                         self.builder.position_at_end(skip_bb);
                     }
-                    CleanupAction::FreeMapHandle { map_alloca } => {
+                    CleanupAction::FreeMapHandle {
+                        map_alloca,
+                        val_is_vec,
+                    } => {
                         let handle = self
                             .builder
                             .build_load(ptr_ty, *map_alloca, "cleanup.map.handle")
                             .unwrap()
                             .into_pointer_value();
+                        // When V is a Vec/String struct, route through the
+                        // recursive-drop runtime helper so each live entry's
+                        // value buffer is freed before the bucket array is
+                        // deallocated. Plain `karac_map_free` is correct
+                        // only when V owns no heap. Closes the 2026-05-13
+                        // bucket leak measured on LeetCode #3629 bfs_sieve
+                        // where `Map[i64, Vec[i64]]` retained one inner
+                        // buffer per prime per `min_jumps` call.
+                        let free_fn = if *val_is_vec {
+                            self.karac_map_free_with_val_drop_vec_fn
+                        } else {
+                            self.karac_map_free_fn
+                        };
                         self.builder
-                            .build_call(self.karac_map_free_fn, &[handle.into()], "")
+                            .build_call(free_fn, &[handle.into()], "")
                             .unwrap();
                     }
                     // Phase 7.2 Slice DP — invoke the per-enum drop
@@ -3797,9 +4039,15 @@ impl<'ctx> Codegen<'ctx> {
     // ── Program / function compilation ───────────────────────────
 
     fn compile_program(&mut self, program: &Program) -> Result<(), String> {
+        // Seed `Option` / `Result` layouts before walking struct fields so
+        // a `shared struct N { mut left: Option[N] }` declaration's field-
+        // type lowering finds the `{i64 tag, i64 payload}` layout via
+        // `llvm_type_for_name("Option")` and embeds a 2-word slot in the
+        // heap struct, rather than collapsing the field to the default
+        // `i64` and losing the payload word.
+        self.seed_builtin_enum_layouts();
         self.declare_structs(program);
         self.declare_enums(program);
-        self.seed_builtin_enum_layouts();
         self.collect_soa_layouts(program);
         self.declare_extern_functions(program)?;
 
@@ -5416,6 +5664,39 @@ impl<'ctx> Codegen<'ctx> {
                             detected = true;
                         }
                     }
+                    // Fall back on the typechecker-recorded surface type for
+                    // the binding when no explicit annotation was written.
+                    // `let mut q = VecDeque.new(); q.push_back(x);` infers
+                    // `q: VecDeque[T]` from the downstream push call; the
+                    // typechecker writes both `pattern_binding_types`
+                    // ("Vec"/"VecDeque") and `pattern_binding_inner_types`
+                    // (the inner `T`) at the binding pattern's span. Codegen
+                    // needs these for method dispatch to find `q` in
+                    // `vec_elem_types`. Symmetric to the explicit-annotation
+                    // path above.
+                    if !detected {
+                        let key = (pattern.span.offset, pattern.span.length);
+                        if let Some(surface) = self.pattern_binding_types.get(&key).cloned() {
+                            if surface == "Vec" || surface == "VecDeque" {
+                                if let Some(elem_te) =
+                                    self.pattern_binding_inner_types.get(&key).cloned()
+                                {
+                                    let elem_ty = self.llvm_type_for_type_expr(&elem_te);
+                                    self.vec_elem_types.insert(var_name.clone(), elem_ty);
+                                    self.var_elem_type_exprs.insert(var_name.clone(), elem_te);
+                                    detected = true;
+                                }
+                            }
+                            // Mirror bind_pattern_values's `var_type_names`
+                            // write so let-bound shared-struct handles
+                            // (`let cur = nodes[0]; cur.left...`) reach
+                            // `shared_type_for_expr` for downstream
+                            // field-access / method-call dispatch. Without
+                            // this, the field load on a let-bound shared
+                            // handle falls through to the i64-zero default.
+                            self.var_type_names.insert(var_name.clone(), surface);
+                        }
+                    }
                     // Infer String from RHS: let s = "hello", let s = String::new(),
                     // or let s = a + b (string concat)
                     if !detected
@@ -5516,7 +5797,27 @@ impl<'ctx> Codegen<'ctx> {
                         TypeKind::Path(p) => p.segments.last().cloned(),
                         _ => None,
                     })
-                    .or_else(|| self.type_name_of(value));
+                    .or_else(|| self.type_name_of(value))
+                    .or_else(|| {
+                        // Fallback: typechecker's recorded surface type for
+                        // this binding (set by `bind_pattern_types` for
+                        // `Type::Shared(name)`). Lets `let cur = nodes[0]`
+                        // (RHS is an Index, which `type_name_of` doesn't
+                        // classify) still surface "TreeNode" so the
+                        // rc_inc / scope-cleanup machinery below fires,
+                        // and the shared-struct copy preserves refcount
+                        // discipline across mutable rebindings.
+                        if let PatternKind::Binding(var_name) = &pattern.kind {
+                            let key = (pattern.span.offset, pattern.span.length);
+                            if let Some(surface) = self.pattern_binding_types.get(&key) {
+                                if self.shared_types.contains_key(surface) {
+                                    let _ = var_name;
+                                    return Some(surface.clone());
+                                }
+                            }
+                        }
+                        None
+                    });
                 self.pending_closure_fn_type = None;
                 let is_fresh_construction = matches!(&value.kind, ExprKind::StructLiteral { .. });
                 let val = self.compile_expr(value)?;
@@ -5646,9 +5947,9 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 // Track Vec variables for scope cleanup.
                 if let PatternKind::Binding(var_name) = &pattern.kind {
-                    if self.vec_elem_types.contains_key(var_name.as_str()) {
+                    if let Some(&elem_ty) = self.vec_elem_types.get(var_name.as_str()) {
                         if let Some(slot) = self.variables.get(var_name.as_str()) {
-                            self.track_vec_var(slot.ptr);
+                            self.track_vec_var(slot.ptr, Some(elem_ty));
                         }
                         // Move-aware suppression for `let outer = inner;`
                         // when `inner` is a tracked Vec / String. Both
@@ -5705,7 +6006,12 @@ impl<'ctx> Codegen<'ctx> {
                             || self.set_elem_types.contains_key(var_name.as_str()))
                     {
                         if let Some(slot) = self.variables.get(var_name.as_str()) {
-                            self.track_map_var(slot.ptr);
+                            let val_is_vec = self
+                                .map_val_types
+                                .get(var_name.as_str())
+                                .copied()
+                                .is_some_and(|t| self.llvm_ty_is_vec_struct(t));
+                            self.track_map_var(slot.ptr, val_is_vec);
                         }
                     }
                 }
@@ -5933,8 +6239,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_store(cap_p, zero).unwrap();
 
                 // Register acc for scope cleanup (non-zero cap will be freed).
-                // vec_ty is the same struct type used for Vec/String.
-                self.track_vec_var(acc);
+                // vec_ty is the same struct type used for Vec/String. The
+                // f-string accumulator is always `String` (Vec[u8]); element
+                // type u8 has no heap content, so no recursive drop needed.
+                let u8_ty: BasicTypeEnum<'ctx> = self.context.i8_type().into();
+                self.track_vec_var(acc, Some(u8_ty));
 
                 for part in parts {
                     match part {
@@ -6473,8 +6782,11 @@ impl<'ctx> Codegen<'ctx> {
                 ty: soa_ty.into(),
             },
         );
-        // Track for scope cleanup (need to free each group buffer).
-        self.track_vec_var(alloca);
+        // Track for scope cleanup (need to free each group buffer). SoA's
+        // multi-group cleanup is its own shape; the recursive-element drop
+        // path doesn't apply here, so pass `None` to use the legacy
+        // outer-buffer-only free.
+        self.track_vec_var(alloca, None);
         Ok(())
     }
 
@@ -11619,7 +11931,8 @@ impl<'ctx> Codegen<'ctx> {
                 ty: ptr_ty.into(),
             },
         );
-        self.track_map_var(slot_ptr);
+        let val_is_vec = self.llvm_ty_is_vec_struct(val_ty);
+        self.track_map_var(slot_ptr, val_is_vec);
         Ok(())
     }
 
@@ -11693,7 +12006,9 @@ impl<'ctx> Codegen<'ctx> {
         );
         // Set handles use the same `karac_map_free` cleanup as Map handles —
         // the runtime is the same; only the type-system identity differs.
-        self.track_map_var(slot_ptr);
+        // Sets have no value slot (val_size = 0 in the bucket layout), so the
+        // recursive value-drop path doesn't apply — pass `false`.
+        self.track_map_var(slot_ptr, false);
         Ok(())
     }
 
@@ -14422,6 +14737,70 @@ impl<'ctx> Codegen<'ctx> {
                 return Ok(self.compile_primitive_const(cv));
             }
         }
+        // Indexed-shared-struct receiver: `nodes[i].field` where
+        // `nodes: Vec[Shared(N)]`. Mirror of `compile_field_store`'s
+        // Index branch — load the heap pointer at `nodes[i]`, GEP into
+        // the heap struct's field, return the typed load. Without this,
+        // the access falls through to the generic Struct-value extract
+        // path which returns `i64 0` for any shared-struct receiver.
+        if let ExprKind::Index {
+            object: inner,
+            index,
+        } = &object.kind
+        {
+            if let ExprKind::Identifier(outer_name) = &inner.kind {
+                if let Some(elem_te) = self.var_elem_type_exprs.get(outer_name.as_str()).cloned() {
+                    if let TypeKind::Path(path) = &elem_te.kind {
+                        if let Some(seg) = path.segments.first() {
+                            if let Some(info) = self.shared_types.get(seg.as_str()).cloned() {
+                                if !info.is_enum {
+                                    let outer_name = outer_name.clone();
+                                    let (elem_ptr, _) =
+                                        if self.vec_elem_types.contains_key(outer_name.as_str()) {
+                                            self.lower_indexed_elem_ptr_vec(&outer_name, index)?
+                                        } else if self
+                                            .slice_elem_types
+                                            .contains_key(outer_name.as_str())
+                                        {
+                                            self.lower_indexed_elem_ptr_slice(&outer_name, index)?
+                                        } else {
+                                            let zero = self.context.i64_type().const_zero();
+                                            return Ok(zero.into());
+                                        };
+                                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                    let heap_ptr = self
+                                        .builder
+                                        .build_load(ptr_ty, elem_ptr, "idx.shared.read")
+                                        .unwrap()
+                                        .into_pointer_value();
+                                    if let Some(names) = self.struct_field_names.get(seg) {
+                                        if let Some(idx) = names.iter().position(|n| n == field) {
+                                            let field_ptr = self
+                                                .builder
+                                                .build_struct_gep(
+                                                    info.heap_type,
+                                                    heap_ptr,
+                                                    (idx + 1) as u32,
+                                                    &format!("sh_idx_{}", field),
+                                                )
+                                                .unwrap();
+                                            let field_ty = info
+                                                .heap_type
+                                                .get_field_type_at_index((idx + 1) as u32)
+                                                .unwrap();
+                                            return Ok(self
+                                                .builder
+                                                .build_load(field_ty, field_ptr, field)
+                                                .unwrap());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Shared type: object compiles to a pointer; field access via GEP.
         if let Some((type_name, info)) = self.shared_type_for_expr(object) {
             if !info.is_enum {
@@ -14465,6 +14844,66 @@ impl<'ctx> Codegen<'ctx> {
         field: &str,
         new_val: BasicValueEnum<'ctx>,
     ) -> Result<(), String> {
+        // Indexed-shared-struct receiver: `nodes[i].field = X` where
+        // `nodes: Vec[Shared(N)]`. Load the heap pointer at `nodes[i]`
+        // (the element slot stores the RC pointer cast to its LLVM
+        // type), then GEP into the heap struct and store. Without this
+        // branch the assignment silently falls through to the no-op
+        // `Ok(())` exit at the function tail — the field write compiles
+        // clean but does not persist, so a subsequent `nodes[i].field`
+        // read returns the stale value.
+        if let ExprKind::Index {
+            object: inner,
+            index,
+        } = &object.kind
+        {
+            if let ExprKind::Identifier(outer_name) = &inner.kind {
+                if let Some(elem_te) = self.var_elem_type_exprs.get(outer_name.as_str()).cloned() {
+                    if let TypeKind::Path(path) = &elem_te.kind {
+                        if let Some(seg) = path.segments.first() {
+                            if let Some(info) = self.shared_types.get(seg.as_str()).cloned() {
+                                if !info.is_enum {
+                                    let outer_name = outer_name.clone();
+                                    let (elem_ptr, _) =
+                                        if self.vec_elem_types.contains_key(outer_name.as_str()) {
+                                            self.lower_indexed_elem_ptr_vec(&outer_name, index)?
+                                        } else if self
+                                            .slice_elem_types
+                                            .contains_key(outer_name.as_str())
+                                        {
+                                            self.lower_indexed_elem_ptr_slice(&outer_name, index)?
+                                        } else {
+                                            return Ok(());
+                                        };
+                                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                                    let heap_ptr = self
+                                        .builder
+                                        .build_load(ptr_ty, elem_ptr, "idx.shared.ptr")
+                                        .unwrap()
+                                        .into_pointer_value();
+                                    if let Some(names) = self.struct_field_names.get(seg) {
+                                        if let Some(idx) = names.iter().position(|n| n == field) {
+                                            let field_ptr = self
+                                                .builder
+                                                .build_struct_gep(
+                                                    info.heap_type,
+                                                    heap_ptr,
+                                                    (idx + 1) as u32,
+                                                    &format!("sh_idx_{}_ptr", field),
+                                                )
+                                                .unwrap();
+                                            self.builder.build_store(field_ptr, new_val).unwrap();
+                                        }
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // `self.field = …` parses as `FieldAccess { object: SelfValue, … }`,
         // and `self` is bound as a regular local named "self" — same lookup
         // path as a plain Identifier. Treat both shapes uniformly so
@@ -18221,6 +18660,46 @@ impl<'ctx> Codegen<'ctx> {
                     return Ok(());
                 }
                 let fn_val = self.current_fn.unwrap();
+
+                // Shared-struct payload reconstitution. `Option[Shared(N)]`
+                // (and every other enum carrying a shared-struct payload)
+                // lowers the heap pointer to an `i64` payload word; the
+                // non-shared-enum extraction path above (line ~18415)
+                // hands us that word as `IntValue`. Without re-typing the
+                // binding's alloca as a pointer, `compile_field_access`
+                // calls `.into_pointer_value()` on the loaded `i64` and
+                // panics — or its shared-enum branch silently misses
+                // because `compile_expr(Identifier("node"))` returns
+                // `IntValue` instead of `PointerValue`. Restore the
+                // pointer shape here so downstream `.field` / method-
+                // call dispatch on a pattern-bound shared handle finds
+                // the heap struct.
+                let key = (pattern.span.offset, pattern.span.length);
+                if let Some(type_name) = self.pattern_binding_types.get(&key).cloned() {
+                    if self.shared_types.contains_key(&type_name) {
+                        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                        let ptr_val = match scrut {
+                            BasicValueEnum::IntValue(iv) => self
+                                .builder
+                                .build_int_to_ptr(iv, ptr_ty, &format!("{}.ptr", name))
+                                .unwrap()
+                                .into(),
+                            BasicValueEnum::PointerValue(_) => scrut,
+                            _ => scrut,
+                        };
+                        let alloca = self.create_entry_alloca(fn_val, name, ptr_ty.into());
+                        self.builder.build_store(alloca, ptr_val).unwrap();
+                        self.variables.insert(
+                            name.clone(),
+                            VarSlot {
+                                ptr: alloca,
+                                ty: ptr_ty.into(),
+                            },
+                        );
+                        self.var_type_names.insert(name.clone(), type_name);
+                        return Ok(());
+                    }
+                }
 
                 // Struct-payload reconstruction: when the typechecker
                 // recorded a struct surface type for this binding, the

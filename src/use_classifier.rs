@@ -119,6 +119,32 @@ struct UseClassifier<'a> {
 }
 
 impl<'a> UseClassifier<'a> {
+    /// Match-ergonomics gate: `true` iff `expr`'s static type is
+    /// `ref T` / `mut ref T`. The match scrutinee classifier consults
+    /// this to demote `Consuming` to `Reading` when the scrutinee is
+    /// a borrow — under such scrutinees, arm bindings borrow (the
+    /// typechecker wraps their types via
+    /// `ScrutineeMode::wrap_binding_ty`), so the scrutinee itself is
+    /// never moved (design.md § Match Arm Binding Modes). Falls back
+    /// to `param_types` / `local_types` when the span lookup misses,
+    /// matching the same lookup chain used in `classify_identifier`.
+    fn is_borrow_typed_expr(&self, expr: &Expr) -> bool {
+        let ty = self
+            .tc
+            .expr_types
+            .get(&SpanKey::from_span(&expr.span))
+            .cloned()
+            .or_else(|| match &expr.kind {
+                ExprKind::Identifier(name) => self
+                    .param_types
+                    .get(name)
+                    .or_else(|| self.local_types.get(name))
+                    .cloned(),
+                _ => None,
+            });
+        matches!(ty, Some(Type::Ref(_)) | Some(Type::MutRef(_)))
+    }
+
     fn record(&mut self, span: &crate::token::Span, kind: UseKind) {
         let key = SpanKey::from_span(span);
         self.classification.kinds.insert(key, kind);
@@ -386,10 +412,17 @@ impl<'a> UseClassifier<'a> {
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
+                // Match-ergonomics: under a `ref T` / `mut ref T`
+                // scrutinee, arm bindings borrow rather than move, so
+                // the scrutinee is always read regardless of what the
+                // arms bind. Mirrors the ownership pass's
+                // `is_borrow_typed_scrutinee` gate (design.md
+                // § Match Arm Binding Modes).
+                let scrut_is_borrow = self.is_borrow_typed_expr(scrutinee);
                 let any_arm_binds = arms
                     .iter()
                     .any(|arm| self.pattern_binds_anything(&arm.pattern));
-                let scrut_mode = if any_arm_binds {
+                let scrut_mode = if any_arm_binds && !scrut_is_borrow {
                     Mode::Consuming
                 } else {
                     Mode::Reading
@@ -558,6 +591,15 @@ impl<'a> UseClassifier<'a> {
 
     fn classify_identifier(&self, name: &str, span: &crate::token::Span, mode: Mode) -> UseKind {
         if mode == Mode::Reading {
+            return UseKind::Read;
+        }
+        // Unit-variant constructors (`None`, `Ok`, custom `Pending`) are
+        // parsed as bare `ExprKind::Identifier(name)` even though they
+        // construct a fresh enum value rather than reading a binding. Two
+        // distinct `None` literals on the same line otherwise collide as
+        // two uses of the same `binding: "None"` in the CFG and the UAM
+        // predicate fires "value 'None' moved here, used again here".
+        if self.unit_variant_names.contains(name) {
             return UseKind::Read;
         }
         // Mode is Consuming: only non-Copy types are actually consumed.

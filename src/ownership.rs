@@ -360,6 +360,13 @@ pub(crate) fn is_copy_type(ty: &Type, tc: &TypeCheckResult) -> bool {
         Type::Tuple(types) => types.iter().all(|t| is_copy_type(t, tc)),
         Type::Array { element, .. } => is_copy_type(element, tc),
         Type::Slice { mutable, .. } => !mutable,
+        // RC-tier types — `shared struct S`, `Rc[T]`, `Arc[T]` — are
+        // cheap-clone reference handles. A use does not consume the
+        // originating binding; the runtime bumps the refcount. Without
+        // this arm, `let mut q = VecDeque.new(); q.push_back(node);
+        // ... return node;` fires a spurious UAM on `node` because
+        // `push_back`'s owned-arg slot is classified as Consume.
+        Type::Shared(_) | Type::Rc(_) | Type::Arc(_) => true,
         Type::Named { name, args } => {
             if matches!(name.as_str(), "Option" | "Result") {
                 return args.iter().all(|a| is_copy_type(a, tc));
@@ -2773,6 +2780,32 @@ impl<'a> OwnershipChecker<'a> {
         }
     }
 
+    /// Whether `scrutinee`'s type is `ref T` / `mut ref T` — match
+    /// ergonomics treat such scrutinees as always-read regardless of
+    /// what the arms bind, since the typechecker has wrapped each arm
+    /// binding's type in the corresponding borrow form (design.md
+    /// § Match Arm Binding Modes). Looks up the scrutinee's type via
+    /// the per-span `expr_types` table the typechecker populates;
+    /// falls back to `param_types` when the scrutinee is a bare
+    /// parameter identifier (the span table can lag in synthesised
+    /// expressions, but param_types is authoritative for parameters).
+    fn is_borrow_typed_scrutinee(
+        &self,
+        scrutinee: &Expr,
+        param_types: &HashMap<String, Type>,
+    ) -> bool {
+        let ty = self
+            .typecheck_result
+            .expr_types
+            .get(&SpanKey::from_span(&scrutinee.span))
+            .cloned()
+            .or_else(|| match &scrutinee.kind {
+                ExprKind::Identifier(name) => param_types.get(name).cloned(),
+                _ => None,
+            });
+        matches!(ty, Some(Type::Ref(_)) | Some(Type::MutRef(_)))
+    }
+
     fn root_identifier(expr: &Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::Identifier(name) => Some(name.clone()),
@@ -3241,10 +3274,23 @@ impl<'a> OwnershipChecker<'a> {
                 // variants like `None` (parsed as `Binding("None")`) so
                 // an all-`Some(_) | None`-style match doesn't false-
                 // positive consume.
+                //
+                // Match-ergonomics exception (design.md § Match Arm
+                // Binding Modes): when the scrutinee's type is
+                // `ref T` / `mut ref T`, bindings borrow rather than
+                // move, so the scrutinee is always read — never
+                // consumed — regardless of what the arms bind. The
+                // typechecker has already wrapped each arm binding's
+                // type in the corresponding borrow form (see
+                // `ScrutineeMode::wrap_binding_ty` in
+                // `typechecker.rs`); we mirror that decision here so
+                // the scrutinee's source binding (typically a `ref T`
+                // parameter) doesn't get falsely marked `Moved`.
+                let scrut_is_borrow = self.is_borrow_typed_scrutinee(scrutinee, param_types);
                 let any_arm_binds = arms
                     .iter()
                     .any(|arm| self.pattern_binds_anything(&arm.pattern));
-                if any_arm_binds {
+                if any_arm_binds && !scrut_is_borrow {
                     self.check_expr_consuming(scrutinee, states, param_types, param_usage);
                 } else {
                     self.check_expr_reading(scrutinee, states, param_types, param_usage);

@@ -191,6 +191,62 @@ impl ConstArg {
     }
 }
 
+/// Borrow form of a match scrutinee, captured once at match entry and
+/// propagated transitively into every sub-pattern via
+/// `check_pattern_against`. The classifier strips a single outer
+/// `ref` / `mut ref` so variant / struct / tuple dispatch keeps matching
+/// the unwrapped shape; each leaf binding's type is then re-wrapped
+/// through `wrap_binding_ty` so the bindings carry the borrow back —
+/// design.md § Match Arm Binding Modes.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum ScrutineeMode {
+    Owned,
+    Ref,
+    MutRef,
+}
+
+impl ScrutineeMode {
+    /// Classify `scrut_ty` into `(mode, dispatch_ty)`. A single layer of
+    /// `Type::Ref` / `Type::MutRef` is stripped — deeper nesting is rare
+    /// (Kāra has no `&&T`-style syntax; `ref ref T` only arises from
+    /// generic instantiation) and the outer-most borrow already governs
+    /// what arm bindings may do, so the simpler shallow strip suffices.
+    pub(crate) fn classify(scrut_ty: &Type) -> (Self, &Type) {
+        match scrut_ty {
+            Type::Ref(inner) => (ScrutineeMode::Ref, inner.as_ref()),
+            Type::MutRef(inner) => (ScrutineeMode::MutRef, inner.as_ref()),
+            _ => (ScrutineeMode::Owned, scrut_ty),
+        }
+    }
+
+    /// Wrap a leaf binding's declared type with the appropriate borrow
+    /// form for this mode. `Owned` is the identity. Types that are
+    /// **already** a borrow shape (`Ref`, `MutRef`, `Slice` /
+    /// `mut Slice`) are left alone so a `ref Foo` field through a
+    /// `ref Container` scrutinee stays `ref Foo` instead of becoming
+    /// `ref ref Foo`, and a struct field declared `Slice[T]`
+    /// (immutable) is not silently elevated to `mut Slice[T]` by a
+    /// `mut ref Container` scrutinee — the field's declared mutability
+    /// is its own ceiling. Mutability propagation for **slice rest
+    /// bindings** (Array[T, K] / Slice[T] freshly synthesized from a
+    /// `mut ref Vec[T]` scrutinee per design.md § Slice patterns —
+    /// Mutability propagation) is handled at the Slice arm of
+    /// `check_pattern_against`, not here.
+    pub(crate) fn wrap_binding_ty(self, ty: Type) -> Type {
+        match self {
+            ScrutineeMode::Owned => ty,
+            ScrutineeMode::Ref => match ty {
+                Type::Ref(_) | Type::MutRef(_) | Type::Slice { .. } => ty,
+                _ => Type::Ref(Box::new(ty)),
+            },
+            ScrutineeMode::MutRef => match ty {
+                Type::Ref(_) | Type::MutRef(_) | Type::Slice { .. } => ty,
+                _ => Type::MutRef(Box::new(ty)),
+            },
+        }
+    }
+}
+
 /// Const generics slice 3 sub-step (g): substitute `ConstArg::ConstParam(name)`
 /// against the typechecker's `SubstValue` map (slice 1 fork F1). When the
 /// map binds `name → Const(cv)`, the result becomes a `Literal` carrying
@@ -3332,6 +3388,16 @@ pub struct TypeChecker<'a> {
     /// bindings. Sibling to `pattern_binding_types`. See the public copy on
     /// `TypeCheckResult` for the full rationale (PB sibling slice 2026-05-09).
     pattern_binding_inner_types: HashMap<SpanKey, TypeExpr>,
+    /// Parallel to `pattern_binding_inner_types`, storing the raw `Type`
+    /// (which may contain unresolved `Type::TypeVar`) captured at the
+    /// recording site. After body inference completes, `finalize_pattern_
+    /// binding_inner_types` walks this map, resolves typevars against
+    /// `env.substitutions`, and overwrites `pattern_binding_inner_types`
+    /// with the substituted `TypeExpr`. Without this, `let mut q =
+    /// VecDeque.new(); q.push_back(x);` writes the inner-type entry at
+    /// the let site (where `?T0` is still unsolved), and the resulting
+    /// `TypeKind::Error` strands codegen with the wrong element type.
+    pattern_binding_inner_unresolved: HashMap<SpanKey, Type>,
     /// Trait bounds for the generic parameters in the current enclosing scope
     /// (impl-level + function/method-level). Indexed by the param's textual
     /// name so it pairs naturally with `Type::TypeParam(name)`. Populated on
@@ -3400,6 +3466,7 @@ impl<'a> TypeChecker<'a> {
             call_type_subs: HashMap::new(),
             pattern_binding_types: HashMap::new(),
             pattern_binding_inner_types: HashMap::new(),
+            pattern_binding_inner_unresolved: HashMap::new(),
             enclosing_bounds: HashMap::new(),
             enclosing_trait: None,
             closure_once_reasons: HashMap::new(),
@@ -3428,6 +3495,7 @@ impl<'a> TypeChecker<'a> {
         self.validate_derive_arithmetic();
         self.check_signature_visibility();
         self.check_items();
+        self.finalize_pattern_binding_inner_types();
         let trait_impls: std::collections::HashSet<(String, String)> = self
             .env
             .impls
@@ -4712,6 +4780,53 @@ impl<'a> TypeChecker<'a> {
         self.register_compiler_intrinsic_env();
 
         let items: Vec<Item> = self.program.items.clone();
+
+        // Stub pre-pass for self-referential shared types. Field-type
+        // lowering inside `env_add_struct` / `env_add_enum` calls
+        // `lower_type_expr`, which checks `env.structs` / `env.enums`
+        // for `is_shared` to decide whether to return `Type::Shared(name)`
+        // vs `Type::Named { name, args: [] }`. Without the stub, a
+        // shared struct's own self-reference resolves before the parent
+        // entry is inserted and falls through to `Type::Named` — later
+        // uses of the same name resolve to `Type::Shared`, and the two
+        // representations fail `types_compatible` with the visually
+        // identical "expected 'Option<S>', found 'Option<S>'"
+        // diagnostic. Insert empty-fields stubs first so the self-ref
+        // path hits the populated entry; the real pass below overwrites
+        // with the fully-lowered fields.
+        for item in &items {
+            match item {
+                Item::StructDef(s) => {
+                    let gp = Self::generic_param_names(&s.generic_params);
+                    let derived_traits = extract_derived_traits(&s.attributes);
+                    self.env.structs.insert(
+                        s.name.clone(),
+                        StructInfo {
+                            generic_params: gp,
+                            fields: Vec::new(),
+                            derived_traits,
+                            no_rc: s.no_rc,
+                            is_shared: s.is_shared,
+                        },
+                    );
+                }
+                Item::EnumDef(e) => {
+                    let gp = Self::generic_param_names(&e.generic_params);
+                    let derived_traits = extract_derived_traits(&e.attributes);
+                    self.env.enums.insert(
+                        e.name.clone(),
+                        EnumInfo {
+                            generic_params: gp,
+                            variants: Vec::new(),
+                            derived_traits,
+                            is_shared: e.is_shared,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+
         for item in &items {
             match item {
                 Item::StructDef(s) => self.env_add_struct(s),
@@ -8215,6 +8330,35 @@ impl<'a> TypeChecker<'a> {
     /// in `into_conversions`; for everything else, falls back to `infer_expr`
     /// plus a `check_assignable` boundary.
     fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Type {
+        // Built-in collection constructors at check-mode: `Vec.new()` /
+        // `VecDeque.new()` / `Set.new()` / `SortedSet.new()` / `Map.new()`
+        // resolve to the expected type directly when the surface names
+        // line up. Without this short-circuit the constructor's synth-
+        // mode return (`Vec[?T]` minted by `infer_call`) flows through
+        // `types_compatible`, which can't unify the fresh typevar
+        // against `Vec<Fn()>` etc. (the existing legacy callers' shape).
+        if let ExprKind::Call { callee, args } = &expr.kind {
+            if args.is_empty() {
+                if let ExprKind::Path { segments, .. } = &callee.kind {
+                    if segments.len() == 2 && segments[1] == "new" {
+                        let collection = segments[0].as_str();
+                        let matches_expected = match (collection, expected) {
+                            ("Vec", Type::Named { name, .. }) => name == "Vec",
+                            ("VecDeque", Type::Named { name, .. }) => name == "VecDeque",
+                            ("Set", Type::Named { name, .. }) => name == "Set",
+                            ("SortedSet", Type::Named { name, .. }) => name == "SortedSet",
+                            ("Map", Type::Named { name, .. }) => name == "Map",
+                            _ => false,
+                        };
+                        if matches_expected {
+                            self.record_expr_type(&expr.span, expected);
+                            return expected.clone();
+                        }
+                    }
+                }
+            }
+        }
+
         // Empty prefix-literal (`Vec[]` / `Array[]` / `Set[]` / `Map[]`) at
         // a check-mode position: recover via the expected type. Synthesis-
         // mode use (no annotation, no expected-type carrier) hits the
@@ -9349,15 +9493,26 @@ impl<'a> TypeChecker<'a> {
             }
 
             ExprKind::IfLet {
-                pattern: _,
+                pattern,
                 value,
                 then_block,
                 else_branch,
             } => {
-                // Type-check the value expression
-                self.infer_expr(value);
-                // Pattern type-checking would go here when pattern typing is implemented
+                let scrut_ty = self.infer_expr(value);
+                // Bind the pattern's variables for the duration of the
+                // then-block so identifier-leaf bindings inside if-let
+                // (e.g. `if let Some(l) = cur.left { queue.push_back(l); }`)
+                // get the right scrutinee-derived type. Without this the
+                // pattern's bindings stay un-typed (silent fall-through
+                // to `Type::Error`), which breaks downstream
+                // `pattern_binding_types` recording, codegen's
+                // `var_type_names` propagation, and method dispatch.
+                let (mode, dispatch_ty) = ScrutineeMode::classify(&scrut_ty);
+                let dispatch_ty = dispatch_ty.clone();
+                self.local_scope.push();
+                self.check_pattern_against(pattern, &dispatch_ty, mode);
                 let then_ty = self.infer_block(then_block);
+                self.local_scope.pop();
                 if let Some(ref else_expr) = else_branch {
                     let else_ty = self.infer_expr(else_expr);
                     if then_ty == Type::Never {
@@ -10453,6 +10608,41 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 return Type::Never;
+            }
+        }
+
+        // Built-in collection constructors with no syntactic stdlib
+        // declaration: `Vec.new()`, `VecDeque.new()`, `Set.new()`,
+        // `SortedSet.new()`, `Map.new()`. These are dispatched at runtime
+        // by the interpreter / codegen, but the typechecker still needs
+        // a meaningful return type at the call site so a downstream
+        // `q.push_back(x)` can solve the element typevar (otherwise the
+        // binding's type collapses to `Type::Error`, the
+        // `pattern_binding_types` / `pattern_binding_inner_types`
+        // side-tables stay empty, and codegen's let-statement
+        // `vec_elem_types` registration never fires). Returns
+        // `Type::Named { name: <coll>, args: [TypeVar(fresh)] }` (or two
+        // typevars for `Map`) so the standard inference machinery does
+        // the rest. Per design.md § Collections (`Vec.new` / `Map.new`
+        // are the canonical constructors).
+        if let ExprKind::Path { segments, .. } = &callee.kind {
+            if segments.len() == 2 && segments[1] == "new" && args.is_empty() {
+                let collection = segments[0].as_str();
+                let result_ty = match collection {
+                    "Vec" | "VecDeque" | "Set" | "SortedSet" => Some(Type::Named {
+                        name: collection.to_string(),
+                        args: vec![self.env.fresh_type_var()],
+                    }),
+                    "Map" => Some(Type::Named {
+                        name: "Map".to_string(),
+                        args: vec![self.env.fresh_type_var(), self.env.fresh_type_var()],
+                    }),
+                    _ => None,
+                };
+                if let Some(ty) = result_ty {
+                    self.record_expr_type(span, &ty);
+                    return ty;
+                }
             }
         }
 
@@ -11772,7 +11962,24 @@ impl<'a> TypeChecker<'a> {
             };
             if let Some(elem) = element_ty {
                 let arg_ty = self.infer_expr(&args[0].value);
-                self.check_assignable(&elem, &arg_ty, args[0].value.span.clone());
+                // Unify so an unsolved element typevar bound to the
+                // receiver (e.g. `let mut v = Vec.new(); v.push(x);`)
+                // gets pinned to the first push's value type. Otherwise
+                // the binding's `pattern_binding_inner_types` entry
+                // stays unresolved and codegen registers `i64` instead
+                // of the right LLVM element type.
+                unify_types(
+                    &elem,
+                    &arg_ty,
+                    &mut self.env.substitutions,
+                    &mut self.env.const_substitutions,
+                );
+                // Resolve `elem` so a successful unification doesn't
+                // leave the assignability check comparing the stale
+                // typevar against the (now-pinned) arg type and emitting
+                // a spurious `?T → ArgT` mismatch diagnostic.
+                let resolved_elem = resolve_type_var_top(&elem, &self.env.substitutions);
+                self.check_assignable(&resolved_elem, &arg_ty, args[0].value.span.clone());
                 return Type::Unit;
             }
         }
@@ -11804,9 +12011,15 @@ impl<'a> TypeChecker<'a> {
                 _ => None,
             };
             if let Some(elem) = element_ty {
+                // Resolve typevars so a `let mut q = VecDeque.new(); q.push(x);
+                // let _ = q.pop_front();` round-trips the element type — without
+                // this, `?T` solved by `push` stays unresolved in the
+                // `Option[?T]` return, and downstream `Some(x)` bindings lose
+                // the surface type they need for codegen routing.
+                let resolved = resolve_type_var_top(&elem, &self.env.substitutions);
                 return Type::Named {
                     name: "Option".to_string(),
-                    args: vec![elem],
+                    args: vec![resolved],
                 };
             }
         }
@@ -11832,7 +12045,17 @@ impl<'a> TypeChecker<'a> {
             };
             if let Some(elem) = element_ty {
                 let arg_ty = self.infer_expr(&args[0].value);
-                self.check_assignable(&elem, &arg_ty, args[0].value.span.clone());
+                // Mirror the unification in the `Vec.push` arm above so an
+                // unsolved receiver-element typevar gets pinned to the first
+                // pushed value type.
+                unify_types(
+                    &elem,
+                    &arg_ty,
+                    &mut self.env.substitutions,
+                    &mut self.env.const_substitutions,
+                );
+                let resolved_elem = resolve_type_var_top(&elem, &self.env.substitutions);
+                self.check_assignable(&resolved_elem, &arg_ty, args[0].value.span.clone());
                 return Type::Unit;
             }
         }
@@ -14086,6 +14309,14 @@ impl<'a> TypeChecker<'a> {
 
         let type_name = match &obj_ty {
             Type::Named { name, .. } => name.clone(),
+            // Shared-struct receivers (`Type::Shared(name)` — a `shared
+            // struct N { ... }`'s value type) carry the same struct
+            // definition lookup as a bare `Type::Named { name, args: [] }`.
+            // Without this arm, `node.field` on a pattern-bound shared
+            // handle falls through to `Type::Error` and silently breaks
+            // every downstream consumer (match scrutinee inference,
+            // method dispatch, pattern-binding type recording).
+            Type::Shared(name) => name.clone(),
             _ => return Type::Error,
         };
 
@@ -14359,15 +14590,22 @@ impl<'a> TypeChecker<'a> {
     /// slice doesn't change diagnostics around irrefutable-let.
     fn check_if_let_against(
         &mut self,
-        _pattern: &Pattern,
+        pattern: &Pattern,
         value: &Expr,
         then_block: &Block,
         else_branch: Option<&Expr>,
         expected: &Type,
         span: &Span,
     ) -> Type {
-        self.infer_expr(value);
+        let scrut_ty = self.infer_expr(value);
+        // Mirror `infer_if_let`'s pattern binding so the then-block sees
+        // the pattern's bindings with their scrutinee-derived types.
+        let (mode, dispatch_ty) = ScrutineeMode::classify(&scrut_ty);
+        let dispatch_ty = dispatch_ty.clone();
+        self.local_scope.push();
+        self.check_pattern_against(pattern, &dispatch_ty, mode);
         let then_ty = self.check_block_against(then_block, expected);
+        self.local_scope.pop();
         if let Some(else_expr) = else_branch {
             let else_ty = self.check_expr(else_expr, expected);
             let result_ty = if then_ty != Type::Never {
@@ -14399,10 +14637,12 @@ impl<'a> TypeChecker<'a> {
         span: &Span,
     ) -> Type {
         let scrut_ty = self.infer_expr(scrutinee);
+        let (mode, dispatch_ty) = ScrutineeMode::classify(&scrut_ty);
+        let dispatch_ty = dispatch_ty.clone();
         let mut arm_types: Vec<Type> = Vec::new();
         for arm in arms {
             self.local_scope.push();
-            self.check_pattern_against(&arm.pattern, &scrut_ty);
+            self.check_pattern_against(&arm.pattern, &dispatch_ty, mode);
             if let Some(guard) = &arm.guard {
                 let guard_ty = self.infer_expr(guard);
                 if guard_ty != Type::Bool && guard_ty != Type::Error {
@@ -14432,11 +14672,13 @@ impl<'a> TypeChecker<'a> {
 
     fn infer_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: &Span) -> Type {
         let scrut_ty = self.infer_expr(scrutinee);
+        let (mode, dispatch_ty) = ScrutineeMode::classify(&scrut_ty);
+        let dispatch_ty = dispatch_ty.clone();
         let mut arm_types: Vec<Type> = Vec::new();
 
         for arm in arms {
             self.local_scope.push();
-            self.check_pattern_against(&arm.pattern, &scrut_ty);
+            self.check_pattern_against(&arm.pattern, &dispatch_ty, mode);
             if let Some(guard) = &arm.guard {
                 let guard_ty = self.infer_expr(guard);
                 if guard_ty != Type::Bool && guard_ty != Type::Error {
@@ -14599,7 +14841,18 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_pattern_against(&mut self, pattern: &Pattern, expected: &Type) {
+    /// Walk `pattern` against the scrutinee's structural type `expected`
+    /// under `mode` (Owned / Ref / MutRef), binding any introduced names
+    /// into `self.local_scope`. The mode is the **match scrutinee's**
+    /// borrow form, captured at the match entry by
+    /// `ScrutineeMode::classify` after stripping one outer `ref` /
+    /// `mut ref` (so the variant / struct / tuple dispatch below keeps
+    /// matching the unwrapped shape). `mode` propagates transitively
+    /// into every sub-pattern; each leaf binding's type is wrapped via
+    /// `ScrutineeMode::wrap_binding_ty` so a `ref T` scrutinee yields
+    /// `ref FieldType` bindings — design.md § Match Arm Binding Modes.
+    /// Owned scrutinees keep the prior behaviour exactly (no wrap).
+    fn check_pattern_against(&mut self, pattern: &Pattern, expected: &Type, mode: ScrutineeMode) {
         match &pattern.kind {
             PatternKind::Wildcard => {}
             PatternKind::Binding(name) => {
@@ -14616,7 +14869,8 @@ impl<'a> TypeChecker<'a> {
                         }
                     }
                 }
-                self.local_scope.insert(name.clone(), expected.clone());
+                let binding_ty = mode.wrap_binding_ty(expected.clone());
+                self.local_scope.insert(name.clone(), binding_ty);
                 // Mirror bind_pattern_types's side-table write so codegen
                 // can reconstitute struct payloads for match-arm bindings.
                 // `Type::Str` registers `"String"` parallel to how
@@ -14624,6 +14878,10 @@ impl<'a> TypeChecker<'a> {
                 // required by the tuple-payload destructure path
                 // (`pattern_payload_word_count`) for variant-payload
                 // tuples containing String elements (Theme 5, 2026-05-10).
+                // `Type::Shared(name)` registers under its bare struct
+                // name so codegen's `shared_type_for_expr` lookup finds
+                // the heap layout for `node.field` access after a
+                // `Some(node)` pattern binding.
                 if let Type::Named {
                     name: type_name, ..
                 } = expected
@@ -14633,6 +14891,9 @@ impl<'a> TypeChecker<'a> {
                 } else if matches!(expected, Type::Str) {
                     self.pattern_binding_types
                         .insert(SpanKey::from_span(&pattern.span), "String".to_string());
+                } else if let Type::Shared(type_name) = expected {
+                    self.pattern_binding_types
+                        .insert(SpanKey::from_span(&pattern.span), type_name.clone());
                 }
                 // PB sibling slice (2026-05-09): mirror
                 // `bind_pattern_types`'s sibling-table write so direct
@@ -14668,7 +14929,7 @@ impl<'a> TypeChecker<'a> {
                                 } else {
                                     substitute_type_params(ty, &subs)
                                 };
-                                self.check_pattern_against(pat, &resolved);
+                                self.check_pattern_against(pat, &resolved, mode);
                             }
                             return;
                         }
@@ -14676,7 +14937,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 // Fallback: bind sub-patterns to Error
                 for pat in patterns {
-                    self.check_pattern_against(pat, &Type::Error);
+                    self.check_pattern_against(pat, &Type::Error, mode);
                 }
             }
             PatternKind::Struct { path, fields } => {
@@ -14715,10 +14976,14 @@ impl<'a> TypeChecker<'a> {
                             .map(|(_, t)| t.clone())
                             .unwrap_or(Type::Error);
                         if let Some(ref sub_pattern) = field.pattern {
-                            self.check_pattern_against(sub_pattern, &field_ty);
+                            self.check_pattern_against(sub_pattern, &field_ty, mode);
                         } else {
-                            // Shorthand: field name becomes binding
-                            self.local_scope.insert(field.name.clone(), field_ty);
+                            // Shorthand: field name becomes binding. Under a
+                            // `ref`/`mut ref` scrutinee, the binding type is
+                            // wrapped per the match-arm binding-mode rule
+                            // (design.md § Match Arm Binding Modes).
+                            let binding_ty = mode.wrap_binding_ty(field_ty);
+                            self.local_scope.insert(field.name.clone(), binding_ty);
                         }
                     }
                 }
@@ -14726,7 +14991,7 @@ impl<'a> TypeChecker<'a> {
             PatternKind::Tuple(patterns) => {
                 if let Type::Tuple(types) = expected {
                     for (pat, ty) in patterns.iter().zip(types.iter()) {
-                        self.check_pattern_against(pat, ty);
+                        self.check_pattern_against(pat, ty, mode);
                     }
                 }
             }
@@ -14734,12 +14999,13 @@ impl<'a> TypeChecker<'a> {
                 // Nothing to bind for range patterns
             }
             PatternKind::AtBinding { name, pattern } => {
-                self.local_scope.insert(name.clone(), expected.clone());
-                self.check_pattern_against(pattern, expected);
+                let binding_ty = mode.wrap_binding_ty(expected.clone());
+                self.local_scope.insert(name.clone(), binding_ty);
+                self.check_pattern_against(pattern, expected, mode);
             }
             PatternKind::Or(alternatives) => {
                 for alt in alternatives {
-                    self.check_pattern_against(alt, expected);
+                    self.check_pattern_against(alt, expected, mode);
                 }
             }
             PatternKind::Slice {
@@ -14750,10 +15016,31 @@ impl<'a> TypeChecker<'a> {
                 let (element_ty, rest_ty) =
                     self.slice_pattern_types(prefix, rest, suffix, expected, &pattern.span);
                 for pat in prefix.iter().chain(suffix.iter()) {
-                    self.check_pattern_against(pat, &element_ty);
+                    self.check_pattern_against(pat, &element_ty, mode);
                 }
                 if let Some(RestPattern::Bound(name)) = rest {
-                    self.local_scope.insert(name.clone(), rest_ty);
+                    // Slice-rest mutability propagation
+                    // (design.md § Slice and array patterns > Mutability
+                    // propagation, lines 7657–7661): a `..rest` over a
+                    // `Vec[T]` / `Slice[T]` produces `Slice[T]`
+                    // (immutable) under `Owned` / `Ref` and
+                    // `mut Slice[T]` under `MutRef`; over an
+                    // `Array[T, N]` the rest binds `Array[T, K]` under
+                    // `Owned`, `ref Array[T, K]` under `Ref`, and
+                    // `mut ref Array[T, K]` under `MutRef`. Generic
+                    // `wrap_binding_ty` skips `Type::Slice` (so struct
+                    // fields typed `Slice[T]` are never elevated) —
+                    // the rest binding's source is the freshly
+                    // synthesised window, so the elevation rule is
+                    // applied locally here.
+                    let binding_ty = match (mode, rest_ty) {
+                        (ScrutineeMode::MutRef, Type::Slice { element, .. }) => Type::Slice {
+                            element,
+                            mutable: true,
+                        },
+                        (m, ty) => m.wrap_binding_ty(ty),
+                    };
+                    self.local_scope.insert(name.clone(), binding_ty);
                 }
             }
         }
@@ -14924,7 +15211,14 @@ impl<'a> TypeChecker<'a> {
             return;
         }
         let (elem, name): (Option<&Type>, Option<&'static str>) = match ty {
-            Type::Named { name, args } if name == "Vec" && args.len() == 1 => {
+            // `VecDeque[T]` shares `Vec[T]`'s `{ptr, len, cap}` codegen
+            // layout (see `extract_vec_elem_type`), so record it under
+            // the same sibling-table path. Without this arm, an untyped
+            // `let mut q = VecDeque.new();` leaves `vec_elem_types`
+            // empty and `q.push_back(x)` falls through method dispatch.
+            Type::Named { name, args }
+                if (name == "Vec" || name == "VecDeque") && args.len() == 1 =>
+            {
                 (Some(&args[0]), None)
             }
             Type::Slice { element, .. } => (Some(element.as_ref()), Some("Slice")),
@@ -14932,12 +15226,47 @@ impl<'a> TypeChecker<'a> {
         };
         if let Some(elem_ty) = elem {
             let elem_te = Self::type_to_type_expr(elem_ty);
-            self.pattern_binding_inner_types
-                .insert(SpanKey::from_span(&pattern.span), elem_te);
+            let key = SpanKey::from_span(&pattern.span);
+            self.pattern_binding_inner_types.insert(key, elem_te);
+            // Stash the raw `Type` so `finalize_pattern_binding_inner_types`
+            // can re-resolve typevars after the function body completes.
+            // Bindings whose element type contains a typevar (e.g. `let mut
+            // q = VecDeque.new();` — `?T` solved later by `q.push_back(x)`)
+            // depend on this re-resolution to surface the right TypeExpr.
+            self.pattern_binding_inner_unresolved
+                .insert(key, elem_ty.clone());
             if let Some(canon_name) = name {
                 self.pattern_binding_types
                     .insert(SpanKey::from_span(&pattern.span), canon_name.to_string());
             }
+        }
+    }
+
+    /// Resolve any `Type::TypeVar` entries captured by
+    /// `record_pattern_inner_type` against `env.substitutions` and
+    /// overwrite the public `pattern_binding_inner_types` table. Runs
+    /// once at the end of `check`, after every function body has been
+    /// inferred and all typevars have either been solved or surfaced as
+    /// "cannot infer" diagnostics.
+    fn finalize_pattern_binding_inner_types(&mut self) {
+        let id_to_name: HashMap<TypeVarId, String> = HashMap::new();
+        let const_id_to_name: HashMap<ConstVarId, String> = HashMap::new();
+        let updates: Vec<(SpanKey, TypeExpr)> = self
+            .pattern_binding_inner_unresolved
+            .iter()
+            .map(|(key, ty)| {
+                let resolved = resolve_type_vars(
+                    ty,
+                    &self.env.substitutions,
+                    &id_to_name,
+                    &self.env.const_substitutions,
+                    &const_id_to_name,
+                );
+                (*key, Self::type_to_type_expr(&resolved))
+            })
+            .collect();
+        for (key, te) in updates {
+            self.pattern_binding_inner_types.insert(key, te);
         }
     }
 
@@ -14965,6 +15294,13 @@ impl<'a> TypeChecker<'a> {
                 } else if matches!(ty, Type::Str) {
                     self.pattern_binding_types
                         .insert(SpanKey::from_span(&pattern.span), "String".to_string());
+                } else if let Type::Shared(type_name) = ty {
+                    // Parallel to `check_pattern_against`: register the
+                    // bare struct name so codegen's `shared_type_for_expr`
+                    // lookup resolves `node.field` access on a pattern-
+                    // bound shared-struct handle.
+                    self.pattern_binding_types
+                        .insert(SpanKey::from_span(&pattern.span), type_name.clone());
                 }
                 // PB sibling slice (2026-05-09): record the inner element
                 // type for `Vec[T]` / `Slice[T]` bindings so codegen can

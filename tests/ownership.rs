@@ -3767,3 +3767,85 @@ fn slice_well_scoped_no_shape_d_false_positive() {
          }",
     );
 }
+
+// ── Match Ergonomics: ref-scrutinee consume gate ─────────────────────
+//
+// design.md § Match Arm Binding Modes — when the scrutinee is
+// `ref T` / `mut ref T`, arm bindings borrow rather than move, so
+// the scrutinee itself is read (never consumed) regardless of what
+// the arms bind. The owned-scrutinee path continues to consume per
+// the prior rule. See `OwnershipChecker::is_borrow_typed_scrutinee`
+// and `UseClassifier::is_borrow_typed_expr`.
+
+#[test]
+fn match_ref_struct_scrutinee_not_consumed_by_binding_arm() {
+    // Binds the struct field `name` from a `ref Foo` scrutinee — under
+    // match ergonomics, the scrutinee `val` stays Live so the post-match
+    // `use_val(val)` does not trip `UseOfMoved`.
+    ownership_ok(
+        "struct Foo { name: String }
+         fn use_str(s: ref String) -> i64 { 0 }
+         fn use_val(v: ref Foo) -> i64 { 0 }
+         fn g(val: ref Foo) -> i64 {
+             let _ = match val { Foo { name } => use_str(name) };
+             use_val(val)
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn match_owned_struct_scrutinee_consumed_by_binding_arm() {
+    // Owned scrutinee + a binding arm still consumes the scrutinee.
+    // Reusing `val` after the match flags as `UseOfMoved`.
+    let errs = ownership_errors(
+        "struct Foo { name: String }
+         fn use_str(s: String) -> i64 { 0 }
+         fn use_val(v: Foo) -> i64 { 0 }
+         fn g(val: Foo) -> i64 {
+             let _ = match val { Foo { name } => use_str(name) };
+             use_val(val)
+         }
+         fn main() { }",
+    );
+    assert!(
+        errs.iter().any(|e| format!("{}", e).contains("val")),
+        "expected use-of-moved on val after owned-match consume, got: {:?}",
+        errs.iter().map(|e| format!("{}", e)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn match_ref_option_payload_does_not_consume_scrutinee() {
+    // Enum-variant payload binding under a `ref Option[String]`
+    // scrutinee — the scrutinee remains usable after the match.
+    ownership_ok(
+        "fn use_str(s: ref String) -> i64 { 0 }
+         fn use_val(v: ref Option[String]) -> i64 { 0 }
+         fn g(val: ref Option[String]) -> i64 {
+             let _ = match val {
+                 Option.Some(s) => use_str(s),
+                 Option.None => 0,
+             };
+             use_val(val)
+         }
+         fn main() { }",
+    );
+}
+
+#[test]
+fn match_mut_ref_scrutinee_not_consumed_by_binding_arm() {
+    // Same exception applies to `mut ref T` scrutinees. Under
+    // `mut ref Foo`, the field binding `name` is wrapped as
+    // `mut ref String`; mirroring functions take the same form.
+    ownership_ok(
+        "struct Foo { name: String }
+         fn use_mut(s: mut ref String) -> i64 { 0 }
+         fn use_val(v: mut ref Foo) -> i64 { 0 }
+         fn g(val: mut ref Foo) -> i64 {
+             let _ = match val { Foo { name } => use_mut(name) };
+             use_val(val)
+         }
+         fn main() { }",
+    );
+}

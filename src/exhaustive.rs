@@ -518,6 +518,36 @@ fn usefulness(matrix: &Matrix, q: &[Pat], head_types: &[Type], env: &TypeEnv) ->
                 .map(|w| repackage_witness(ctor, arity, w))
         }
         Pat::Wildcard => {
+            // Fast path: when every matrix row has a wildcard at the head
+            // column, that column carries no constraint. Skip it via the
+            // default matrix instead of enumerating constructors and
+            // recursing per-field. Without this, an `Array[T, N]` scrutinee
+            // (single `PatCtor::Array(N)` constructor with N-arity expansion)
+            // builds N-length wildcard vectors at each of N recursion levels
+            // — O(N²) memory and time. The let-irrefutability check at
+            // `typechecker.rs::is_irrefutable_pattern` exercises this path
+            // even for trivial `let name: Array[T, N] = …` bindings, where
+            // `lower_pattern` lowers `name` to `Pat::Wildcard`. Skipping
+            // changes nothing observable for the irrefutability return value
+            // (still `None` when the row covers); witness shape becomes
+            // `_` instead of `[_, _, …, _]`, which is strictly more readable
+            // at scale. Gated on non-empty matrix so the empty-match witness
+            // (e.g. `missing: true` on `match b: bool {}`) keeps its
+            // ctor-specific shape.
+            if !matrix.rows.is_empty()
+                && matrix
+                    .rows
+                    .iter()
+                    .all(|r| matches!(r.pats.first(), Some(Pat::Wildcard)))
+            {
+                let default = default_matrix(matrix);
+                return usefulness(&default, q_rest, rest_tys, env).map(|w| {
+                    let mut out = Vec::with_capacity(w.len() + 1);
+                    out.push(Pat::Wildcard);
+                    out.extend(w);
+                    out
+                });
+            }
             if let Some(all) = enumerate_ctors(head_ty, env) {
                 for c in &all {
                     let arity = ctor_arity(c, head_ty, env);
