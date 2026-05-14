@@ -18627,6 +18627,31 @@ impl<'ctx> Codegen<'ctx> {
         scrutinee: &Expr,
         arms: &[MatchArm],
     ) -> Result<BasicValueEnum<'ctx>, String> {
+        // Slice 3b: when the scrutinee is a ref-typed identifier
+        // (function parameter `f: ref T` / `mut ref T`), obtain the raw
+        // scrutinee pointer in addition to the auto-derefed value.
+        // Pattern conditions still run against the value (tag/field
+        // checks are identical); leaf bindings under recognized
+        // pattern shapes can then route through
+        // `bind_pattern_values_via_ptr` to emit GEP-based shims that
+        // alias the scrutinee storage rather than a local copy — which
+        // is what makes `mut ref` write-through propagate back to the
+        // caller's storage.
+        let scrut_ref_ptr: Option<(PointerValue<'ctx>, StructType<'ctx>)> =
+            if let ExprKind::Identifier(name) = &scrutinee.kind {
+                if self.ref_params.contains_key(name) {
+                    let pointee = *self.ref_params.get(name).unwrap();
+                    if let BasicTypeEnum::StructType(st) = pointee {
+                        self.get_data_ptr(name).map(|p| (p, st))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
         let scrut = self.compile_expr(scrutinee)?;
         // Detect borrow-returning scrutinees so pattern bindings don't
         // register a `FreeVecBuffer` against a buffer the container still
@@ -18718,7 +18743,22 @@ impl<'ctx> Codegen<'ctx> {
                 })?;
                 self.bind_slice_pattern(prefix, rest, suffix, &src, true)?;
             } else {
-                self.bind_pattern_values(&arm.pattern, scrut)?;
+                // Slice 3b: try the pointer-source binding path first
+                // when we have a ref-scrutinee. If the pattern shape
+                // isn't recognized by `bind_pattern_values_via_ptr`
+                // (e.g., or-patterns, at-bindings, slice patterns,
+                // multi-word payloads), fall back to slice 3a's
+                // value-source + ref-shim path which still produces
+                // correct (though copy-aliased) bindings.
+                let handled_via_ptr = if let Some((scrut_ptr, pointee_ty)) = scrut_ref_ptr {
+                    self.bind_pattern_values_via_ptr(&arm.pattern, scrut_ptr, pointee_ty)?
+                        .is_some()
+                } else {
+                    false
+                };
+                if !handled_via_ptr {
+                    self.bind_pattern_values(&arm.pattern, scrut)?;
+                }
             }
 
             let arm_val = self.compile_expr(&arm.body)?;
@@ -19647,6 +19687,276 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(())
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Slice 3b: emit a leaf binding whose shim alloca points **into**
+    /// the scrutinee's storage (via GEP) rather than into a local copy
+    /// of the field value. This is what makes mutation through a
+    /// `mut ref`-typed match-arm binding flow back to the original
+    /// scrutinee — `set_to(name, v)` where `name: mut ref T` writes
+    /// through the GEP'd pointer, mutating the source `foo.name`.
+    ///
+    /// The shim mechanic itself is identical to slice 3a's
+    /// `pattern_binding_borrow_modes` path: a `ptr` alloca registered
+    /// in `variables` + `ref_params`, so subsequent `load_variable`
+    /// auto-derefs back to the value and `compile_call`'s `is_ref`
+    /// arg path uses `get_data_ptr` to pass the stored pointer. The
+    /// only thing that changes between 3a and 3b is **what** pointer
+    /// the shim stores: 3a stores the address of a local value-alloca;
+    /// 3b stores a GEP into the scrutinee.
+    fn emit_ref_leaf_binding_at_ptr(
+        &mut self,
+        name: &str,
+        field_ptr: PointerValue<'ctx>,
+        inner_ty: BasicTypeEnum<'ctx>,
+        debug_label: &str,
+    ) {
+        let fn_val = self.current_fn.unwrap();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let shim_alloca =
+            self.create_entry_alloca(fn_val, &format!("{}.{}", name, debug_label), ptr_ty.into());
+        self.builder.build_store(shim_alloca, field_ptr).unwrap();
+        self.variables.insert(
+            name.to_string(),
+            VarSlot {
+                ptr: shim_alloca,
+                ty: ptr_ty.into(),
+            },
+        );
+        self.ref_params.insert(name.to_string(), inner_ty);
+    }
+
+    /// Slice 3b pointer-source twin of `bind_pattern_values`. Walks the
+    /// pattern and, for each leaf binding, emits a GEP into the
+    /// scrutinee pointer rather than reconstructing the field value
+    /// and shimming a local copy. Returns `Some(())` when the pattern
+    /// shape was handled by this path; `None` falls back to the
+    /// value-source `bind_pattern_values` (which slice 3a's shim still
+    /// adapts to the ref-binding ABI shape).
+    ///
+    /// Coverage at slice 3b landing:
+    /// - `PatternKind::Struct` on a plain (non-enum) struct: GEP into
+    ///   each field by index; recurse on sub-pattern OR emit leaf
+    ///   binding directly for shorthand.
+    /// - `PatternKind::TupleVariant` on a non-shared enum: GEP into
+    ///   the layout's payload word for each positional sub-pattern;
+    ///   emit leaf binding directly (nested destructure under enum
+    ///   payload not supported at this slice — return `None` to defer
+    ///   to value-source path for those cases).
+    /// - `PatternKind::Wildcard`: bind nothing.
+    /// - `PatternKind::Binding`: the scrutinee pointer IS what we want
+    ///   to alias; register a leaf binding at the pointer with the
+    ///   pointee type.
+    /// - Anything else (slice patterns, range patterns, or-patterns,
+    ///   at-bindings, literals): return `None`, defer to the existing
+    ///   value-source pipeline.
+    fn bind_pattern_values_via_ptr(
+        &mut self,
+        pattern: &Pattern,
+        scrut_ptr: PointerValue<'ctx>,
+        pointee_ty: StructType<'ctx>,
+    ) -> Result<Option<()>, String> {
+        match &pattern.kind {
+            PatternKind::Wildcard => Ok(Some(())),
+            PatternKind::Binding(name) => {
+                // Unit-variant guard mirrors the value-source path.
+                let variant_name = name.rsplit('.').next().unwrap_or(name);
+                if self.enum_tag_for_variant(variant_name).is_some() {
+                    return Ok(Some(()));
+                }
+                // The scrutinee pointer IS the data we want to alias.
+                // Inner type is the full pointee struct.
+                self.emit_ref_leaf_binding_at_ptr(
+                    name,
+                    scrut_ptr,
+                    pointee_ty.into(),
+                    "refshim.ptr",
+                );
+                Ok(Some(()))
+            }
+            PatternKind::Struct { path, fields } => {
+                let struct_name = path.last().cloned().unwrap_or_default();
+                // Plain user struct: GEP into each field by name-resolved
+                // index. Enum struct-variants would also reach here, but
+                // those require tag-aware payload routing — defer to the
+                // value-source path until slice 3c.
+                let Some(field_names) = self.struct_field_names.get(&struct_name).cloned() else {
+                    return Ok(None);
+                };
+                let Some(&struct_ty) = self.struct_types.get(&struct_name) else {
+                    return Ok(None);
+                };
+                if struct_ty != pointee_ty {
+                    return Ok(None);
+                }
+                for field_pat in fields {
+                    let Some(idx) = field_names.iter().position(|n| n == &field_pat.name) else {
+                        continue;
+                    };
+                    let field_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            struct_ty,
+                            scrut_ptr,
+                            idx as u32,
+                            &format!("{}.fld.{}.ptr", struct_name, field_pat.name),
+                        )
+                        .unwrap();
+                    let field_ty =
+                        struct_ty
+                            .get_field_type_at_index(idx as u32)
+                            .ok_or_else(|| {
+                                format!("field index {} out of range for {}", idx, struct_name)
+                            })?;
+                    if let Some(sub_pat) = &field_pat.pattern {
+                        // For nested destructure under a struct field,
+                        // recurse only when the sub-pattern is a Binding
+                        // / Wildcard (the GEP semantics compose). For
+                        // deeper structural sub-patterns under a ref
+                        // scrutinee, fall back to value-source: it
+                        // preserves correctness at the cost of the
+                        // copy-shim semantic for that sub-tree.
+                        match (&sub_pat.kind, field_ty) {
+                            (PatternKind::Wildcard, _) => {}
+                            (PatternKind::Binding(sub_name), _) => {
+                                // Same unit-variant guard.
+                                let variant_name = sub_name.rsplit('.').next().unwrap_or(sub_name);
+                                if self.enum_tag_for_variant(variant_name).is_some() {
+                                    continue;
+                                }
+                                self.emit_ref_leaf_binding_at_ptr(
+                                    sub_name,
+                                    field_ptr,
+                                    field_ty,
+                                    "fld.refshim",
+                                );
+                            }
+                            (_, BasicTypeEnum::StructType(field_struct_ty)) => {
+                                if let Some(()) = self.bind_pattern_values_via_ptr(
+                                    sub_pat,
+                                    field_ptr,
+                                    field_struct_ty,
+                                )? {
+                                    // ok
+                                } else {
+                                    return Ok(None);
+                                }
+                            }
+                            _ => return Ok(None),
+                        }
+                    } else {
+                        // Shorthand: bind field name as a ref leaf.
+                        self.emit_ref_leaf_binding_at_ptr(
+                            &field_pat.name,
+                            field_ptr,
+                            field_ty,
+                            "fld.refshim",
+                        );
+                    }
+                }
+                Ok(Some(()))
+            }
+            PatternKind::TupleVariant { path, patterns } => {
+                let variant_name = path.last().map(|s| s.as_str()).unwrap_or("");
+                // Locate the enum layout whose llvm_type matches the
+                // pointee (variant-name collisions across enums are
+                // disambiguated by struct identity, mirroring the
+                // value-source `TupleVariant` arm).
+                let Some((_enum_name, layout)) = self
+                    .enum_layouts
+                    .iter()
+                    .find(|(_, l)| l.tags.contains_key(variant_name) && l.llvm_type == pointee_ty)
+                    .or_else(|| {
+                        self.enum_layouts
+                            .iter()
+                            .find(|(_, l)| l.tags.contains_key(variant_name))
+                    })
+                    .map(|(n, l)| (n.clone(), l.clone()))
+                else {
+                    return Ok(None);
+                };
+                // Shared (heap) enums use a different pointee shape (the
+                // refcount header sits at index 0, tag at 1, payload at
+                // 2+). The current call site routes shared enums
+                // through the value-source path's heap-pointer branch;
+                // mirror that by falling back here.
+                if layout.is_shared {
+                    return Ok(None);
+                }
+                let offsets: Vec<(usize, usize)> = layout
+                    .field_word_offsets
+                    .get(variant_name)
+                    .cloned()
+                    .unwrap_or_else(|| (0..patterns.len()).map(|i| (i, 1)).collect());
+                for (i, sub_pat) in patterns.iter().enumerate() {
+                    let (start_word, num_words) = offsets.get(i).copied().unwrap_or((i, 1));
+                    let word_idx = (start_word + 1) as u32; // +1 for the tag word
+                    let field_ty = layout.llvm_type.get_field_type_at_index(word_idx).unwrap();
+                    // Multi-word source fields (aggregate payloads like
+                    // String / Vec / user struct that span >1 word) need
+                    // word-stream reconstruction — defer to the value-
+                    // source path for those. Single-word source fields
+                    // (primitive payloads — i64, bool, char) GEP cleanly
+                    // to the first payload word. Note: `Option`'s seeded
+                    // layout sets `num_words` to `option_payload_words`
+                    // (the cross-variant max, often 3), but the actual
+                    // payload of `Option[i64]` is one i64 — the layout's
+                    // wider `num_words` is an over-estimate for the
+                    // single-word use. Recognize this shape by checking
+                    // the sub-pattern (a leaf `Binding` / `Wildcard`)
+                    // and the first payload word's LLVM type (primitive
+                    // int / bool / float).
+                    let sub_is_leaf = matches!(
+                        sub_pat.kind,
+                        PatternKind::Binding(_) | PatternKind::Wildcard
+                    );
+                    let first_word_is_primitive = matches!(
+                        field_ty,
+                        BasicTypeEnum::IntType(_) | BasicTypeEnum::FloatType(_)
+                    );
+                    let ok_single_word = num_words == 1;
+                    let ok_padded_primitive =
+                        num_words > 1 && sub_is_leaf && first_word_is_primitive;
+                    if !ok_single_word && !ok_padded_primitive {
+                        return Ok(None);
+                    }
+                    let field_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            layout.llvm_type,
+                            scrut_ptr,
+                            word_idx,
+                            &format!("{}.pl.{}.ptr", variant_name, i),
+                        )
+                        .unwrap();
+                    match &sub_pat.kind {
+                        PatternKind::Wildcard => {}
+                        PatternKind::Binding(sub_name) => {
+                            let vn = sub_name.rsplit('.').next().unwrap_or(sub_name);
+                            if self.enum_tag_for_variant(vn).is_some() {
+                                continue;
+                            }
+                            self.emit_ref_leaf_binding_at_ptr(
+                                sub_name,
+                                field_ptr,
+                                field_ty,
+                                "pl.refshim",
+                            );
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                Ok(Some(()))
+            }
+            // Or-patterns, at-bindings, slice patterns, range patterns,
+            // and literals fall back to the value-source path. The
+            // value-source path under a ref scrutinee still produces
+            // the correct match-condition + copy-semantic binding (per
+            // slice 3a); slice 3b's pull-signal trigger names the
+            // shapes that need write-through, and the four shapes
+            // above don't appear in those triggers yet.
+            _ => Ok(None),
         }
     }
 

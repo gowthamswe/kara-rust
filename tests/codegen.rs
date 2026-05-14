@@ -10224,4 +10224,113 @@ fn main() {
             assert_eq!(out, "11\n");
         }
     }
+
+    // ── Slice 3b probe tests: mut-ref scrutinee write-through ──
+    //
+    // These tests assert that mutation through a `mut ref` leaf binding
+    // *propagates back* to the original scrutinee storage. Slice 3a's
+    // ref-shim aliases a copy — these tests will FAIL until slice 3b's
+    // GEP-into-scrutinee lowering lands. The probe converts the silent
+    // miscompile into a known-failing pin so the gap can't persist
+    // unnoticed.
+    //
+    // Each test follows the same shape: mutate via a `mut ref` arg
+    // inside a match arm under a `mut ref` scrutinee, then observe the
+    // scrutinee's state from the outer scope. If the shim's copy
+    // semantics dominate, the outer observation reads the pre-mutation
+    // value (test fails). If true GEP aliasing is in place, the outer
+    // observation reads the post-mutation value (test passes).
+
+    #[test]
+    fn test_e2e_match_mut_ref_struct_field_write_through_propagates() {
+        // The match arm returns `set_to`'s i64 (Kara represents unit as
+        // i64 zero), so the match-as-statement form would trip an
+        // unrelated "non-void return in void function" codegen bug.
+        // Returning the propagation result through the function value
+        // sidesteps that orthogonal gap and isolates the write-through
+        // semantic this test is probing.
+        let out = run_program(
+            r#"
+struct Bag { n: i64 }
+fn set_to(n: mut ref i64, v: i64) -> i64 { *n = v; v }
+fn mutate(b: mut ref Bag) -> i64 {
+    match b {
+        Bag { n } => set_to(n, 99),
+    }
+}
+fn main() {
+    let mut b = Bag { n: 10 };
+    let _ = mutate(b);
+    println(b.n);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "99\n",
+                "mut-ref scrutinee leaf binding must write through to scrutinee storage"
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_match_mut_ref_option_payload_write_through_propagates() {
+        // Tuple-variant payload: under `mut ref Option[i64]`, the
+        // `Option.Some(n)` binding `n` should be `mut ref i64` aliasing
+        // the Some-payload's storage.
+        let out = run_program(
+            r#"
+fn set_to(n: mut ref i64, v: i64) -> i64 { *n = v; v }
+fn mutate(opt: mut ref Option[i64]) -> i64 {
+    match opt {
+        Option.Some(n) => set_to(n, 42),
+        Option.None => 0,
+    }
+}
+fn main() {
+    let mut opt = Option.Some(7);
+    let _ = mutate(opt);
+    match opt {
+        Option.Some(v) => println(v),
+        Option.None => println(-1),
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "42\n",
+                "mut-ref Option payload binding must write through to scrutinee storage"
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_match_mut_ref_struct_two_fields_independent_write_through() {
+        // Two leaf bindings under the same scrutinee: each should alias
+        // its own field independently.
+        let out = run_program(
+            r#"
+struct Pair { a: i64, b: i64 }
+fn set_to(n: mut ref i64, v: i64) -> i64 { *n = v; v }
+fn mutate(p: mut ref Pair) -> i64 {
+    match p {
+        Pair { a, b } => set_to(a, 100) + set_to(b, 200),
+    }
+}
+fn main() {
+    let mut p = Pair { a: 1, b: 2 };
+    let _ = mutate(p);
+    println(p.a);
+    println(p.b);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "100\n200\n",
+                "two mut-ref leaf bindings must each write through to their own field"
+            );
+        }
+    }
 }
