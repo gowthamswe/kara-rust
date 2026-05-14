@@ -701,6 +701,27 @@ enum CleanupAction<'ctx> {
         /// that type.
         drop_fn: FunctionValue<'ctx>,
     },
+    /// Run a per-struct drop function on a non-shared struct alloca at
+    /// scope exit. The drop fn is synthesized once per struct type via
+    /// `emit_struct_drop_synthesis` (one `__karac_drop_struct_<Name>`
+    /// symbol per struct with at least one heap-owning field — Vec /
+    /// String / Map / Set). The function takes `*mut StructTy` and
+    /// frees each heap-owning field's content:
+    ///   - Vec / String field → free `(field).data` when `cap > 0`
+    ///   - Map / Set field → call `karac_map_free_with_drop_vec` /
+    ///     `karac_map_free` per the field's key/val heap-ness
+    /// Structs whose every field is primitive don't get a drop fn
+    /// emitted and don't reach this cleanup variant. Closes the
+    /// 2026-05-14 leak class for `struct { v: Vec[i64] }` /
+    /// `struct { cache: Map[String, V] }` / `Vec[Container]` shapes
+    /// (slice γ of the recursive-drop work).
+    StructDrop {
+        /// Alloca holding the struct value (`StructTy` directly, not
+        /// a pointer to it).
+        struct_alloca: PointerValue<'ctx>,
+        /// Cached `__karac_drop_struct_<Name>` function.
+        drop_fn: FunctionValue<'ctx>,
+    },
 }
 
 /// One let-binding hoisted out of an auto-par group via the slice-A return-
@@ -952,6 +973,15 @@ struct Codegen<'ctx> {
     /// reused across all registration sites for that type. Mirrors the
     /// existing `display_fn_cache` / `clone_fn_cache` lazy-synth pattern.
     enum_drop_fns: HashMap<String, FunctionValue<'ctx>>,
+    /// Per-struct lazy drop-fn cache (struct name → `__karac_drop_struct_<Name>`
+    /// `FunctionValue`). Lazily populated by `emit_struct_drop_synthesis` on
+    /// first registration of a non-shared struct binding via `track_struct_var`.
+    /// One drop fn per struct type; reused across registration sites. Mirrors
+    /// `enum_drop_fns`. The drop fn walks fields and frees Vec/String data
+    /// buffers + invokes `karac_map_free` on Map/Set handle fields. Structs
+    /// with no heap-owning fields don't get an entry (the synthesis fn returns
+    /// `None`) and don't reach `CleanupAction::StructDrop`.
+    struct_drop_fns: HashMap<String, FunctionValue<'ctx>>,
     /// Cross-error-type conversion targets at `?` sites — populated from
     /// `Program.question_conversions` (set by the lowering pass from the
     /// typechecker's `question_conversions` map). Key: `(span.offset,
@@ -1745,6 +1775,7 @@ impl<'ctx> Codegen<'ctx> {
             scope_cleanup_actions: Vec::new(),
             pattern_binding_is_borrow: false,
             enum_drop_fns: HashMap::new(),
+            struct_drop_fns: HashMap::new(),
             question_conversions: HashMap::new(),
             callee_effectful: HashMap::new(),
             method_callee_types: HashMap::new(),
@@ -2990,6 +3021,35 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Track a non-shared struct alloca for scope-exit drop-fn invocation.
+    /// Mirrors `track_enum_var` but for struct types. The per-struct drop
+    /// fn is lazily synthesized by `emit_struct_drop_synthesis`; if the
+    /// struct has no heap-owning fields (every field is primitive / Slice
+    /// / Ref / etc.) the synthesis returns `None` and we skip registration
+    /// — there's nothing to drop. Shared structs use the RC machinery
+    /// (`track_rc_var` / `emit_refcount_dec`) and are also filtered out by
+    /// `emit_struct_drop_synthesis`.
+    ///
+    /// Closes the 2026-05-14 leak class for `struct Holder { v: Vec[i64] }`
+    /// / `struct Cache { entries: Map[String, V] }` / `Vec[Container]`
+    /// (slice γ of the recursive-drop work). Without this, a let-binding
+    /// of a struct value never drops its Vec/Map/Set field contents on
+    /// scope exit — only the struct's own inline storage (the
+    /// `{ptr, len, cap}` field for a Vec field) was released, the actual
+    /// heap-allocated backing buffer leaked.
+    fn track_struct_var(&mut self, struct_name: &str, struct_alloca: PointerValue<'ctx>) {
+        let drop_fn = match self.emit_struct_drop_synthesis(struct_name) {
+            Some(f) => f,
+            None => return,
+        };
+        if let Some(frame) = self.scope_cleanup_actions.last_mut() {
+            frame.push(CleanupAction::StructDrop {
+                struct_alloca,
+                drop_fn,
+            });
+        }
+    }
+
     /// Emit all cleanup actions registered across all scope frames (for function exit).
     /// Iterates frames in reverse (innermost first) and within each frame in push order
     /// (consistent with how RAII destruction works in block-structured languages).
@@ -3282,6 +3342,14 @@ impl<'ctx> Codegen<'ctx> {
             } => {
                 self.builder
                     .build_call(*drop_fn, &[(*enum_alloca).into()], "")
+                    .unwrap();
+            }
+            CleanupAction::StructDrop {
+                struct_alloca,
+                drop_fn,
+            } => {
+                self.builder
+                    .build_call(*drop_fn, &[(*struct_alloca).into()], "")
                     .unwrap();
             }
         }
@@ -6060,6 +6128,26 @@ impl<'ctx> Codegen<'ctx> {
                         if let Some(slot) = self.variables.get(var_name.as_str()) {
                             let alloca = slot.ptr;
                             self.track_enum_var(&name, alloca);
+                        }
+                    }
+                }
+                // Slice γ (2026-05-14): track value-type struct bindings
+                // for scope-exit drop-fn invocation. Mirrors the enum
+                // tracking above. The drop fn frees per-field heap
+                // content (Vec/String data buffers, Map/Set handles).
+                // `track_struct_var` self-filters shared structs (those
+                // use RC) and structs with no heap-owning fields (the
+                // synthesis returns `None`, no IR bloat). Struct name
+                // is recovered from `var_type_names` populated by the
+                // explicit-annotation / struct-literal / fresh-call
+                // paths in `bind_pattern` / `compile_struct_init`.
+                if let PatternKind::Binding(var_name) = &pattern.kind {
+                    if let Some(struct_name) = self.var_type_names.get(var_name.as_str()).cloned() {
+                        if self.struct_types.contains_key(&struct_name) {
+                            if let Some(slot) = self.variables.get(var_name.as_str()) {
+                                let alloca = slot.ptr;
+                                self.track_struct_var(&struct_name, alloca);
+                            }
                         }
                     }
                 }
@@ -10756,6 +10844,210 @@ impl<'ctx> Codegen<'ctx> {
 
     /// TypeExpr-aware hash-fn wrapper. Dispatches tuples to a recursive
     /// composition (per-field hash + FNV tail-mix combine) and falls through
+    /// Synthesize (or fetch from cache) a per-struct drop function for a
+    /// non-shared user struct. Returns `None` when the struct has no
+    /// heap-owning fields (every field is primitive / Slice / Ref / etc.)
+    /// — in that case no cleanup is needed and `track_struct_var` skips
+    /// `CleanupAction::StructDrop` registration entirely. Otherwise emits
+    /// `__karac_drop_struct_<Name>(*mut StructTy)` once per struct type
+    /// (cached in `struct_drop_fns`) that iterates fields and frees:
+    ///
+    /// - **Vec / String fields** (`{ptr, len, cap}` layout): load `cap`,
+    ///   if > 0 free `(field).data`. Same shape as `FreeVecBuffer`'s
+    ///   inline cleanup, just GEP'd into the struct.
+    /// - **Map / Set handle fields** (single `ptr`): call
+    ///   `karac_map_free` (primitive K / V) or `karac_map_free_with_drop_vec`
+    ///   when the field's K or V is itself Vec/String. The drop fn does
+    ///   NOT have per-field-instance K/V type info — it conservatively
+    ///   routes every Map/Set field to `karac_map_free_with_drop_vec`
+    ///   with both flags set, which is correct (the runtime helper
+    ///   reads no key/value heap when the relevant size is 0 or the
+    ///   field's `cap == 0`).
+    ///
+    /// Limited to direct Vec/String/Map/Set fields. Nested-struct /
+    /// enum / Vec[Vec[T]] field types are NOT recursed in this slice
+    /// — that's slice δ's `emit_drop_fn_for_type` framework. Field
+    /// type identification uses `struct_field_type_names` (first path
+    /// segment of each field's source TypeExpr), so a field typed
+    /// `Vec[i64]` is detected by its first segment "Vec".
+    fn emit_struct_drop_synthesis(&mut self, struct_name: &str) -> Option<FunctionValue<'ctx>> {
+        if let Some(f) = self.struct_drop_fns.get(struct_name) {
+            return Some(*f);
+        }
+        // Shared structs use the RC machinery; their cleanup is via
+        // `track_rc_var` / `emit_refcount_dec`, not a synthesized
+        // per-value drop fn.
+        if self.shared_types.contains_key(struct_name) {
+            return None;
+        }
+        let st = *self.struct_types.get(struct_name)?;
+        let field_kinds = self.struct_field_type_names.get(struct_name)?.clone();
+
+        // Classify each field: Vec/String (vec-struct layout), Map/Set
+        // (single ptr handle), or no-cleanup. If every field is no-cleanup,
+        // skip emission entirely — `track_struct_var` will get `None`
+        // and skip the `StructDrop` cleanup action.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum FieldDrop {
+            None,
+            VecOrString,
+            MapOrSet,
+        }
+        let kinds: Vec<FieldDrop> = field_kinds
+            .iter()
+            .map(|opt_name| match opt_name.as_deref() {
+                Some("Vec") | Some("VecDeque") | Some("String") => FieldDrop::VecOrString,
+                Some("Map") | Some("HashMap") | Some("Set") | Some("HashSet") => {
+                    FieldDrop::MapOrSet
+                }
+                _ => FieldDrop::None,
+            })
+            .collect();
+        if kinds.iter().all(|k| *k == FieldDrop::None) {
+            return None;
+        }
+
+        let fn_name = format!("__karac_drop_struct_{struct_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            self.struct_drop_fns.insert(struct_name.to_string(), f);
+            return Some(f);
+        }
+
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let i32_t = self.context.i32_type();
+        let void_ty = self.context.void_type();
+        let vec_ty = self.vec_struct_type();
+
+        let saved_bb = self.builder.get_insert_block();
+
+        let drop_fn_ty = void_ty.fn_type(&[ptr_ty.into()], false);
+        let drop_fn = self
+            .module
+            .add_function(&fn_name, drop_fn_ty, Some(Linkage::Internal));
+        self.struct_drop_fns
+            .insert(struct_name.to_string(), drop_fn);
+
+        let entry_bb = self.context.append_basic_block(drop_fn, "entry");
+        self.builder.position_at_end(entry_bb);
+        let p_arg = drop_fn.get_nth_param(0).unwrap().into_pointer_value();
+
+        for (field_idx, kind) in kinds.iter().enumerate() {
+            match kind {
+                FieldDrop::None => {}
+                FieldDrop::VecOrString => {
+                    // GEP the Vec struct field within the parent struct.
+                    let field_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            st,
+                            p_arg,
+                            field_idx as u32,
+                            &format!("drop.field{field_idx}.p"),
+                        )
+                        .unwrap();
+                    // Load cap (Vec struct field index 2).
+                    let cap_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            vec_ty,
+                            field_ptr,
+                            2,
+                            &format!("drop.field{field_idx}.cap.p"),
+                        )
+                        .unwrap();
+                    let cap = self
+                        .builder
+                        .build_load(i64_t, cap_ptr, &format!("drop.field{field_idx}.cap"))
+                        .unwrap()
+                        .into_int_value();
+                    let zero = i64_t.const_int(0, false);
+                    let is_heap = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::UGT,
+                            cap,
+                            zero,
+                            &format!("drop.field{field_idx}.is_heap"),
+                        )
+                        .unwrap();
+                    let free_bb = self
+                        .context
+                        .append_basic_block(drop_fn, &format!("drop.field{field_idx}.free"));
+                    let skip_bb = self
+                        .context
+                        .append_basic_block(drop_fn, &format!("drop.field{field_idx}.skip"));
+                    self.builder
+                        .build_conditional_branch(is_heap, free_bb, skip_bb)
+                        .unwrap();
+                    self.builder.position_at_end(free_bb);
+                    let data_ptr_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            vec_ty,
+                            field_ptr,
+                            0,
+                            &format!("drop.field{field_idx}.data.p"),
+                        )
+                        .unwrap();
+                    let data = self
+                        .builder
+                        .build_load(ptr_ty, data_ptr_ptr, &format!("drop.field{field_idx}.data"))
+                        .unwrap()
+                        .into_pointer_value();
+                    self.builder
+                        .build_call(self.free_fn, &[data.into()], "")
+                        .unwrap();
+                    self.builder.build_unconditional_branch(skip_bb).unwrap();
+                    self.builder.position_at_end(skip_bb);
+                }
+                FieldDrop::MapOrSet => {
+                    // Map/Set field is a single opaque ptr stored inline.
+                    // Load the handle; if non-null, route to
+                    // `karac_map_free_with_drop_vec(handle, 1, 1)` —
+                    // conservatively drop both sides. The runtime helper
+                    // is a no-op for the side whose `cap == 0` or whose
+                    // `_size == 0`, so over-flagging is correctness-safe
+                    // even on `Map[i64, i64]` / `Set[i64]` fields (those
+                    // never had a `data` ptr to free; `cap == 0` skips
+                    // the free). When per-field K/V type info is wired
+                    // through (slice δ), tighten the flags to the
+                    // minimum needed.
+                    let field_ptr = self
+                        .builder
+                        .build_struct_gep(
+                            st,
+                            p_arg,
+                            field_idx as u32,
+                            &format!("drop.field{field_idx}.p"),
+                        )
+                        .unwrap();
+                    let handle = self
+                        .builder
+                        .build_load(ptr_ty, field_ptr, &format!("drop.field{field_idx}.handle"))
+                        .unwrap()
+                        .into_pointer_value();
+                    let one = i32_t.const_int(1, false);
+                    self.builder
+                        .build_call(
+                            self.karac_map_free_with_drop_vec_fn,
+                            &[handle.into(), one.into(), one.into()],
+                            "",
+                        )
+                        .unwrap();
+                }
+            }
+        }
+
+        self.builder.build_return(None).unwrap();
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        Some(drop_fn)
+    }
+
     /// to the primitive `emit_hash_fn_for_type` path for everything else.
     ///
     /// Cache key is the mangled type name (`Self::mangled_type_name`), so a
@@ -16322,23 +16614,67 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::Identifier(n) => n.as_str(),
             _ => return,
         };
-        // Only zero the cap when the source binding is a tracked
-        // Vec/String — its slot has the {ptr, len, cap} shape.
-        if !self.vec_elem_types.contains_key(var_name) {
-            return;
-        }
         let slot = match self.variables.get(var_name) {
             Some(s) => *s,
             None => return,
         };
         let vec_ty = self.vec_struct_type();
         let i64_t = self.context.i64_type();
-        if let Ok(cap_ptr) = self
-            .builder
-            .build_struct_gep(vec_ty, slot.ptr, 2, "move.cap.p")
-        {
-            let zero = i64_t.const_int(0, false);
-            let _ = self.builder.build_store(cap_ptr, zero);
+        // Vec / String binding: zero the source's `cap` so the source's
+        // `FreeVecBuffer` cleanup's `cap > 0` guard skips. The consumer
+        // now owns the buffer.
+        if self.vec_elem_types.contains_key(var_name) {
+            if let Ok(cap_ptr) = self
+                .builder
+                .build_struct_gep(vec_ty, slot.ptr, 2, "move.cap.p")
+            {
+                let zero = i64_t.const_int(0, false);
+                let _ = self.builder.build_store(cap_ptr, zero);
+            }
+            return;
+        }
+        // Struct binding (slice γ, 2026-05-14): when the source is a
+        // tracked non-shared struct, walk its fields and zero each
+        // Vec/String field's `cap`. The struct's `StructDrop` cleanup
+        // will then no-op on each freed field — the consumer (caller
+        // / new binding / struct constructor) now owns the heap content.
+        // Without this, returning a struct-with-Vec from a function
+        // double-frees the inner buffer against the caller's own
+        // tracked-struct cleanup. Map/Set field handles are NOT zeroed
+        // by this helper today — they need a `null`-marker convention
+        // through `karac_map_free` to no-op, which would be a separate
+        // runtime change (filed under slice δ as the per-field K/V
+        // type-info-aware drop work).
+        if let Some(type_name) = self.var_type_names.get(var_name).cloned() {
+            if let Some(&st) = self.struct_types.get(&type_name) {
+                if let Some(field_names) = self.struct_field_type_names.get(&type_name) {
+                    for (i, opt_name) in field_names.iter().enumerate() {
+                        let is_vec_field = matches!(
+                            opt_name.as_deref(),
+                            Some("Vec") | Some("VecDeque") | Some("String")
+                        );
+                        if !is_vec_field {
+                            continue;
+                        }
+                        if let Ok(field_ptr) = self.builder.build_struct_gep(
+                            st,
+                            slot.ptr,
+                            i as u32,
+                            &format!("move.field{i}.p"),
+                        ) {
+                            if let Ok(cap_ptr) = self.builder.build_struct_gep(
+                                vec_ty,
+                                field_ptr,
+                                2,
+                                &format!("move.field{i}.cap.p"),
+                            ) {
+                                let zero = i64_t.const_int(0, false);
+                                let _ = self.builder.build_store(cap_ptr, zero);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

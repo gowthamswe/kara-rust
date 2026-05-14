@@ -1291,4 +1291,140 @@ fn main() {
             "map_string_keys_vec_values_no_leak",
         );
     }
+
+    // ── Struct field drop synthesis (2026-05-14, slice γ) ────────
+    // `track_struct_var` + `emit_struct_drop_synthesis` emit a per-struct
+    // `__karac_drop_struct_<Name>` function that frees each heap-owning
+    // field's content on scope exit. Vec / String fields free their data
+    // buffer (`cap > 0` guard); Map / Set fields call
+    // `karac_map_free_with_drop_vec`. The move-aware
+    // `suppress_source_vec_cleanup_for_arg` is extended for struct
+    // identifiers — walks fields and zeros each Vec/String field's `cap`
+    // — so `return h` / `let g = h` / `consume(h)` don't double-free
+    // the inner buffer against the consumer's own tracking.
+
+    #[test]
+    fn asan_struct_with_vec_field_freed_on_scope_exit() {
+        // Struct with Vec field — the canonical "compose a heap-owning
+        // type into a value-type wrapper" pattern. Pre-fix the struct
+        // had no scope-exit drop, so the inner Vec's data buffer leaked
+        // when h went out of scope.
+        assert_clean_asan_run(
+            r#"
+struct Holder { v: Vec[i64] }
+fn build() -> i64 {
+    let mut inner: Vec[i64] = Vec.new();
+    inner.push(1i64);
+    inner.push(2i64);
+    inner.push(3i64);
+    let h: Holder = Holder { v: inner };
+    42i64
+}
+fn main() {
+    let mut s = 0i64;
+    let mut i = 0i64;
+    while i < 10 {
+        s = s + build();
+        i = i + 1;
+    }
+    println(s);
+}
+"#,
+            &["420"],
+            "struct_with_vec_field_freed_on_scope_exit",
+        );
+    }
+
+    #[test]
+    fn asan_struct_with_vec_field_returned_no_double_free() {
+        // `return h` where h has a Vec field — the move-aware suppress
+        // in `suppress_source_vec_cleanup_for_arg` must walk h's fields
+        // and zero each Vec field's cap so the function-end StructDrop
+        // is a no-op for the returned value (the caller now owns it
+        // and will run its own StructDrop). Pre-suppress, this
+        // double-freed and SIGABRTed / hung on macOS allocator.
+        assert_clean_asan_run(
+            r#"
+struct Holder { v: Vec[i64] }
+fn build() -> Holder {
+    let mut inner: Vec[i64] = Vec.new();
+    inner.push(1i64);
+    inner.push(2i64);
+    let h: Holder = Holder { v: inner };
+    h
+}
+fn first_elem(h: Holder) -> i64 {
+    let inner = h.v;
+    inner[0]
+}
+fn main() {
+    let h = build();
+    let f = first_elem(h);
+    println(f);
+}
+"#,
+            &["1"],
+            "struct_with_vec_field_returned_no_double_free",
+        );
+    }
+
+    #[test]
+    fn asan_struct_with_string_field_freed_on_scope_exit() {
+        // String is layout-equivalent to Vec[u8] (`{ptr, len, cap}`)
+        // and is treated identically by the struct-drop synthesis.
+        assert_clean_asan_run(
+            r#"
+struct Named { name: String }
+fn build() -> i64 {
+    let mut s = String.new();
+    s.push_str("hello");
+    let n: Named = Named { name: s };
+    99i64
+}
+fn main() {
+    let mut sum = 0i64;
+    let mut i = 0i64;
+    while i < 5 {
+        sum = sum + build();
+        i = i + 1;
+    }
+    println(sum);
+}
+"#,
+            &["495"],
+            "struct_with_string_field_freed_on_scope_exit",
+        );
+    }
+
+    #[test]
+    fn asan_struct_with_multiple_vec_fields_freed_on_scope_exit() {
+        // Two Vec fields in one struct — verifies the per-field loop
+        // in `emit_struct_drop_synthesis` correctly emits cleanup for
+        // both, not just the first.
+        assert_clean_asan_run(
+            r#"
+struct Pair { a: Vec[i64], b: Vec[i64] }
+fn build() -> i64 {
+    let mut x: Vec[i64] = Vec.new();
+    x.push(10i64);
+    let mut y: Vec[i64] = Vec.new();
+    y.push(20i64);
+    y.push(30i64);
+    let p: Pair = Pair { a: x, b: y };
+    0i64
+}
+fn main() {
+    let mut s = 0i64;
+    let mut i = 0i64;
+    while i < 5 {
+        s = s + build();
+        i = i + 1;
+    }
+    println(s);
+}
+"#,
+            &["0"],
+            "struct_with_multiple_vec_fields_freed_on_scope_exit",
+        );
+    }
 }
