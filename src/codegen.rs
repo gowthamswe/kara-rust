@@ -710,6 +710,7 @@ enum CleanupAction<'ctx> {
     ///   - Vec / String field → free `(field).data` when `cap > 0`
     ///   - Map / Set field → call `karac_map_free_with_drop_vec` /
     ///     `karac_map_free` per the field's key/val heap-ness
+    ///
     /// Structs whose every field is primitive don't get a drop fn
     /// emitted and don't reach this cleanup variant. Closes the
     /// 2026-05-14 leak class for `struct { v: Vec[i64] }` /
@@ -4149,45 +4150,57 @@ impl<'ctx> Codegen<'ctx> {
 
     fn declare_extern_functions(&mut self, program: &Program) -> Result<(), String> {
         for item in &program.items {
-            if let Item::ExternFunction(ext) = item {
-                let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = ext
-                    .params
-                    .iter()
-                    .map(|p| BasicMetadataTypeEnum::from(self.llvm_type_for_type_expr(&p.ty)))
-                    .collect();
-
-                let fn_type = match ext.return_type.as_ref().and_then(|ty| match &ty.kind {
-                    TypeKind::Path(path) => {
-                        let name = path.segments.first().map(|s| s.as_str()).unwrap_or("");
-                        if name.is_empty() {
-                            None
-                        } else {
-                            Some(self.llvm_type_for_name(name))
+            match item {
+                Item::ExternFunction(ext) => self.declare_one_extern_function(ext),
+                Item::ExternBlock(b) => {
+                    for it in &b.items {
+                        match it {
+                            ExternItem::Function(ext) => self.declare_one_extern_function(ext),
                         }
                     }
-                    TypeKind::Tuple(elems) if elems.is_empty() => None,
-                    _ => Some(self.llvm_type_for_type_expr(ty)),
-                }) {
-                    Some(BasicTypeEnum::IntType(t)) => t.fn_type(&param_types, false),
-                    Some(BasicTypeEnum::FloatType(t)) => t.fn_type(&param_types, false),
-                    Some(BasicTypeEnum::PointerType(t)) => t.fn_type(&param_types, false),
-                    Some(BasicTypeEnum::StructType(t)) => t.fn_type(&param_types, false),
-                    Some(BasicTypeEnum::ArrayType(t)) => t.fn_type(&param_types, false),
-                    Some(BasicTypeEnum::VectorType(t)) => t.fn_type(&param_types, false),
-                    Some(BasicTypeEnum::ScalableVectorType(_)) | None => {
-                        self.context.void_type().fn_type(&param_types, false)
-                    }
-                };
-
-                let fn_val = self
-                    .module
-                    .add_function(&ext.name, fn_type, Some(Linkage::External));
-                // `#[link_section]`, `#[no_mangle]`, `#[used]` attached to
-                // an `extern` declaration apply to the symbol as imported.
-                self.apply_linker_attrs(fn_val, &ext.attributes);
+                }
+                _ => {}
             }
         }
         Ok(())
+    }
+
+    fn declare_one_extern_function(&mut self, ext: &ExternFunction) {
+        let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = ext
+            .params
+            .iter()
+            .map(|p| BasicMetadataTypeEnum::from(self.llvm_type_for_type_expr(&p.ty)))
+            .collect();
+
+        let fn_type = match ext.return_type.as_ref().and_then(|ty| match &ty.kind {
+            TypeKind::Path(path) => {
+                let name = path.segments.first().map(|s| s.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(self.llvm_type_for_name(name))
+                }
+            }
+            TypeKind::Tuple(elems) if elems.is_empty() => None,
+            _ => Some(self.llvm_type_for_type_expr(ty)),
+        }) {
+            Some(BasicTypeEnum::IntType(t)) => t.fn_type(&param_types, false),
+            Some(BasicTypeEnum::FloatType(t)) => t.fn_type(&param_types, false),
+            Some(BasicTypeEnum::PointerType(t)) => t.fn_type(&param_types, false),
+            Some(BasicTypeEnum::StructType(t)) => t.fn_type(&param_types, false),
+            Some(BasicTypeEnum::ArrayType(t)) => t.fn_type(&param_types, false),
+            Some(BasicTypeEnum::VectorType(t)) => t.fn_type(&param_types, false),
+            Some(BasicTypeEnum::ScalableVectorType(_)) | None => {
+                self.context.void_type().fn_type(&param_types, false)
+            }
+        };
+
+        let fn_val = self
+            .module
+            .add_function(&ext.name, fn_type, Some(Linkage::External));
+        // `#[link_section]`, `#[no_mangle]`, `#[used]` attached to an
+        // `extern` declaration apply to the symbol as imported.
+        self.apply_linker_attrs(fn_val, &ext.attributes);
     }
 
     // ── Program / function compilation ───────────────────────────

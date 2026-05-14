@@ -532,6 +532,13 @@ fn module_top_level_names_for_id(tree: &ProgramTree, id: ModuleId) -> Vec<String
             Item::TypeAlias(t) => names.push(t.name.clone()),
             Item::DistinctType(d) => names.push(d.name.clone()),
             Item::ExternFunction(e) => names.push(e.name.clone()),
+            Item::ExternBlock(b) => {
+                for it in &b.items {
+                    match it {
+                        ExternItem::Function(f) => names.push(f.name.clone()),
+                    }
+                }
+            }
             Item::EffectResource(r) => names.push(r.name.clone()),
             Item::EffectGroup(g) => names.push(g.name.clone()),
             Item::EffectVerbDecl(v) => names.push(v.verb_name.clone()),
@@ -754,6 +761,13 @@ impl<'a> Resolver<'a> {
                 Item::UseDecl(u) => self.collect_use(u),
                 Item::Import(i) => self.collect_import(i),
                 Item::ExternFunction(e) => self.collect_extern_function(e),
+                Item::ExternBlock(b) => {
+                    for it in &b.items {
+                        match it {
+                            ExternItem::Function(f) => self.collect_extern_function(f),
+                        }
+                    }
+                }
                 Item::DistinctType(d) => self.collect_distinct_type(d),
                 Item::LayoutDef(_) | Item::AliasDecl(_) | Item::IndependentDecl(_) => {}
             }
@@ -1546,6 +1560,13 @@ impl<'a> Resolver<'a> {
                 Item::ConstDecl(c) => self.resolve_const_decl(c),
                 Item::TypeAlias(t) => self.resolve_type_alias_def(t),
                 Item::ExternFunction(e) => self.resolve_extern_function(e),
+                Item::ExternBlock(b) => {
+                    for it in &b.items {
+                        match it {
+                            ExternItem::Function(f) => self.resolve_extern_function(f),
+                        }
+                    }
+                }
                 Item::EffectGroup(g) => self.resolve_effect_group_def(g),
                 _ => {}
             }

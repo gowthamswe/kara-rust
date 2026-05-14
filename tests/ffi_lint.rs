@@ -22,7 +22,7 @@ fn lint(source: &str) -> Vec<karac::ffi_lint::FfiFloatEqDiagnostic> {
 #[test]
 fn test_ffi_float_eq_direct_warns() {
     let diags = lint(
-        r#"extern "C" fn sin(x: f64) -> f64;
+        r#"unsafe extern "C" { fn sin(x: f64) -> f64; }
            fn f() { let _ok = sin(1.0) == 0.0; }"#,
     );
     assert_eq!(diags.len(), 1, "Expected 1 diagnostic, got: {:?}", diags);
@@ -33,7 +33,7 @@ fn test_ffi_float_eq_direct_warns() {
 #[test]
 fn test_ffi_float_ne_direct_warns() {
     let diags = lint(
-        r#"extern "C" fn cos(x: f64) -> f64;
+        r#"unsafe extern "C" { fn cos(x: f64) -> f64; }
            fn f() { let _ok = cos(0.0) != 1.0; }"#,
     );
     assert_eq!(diags.len(), 1, "Expected 1 diagnostic, got: {:?}", diags);
@@ -43,7 +43,7 @@ fn test_ffi_float_ne_direct_warns() {
 #[test]
 fn test_ffi_non_float_no_warn() {
     let diags = lint(
-        r#"extern "C" fn strlen(s: *const u8) -> i64;
+        r#"unsafe extern "C" { fn strlen(s: *const u8) -> i64; }
            fn f() { let _ok = strlen(0 as *const u8) == 0; }"#,
     );
     assert!(
@@ -68,7 +68,7 @@ fn test_regular_float_comparison_no_warn() {
 fn test_ffi_float_eq_rhs_warns() {
     // FFI float on the right side of ==
     let diags = lint(
-        r#"extern "C" fn get_pi() -> f32;
+        r#"unsafe extern "C" { fn get_pi() -> f32; }
            fn f() { let _ok = 3.14 == get_pi(); }"#,
     );
     assert_eq!(
@@ -84,7 +84,7 @@ fn test_ffi_float_eq_rhs_warns() {
 fn test_ffi_float_less_than_no_warn() {
     // Only == and != are flagged; < is fine
     let diags = lint(
-        r#"extern "C" fn norm(x: f64) -> f64;
+        r#"unsafe extern "C" { fn norm(x: f64) -> f64; }
            fn f() { let _ok = norm(1.0) < 0.001; }"#,
     );
     assert!(

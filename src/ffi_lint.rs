@@ -10,7 +10,10 @@
 //! FPU registers or ABI differences; equality comparison is almost always
 //! unintentional. Use an epsilon comparison instead.
 
-use crate::ast::{BinOp, Block, Expr, ExprKind, Item, MatchArm, Program, Stmt, StmtKind, TypeKind};
+use crate::ast::{
+    BinOp, Block, Expr, ExprKind, ExternFunction, ExternItem, Item, MatchArm, Program, Stmt,
+    StmtKind, TypeKind,
+};
 use crate::token::Span;
 
 #[derive(Debug, Clone)]
@@ -48,15 +51,27 @@ pub fn check_ffi_float_eq(program: &Program) -> Vec<FfiFloatEqDiagnostic> {
 fn collect_ffi_float_fns(program: &Program) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     for item in &program.items {
-        if let Item::ExternFunction(ef) = item {
-            if let Some(ret) = &ef.return_type {
-                if is_float_typexpr(ret) {
-                    set.insert(ef.name.clone());
+        match item {
+            Item::ExternFunction(ef) => record_if_float_return(ef, &mut set),
+            Item::ExternBlock(b) => {
+                for it in &b.items {
+                    match it {
+                        ExternItem::Function(ef) => record_if_float_return(ef, &mut set),
+                    }
                 }
             }
+            _ => {}
         }
     }
     set
+}
+
+fn record_if_float_return(ef: &ExternFunction, set: &mut std::collections::HashSet<String>) {
+    if let Some(ret) = &ef.return_type {
+        if is_float_typexpr(ret) {
+            set.insert(ef.name.clone());
+        }
+    }
 }
 
 fn is_float_typexpr(ty: &crate::ast::TypeExpr) -> bool {

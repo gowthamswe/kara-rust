@@ -211,7 +211,7 @@ impl Parser {
 
         match self.peek_token() {
             Token::Fn => Some(Item::Function(
-                self.parse_function(attributes, is_pub, is_private)?,
+                self.parse_function(attributes, is_pub, is_private, false)?,
             )),
             Token::Struct => Some(Item::StructDef(
                 self.parse_struct_def(attributes, is_pub, is_private, false)?,
@@ -277,9 +277,50 @@ impl Parser {
                 let decl = self.parse_independent_decl()?;
                 Some(Item::IndependentDecl(decl))
             }
+            Token::Unsafe => {
+                // `unsafe` at module scope prefixes one of:
+                //   - `unsafe extern "ABI" { ... }` block (FFI trust boundary)
+                //   - `unsafe fn name(...) { ... }` (declaration-side
+                //     precondition: callers must wrap calls to this fn in
+                //     `unsafe { ... }` per the `unsafe_op_in_unsafe_fn`
+                //     rule, which also requires unsafe ops INSIDE the
+                //     body to be wrapped even when the outer fn is
+                //     `unsafe fn`)
+                // Dispatch is by lookahead at the token after `unsafe`.
+                match self.peek_token_at(1) {
+                    Token::Extern => {
+                        let decl =
+                            self.parse_unsafe_extern_block(attributes, is_pub, is_private)?;
+                        Some(Item::ExternBlock(decl))
+                    }
+                    Token::Fn => {
+                        self.advance(); // consume `unsafe`
+                        Some(Item::Function(
+                            self.parse_function(attributes, is_pub, is_private, true)?,
+                        ))
+                    }
+                    _ => {
+                        self.error(
+                            "expected `extern` or `fn` after `unsafe` at module scope — \
+                             `unsafe` may only prefix an `unsafe extern \"ABI\" { ... }` \
+                             block or an `unsafe fn` declaration.",
+                        );
+                        self.advance(); // consume `unsafe` for recovery
+                        None
+                    }
+                }
+            }
             Token::Extern => {
-                let decl = self.parse_extern_function(attributes, is_pub, is_private)?;
-                Some(Item::ExternFunction(decl))
+                // Bare module-scope `extern "C" fn name(...);` and `extern "C"
+                // { ... }` are no longer accepted — foreign imports must live
+                // inside an `unsafe extern "ABI" { ... }` block (the trust
+                // boundary the programmer asserts at). Definitions with a
+                // body (`pub extern "C" fn name() { ... }`) are a separate
+                // form and keep their own parsing path (not yet implemented
+                // in v1; tracked at design.md § FFI > "Definitions are not
+                // affected").
+                self.error_bare_extern_at_module_scope();
+                None
             }
             Token::Distinct => {
                 let def = self.parse_distinct_type(attributes, is_pub, is_private)?;
@@ -305,6 +346,7 @@ impl Parser {
         attributes: Vec<Attribute>,
         is_pub: bool,
         is_private: bool,
+        is_unsafe: bool,
     ) -> Option<Function> {
         let start = self.current_span();
         self.expect(&Token::Fn)?;
@@ -347,6 +389,7 @@ impl Parser {
             doc_comment,
             is_pub,
             is_private,
+            is_unsafe,
             name,
             generic_params,
             params,
@@ -1185,7 +1228,14 @@ impl Parser {
                 } else {
                     false
                 };
-                let method = self.parse_function(attrs, is_pub, is_private)?;
+                // Methods inherit `unsafe` from the impl-block context if
+                // ever added; for v1 there is no `unsafe impl` syntax and
+                // `unsafe fn` inside an impl block is captured by parsing
+                // `unsafe` directly before `fn`. Slice 1 only sees the
+                // module-scope `unsafe fn` path; impl-method `unsafe fn`
+                // parses at the impl-method level (carry-forward to a
+                // sub-slice when needed).
+                let method = self.parse_function(attrs, is_pub, is_private, false)?;
                 items.push(ImplItem::Method(Box::new(method)));
             }
         }
@@ -1814,15 +1864,49 @@ impl Parser {
         })
     }
 
-    // ── Extern Functions ─────────────────────────────────────────
+    // ── Extern Functions (FFI) ───────────────────────────────────
 
-    fn parse_extern_function(
+    /// Parse an `unsafe extern "ABI" { ... }` block at module scope.
+    /// The leading `unsafe` keyword has not yet been consumed; the
+    /// `pending_doc` slot holds any `///` lines that preceded the
+    /// block. `attributes` is the set of `#[...]` / `@...` attributes
+    /// the caller already parsed (block-level attributes — these
+    /// pre-merge into every contained item).
+    fn parse_unsafe_extern_block(
         &mut self,
-        attributes: Vec<Attribute>,
+        block_attributes: Vec<Attribute>,
         is_pub: bool,
         is_private: bool,
-    ) -> Option<ExternFunction> {
+    ) -> Option<ExternBlock> {
         let start = self.current_span();
+        // Capture the block's own doc-comment before we descend.
+        let block_doc = self.take_pending_doc();
+
+        self.expect(&Token::Unsafe)?;
+
+        // `unsafe` at module scope is only valid as the block-header
+        // prefix for `unsafe extern "ABI" { ... }`. Any other shape
+        // (`unsafe fn`, `unsafe { ... }` at module scope, etc.) is
+        // rejected here with a focused diagnostic.
+        if !self.check(&Token::Extern) {
+            self.error(
+                "expected `extern` after `unsafe` at module scope — \
+                 `unsafe` at module scope is only valid as the prefix \
+                 of an `unsafe extern \"ABI\" { ... }` block. \
+                 See design.md § FFI > `unsafe extern { ... }` block requirement.",
+            );
+            return None;
+        }
+
+        if is_pub || is_private {
+            self.error(
+                "visibility (`pub`/`private`) on an `unsafe extern { ... }` \
+                 block is not meaningful — apply visibility to each item \
+                 inside the block instead.",
+            );
+            // continue parsing for better error recovery
+        }
+
         self.expect(&Token::Extern)?;
 
         let abi = match self.peek_token() {
@@ -1832,22 +1916,67 @@ impl Parser {
                 s
             }
             _ => {
-                self.error("Expected ABI string (e.g., \"C\") after 'extern'");
+                self.error("expected ABI string (e.g., \"C\") after `extern`");
                 return None;
             }
         };
 
+        self.expect(&Token::LeftBrace)?;
+
+        let mut items = Vec::new();
+        while !self.check(&Token::RightBrace) && !self.is_at_end() {
+            let item = self.parse_extern_block_item_fn(&abi, &block_attributes)?;
+            items.push(ExternItem::Function(item));
+        }
+        self.expect(&Token::RightBrace)?;
+
+        Some(ExternBlock {
+            span: self.span_from(&start),
+            attributes: block_attributes,
+            doc_comment: block_doc,
+            abi,
+            items,
+        })
+    }
+
+    /// Parse a single `fn name(...) -> T effects;` item *inside* an
+    /// `unsafe extern { ... }` block. `block_abi` and `block_attributes`
+    /// come from the enclosing block; the block's attributes are
+    /// pre-merged into the item's `attributes` so downstream phases
+    /// (which today read only the item's own attribute set) see the
+    /// effective union without needing a block-aware code path.
+    fn parse_extern_block_item_fn(
+        &mut self,
+        block_abi: &str,
+        block_attributes: &[Attribute],
+    ) -> Option<ExternFunction> {
+        let start = self.current_span();
+
+        // Per-item leading doc + attributes (in addition to block-level).
+        self.collect_leading_doc_comments();
+        let per_item_attrs = self.parse_attributes();
+        let mut attributes = block_attributes.to_vec();
+        attributes.extend(per_item_attrs);
+
+        let is_pub = self.eat(&Token::Pub);
+        let is_private = if !is_pub {
+            self.eat(&Token::Private)
+        } else {
+            false
+        };
+
         self.expect(&Token::Fn)?;
         let name = self.expect_identifier()?;
-        // Skip naming check when `#[kara_name]` is present — the C-side name is
-        // the canonical identifier; the Kara binding name is whatever the user wants.
+        // Skip naming check when `#[kara_name]` is present — the C-side
+        // name is the canonical identifier; the Kāra binding name is
+        // whatever the user wants.
         if !attributes.iter().any(|a| a.name == "kara_name") {
             let name_span = self.span_from(&start);
             self.check_ident_class(&name, IdentClass::Value, "extern function", name_span);
         }
-        // Take the item-level doc *before* descending into the param list —
-        // per-param doc collection inside `parse_param` would otherwise
-        // overwrite it.
+        // Take the item-level doc *before* descending into the param
+        // list — per-param doc collection inside `parse_param` would
+        // otherwise overwrite it.
         let doc_comment = self.take_pending_doc();
         self.expect(&Token::LeftParen)?;
 
@@ -1877,12 +2006,59 @@ impl Parser {
             doc_comment,
             is_pub,
             is_private,
-            abi,
+            abi: block_abi.to_string(),
             name,
             params,
             return_type,
             effects,
         })
+    }
+
+    /// Diagnostic for bare module-scope `extern "ABI" fn ...;` and
+    /// `extern "ABI" { ... }` (no `unsafe` keyword). Foreign-import
+    /// declarations must live inside an `unsafe extern "ABI" { ... }`
+    /// block per design.md § FFI > `unsafe extern { ... }` block
+    /// requirement. After emitting, the parser swallows the offending
+    /// declaration end-to-end (up to and including the next `;` or
+    /// balanced `{ }` body) so the error doesn't cascade into a
+    /// "missing brace" or "missing semicolon" follow-up.
+    fn error_bare_extern_at_module_scope(&mut self) {
+        self.error(
+            "bare `extern \"ABI\" ...` is not allowed at module scope. \
+             Foreign-import declarations must live inside an \
+             `unsafe extern \"ABI\" { ... }` block — the `unsafe` keyword \
+             marks the trust boundary at which the programmer asserts the \
+             foreign signature, ABI, and effect set faithfully describe the \
+             foreign symbol. See design.md § FFI > `unsafe extern { ... }` \
+             block requirement.",
+        );
+        // Recovery: consume tokens until we cleanly close the offending
+        // declaration. Two shapes to handle: `extern "ABI" fn ...;`
+        // (semicolon-terminated) and `extern "ABI" { ... }` (block).
+        self.advance(); // consume `extern`
+        let mut brace_depth = 0_i32;
+        while !self.is_at_end() {
+            match self.peek_token() {
+                Token::LeftBrace => {
+                    brace_depth += 1;
+                    self.advance();
+                }
+                Token::RightBrace => {
+                    self.advance();
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        return;
+                    }
+                }
+                Token::Semicolon if brace_depth == 0 => {
+                    self.advance();
+                    return;
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
     }
 
     // ── Type Aliases ─────────────────────────────────────────────

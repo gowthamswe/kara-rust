@@ -1522,10 +1522,13 @@ fn item_name(item: &crate::ast::Item) -> Option<&str> {
         // `AliasDecl` is an alias *declaration* (`alias L = R`), not a
         // type alias — its identity is the LHS name pair, not a single
         // shadowable identifier. Treat as anonymous for shadow purposes.
+        // `ExternBlock` groups N items under one trust-boundary header;
+        // there is no single shadowable identifier — treat as anonymous.
         Item::ImplBlock(_)
         | Item::UseDecl(_)
         | Item::Import(_)
         | Item::IndependentDecl(_)
+        | Item::ExternBlock(_)
         | Item::AliasDecl(_) => None,
     }
 }
@@ -1557,6 +1560,7 @@ fn item_span(item: &crate::ast::Item) -> &crate::token::Span {
         Item::UseDecl(u) => &u.span,
         Item::Import(i) => &i.span,
         Item::IndependentDecl(d) => &d.span,
+        Item::ExternBlock(b) => &b.span,
     }
 }
 

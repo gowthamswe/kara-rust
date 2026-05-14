@@ -218,6 +218,7 @@ impl Formatter {
                 ));
             }
             Item::ExternFunction(e) => self.format_extern_fn(e),
+            Item::ExternBlock(b) => self.format_extern_block(b),
             Item::TypeAlias(t) => self.format_type_alias(t),
             Item::DistinctType(d) => self.format_distinct_type(d),
         }
@@ -786,6 +787,49 @@ impl Formatter {
         self.write_indent();
         self.write_visibility(e.visibility());
         write!(self.output, "extern \"{}\" fn ", e.abi).unwrap();
+        self.write_ident(&e.name);
+        self.write_str("(");
+        for (i, p) in e.params.iter().enumerate() {
+            if i > 0 {
+                self.write_str(", ");
+            }
+            self.format_pattern(&p.pattern);
+            self.write_str(": ");
+            self.format_type_expr(&p.ty);
+        }
+        self.write_str(")");
+        if let Some(ref rt) = e.return_type {
+            self.write_str(" -> ");
+            self.format_type_expr(rt);
+        }
+        self.format_effects(&e.effects);
+        self.write_str(";\n");
+    }
+
+    fn format_extern_block(&mut self, b: &ExternBlock) {
+        // Block-level attributes are pre-merged into each child's
+        // `attributes` at parse time, so rendering them here would
+        // duplicate. Each item's attribute set already contains them;
+        // round-trip therefore desugars `#[noblock] unsafe extern { fn a; }`
+        // to `unsafe extern { #[noblock] fn a; }` — semantically equivalent.
+        self.write_indent();
+        writeln!(self.output, "unsafe extern \"{}\" {{", b.abi).unwrap();
+        self.indent += 1;
+        for item in &b.items {
+            match item {
+                ExternItem::Function(f) => self.format_extern_block_item_fn(f),
+            }
+        }
+        self.indent -= 1;
+        self.write_indent();
+        self.write_str("}\n");
+    }
+
+    fn format_extern_block_item_fn(&mut self, e: &ExternFunction) {
+        self.format_attributes(&e.attributes);
+        self.write_indent();
+        self.write_visibility(e.visibility());
+        self.write_str("fn ");
         self.write_ident(&e.name);
         self.write_str("(");
         for (i, p) in e.params.iter().enumerate() {

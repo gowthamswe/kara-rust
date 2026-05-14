@@ -678,107 +678,14 @@ impl<'a> EffectChecker<'a> {
                     self.function_visibility.insert(f.name.clone(), f.is_pub);
                     self.function_spans.insert(f.name.clone(), f.span.clone());
                 }
-                Item::ExternFunction(e) => {
-                    // ABI-keyed default effect set (trust-not-verify: extern has no body).
-                    // `extern "C"` → {blocks}; `extern "C-unwind"` → {blocks, panics}.
-                    // `@noblock` removes blocks from the default (e.g. a pure-CPU C++ fn).
-                    let builtin_span = Span {
-                        line: 0,
-                        column: 0,
-                        offset: 0,
-                        length: 0,
-                    };
-                    let has_noblock = e.attributes.iter().any(|a| a.name == "noblock");
-                    let mut abi_defaults = EffectSet::new();
-                    match e.abi.as_str() {
-                        "C" if !has_noblock => {
-                            abi_defaults.add(
-                                Effect {
-                                    verb: EffectVerbKind::Blocks,
-                                    resource: String::new(),
-                                },
-                                EffectOrigin::Direct(builtin_span.clone()),
-                            );
-                        }
-                        "C" => {}
-                        "C-unwind" => {
-                            if !has_noblock {
-                                abi_defaults.add(
-                                    Effect {
-                                        verb: EffectVerbKind::Blocks,
-                                        resource: String::new(),
-                                    },
-                                    EffectOrigin::Direct(builtin_span.clone()),
-                                );
-                            }
-                            // panics is always included for C-unwind (throws across FFI boundary).
-                            // @noblock cannot suppress panics.
-                            abi_defaults.add(
-                                Effect {
-                                    verb: EffectVerbKind::Panics,
-                                    resource: String::new(),
-                                },
-                                EffectOrigin::Direct(builtin_span),
-                            );
-                        }
-                        _ => {} // other ABIs: no defaults until implemented
-                    }
-
-                    // Parse programmer-supplied annotations, then union with ABI defaults.
-                    let programmer_decl = self.parse_effect_list(&e.effects);
-                    let final_decl = match &programmer_decl {
-                        DeclaredEffects::Polymorphic | DeclaredEffects::PolymorphicWithFixed(_) => {
-                            // Polymorphic extern: unusual but accepted; ABI defaults dropped.
-                            programmer_decl.clone()
-                        }
-                        DeclaredEffects::Explicit(prog_set) => {
-                            let mut merged = abi_defaults;
-                            for te in &prog_set.effects {
-                                merged.add(te.effect.clone(), te.origin.clone());
-                            }
-                            DeclaredEffects::Explicit(merged)
-                        }
-                        DeclaredEffects::None => {
-                            if abi_defaults.is_empty() {
-                                DeclaredEffects::None
-                            } else {
-                                DeclaredEffects::Explicit(abi_defaults)
+                Item::ExternFunction(e) => self.register_extern_function_effects(e),
+                Item::ExternBlock(b) => {
+                    for it in &b.items {
+                        match it {
+                            ExternItem::Function(e) => {
+                                self.register_extern_function_effects(e);
                             }
                         }
-                    };
-
-                    // Profile-compatibility check: reject effects forbidden by the
-                    // active compile profile at the extern declaration site.
-                    if let DeclaredEffects::Explicit(ref set) = final_decl {
-                        for te in &set.effects {
-                            if let Some(forbidden_reason) =
-                                self.profile_forbids(&te.effect, &e.name, &e.abi)
-                            {
-                                self.errors.push(EffectError {
-                                    message: forbidden_reason,
-                                    span: e.span.clone(),
-                                    kind: EffectErrorKind::ProfileViolation,
-                                    subtype_trace: None,
-                                });
-                            }
-                        }
-                    }
-
-                    // Advisory linter hints for commonly-omitted effects.
-                    self.check_ffi_linter_hints(&e.name, &e.span, &final_decl);
-
-                    self.declared_effects.insert(e.name.clone(), final_decl);
-                    self.function_visibility.insert(e.name.clone(), true);
-                    self.function_spans.insert(e.name.clone(), e.span.clone());
-                    // Seed inferred_effects from the merged set so callers accumulate
-                    // the correct leaf effects (ABI defaults + programmer annotations).
-                    if let Some(DeclaredEffects::Explicit(ref set)) =
-                        self.declared_effects.get(&e.name)
-                    {
-                        self.inferred_effects.insert(e.name.clone(), set.clone());
-                    } else {
-                        self.inferred_effects
-                            .insert(e.name.clone(), EffectSet::new());
                     }
                 }
                 Item::ImplBlock(imp) => {
@@ -1001,6 +908,7 @@ impl<'a> EffectChecker<'a> {
                             doc_comment: None,
                             is_pub: t.is_pub,
                             is_private: t.is_private,
+                            is_unsafe: false,
                             name: m.name.clone(),
                             generic_params: m.generic_params.clone(),
                             params: m.params.clone(),
@@ -2031,6 +1939,7 @@ impl<'a> EffectChecker<'a> {
                                 doc_comment: None,
                                 is_pub: t.is_pub,
                                 is_private: t.is_private,
+                                is_unsafe: false,
                                 name: m.name.clone(),
                                 generic_params: m.generic_params.clone(),
                                 params: m.params.clone(),
@@ -3401,6 +3310,111 @@ impl<'a> EffectChecker<'a> {
     /// suggest commonly-omitted effects (`blocks`, `allocates(Heap)`).
     ///
     /// Never rejects — linter advice only.
+    /// Per-`ExternFunction` effect-set registration. Used at both the
+    /// (now-dead) top-level `Item::ExternFunction` arm and the per-item
+    /// arm inside an `Item::ExternBlock`. Block-level attributes are
+    /// pre-merged into each item's `attributes` at parse time, so the
+    /// `@noblock` check below sees the union of block + per-item attrs.
+    fn register_extern_function_effects(&mut self, e: &ExternFunction) {
+        // ABI-keyed default effect set (trust-not-verify: extern has no body).
+        // `extern "C"` → {blocks}; `extern "C-unwind"` → {blocks, panics}.
+        // `@noblock` removes blocks from the default (e.g. a pure-CPU C++ fn).
+        let builtin_span = Span {
+            line: 0,
+            column: 0,
+            offset: 0,
+            length: 0,
+        };
+        let has_noblock = e.attributes.iter().any(|a| a.name == "noblock");
+        let mut abi_defaults = EffectSet::new();
+        match e.abi.as_str() {
+            "C" if !has_noblock => {
+                abi_defaults.add(
+                    Effect {
+                        verb: EffectVerbKind::Blocks,
+                        resource: String::new(),
+                    },
+                    EffectOrigin::Direct(builtin_span.clone()),
+                );
+            }
+            "C" => {}
+            "C-unwind" => {
+                if !has_noblock {
+                    abi_defaults.add(
+                        Effect {
+                            verb: EffectVerbKind::Blocks,
+                            resource: String::new(),
+                        },
+                        EffectOrigin::Direct(builtin_span.clone()),
+                    );
+                }
+                // panics is always included for C-unwind (throws across FFI boundary).
+                // @noblock cannot suppress panics.
+                abi_defaults.add(
+                    Effect {
+                        verb: EffectVerbKind::Panics,
+                        resource: String::new(),
+                    },
+                    EffectOrigin::Direct(builtin_span),
+                );
+            }
+            _ => {} // other ABIs: no defaults until implemented
+        }
+
+        // Parse programmer-supplied annotations, then union with ABI defaults.
+        let programmer_decl = self.parse_effect_list(&e.effects);
+        let final_decl = match &programmer_decl {
+            DeclaredEffects::Polymorphic | DeclaredEffects::PolymorphicWithFixed(_) => {
+                // Polymorphic extern: unusual but accepted; ABI defaults dropped.
+                programmer_decl.clone()
+            }
+            DeclaredEffects::Explicit(prog_set) => {
+                let mut merged = abi_defaults;
+                for te in &prog_set.effects {
+                    merged.add(te.effect.clone(), te.origin.clone());
+                }
+                DeclaredEffects::Explicit(merged)
+            }
+            DeclaredEffects::None => {
+                if abi_defaults.is_empty() {
+                    DeclaredEffects::None
+                } else {
+                    DeclaredEffects::Explicit(abi_defaults)
+                }
+            }
+        };
+
+        // Profile-compatibility check: reject effects forbidden by the
+        // active compile profile at the extern declaration site.
+        if let DeclaredEffects::Explicit(ref set) = final_decl {
+            for te in &set.effects {
+                if let Some(forbidden_reason) = self.profile_forbids(&te.effect, &e.name, &e.abi) {
+                    self.errors.push(EffectError {
+                        message: forbidden_reason,
+                        span: e.span.clone(),
+                        kind: EffectErrorKind::ProfileViolation,
+                        subtype_trace: None,
+                    });
+                }
+            }
+        }
+
+        // Advisory linter hints for commonly-omitted effects.
+        self.check_ffi_linter_hints(&e.name, &e.span, &final_decl);
+
+        self.declared_effects.insert(e.name.clone(), final_decl);
+        self.function_visibility.insert(e.name.clone(), true);
+        self.function_spans.insert(e.name.clone(), e.span.clone());
+        // Seed inferred_effects from the merged set so callers accumulate
+        // the correct leaf effects (ABI defaults + programmer annotations).
+        if let Some(DeclaredEffects::Explicit(ref set)) = self.declared_effects.get(&e.name) {
+            self.inferred_effects.insert(e.name.clone(), set.clone());
+        } else {
+            self.inferred_effects
+                .insert(e.name.clone(), EffectSet::new());
+        }
+    }
+
     fn check_ffi_linter_hints(&mut self, symbol: &str, span: &Span, decl: &DeclaredEffects) {
         // Normalize: take the last segment after any `.` separator, strip a
         // leading `_` that some platforms prepend (e.g. macOS `_malloc`).

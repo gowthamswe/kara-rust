@@ -3299,6 +3299,16 @@ fn find_item_visibility(module: &crate::module::Module, name: &str) -> Option<Vi
             Item::TypeAlias(t) if t.name == name => return Some(t.visibility()),
             Item::DistinctType(d) if d.name == name => return Some(d.visibility()),
             Item::ExternFunction(e) if e.name == name => return Some(e.visibility()),
+            Item::ExternBlock(b) => {
+                for it in &b.items {
+                    match it {
+                        ExternItem::Function(f) if f.name == name => {
+                            return Some(f.visibility());
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4852,6 +4862,13 @@ impl<'a> TypeChecker<'a> {
                 Item::ConstDecl(c) => self.env_add_const(c),
                 Item::TypeAlias(t) => self.env_add_type_alias(t),
                 Item::ExternFunction(e) => self.env_add_extern_function(e),
+                Item::ExternBlock(b) => {
+                    for it in &b.items {
+                        match it {
+                            ExternItem::Function(f) => self.env_add_extern_function(f),
+                        }
+                    }
+                }
                 Item::DistinctType(d) => self.env_add_distinct_type(d),
                 _ => {}
             }
@@ -5007,6 +5024,7 @@ impl<'a> TypeChecker<'a> {
                 | Item::ConstDecl(_)
                 | Item::TypeAlias(_)
                 | Item::ExternFunction(_)
+                | Item::ExternBlock(_)
                 | Item::DistinctType(_)
                 | Item::EffectResource(_)
                 | Item::EffectGroup(_)
@@ -6391,6 +6409,7 @@ impl<'a> TypeChecker<'a> {
                         doc_comment: None,
                         is_pub: false,
                         is_private: false,
+                        is_unsafe: false,
                         name: method.name.clone(),
                         generic_params: method.generic_params.clone(),
                         params: method.params.clone(),
@@ -6583,6 +6602,33 @@ impl<'a> TypeChecker<'a> {
                             "extern return type",
                             &e.name,
                         );
+                    }
+                }
+                Item::ExternBlock(b) => {
+                    for it in &b.items {
+                        match it {
+                            ExternItem::Function(e) if e.is_pub => {
+                                for p in &e.params {
+                                    self.check_type_expr_visibility(
+                                        &p.ty,
+                                        &[],
+                                        &type_vis,
+                                        "extern parameter",
+                                        &e.name,
+                                    );
+                                }
+                                if let Some(ref rt) = e.return_type {
+                                    self.check_type_expr_visibility(
+                                        rt,
+                                        &[],
+                                        &type_vis,
+                                        "extern return type",
+                                        &e.name,
+                                    );
+                                }
+                            }
+                            ExternItem::Function(_) => {}
+                        }
                     }
                 }
                 Item::StructDef(s) if s.is_pub => {

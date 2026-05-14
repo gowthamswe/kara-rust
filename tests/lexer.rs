@@ -275,8 +275,8 @@ fn test_unsafe_extern() {
         unsafe {
             let ptr = value;
         }
-        extern "C" fn write(fd: i32) -> i32
-            writes(FileSystem);
+        unsafe extern "C" { fn write(fd: i32) -> i32
+            writes(FileSystem); }
     "#;
 
     let tokens = tokens_only(source);

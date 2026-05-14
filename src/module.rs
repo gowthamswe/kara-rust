@@ -21,7 +21,7 @@
 //! `ModulePath` is a plain `Vec<String>` for v1; interning is a later
 //! optimization once lookup / clone becomes a hotspot.
 
-use crate::ast::{ImportDecl, Item, Program, Visibility};
+use crate::ast::{ExternItem, ImportDecl, Item, Program, Visibility};
 use crate::parser::ParseError;
 use crate::prelude;
 use crate::walker::{self, WalkResult};
@@ -755,6 +755,9 @@ fn module_defines_local_item(module: &Module, name: &str) -> bool {
         Item::TypeAlias(t) => t.name == name,
         Item::DistinctType(d) => d.name == name,
         Item::ExternFunction(e) => e.name == name,
+        Item::ExternBlock(b) => b.items.iter().any(|it| match it {
+            ExternItem::Function(f) => f.name == name,
+        }),
         Item::EffectResource(r) => r.name == name,
         Item::EffectGroup(g) => g.name == name,
         Item::EffectVerbDecl(v) => v.verb_name == name,
@@ -852,6 +855,16 @@ pub fn canonical_item_visibility(
             Item::TypeAlias(t) if t.name == origin_name => return Some(t.visibility()),
             Item::DistinctType(d) if d.name == origin_name => return Some(d.visibility()),
             Item::ExternFunction(e) if e.name == origin_name => return Some(e.visibility()),
+            Item::ExternBlock(b) => {
+                for it in &b.items {
+                    match it {
+                        ExternItem::Function(f) if f.name == origin_name => {
+                            return Some(f.visibility());
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }

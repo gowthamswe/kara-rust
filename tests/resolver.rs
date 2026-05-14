@@ -625,7 +625,7 @@ fn test_multiple_errors_reported() {
 fn test_extern_function() {
     resolve_ok(
         "effect resource FileSystem;\n\
-         extern \"C\" fn write(fd: i32, buf: i64, count: i64) -> i64 writes(FileSystem);",
+         unsafe extern \"C\" { fn write(fd: i32, buf: i64, count: i64) -> i64 writes(FileSystem); }",
     );
 }
 

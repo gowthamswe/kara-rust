@@ -654,6 +654,7 @@ fn stub_function(name: &str, span: &Span) -> Item {
         doc_comment: None,
         is_pub: true,
         is_private: false,
+        is_unsafe: false,
         name: name.to_string(),
         generic_params: None,
         params: Vec::new(),

@@ -20,9 +20,9 @@
 //! `line:col` form. Graceful degradation; never an error.
 
 use crate::ast::{
-    Block, CallArg, ClosureParam, EnsuresClause, Expr, ExprKind, FieldInit, FieldPattern, Function,
-    ImplBlock, ImplItem, Item, MatchArm, Param, ParsedInterpolationPart, Pattern, PatternKind,
-    ProviderBinding, Stmt, StmtKind, TypeExpr,
+    Block, CallArg, ClosureParam, EnsuresClause, Expr, ExprKind, ExternItem, FieldInit,
+    FieldPattern, Function, ImplBlock, ImplItem, Item, MatchArm, Param, ParsedInterpolationPart,
+    Pattern, PatternKind, ProviderBinding, Stmt, StmtKind, TypeExpr,
 };
 use crate::token::Span;
 
@@ -115,6 +115,22 @@ pub fn visit_item_spans(item: &Item, visit: &mut impl FnMut(&Span)) {
             }
             if let Some(rt) = &e.return_type {
                 visit_type(rt, visit);
+            }
+        }
+        Item::ExternBlock(b) => {
+            visit(&b.span);
+            for it in &b.items {
+                match it {
+                    ExternItem::Function(e) => {
+                        visit(&e.span);
+                        for p in &e.params {
+                            visit_param(p, visit);
+                        }
+                        if let Some(rt) = &e.return_type {
+                            visit_type(rt, visit);
+                        }
+                    }
+                }
             }
         }
         Item::TypeAlias(a) => {

@@ -3,7 +3,9 @@
 // and `kernel`. Used by `karac check --profiles=...` driver tests.
 effect resource Heap;
 
-extern "C" fn xmalloc(size: i64) -> i64 allocates(Heap);
+unsafe extern "C" {
+    fn xmalloc(size: i64) -> i64 allocates(Heap);
+}
 
 fn main() {
     let _p = xmalloc(64);

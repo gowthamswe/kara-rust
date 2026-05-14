@@ -1867,33 +1867,187 @@ fn test_refinement_type_multiple() {
 #[test]
 fn test_extern_function() {
     let prog = parse_ok(
-        r#"extern "C" fn write(fd: i32, buf: i64, count: u64) -> i64 writes(FileSystem);"#,
+        r#"unsafe extern "C" {
+               fn write(fd: i32, buf: i64, count: u64) -> i64 writes(FileSystem);
+           }"#,
     );
-    if let Item::ExternFunction(f) = &prog.items[0] {
-        assert_eq!(f.abi, "C");
-        assert_eq!(f.name, "write");
-        assert_eq!(f.params.len(), 3);
-        assert!(f.effects.is_some());
-    }
+    let Item::ExternBlock(b) = &prog.items[0] else {
+        panic!("expected ExternBlock, got {:?}", &prog.items[0]);
+    };
+    assert_eq!(b.abi, "C");
+    assert_eq!(b.items.len(), 1);
+    let ExternItem::Function(f) = &b.items[0];
+    assert_eq!(f.abi, "C");
+    assert_eq!(f.name, "write");
+    assert_eq!(f.params.len(), 3);
+    assert!(f.effects.is_some());
 }
 
 #[test]
 fn test_extern_function_accepts_pub_and_attributes() {
     let prog = parse_ok(
         r#"
-        #[link_name = "puts"]
-        pub extern "C" fn puts(s: i64) -> i32;
+        unsafe extern "C" {
+            #[link_name = "puts"]
+            pub fn puts(s: i64) -> i32;
+        }
         "#,
     );
-    if let Item::ExternFunction(f) = &prog.items[0] {
-        assert!(f.is_pub, "pub should be threaded to ExternFunction");
-        assert_eq!(f.attributes.len(), 1, "attribute should be captured");
-        assert_eq!(f.attributes[0].name, "link_name");
-        assert_eq!(f.abi, "C");
-        assert_eq!(f.name, "puts");
-    } else {
-        panic!("expected ExternFunction");
+    let Item::ExternBlock(b) = &prog.items[0] else {
+        panic!("expected ExternBlock");
+    };
+    let ExternItem::Function(f) = &b.items[0];
+    assert!(f.is_pub, "pub should be threaded to the inner fn");
+    assert_eq!(f.attributes.len(), 1, "attribute should be captured");
+    assert_eq!(f.attributes[0].name, "link_name");
+    assert_eq!(f.abi, "C");
+    assert_eq!(f.name, "puts");
+}
+
+#[test]
+fn test_unsafe_extern_block_multiple_items() {
+    let prog = parse_ok(
+        r#"
+        unsafe extern "C" {
+            fn getpid() -> i32;
+            fn write(fd: i32, buf: i64, count: u64) -> i64 writes(FileSystem);
+            fn close(fd: i32) -> i32;
+        }
+        "#,
+    );
+    let Item::ExternBlock(b) = &prog.items[0] else {
+        panic!("expected ExternBlock");
+    };
+    assert_eq!(b.abi, "C");
+    assert_eq!(b.items.len(), 3);
+    let names: Vec<&str> = b
+        .items
+        .iter()
+        .map(|it| {
+            let ExternItem::Function(f) = it;
+            f.name.as_str()
+        })
+        .collect();
+    assert_eq!(names, vec!["getpid", "write", "close"]);
+}
+
+#[test]
+fn test_unsafe_extern_block_propagates_block_level_noblock() {
+    // Block-level `@noblock` pre-merges into each child's attributes at parse
+    // time so downstream consumers (effectchecker) see the union.
+    let prog = parse_ok(
+        r#"
+        @noblock
+        unsafe extern "C" {
+            fn abs(x: i32) -> i32;
+            fn sqrt(x: f64) -> f64;
+        }
+        "#,
+    );
+    let Item::ExternBlock(b) = &prog.items[0] else {
+        panic!("expected ExternBlock");
+    };
+    assert!(b.attributes.iter().any(|a| a.name == "noblock"));
+    for it in &b.items {
+        let ExternItem::Function(f) = it;
+        assert!(
+            f.attributes.iter().any(|a| a.name == "noblock"),
+            "block-level @noblock should pre-merge into each item"
+        );
     }
+}
+
+#[test]
+fn test_bare_extern_fn_at_module_scope_rejected() {
+    // The pre-v1 shorthand `extern "C" fn name(...);` (without an enclosing
+    // `unsafe extern { }` block) is removed from the grammar.
+    let (_, errors) = parse_with_errors(r#"extern "C" fn write(fd: i32) -> i64;"#);
+    assert!(
+        !errors.is_empty(),
+        "expected rejection of bare module-scope extern fn"
+    );
+    assert!(
+        errors_contain(&errors, "unsafe extern"),
+        "expected diagnostic to redirect to `unsafe extern \"ABI\" {{ ... }}` block form; got {errors:?}"
+    );
+}
+
+#[test]
+fn test_bare_extern_block_no_unsafe_rejected() {
+    let (_, errors) = parse_with_errors(r#"extern "C" { fn foo(); }"#);
+    assert!(
+        !errors.is_empty(),
+        "expected rejection of bare extern block (no `unsafe`)"
+    );
+    assert!(
+        errors_contain(&errors, "unsafe extern"),
+        "expected diagnostic to redirect to `unsafe extern`; got {errors:?}"
+    );
+}
+
+#[test]
+fn test_unsafe_fn_parses_and_records_is_unsafe() {
+    // `unsafe fn` at module scope: parses, `is_unsafe` is set on the
+    // resulting `Function` node. The `unsafe_op_in_unsafe_fn` lint
+    // (slice 3 of the v2 unsafe epic) walks the body and enforces that
+    // raw-ptr deref / unsafe-fn calls / volatile / etc. inside this
+    // body are still wrapped in `unsafe { ... }` — slice 1 captures
+    // only the surface marker.
+    let prog = parse_ok("unsafe fn foo() {}");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("expected Function, got {:?}", &prog.items[0]);
+    };
+    assert!(f.is_unsafe, "is_unsafe should be set on `unsafe fn`");
+    assert_eq!(f.name, "foo");
+}
+
+#[test]
+fn test_plain_fn_has_is_unsafe_false() {
+    // Regression-pin: bare `fn foo() {}` must not set `is_unsafe`.
+    let prog = parse_ok("fn foo() {}");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("expected Function");
+    };
+    assert!(!f.is_unsafe, "plain fn should not be unsafe");
+}
+
+#[test]
+fn test_unsafe_fn_pub_attributes_effects_roundtrip() {
+    // `unsafe fn` composes with `pub`, doc comments, attributes, generics,
+    // params, return type, and effect lists exactly like a plain `fn`.
+    let prog = parse_ok(
+        r#"
+        /// Reads `n` bytes from a raw pointer.
+        #[noblock]
+        pub unsafe fn read_raw(p: i64, n: i64) -> i64 reads(Memory) {
+            n
+        }
+        "#,
+    );
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("expected Function");
+    };
+    assert!(f.is_unsafe);
+    assert!(f.is_pub);
+    assert_eq!(f.name, "read_raw");
+    assert_eq!(f.params.len(), 2);
+    assert!(f.return_type.is_some());
+    assert!(f.effects.is_some());
+    assert!(f.doc_comment.is_some());
+    assert_eq!(f.attributes.len(), 1);
+}
+
+#[test]
+fn test_unsafe_followed_by_invalid_token_at_module_scope_rejected() {
+    // `unsafe` at module scope is only valid as the prefix to either
+    // an `unsafe extern "ABI" { ... }` block or an `unsafe fn` decl.
+    // Any other shape is rejected with a focused diagnostic.
+    let (_, errors) = parse_with_errors("unsafe struct Foo {}");
+    assert!(!errors.is_empty());
+    assert!(
+        errors_contain(&errors, "expected `extern` or `fn` after `unsafe`"),
+        "expected focused diagnostic; got {errors:?}"
+    );
 }
 
 #[test]
@@ -4895,7 +5049,7 @@ fn test_ident_class_leading_underscore_value_ok() {
 
 #[test]
 fn test_ident_class_extern_fn_value_class_enforced() {
-    let (_, errors) = parse_with_errors(r#"extern "C" fn BadName(); "#);
+    let (_, errors) = parse_with_errors(r#"unsafe extern "C" { fn BadName(); }"#);
     assert!(
         !errors.is_empty(),
         "expected naming error for PascalCase extern fn"
@@ -4906,7 +5060,12 @@ fn test_ident_class_extern_fn_value_class_enforced() {
 #[test]
 fn test_ident_class_extern_fn_kara_name_skips_check() {
     // With #[kara_name], the Kara-side name bypasses the naming check.
-    parse_ok(r#"#[kara_name = "malloc"] extern "C" fn BadName(size: i32) -> i32;"#);
+    parse_ok(
+        r#"unsafe extern "C" {
+               #[kara_name = "malloc"]
+               fn BadName(size: i32) -> i32;
+           }"#,
+    );
 }
 
 #[test]

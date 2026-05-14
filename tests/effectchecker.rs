@@ -146,7 +146,7 @@ fn test_function_with_declared_effects() {
 fn test_extern_function_effects_trusted() {
     let result = effectcheck_ok(
         "effect resource FileSystem;\n\
-         extern \"C\" fn write(fd: i32, buf: i64, count: i64) -> i64 writes(FileSystem);",
+         unsafe extern \"C\" { fn write(fd: i32, buf: i64, count: i64) -> i64 writes(FileSystem); }",
     );
     let inferred = result.inferred_effects.get("write").unwrap();
     assert!(inferred
@@ -158,7 +158,7 @@ fn test_extern_function_effects_trusted() {
 #[test]
 fn test_extern_c_gets_blocks_by_default() {
     // extern "C" functions default to {blocks} (may call blocking OS APIs)
-    let result = effectcheck_ok("extern \"C\" fn sleep(secs: i32);");
+    let result = effectcheck_ok("unsafe extern \"C\" { fn sleep(secs: i32); }");
     let inferred = result.inferred_effects.get("sleep").unwrap();
     assert!(
         inferred
@@ -173,7 +173,7 @@ fn test_extern_c_gets_blocks_by_default() {
 #[test]
 fn test_extern_c_unwind_gets_blocks_and_panics() {
     // extern "C-unwind" functions default to {blocks, panics}
-    let result = effectcheck_ok("extern \"C-unwind\" fn risky();");
+    let result = effectcheck_ok("unsafe extern \"C-unwind\" { fn risky(); }");
     let inferred = result.inferred_effects.get("risky").unwrap();
     assert!(
         inferred
@@ -194,7 +194,7 @@ fn test_extern_c_unwind_gets_blocks_and_panics() {
 #[test]
 fn test_noblock_removes_blocks_from_extern_c() {
     // @noblock on extern "C" removes the blocks default
-    let result = effectcheck_ok("@noblock extern \"C\" fn cpu_work() -> i32;");
+    let result = effectcheck_ok("unsafe extern \"C\" { @noblock fn cpu_work() -> i32; }");
     let inferred = result.inferred_effects.get("cpu_work").unwrap();
     assert!(
         !inferred
@@ -208,7 +208,7 @@ fn test_noblock_removes_blocks_from_extern_c() {
 #[test]
 fn test_noblock_removes_blocks_from_c_unwind_but_keeps_panics() {
     // @noblock on extern "C-unwind": blocks removed, panics stays
-    let result = effectcheck_ok("@noblock extern \"C-unwind\" fn throwing();");
+    let result = effectcheck_ok("unsafe extern \"C-unwind\" { @noblock fn throwing(); }");
     let inferred = result.inferred_effects.get("throwing").unwrap();
     assert!(
         !inferred
@@ -232,7 +232,7 @@ fn test_extern_c_merges_programmer_annotations() {
     // extern "C" fn read_db() reads(Db) → final = {blocks, reads(Db)}
     let result = effectcheck_ok(
         "effect resource Db;\n\
-         extern \"C\" fn read_db() reads(Db);",
+         unsafe extern \"C\" { fn read_db() reads(Db); }",
     );
     let inferred = result.inferred_effects.get("read_db").unwrap();
     assert!(
@@ -252,7 +252,7 @@ fn test_extern_c_merges_programmer_annotations() {
 fn test_caller_inherits_extern_c_blocks() {
     // A private function calling an extern "C" fn inherits its {blocks} effect.
     let result = effectcheck_ok(
-        "extern \"C\" fn os_call() -> i32;\n\
+        "unsafe extern \"C\" { fn os_call() -> i32; }\n\
          fn wrapper() -> i32 { os_call() }",
     );
     let inferred = result.inferred_effects.get("wrapper").unwrap();
@@ -2713,7 +2713,7 @@ fn profile_errors(source: &str, profile: CompileProfile) -> Vec<EffectError> {
 fn test_profile_default_allows_all_effects() {
     // Default profile imposes no restrictions on extern declarations.
     profile_ok(
-        "extern \"C\" fn malloc(size: i64) -> i64 allocates(Heap) blocks panics;",
+        "unsafe extern \"C\" { fn malloc(size: i64) -> i64 allocates(Heap) blocks panics; }",
         CompileProfile::Default,
     );
 }
@@ -2722,7 +2722,7 @@ fn test_profile_default_allows_all_effects() {
 fn test_profile_embedded_forbids_heap_allocation() {
     // Embedded profile forbids allocates(Heap) on extern fns.
     let errors = profile_errors(
-        "extern \"C\" fn malloc(size: i64) -> i64 allocates(Heap);",
+        "unsafe extern \"C\" { fn malloc(size: i64) -> i64 allocates(Heap); }",
         CompileProfile::Embedded,
     );
     assert!(
@@ -2743,7 +2743,7 @@ fn test_profile_embedded_forbids_heap_allocation() {
 fn test_profile_embedded_allows_non_heap_allocates() {
     // Embedded only forbids allocates(Heap); other resources are fine.
     profile_ok(
-        "extern \"C\" fn arena_alloc(size: i64) -> i64 allocates(Arena);",
+        "unsafe extern \"C\" { fn arena_alloc(size: i64) -> i64 allocates(Arena); }",
         CompileProfile::Embedded,
     );
 }
@@ -2752,7 +2752,7 @@ fn test_profile_embedded_allows_non_heap_allocates() {
 fn test_profile_embedded_allows_blocks_and_panics() {
     // Embedded does not restrict blocks or panics.
     profile_ok(
-        "extern \"C\" fn os_write(fd: i32) -> i32 blocks panics;",
+        "unsafe extern \"C\" { fn os_write(fd: i32) -> i32 blocks panics; }",
         CompileProfile::Embedded,
     );
 }
@@ -2760,7 +2760,10 @@ fn test_profile_embedded_allows_blocks_and_panics() {
 #[test]
 fn test_profile_kernel_forbids_panics() {
     // Kernel profile forbids panics on extern fns.
-    let errors = profile_errors("extern \"C\" fn risky() panics;", CompileProfile::Kernel);
+    let errors = profile_errors(
+        "unsafe extern \"C\" { fn risky() panics; }",
+        CompileProfile::Kernel,
+    );
     assert!(
         errors
             .iter()
@@ -2774,7 +2777,7 @@ fn test_profile_kernel_forbids_panics() {
 fn test_profile_kernel_forbids_blocks() {
     // Kernel profile forbids blocks on extern fns.
     let errors = profile_errors(
-        "extern \"C\" fn sleep(ms: i32) blocks;",
+        "unsafe extern \"C\" { fn sleep(ms: i32) blocks; }",
         CompileProfile::Kernel,
     );
     assert!(
@@ -2790,7 +2793,7 @@ fn test_profile_kernel_forbids_blocks() {
 fn test_profile_kernel_forbids_allocates() {
     // Kernel profile forbids any allocates on extern fns.
     let errors = profile_errors(
-        "extern \"C\" fn kmalloc(size: i64) -> i64 allocates(Heap);",
+        "unsafe extern \"C\" { fn kmalloc(size: i64) -> i64 allocates(Heap); }",
         CompileProfile::Kernel,
     );
     assert!(
@@ -2806,7 +2809,7 @@ fn test_profile_kernel_forbids_allocates() {
 fn test_profile_kernel_forbids_suspends() {
     // Kernel profile forbids suspends on extern fns.
     let errors = profile_errors(
-        "extern \"C\" fn await_io() suspends;",
+        "unsafe extern \"C\" { fn await_io() suspends; }",
         CompileProfile::Kernel,
     );
     assert!(
@@ -2823,7 +2826,7 @@ fn test_profile_kernel_allows_reads_writes_sends_receives() {
     // Kernel profile allows resource-verb effects (reads, writes, sends, receives).
     // @noblock suppresses the extern "C" auto-blocks default so it doesn't mask the signal.
     profile_ok(
-        "@noblock extern \"C\" fn io_op() reads(FileSystem) writes(FileSystem) sends(Channel) receives(Channel);",
+        "unsafe extern \"C\" { @noblock fn io_op() reads(FileSystem) writes(FileSystem) sends(Channel) receives(Channel); }",
         CompileProfile::Kernel,
     );
 }
@@ -2832,7 +2835,7 @@ fn test_profile_kernel_allows_reads_writes_sends_receives() {
 fn test_profile_violation_message_contains_profile_name() {
     // Error message must name the offending profile.
     let errors = profile_errors(
-        "extern \"C\" fn malloc(size: i64) -> i64 allocates(Heap);",
+        "unsafe extern \"C\" { fn malloc(size: i64) -> i64 allocates(Heap); }",
         CompileProfile::Embedded,
     );
     let msg = &errors[0].message;
@@ -2847,7 +2850,7 @@ fn test_profile_violation_message_contains_profile_name() {
 fn test_profile_violation_message_contains_fn_name() {
     // Error message must name the offending extern function.
     let errors = profile_errors(
-        "extern \"C\" fn my_alloc(size: i64) -> i64 allocates(Heap);",
+        "unsafe extern \"C\" { fn my_alloc(size: i64) -> i64 allocates(Heap); }",
         CompileProfile::Embedded,
     );
     let msg = &errors[0].message;
@@ -2861,13 +2864,19 @@ fn test_profile_violation_message_contains_fn_name() {
 #[test]
 fn test_profile_default_extern_c_blocks_default_is_ok() {
     // Default profile: extern "C" auto-defaults to {blocks}; no violation.
-    profile_ok("extern \"C\" fn sleep(secs: i32);", CompileProfile::Default);
+    profile_ok(
+        "unsafe extern \"C\" { fn sleep(secs: i32); }",
+        CompileProfile::Default,
+    );
 }
 
 #[test]
 fn test_profile_kernel_extern_c_blocks_default_is_violation() {
     // Kernel profile: extern "C" auto-defaults to {blocks}; blocks is forbidden.
-    let errors = profile_errors("extern \"C\" fn sleep(secs: i32);", CompileProfile::Kernel);
+    let errors = profile_errors(
+        "unsafe extern \"C\" { fn sleep(secs: i32); }",
+        CompileProfile::Kernel,
+    );
     assert!(
         errors
             .iter()
@@ -2881,7 +2890,7 @@ fn test_profile_kernel_extern_c_blocks_default_is_violation() {
 fn test_profile_multiple_violations_reported() {
     // Both allocates(Heap) and blocks generate violations in kernel profile.
     let errors = profile_errors(
-        "extern \"C\" fn big_alloc(size: i64) -> i64 allocates(Heap) blocks;",
+        "unsafe extern \"C\" { fn big_alloc(size: i64) -> i64 allocates(Heap) blocks; }",
         CompileProfile::Kernel,
     );
     let violations: Vec<_> = errors
@@ -2915,7 +2924,7 @@ fn ffi_hints(source: &str) -> Vec<EffectError> {
 #[test]
 fn test_ffi_hint_malloc_missing_allocates() {
     // `malloc` without `allocates(Heap)` → lint hint
-    let hints = ffi_hints("extern \"C\" fn malloc(size: i64) -> i64;");
+    let hints = ffi_hints("unsafe extern \"C\" { fn malloc(size: i64) -> i64; }");
     assert!(
         hints.iter().any(|h| h.message.contains("allocates(Heap)")),
         "Expected allocates(Heap) hint for malloc, got: {:?}",
@@ -2926,7 +2935,7 @@ fn test_ffi_hint_malloc_missing_allocates() {
 #[test]
 fn test_ffi_hint_malloc_suppressed_when_declared() {
     // `malloc` with `allocates(Heap)` → no hint
-    let hints = ffi_hints("extern \"C\" fn malloc(size: i64) -> i64 allocates(Heap);");
+    let hints = ffi_hints("unsafe extern \"C\" { fn malloc(size: i64) -> i64 allocates(Heap); }");
     assert!(
         hints.is_empty(),
         "No alloc hint expected when allocates(Heap) is declared, got: {:?}",
@@ -2937,7 +2946,7 @@ fn test_ffi_hint_malloc_suppressed_when_declared() {
 #[test]
 fn test_ffi_hint_sleep_missing_blocks() {
     // extern "C" sleep already gets blocks from the ABI default — no hint
-    let hints = ffi_hints("extern \"C\" fn sleep(secs: i32);");
+    let hints = ffi_hints("unsafe extern \"C\" { fn sleep(secs: i32); }");
     assert!(
         hints.is_empty(),
         "No blocks hint expected for extern \"C\" sleep (ABI default adds it), got: {:?}",
@@ -2948,7 +2957,7 @@ fn test_ffi_hint_sleep_missing_blocks() {
 #[test]
 fn test_ffi_hint_sleep_noblock_suggests_blocks() {
     // @noblock removes the ABI default → blocks is now missing → hint fires
-    let hints = ffi_hints("@noblock extern \"C\" fn sleep(secs: i32);");
+    let hints = ffi_hints("unsafe extern \"C\" { @noblock fn sleep(secs: i32); }");
     assert!(
         hints.iter().any(|h| h.message.contains("blocks")),
         "Expected blocks hint for @noblock sleep, got: {:?}",
@@ -2961,7 +2970,7 @@ fn test_ffi_hint_getaddrinfo_both_blocking_and_allocating() {
     // getaddrinfo is both blocking and allocating; bare declaration gets two hints.
     // extern "C" ABI default already covers `blocks`, so only allocates hint fires.
     let hints = ffi_hints(
-        "extern \"C\" fn getaddrinfo(node: i64, service: i64, hints: i64, res: i64) -> i32;",
+        "unsafe extern \"C\" { fn getaddrinfo(node: i64, service: i64, hints: i64, res: i64) -> i32; }",
     );
     assert!(
         hints.iter().any(|h| h.message.contains("allocates(Heap)")),
@@ -2979,7 +2988,7 @@ fn test_ffi_hint_getaddrinfo_both_blocking_and_allocating() {
 #[test]
 fn test_ffi_hint_unknown_symbol_no_hint() {
     // An extern fn with an unknown symbol name gets no hints.
-    let hints = ffi_hints("extern \"C\" fn do_something_custom() -> i32;");
+    let hints = ffi_hints("unsafe extern \"C\" { fn do_something_custom() -> i32; }");
     assert!(
         hints.is_empty(),
         "No hints expected for unknown symbol, got: {:?}",
@@ -2990,7 +2999,7 @@ fn test_ffi_hint_unknown_symbol_no_hint() {
 #[test]
 fn test_ffi_hint_strdup_missing_allocates() {
     // strdup without allocates(Heap) → hint
-    let hints = ffi_hints("extern \"C\" fn strdup(s: i64) -> i64;");
+    let hints = ffi_hints("unsafe extern \"C\" { fn strdup(s: i64) -> i64; }");
     assert!(
         hints.iter().any(|h| h.message.contains("allocates(Heap)")),
         "Expected allocates(Heap) hint for strdup, got: {:?}",
@@ -3002,13 +3011,13 @@ fn test_ffi_hint_strdup_missing_allocates() {
 fn test_ffi_hint_is_advisory_not_error() {
     // A program with only FFI lint hints still passes effectcheck_ok
     // (hints do not prevent compilation).
-    effectcheck_ok("extern \"C\" fn malloc(size: i64) -> i64;");
+    effectcheck_ok("unsafe extern \"C\" { fn malloc(size: i64) -> i64; }");
 }
 
 #[test]
 fn test_ffi_hint_leading_underscore_normalized() {
     // Platform-prefixed names like `_malloc` still match the table.
-    let hints = ffi_hints("extern \"C\" fn _malloc(size: i64) -> i64;");
+    let hints = ffi_hints("unsafe extern \"C\" { fn _malloc(size: i64) -> i64; }");
     assert!(
         hints.iter().any(|h| h.message.contains("allocates(Heap)")),
         "Expected allocates(Heap) hint for _malloc, got: {:?}",

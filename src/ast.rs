@@ -171,6 +171,16 @@ pub enum Item {
     AliasDecl(AliasDecl),
     IndependentDecl(IndependentDecl),
     ExternFunction(ExternFunction),
+    /// `unsafe extern "ABI" { ... }` block — the trust-boundary form for
+    /// foreign-import declarations. The bare standalone `extern "C" fn
+    /// name(...);` shape is rejected at module scope; foreign imports
+    /// must live inside one of these blocks. Block-level attributes
+    /// (`@noblock`, `#[noblock]`) are pre-merged into each contained
+    /// item's `attributes` at parse time, so downstream phases process
+    /// the inner `ExternFunction`s identically to today's standalone
+    /// form. The block itself carries the abi/doc/attributes for
+    /// block-scoped consumers (e.g. the `undocumented_unsafe` lint).
+    ExternBlock(ExternBlock),
     TypeAlias(TypeAliasDef),
     DistinctType(DistinctTypeDef),
 }
@@ -186,6 +196,16 @@ pub struct Function {
     pub doc_comment: Option<String>,
     pub is_pub: bool,
     pub is_private: bool,
+    /// `unsafe fn ...` declaration marker. The `unsafe` keyword on a fn
+    /// declaration is a *precondition* the function asserts callers must
+    /// satisfy — it is NOT an implicit `unsafe { ... }` block around the
+    /// body. The `unsafe_op_in_unsafe_fn` rule (slice 3 of the v2 unsafe
+    /// epic) walks every fn body uniformly and requires raw-ptr derefs,
+    /// calls to other `unsafe fn`s, asm intrinsics, volatile reads/writes,
+    /// and union field access to be wrapped in `unsafe { ... }` even
+    /// inside an `unsafe fn` body. Slice 1 only captures the surface
+    /// marker; the lint that consumes it lands in slice 3.
+    pub is_unsafe: bool,
     pub name: String,
     pub generic_params: Option<GenericParams>,
     pub params: Vec<Param>,
@@ -644,6 +664,28 @@ pub struct ExternFunction {
     pub params: Vec<Param>,
     pub return_type: Option<TypeExpr>,
     pub effects: Option<EffectList>,
+}
+
+/// `unsafe extern "ABI" { ... }` block — see [`Item::ExternBlock`].
+#[derive(Debug, Clone)]
+pub struct ExternBlock {
+    pub span: Span,
+    /// Block-level attributes (e.g. block-scoped `@noblock`). Already
+    /// pre-merged into each item's `attributes` at parse time; kept on
+    /// the block too for lint / doc surfaces that care about block
+    /// identity.
+    pub attributes: Vec<Attribute>,
+    /// Joined contents of `///` doc-comments preceding the block. The
+    /// `undocumented_unsafe` lint reads this to enforce a `# Safety`
+    /// section at the block level.
+    pub doc_comment: Option<String>,
+    pub abi: String,
+    pub items: Vec<ExternItem>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExternItem {
+    Function(ExternFunction),
 }
 
 // ── Type Aliases ─────────────────────────────────────────────────

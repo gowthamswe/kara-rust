@@ -1566,7 +1566,7 @@ fn test_nested_function_calls() {
 fn test_extern_function_types() {
     typecheck_ok(
         "effect resource FileSystem;\n\
-         extern \"C\" fn write(fd: i32, buf: i64, count: i64) -> i64 writes(FileSystem);\n\
+         unsafe extern \"C\" { fn write(fd: i32, buf: i64, count: i64) -> i64 writes(FileSystem); }\n\
          fn main() {\n\
              let result: i64 = write(1, 0, 10);\n\
          }",
