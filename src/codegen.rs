@@ -22685,17 +22685,26 @@ impl<'ctx> Codegen<'ctx> {
 
     // ── Monomorphized Map[K, V] symbol emission (Slice 1) ───────
 
-    /// Byte offset of `KaracMap.len` in the runtime's `#[repr(C)]`
+    /// Byte offsets into the runtime's `#[repr(C)]` `KaracMap`
     /// layout (`runtime/src/map.rs`). Codegen-emitted monomorphized
-    /// `Map[K, V].len` symbols load this field by direct GEP +
+    /// `Map[K, V]` method symbols load these fields by direct GEP +
     /// load against a `*mut KaracMap` opaque pointer rather than
-    /// calling through the type-erased `karac_map_len` runtime
-    /// function. Pinned by the runtime-side unit test
+    /// calling through the type-erased `karac_map_*` runtime
+    /// functions. Pinned by the runtime-side unit test
     /// `karac_map_field_offsets_match_codegen` — any drift trips
-    /// the runtime test before the binary can diverge. Slices 1b.2
-    /// and 1b.3 will add sibling constants for `status` / `kv` /
-    /// `capacity` once `insert_old` / `get` need them.
+    /// the runtime test before the binary can diverge.
+    const KARAC_MAP_STATUS_OFFSET: u64 = 0;
+    const KARAC_MAP_KV_OFFSET: u64 = 8;
+    const KARAC_MAP_CAPACITY_OFFSET: u64 = 16;
     const KARAC_MAP_LEN_OFFSET: u64 = 24;
+    const KARAC_MAP_TOMBSTONES_OFFSET: u64 = 32;
+    /// Bucket status-byte sentinels for the monomorphized probe
+    /// loop. Must match the runtime's `BUCKET_EMPTY` /
+    /// `BUCKET_OCCUPIED` / `BUCKET_TOMBSTONE` constants in
+    /// `runtime/src/map.rs`.
+    const BUCKET_EMPTY: u64 = 0;
+    const BUCKET_OCCUPIED: u64 = 1;
+    const BUCKET_TOMBSTONE: u64 = 2;
 
     /// Cache key for the monomorphized Map[K, V] symbol family —
     /// `"{key_mangle}_{val_mangle}"` (e.g. `"i64_i64"`). Mirrors the
@@ -22790,13 +22799,15 @@ impl<'ctx> Codegen<'ctx> {
             }
         };
 
-        // insert_old: slow-path delegation. Body allocates two
-        // stack slots for key and val (the erased extern takes
-        // pointers), forwards to `karac_map_insert_old`, returns
-        // the existed bit. Slice 1b.2b will branch on a load-factor
-        // check and only delegate to the erased extern on the
-        // resize-needed slow path; the fast path will inline the
-        // hash + probe + eq loop.
+        // insert_old: fast path inlines load-factor check, FNV-1a
+        // hash (via direct call to the existing `karac_hash_i64`
+        // helper — same hash as the erased fallback so cross-path
+        // consistency holds while coexist is in effect), linear
+        // probe with empty / tombstone / occupied switch, and
+        // inline i64 eq. Slow path (resize-needed branch and
+        // safety fallback for the impossible exhausted-probe case)
+        // forwards to `karac_map_insert_old` extern. Slice 1b.3
+        // will mirror this shape for `get`.
         let insert_name = format!("karac_map_{cache_key}_insert_old");
         let insert_old_fn = match self.module.get_function(&insert_name) {
             Some(f) => f,
@@ -22809,40 +22820,7 @@ impl<'ctx> Codegen<'ctx> {
                 let f =
                     self.module
                         .add_function(&insert_name, insert_ty, Some(Linkage::LinkOnceODR));
-                let entry = self.context.append_basic_block(f, "entry");
-                self.builder.position_at_end(entry);
-                let map_arg = f.get_nth_param(0).unwrap().into_pointer_value();
-                let key_arg = f.get_nth_param(1).unwrap();
-                let val_arg = f.get_nth_param(2).unwrap();
-                let out_old_arg = f.get_nth_param(3).unwrap().into_pointer_value();
-
-                let key_slot = self
-                    .builder
-                    .build_alloca(key_ty, "mono.insert.key.slot")
-                    .unwrap();
-                let val_slot = self
-                    .builder
-                    .build_alloca(val_ty, "mono.insert.val.slot")
-                    .unwrap();
-                self.builder.build_store(key_slot, key_arg).unwrap();
-                self.builder.build_store(val_slot, val_arg).unwrap();
-
-                let existed = self
-                    .builder
-                    .build_call(
-                        self.karac_map_insert_old_fn,
-                        &[
-                            map_arg.into(),
-                            key_slot.into(),
-                            val_slot.into(),
-                            out_old_arg.into(),
-                        ],
-                        "mono.insert.existed",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                self.builder.build_return(Some(&existed)).unwrap();
+                self.emit_mono_map_i64_i64_insert_old_body(f);
                 f
             }
         };
@@ -22857,6 +22835,413 @@ impl<'ctx> Codegen<'ctx> {
         };
         self.map_mono_methods.insert(cache_key, methods);
         methods
+    }
+
+    /// Emit the fast-path-inlined body of the monomorphized
+    /// `karac_map_i64_i64_insert_old` function. The shape mirrors
+    /// the runtime's `KaracMap::insert` algorithm
+    /// (`runtime/src/map.rs:166`) — load-factor branch first,
+    /// then linear probe — but inlines the hash (via direct call
+    /// to `karac_hash_i64`, the same FNV-1a helper the erased
+    /// fallback's function-pointer hash dispatches to) and the eq
+    /// (direct i64 icmp), dropping the function-pointer
+    /// indirection that defines the erasure tax.
+    ///
+    /// On entry, the function has signature `i1 (ptr map, i64
+    /// key, i64 val, ptr out_old_val)`. On exit, every path
+    /// terminates with `ret i1` (the existed bit).
+    fn emit_mono_map_i64_i64_insert_old_body(&mut self, f: FunctionValue<'ctx>) {
+        let i8_t = self.context.i8_type();
+        let i64_t = self.context.i64_type();
+        let bool_t = self.context.bool_type();
+
+        let map_arg = f.get_nth_param(0).unwrap().into_pointer_value();
+        let key_arg = f.get_nth_param(1).unwrap().into_int_value();
+        let val_arg = f.get_nth_param(2).unwrap().into_int_value();
+        let out_old_arg = f.get_nth_param(3).unwrap().into_pointer_value();
+
+        // Ensure `karac_hash_i64` exists at the module level so the
+        // fast path can call it directly. `emit_hash_fn_for_type`
+        // already memoizes via `module.get_function`, and saves/
+        // restores its own builder position.
+        let hash_fn = self.emit_hash_fn_for_type("i64", i64_t.into());
+
+        let entry_bb = self.context.append_basic_block(f, "entry");
+        let slow_bb = self.context.append_basic_block(f, "slow_path");
+        let fast_bb = self.context.append_basic_block(f, "fast_path");
+        let probe_cond_bb = self.context.append_basic_block(f, "probe.cond");
+        let probe_body_bb = self.context.append_basic_block(f, "probe.body");
+        let case_empty_bb = self.context.append_basic_block(f, "case.empty");
+        let case_tomb_check_bb = self.context.append_basic_block(f, "case.check_tomb");
+        let case_tomb_bb = self.context.append_basic_block(f, "case.tomb");
+        let case_occupied_bb = self.context.append_basic_block(f, "case.occupied");
+        let match_found_bb = self.context.append_basic_block(f, "match.found");
+        let exhausted_bb = self.context.append_basic_block(f, "exhausted");
+
+        // ── entry: field loads + load-factor check ────────────────
+        self.builder.position_at_end(entry_bb);
+        let len_p = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    map_arg,
+                    &[i64_t.const_int(Self::KARAC_MAP_LEN_OFFSET, false)],
+                    "len.p",
+                )
+                .unwrap()
+        };
+        let len = self
+            .builder
+            .build_load(i64_t, len_p, "len")
+            .unwrap()
+            .into_int_value();
+        let tomb_p = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    map_arg,
+                    &[i64_t.const_int(Self::KARAC_MAP_TOMBSTONES_OFFSET, false)],
+                    "tomb.p",
+                )
+                .unwrap()
+        };
+        let tombs = self
+            .builder
+            .build_load(i64_t, tomb_p, "tombs")
+            .unwrap()
+            .into_int_value();
+        let cap_p = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    map_arg,
+                    &[i64_t.const_int(Self::KARAC_MAP_CAPACITY_OFFSET, false)],
+                    "cap.p",
+                )
+                .unwrap()
+        };
+        let cap = self
+            .builder
+            .build_load(i64_t, cap_p, "cap")
+            .unwrap()
+            .into_int_value();
+
+        // Load factor: (len + tombs + 1) * 4 > cap * 3 → resize
+        let sum = self.builder.build_int_add(len, tombs, "len+tombs").unwrap();
+        let sum1 = self
+            .builder
+            .build_int_add(sum, i64_t.const_int(1, false), "lt+1")
+            .unwrap();
+        let lhs = self
+            .builder
+            .build_int_mul(sum1, i64_t.const_int(4, false), "lhs")
+            .unwrap();
+        let rhs = self
+            .builder
+            .build_int_mul(cap, i64_t.const_int(3, false), "rhs")
+            .unwrap();
+        let need_resize = self
+            .builder
+            .build_int_compare(IntPredicate::UGT, lhs, rhs, "need_resize")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(need_resize, slow_bb, fast_bb)
+            .unwrap();
+
+        // ── slow_path: forward to erased karac_map_insert_old ─────
+        self.builder.position_at_end(slow_bb);
+        let slow_key_slot = self.builder.build_alloca(i64_t, "slow.key.slot").unwrap();
+        let slow_val_slot = self.builder.build_alloca(i64_t, "slow.val.slot").unwrap();
+        self.builder.build_store(slow_key_slot, key_arg).unwrap();
+        self.builder.build_store(slow_val_slot, val_arg).unwrap();
+        let slow_existed = self
+            .builder
+            .build_call(
+                self.karac_map_insert_old_fn,
+                &[
+                    map_arg.into(),
+                    slow_key_slot.into(),
+                    slow_val_slot.into(),
+                    out_old_arg.into(),
+                ],
+                "slow.existed",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic();
+        self.builder.build_return(Some(&slow_existed)).unwrap();
+
+        // ── fast_path: load status/kv ptrs, inline hash ───────────
+        self.builder.position_at_end(fast_bb);
+        let status_pp = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    map_arg,
+                    &[i64_t.const_int(Self::KARAC_MAP_STATUS_OFFSET, false)],
+                    "status.pp",
+                )
+                .unwrap()
+        };
+        let status_ptr = self
+            .builder
+            .build_load(
+                self.context.ptr_type(AddressSpace::default()),
+                status_pp,
+                "status",
+            )
+            .unwrap()
+            .into_pointer_value();
+        let kv_pp = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    map_arg,
+                    &[i64_t.const_int(Self::KARAC_MAP_KV_OFFSET, false)],
+                    "kv.pp",
+                )
+                .unwrap()
+        };
+        let kv_ptr = self
+            .builder
+            .build_load(self.context.ptr_type(AddressSpace::default()), kv_pp, "kv")
+            .unwrap()
+            .into_pointer_value();
+
+        // Compute hash via direct call to karac_hash_i64. Stack-
+        // alloca + store + call matches the existing erased path's
+        // hash exactly (same FNV-1a basis + prime, same byte order).
+        let hash_key_slot = self.builder.build_alloca(i64_t, "hash.key.slot").unwrap();
+        self.builder.build_store(hash_key_slot, key_arg).unwrap();
+        let hash = self
+            .builder
+            .build_call(hash_fn, &[hash_key_slot.into()], "hash")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        let mask = self
+            .builder
+            .build_int_sub(cap, i64_t.const_int(1, false), "mask")
+            .unwrap();
+        let start = self.builder.build_and(hash, mask, "start").unwrap();
+        self.builder
+            .build_unconditional_branch(probe_cond_bb)
+            .unwrap();
+
+        // ── probe.cond: 3-PHI'd state, bound check on i ───────────
+        self.builder.position_at_end(probe_cond_bb);
+        let i_phi = self.builder.build_phi(i64_t, "i").unwrap();
+        let ft_phi = self.builder.build_phi(i64_t, "ft").unwrap();
+        let ft_set_phi = self.builder.build_phi(bool_t, "ft_set").unwrap();
+        i_phi.add_incoming(&[(&i64_t.const_zero(), fast_bb)]);
+        ft_phi.add_incoming(&[(&i64_t.const_zero(), fast_bb)]);
+        ft_set_phi.add_incoming(&[(&bool_t.const_zero(), fast_bb)]);
+        let i_val = i_phi.as_basic_value().into_int_value();
+        let ft_val = ft_phi.as_basic_value().into_int_value();
+        let ft_set_val = ft_set_phi.as_basic_value().into_int_value();
+        let bound_done = self
+            .builder
+            .build_int_compare(IntPredicate::UGE, i_val, cap, "bound.done")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(bound_done, exhausted_bb, probe_body_bb)
+            .unwrap();
+
+        // ── probe.body: compute slot, load status, switch ─────────
+        self.builder.position_at_end(probe_body_bb);
+        let sum_si = self.builder.build_int_add(start, i_val, "sum.si").unwrap();
+        let slot = self.builder.build_and(sum_si, mask, "slot").unwrap();
+        let status_slot_p = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_t, status_ptr, &[slot], "status.slot.p")
+                .unwrap()
+        };
+        let status_byte = self
+            .builder
+            .build_load(i8_t, status_slot_p, "status.byte")
+            .unwrap()
+            .into_int_value();
+        let is_empty = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                status_byte,
+                i8_t.const_int(Self::BUCKET_EMPTY, false),
+                "is.empty",
+            )
+            .unwrap();
+        self.builder
+            .build_conditional_branch(is_empty, case_empty_bb, case_tomb_check_bb)
+            .unwrap();
+
+        // ── case.check_tomb: branch tomb vs occupied ──────────────
+        self.builder.position_at_end(case_tomb_check_bb);
+        let is_tomb = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                status_byte,
+                i8_t.const_int(Self::BUCKET_TOMBSTONE, false),
+                "is.tomb",
+            )
+            .unwrap();
+        self.builder
+            .build_conditional_branch(is_tomb, case_tomb_bb, case_occupied_bb)
+            .unwrap();
+
+        // ── case.empty: write fresh entry, possibly at earlier tomb
+        self.builder.position_at_end(case_empty_bb);
+        let target_slot = self
+            .builder
+            .build_select(ft_set_val, ft_val, slot, "target.slot")
+            .unwrap()
+            .into_int_value();
+        let kv_size = i64_t.const_int(16, false); // sizeof(i64) + sizeof(i64)
+        let target_off = self
+            .builder
+            .build_int_mul(target_slot, kv_size, "target.off")
+            .unwrap();
+        let target_kv_p = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_t, kv_ptr, &[target_off], "target.kv.p")
+                .unwrap()
+        };
+        self.builder.build_store(target_kv_p, key_arg).unwrap();
+        let target_val_p = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    target_kv_p,
+                    &[i64_t.const_int(8, false)],
+                    "target.val.p",
+                )
+                .unwrap()
+        };
+        self.builder.build_store(target_val_p, val_arg).unwrap();
+        let target_status_p = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_t, status_ptr, &[target_slot], "target.status.p")
+                .unwrap()
+        };
+        self.builder
+            .build_store(
+                target_status_p,
+                i8_t.const_int(Self::BUCKET_OCCUPIED, false),
+            )
+            .unwrap();
+        // len += 1
+        let new_len = self
+            .builder
+            .build_int_add(len, i64_t.const_int(1, false), "len.new")
+            .unwrap();
+        self.builder.build_store(len_p, new_len).unwrap();
+        // if ft_set, tombs -= 1
+        let tombs_dec = self
+            .builder
+            .build_int_sub(tombs, i64_t.const_int(1, false), "tombs.dec")
+            .unwrap();
+        let new_tombs = self
+            .builder
+            .build_select(ft_set_val, tombs_dec, tombs, "tombs.new")
+            .unwrap()
+            .into_int_value();
+        self.builder.build_store(tomb_p, new_tombs).unwrap();
+        self.builder
+            .build_return(Some(&bool_t.const_zero()))
+            .unwrap();
+
+        // ── case.tomb: remember first tomb, continue probing ─────
+        self.builder.position_at_end(case_tomb_bb);
+        let new_ft = self
+            .builder
+            .build_select(ft_set_val, ft_val, slot, "ft.new")
+            .unwrap()
+            .into_int_value();
+        let tomb_i_next = self
+            .builder
+            .build_int_add(i_val, i64_t.const_int(1, false), "i.next.tomb")
+            .unwrap();
+        i_phi.add_incoming(&[(&tomb_i_next, case_tomb_bb)]);
+        ft_phi.add_incoming(&[(&new_ft, case_tomb_bb)]);
+        ft_set_phi.add_incoming(&[(&bool_t.const_int(1, false), case_tomb_bb)]);
+        self.builder
+            .build_unconditional_branch(probe_cond_bb)
+            .unwrap();
+
+        // ── case.occupied: eq-check, found vs continue ───────────
+        self.builder.position_at_end(case_occupied_bb);
+        let slot_off = self
+            .builder
+            .build_int_mul(slot, kv_size, "slot.off")
+            .unwrap();
+        let slot_kv_p = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_t, kv_ptr, &[slot_off], "slot.kv.p")
+                .unwrap()
+        };
+        let slot_key = self
+            .builder
+            .build_load(i64_t, slot_kv_p, "slot.key")
+            .unwrap()
+            .into_int_value();
+        let key_match = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, slot_key, key_arg, "key.match")
+            .unwrap();
+        let occ_i_next = self
+            .builder
+            .build_int_add(i_val, i64_t.const_int(1, false), "i.next.occ")
+            .unwrap();
+        // Pre-build the no-match phi inputs.
+        i_phi.add_incoming(&[(&occ_i_next, case_occupied_bb)]);
+        ft_phi.add_incoming(&[(&ft_val, case_occupied_bb)]);
+        ft_set_phi.add_incoming(&[(&ft_set_val, case_occupied_bb)]);
+        self.builder
+            .build_conditional_branch(key_match, match_found_bb, probe_cond_bb)
+            .unwrap();
+
+        // ── match.found: copy old val out, write new val ─────────
+        self.builder.position_at_end(match_found_bb);
+        let slot_val_p = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_t, slot_kv_p, &[i64_t.const_int(8, false)], "slot.val.p")
+                .unwrap()
+        };
+        let old_val = self
+            .builder
+            .build_load(i64_t, slot_val_p, "old.val")
+            .unwrap()
+            .into_int_value();
+        self.builder.build_store(out_old_arg, old_val).unwrap();
+        self.builder.build_store(slot_val_p, val_arg).unwrap();
+        self.builder
+            .build_return(Some(&bool_t.const_int(1, false)))
+            .unwrap();
+
+        // ── exhausted: unreachable under correct resize policy,
+        //               fall back to erased extern for safety ──────
+        self.builder.position_at_end(exhausted_bb);
+        let safe_key_slot = self.builder.build_alloca(i64_t, "safe.key.slot").unwrap();
+        let safe_val_slot = self.builder.build_alloca(i64_t, "safe.val.slot").unwrap();
+        self.builder.build_store(safe_key_slot, key_arg).unwrap();
+        self.builder.build_store(safe_val_slot, val_arg).unwrap();
+        let safe_existed = self
+            .builder
+            .build_call(
+                self.karac_map_insert_old_fn,
+                &[
+                    map_arg.into(),
+                    safe_key_slot.into(),
+                    safe_val_slot.into(),
+                    out_old_arg.into(),
+                ],
+                "safe.existed",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic();
+        self.builder.build_return(Some(&safe_existed)).unwrap();
     }
 
     // ── Helpers ─────────────────────────────────────────────────

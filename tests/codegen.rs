@@ -5436,6 +5436,71 @@ fn main() {
     }
 
     #[test]
+    fn test_ir_map_i64_i64_insert_body_has_inline_probe() {
+        // Slice 1b.2b — the mono insert_old body inlines the
+        // load-factor check, the FNV-1a hash call (via direct call
+        // to `karac_hash_i64` rather than through the runtime's
+        // function-pointer dispatch), and the linear-probe + i64
+        // eq loop. Pin the new body shape.
+        let ir = ir_for(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.insert(1_i64, 100_i64);
+}
+"#,
+        );
+        // Extract the mono insert_old body.
+        let mut in_body = false;
+        let mut body_lines: Vec<&str> = Vec::new();
+        for line in ir.lines() {
+            if line.starts_with("define") && line.contains("@karac_map_i64_i64_insert_old") {
+                in_body = true;
+                continue;
+            }
+            if in_body {
+                if line.starts_with('}') {
+                    break;
+                }
+                body_lines.push(line);
+            }
+        }
+        assert!(
+            !body_lines.is_empty(),
+            "could not extract mono insert body; IR:\n{}",
+            ir
+        );
+        let body = body_lines.join("\n");
+        // Load-factor branch label.
+        assert!(
+            body.contains("fast_path") && body.contains("slow_path"),
+            "mono insert should have fast/slow path basic blocks; body:\n{}",
+            body
+        );
+        // Direct call to karac_hash_i64 (not function-pointer dispatch).
+        assert!(
+            body.contains("call i64 @karac_hash_i64"),
+            "mono insert fast path should call karac_hash_i64 directly; body:\n{}",
+            body
+        );
+        // Probe loop: status byte load + 3-way switch on EMPTY /
+        // TOMBSTONE / OCCUPIED. The presence of `load i8` for the
+        // status byte and an `icmp eq i8` against the empty/
+        // tombstone sentinels distinguishes the inline probe from
+        // a pure delegation body.
+        assert!(
+            body.contains("load i8"),
+            "mono insert should load the status byte inline; body:\n{}",
+            body
+        );
+        assert!(
+            body.contains("icmp eq i64") || body.contains("icmp ne i64"),
+            "mono insert should inline the i64 eq check; body:\n{}",
+            body
+        );
+    }
+
+    #[test]
     fn test_ir_map_i64_i64_len_emitted_once_per_module() {
         // Multiple `m.len()` sites on Map[i64, i64] should share a
         // single emission (the side-table cache returns the cached
