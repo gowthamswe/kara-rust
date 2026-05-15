@@ -12679,6 +12679,38 @@ impl<'a> TypeChecker<'a> {
             }
         }
 
+        // `Vec[T].get_unchecked(i: i64) -> T` — unsafe direct-index read.
+        // Skips the bounds check that `vec[i]` and `Vec.get(i)` emit; UB on
+        // out-of-range index. Must be called inside `unsafe { ... }`; the
+        // enforcement is hardcoded in `unsafe_lint::build_unsafe_fn_registry`
+        // (the built-in equivalent of marking an impl-method `unsafe fn`).
+        // Counterpart to the deferred `Slice.get_unchecked` plan at
+        // `phase-7-codegen.md:481`; surfaced as the perf lever for the
+        // bounds-check tax measured on kata #5 (see `wip-kata5-perf.md`).
+        if method == "get_unchecked" && args.len() == 1 {
+            let element_ty = match &obj_ty {
+                Type::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                    Some(args[0].clone())
+                }
+                Type::Ref(inner) | Type::MutRef(inner) => match inner.as_ref() {
+                    Type::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                        Some(args[0].clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(elem) = element_ty {
+                let arg_ty = self.infer_expr(&args[0].value);
+                self.check_assignable(
+                    &Type::Int(IntSize::I64),
+                    &arg_ty,
+                    args[0].value.span.clone(),
+                );
+                return resolve_type_var_top(&elem, &self.env.substitutions);
+            }
+        }
+
         // `VecDeque[T].push_back(item)` / `push_front(item)` — slot
         // check sibling to `Vec.push`. Returns `Type::Unit`.
         if matches!(method, "push_back" | "push_front") && args.len() == 1 {

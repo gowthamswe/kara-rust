@@ -5009,9 +5009,9 @@ fn stdlib_method_self_borrow_kind(key: &str) -> Option<BorrowKind> {
         | "Vec.truncate" | "Vec.resize" | "Vec.retain" | "Vec.extend" | "Vec.sort"
         | "Vec.sort_by" | "Vec.reverse" | "Vec.fill" | "Vec.swap" | "Vec.as_slice_mut" => MutRef,
         // Vec[T] read methods — `ref self` / read borrow.
-        "Vec.len" | "Vec.is_empty" | "Vec.first" | "Vec.last" | "Vec.get" | "Vec.contains"
-        | "Vec.iter" | "Vec.binary_search" | "Vec.split_at" | "Vec.chunks" | "Vec.windows"
-        | "Vec.as_slice" | "Vec.sorted" | "Vec.sorted_by" | "Vec.clone" => ImmRef,
+        "Vec.len" | "Vec.is_empty" | "Vec.first" | "Vec.last" | "Vec.get" | "Vec.get_unchecked"
+        | "Vec.contains" | "Vec.iter" | "Vec.binary_search" | "Vec.split_at" | "Vec.chunks"
+        | "Vec.windows" | "Vec.as_slice" | "Vec.sorted" | "Vec.sorted_by" | "Vec.clone" => ImmRef,
         // Map[K, V] mutating methods.
         "Map.insert" | "Map.remove" | "Map.clear" | "Map.merge" => MutRef,
         // Map[K, V] read methods.

@@ -6800,6 +6800,43 @@ impl<'a> Interpreter<'a> {
                     },
                 };
             }
+            "get_unchecked" => {
+                // Direct-index read with no bounds check. Codegen returns
+                // garbage on OOB; the interpreter mirror panics with the
+                // standard out-of-bounds message rather than return Value::Unit,
+                // so misuse surfaces immediately under `karac run` even though
+                // the codegen path is "UB" by design.
+                let array_view: Option<Vec<Value>> = match &obj {
+                    Value::Array(rc) => Some(rc.read().unwrap().clone()),
+                    Value::Slice {
+                        storage,
+                        start,
+                        len,
+                        ..
+                    } => Some(storage.read().unwrap()[*start..*start + *len].to_vec()),
+                    _ => None,
+                };
+                if let Some(v) = array_view {
+                    let idx = args
+                        .first()
+                        .map(|a| self.eval_expr_inner(&a.value))
+                        .unwrap_or(Value::Int(0));
+                    if let Value::Int(i) = idx {
+                        let i = i as usize;
+                        if i >= v.len() {
+                            panic!(
+                                "Vec.get_unchecked: index {} out of bounds (len={}) — \
+                                 caller broke the unsafe precondition",
+                                i,
+                                v.len()
+                            );
+                        }
+                        return v[i].clone();
+                    }
+                    return Value::Unit;
+                }
+                return Value::Unit;
+            }
             "get" => {
                 let array_view: Option<Vec<Value>> = match &obj {
                     Value::Array(rc) => Some(rc.read().unwrap().clone()),

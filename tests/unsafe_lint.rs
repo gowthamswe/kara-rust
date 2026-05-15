@@ -610,3 +610,45 @@ fn test_unsafe_block_wraps_multiple_ops() {
     );
     assert!(diags.is_empty(), "expected no diagnostics, got: {diags:?}");
 }
+
+// ── Built-in unsafe methods on prelude collections ──────────────
+//
+// `Vec.get_unchecked` is seeded into the unsafe-fn registry in
+// `unsafe_lint::build_unsafe_fn_registry` rather than discovered from a
+// user `impl ... { unsafe fn ... }` block. These tests pin the wiring
+// — the diagnostic must fire at the call site when unwrapped, and stay
+// silent inside `unsafe { ... }`.
+
+#[test]
+fn test_vec_get_unchecked_outside_unsafe_block_errors() {
+    let diags = lint_op(
+        "fn main() {\n\
+             let mut v: Vec[i64] = Vec.new();\n\
+             v.push(42);\n\
+             let _ = v.get_unchecked(0);\n\
+         }",
+    );
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected exactly one diagnostic, got: {diags:?}"
+    );
+    assert_eq!(diags[0].lint_name, "unsafe_op_in_unsafe_fn");
+    assert!(
+        diags[0].message.contains("Vec.get_unchecked"),
+        "diagnostic should name `Vec.get_unchecked`, got: {}",
+        diags[0].message
+    );
+}
+
+#[test]
+fn test_vec_get_unchecked_inside_unsafe_block_silent() {
+    let diags = lint_op(
+        "fn main() {\n\
+             let mut v: Vec[i64] = Vec.new();\n\
+             v.push(42);\n\
+             unsafe { let _ = v.get_unchecked(0); }\n\
+         }",
+    );
+    assert!(diags.is_empty(), "expected no diagnostics, got: {diags:?}");
+}

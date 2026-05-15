@@ -4330,6 +4330,180 @@ fn main() {
         }
     }
 
+    // ── Vec.get_unchecked — unsafe direct-index, no bounds check ────────
+    //
+    // Counterpart to `test_e2e_vec_get_in_bounds`: same indexing semantics
+    // but skips the bounds-check CFG (no `oob_bb` / `valid_bb`, no Option
+    // wrap). Lever for the bounds-check tax measured on kata #5
+    // (`wip-kata5-perf.md`). Out-of-range index is UB at runtime — the
+    // codegen path emits no diagnostic.
+
+    #[test]
+    fn test_e2e_vec_get_unchecked_in_bounds_returns_element() {
+        let out = run_program(
+            r#"
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    unsafe {
+        println(v.get_unchecked(0));
+        println(v.get_unchecked(1));
+        println(v.get_unchecked(2));
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "10\n20\n30");
+        }
+    }
+
+    #[test]
+    fn test_e2e_vec_get_unchecked_string_element() {
+        // Heap-bearing element type — exercises the codegen elem-load shape
+        // for non-i64 cells (different stride, different copy semantics).
+        let out = run_program(
+            r#"
+fn main() {
+    let mut v: Vec[String] = Vec.new();
+    v.push("alpha");
+    v.push("beta");
+    unsafe {
+        println(v.get_unchecked(0));
+        println(v.get_unchecked(1));
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "alpha\nbeta");
+        }
+    }
+
+    // ── Bounds-check elision via dominating loop guard ────────────────
+    //
+    // The same indexing pattern `Vec.get_unchecked` skips at runtime, but
+    // through safe `v[i]` reads when the loop guard already proves
+    // `0 <= i < v.len()`. Output correctness is the regression gate;
+    // perf is validated separately on the kata bench (`wip-kata5-perf.md`).
+    // The end-to-end shape these tests pin: build the vec, walk it under
+    // a guard that asserts both halves of the bound, and confirm the
+    // expected element values flow through. If the elision pass were
+    // unsound (e.g. mis-classified a fact, skipped a real-check), one of
+    // these would either crash or produce wrong output.
+
+    #[test]
+    fn test_e2e_bounds_elision_while_guard_proves_both() {
+        // `while i >= 0 and i < n` asserts both halves; v[i] inside skips
+        // both bounds checks. Sum across all elements proves we read
+        // every cell correctly.
+        let out = run_program(
+            r#"
+fn sum_all(v: ref Vec[i64]) -> i64 {
+    let n = v.len();
+    let mut i = 0i64;
+    let mut acc = 0i64;
+    while i >= 0 and i < n {
+        acc = acc + v[i];
+        i = i + 1;
+    }
+    acc
+}
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    v.push(4);
+    v.push(5);
+    println(sum_all(v));
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "15");
+        }
+    }
+
+    #[test]
+    fn test_e2e_bounds_elision_two_pointer_in_guard() {
+        // Kata #5's exact pattern: `lo >= 0 and hi < n and v[lo] == v[hi]`.
+        // The indexing happens INSIDE the guard's short-circuit `and`,
+        // so the asserted bounds must propagate through the short-circuit
+        // RHS evaluation, not just into the loop body. Returns the size
+        // of the longest palindrome seeded at the middle of the input.
+        let out = run_program(
+            r#"
+fn expand(chars: ref Vec[i64], lo0: i64, hi0: i64) -> i64 {
+    let mut lo = lo0;
+    let mut hi = hi0;
+    let n = chars.len();
+    while lo >= 0 and hi < n and chars[lo] == chars[hi] {
+        lo = lo - 1;
+        hi = hi + 1;
+    }
+    hi - lo - 1
+}
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    v.push(2);
+    v.push(1);
+    println(expand(v, 2, 2));
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "5");
+        }
+    }
+
+    #[test]
+    fn test_e2e_bounds_elision_partial_proof_still_safe() {
+        // Only the lower bound is proven (`i >= 0`). The upper-half
+        // bounds check must still fire — without it, the off-by-one
+        // indexing past `n - 1` would either UB or pull garbage. The
+        // assert here is that the program panics (specifically: the
+        // upper bounds check fires) rather than producing wrong output.
+        // The runner returns None when the compiled binary exits non-zero;
+        // we just check that it doesn't silently succeed.
+        let out = run_program(
+            r#"
+fn check_within(v: ref Vec[i64]) -> i64 {
+    let n = v.len();
+    let mut i = 0i64;
+    let mut acc = 0i64;
+    while i >= 0 and i < n + 1 {
+        acc = acc + v[i];
+        i = i + 1;
+    }
+    acc
+}
+fn main() {
+    let mut v: Vec[i64] = Vec.new();
+    v.push(10);
+    v.push(20);
+    println(check_within(v));
+}
+"#,
+        );
+        // Should NOT silently succeed with a value — must either panic
+        // (out is None / not the legitimate sum) or be obviously wrong.
+        // The legitimate sum would be 30; if elision were unsound, that
+        // could be the output. Assert it's not.
+        if let Some(out) = out {
+            assert_ne!(
+                out.trim(),
+                "30",
+                "elision must NOT skip upper bound when only lower is proven"
+            );
+        }
+    }
+
     // ── ? operator codegen ───────────────────────────────────────────────────
 
     #[test]

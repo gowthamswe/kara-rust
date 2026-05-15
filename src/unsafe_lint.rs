@@ -448,6 +448,13 @@ struct UnsafeFnRegistry {
 fn build_unsafe_fn_registry(program: &Program) -> UnsafeFnRegistry {
     let mut top_level_unsafe: HashSet<String> = HashSet::new();
     let mut impl_method_unsafe: HashSet<(String, String)> = HashSet::new();
+    // Built-in `unsafe fn` methods on prelude collections. These have no
+    // user-declared `impl` block to carry an `is_unsafe` flag, so the
+    // unsafe-required diagnostic is wired by seeding the registry here.
+    // Currently:
+    //   - `Vec.get_unchecked(i)`: skips the runtime bounds check — UB on
+    //     out-of-range index. Counterpart to the deferred Slice variant.
+    impl_method_unsafe.insert(("Vec".to_string(), "get_unchecked".to_string()));
     for item in &program.items {
         match item {
             Item::Function(f) if f.is_unsafe => {

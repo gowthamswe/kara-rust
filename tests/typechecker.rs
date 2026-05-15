@@ -12162,3 +12162,63 @@ fn test_match_owned_array_slice_rest_is_owned_array() {
          fn main() { }",
     );
 }
+
+// ── Vec.get_unchecked — unsafe direct-index read ─────────────────
+//
+// Counterpart to the bounds-check elision tax measured on kata #5
+// (`wip-kata5-perf.md`). `Vec[T].get_unchecked(i: i64) -> T` skips the
+// runtime bounds check that `vec[i]` / `vec.get(i)` emit. The unsafe-block
+// requirement is enforced by `src/unsafe_lint.rs` (the registry is seeded
+// with `("Vec", "get_unchecked")` so calls outside `unsafe { }` trip the
+// existing `unsafe_op_in_unsafe_fn` diagnostic — separate `tests/unsafe_lint.rs`
+// case pins that). These tests pin the typechecker side: signature shape,
+// receiver coercion, return-type pinning.
+
+#[test]
+fn test_vec_get_unchecked_returns_element_type() {
+    // The method returns `T` directly, not `Option[T]` like `get` —
+    // that's the whole point of the unsafe variant.
+    typecheck_ok(
+        "fn main() {
+             let mut v: Vec[i64] = Vec.new();
+             v.push(42);
+             unsafe {
+                 let x: i64 = v.get_unchecked(0);
+                 let _ = x;
+             }
+         }",
+    );
+}
+
+#[test]
+fn test_vec_get_unchecked_through_ref_borrow() {
+    // Receiver coercion mirrors other Vec read methods: `ref Vec[T]`
+    // and `mut ref Vec[T]` both dispatch identically.
+    typecheck_ok(
+        "fn first(v: ref Vec[i64]) -> i64 {
+             unsafe { v.get_unchecked(0) }
+         }
+         fn main() {
+             let mut v: Vec[i64] = Vec.new();
+             v.push(1);
+             let _ = first(v);
+         }",
+    );
+}
+
+#[test]
+fn test_vec_get_unchecked_pins_element_typevar() {
+    // Element type flowing into a generic Vec[?T] via earlier `push`
+    // must propagate so the return is concrete by the time downstream
+    // code consumes it.
+    typecheck_ok(
+        "fn main() {
+             let mut v = Vec.new();
+             v.push(7);
+             unsafe {
+                 let x: i64 = v.get_unchecked(0);
+                 let _ = x;
+             }
+         }",
+    );
+}

@@ -834,6 +834,31 @@ struct LoopFrame<'ctx> {
     result_slot: Option<PointerValue<'ctx>>,
 }
 
+/// One half of a Vec-index safety fact, asserted by a dominating
+/// `while`-guard or `for`-range and consulted by `compile_vec_index`
+/// to elide the matching half of its bounds check.
+///
+/// The two halves correspond to the unsigned bounds check
+/// (`icmp uge idx, len` → panic) which catches both negative-idx and
+/// idx-too-big in one compare. Splitting into signed-form facts lets
+/// us drop one or both halves when the source-level guard already
+/// proves them.
+#[derive(Debug, Clone)]
+enum AssertedIndexBound {
+    /// `idx_var >= 0` is known true in the current scope. Elides the
+    /// negative-idx half of the bounds check on `vec[idx_var]` regardless
+    /// of which Vec is being indexed (the lower bound doesn't depend on
+    /// the Vec).
+    LowerBound { idx_var: String },
+    /// `idx_var < vec_var.len()` is known true in the current scope.
+    /// Elides the upper-half of the bounds check on `vec_var[idx_var]`
+    /// (and only on that specific Vec). The Vec is identified by its
+    /// source-level variable name; the `len_alias` table is consulted
+    /// during guard parsing to resolve `idx_var < n` where `n` is a
+    /// local binding to `vec_var.len()`.
+    UpperBound { idx_var: String, vec_var: String },
+}
+
 // ── Spawn-site metadata (Debugger Contract slice 3) ────────────
 
 /// One row of the `KARAC_SPAWN_SITES` metadata table.
@@ -1016,6 +1041,24 @@ struct Codegen<'ctx> {
     exit_fn: FunctionValue<'ctx>,
     /// memcmp for string comparison.
     memcmp_fn: FunctionValue<'ctx>,
+    /// Local bindings that alias `vec_var.len()` — populated at let-sites of
+    /// the form `let n = v.len()` where `v` is a Vec identifier in scope.
+    /// Consulted by the bounds-check-elision pass when parsing while-guard
+    /// predicates of form `idx < n`: resolving `n` back to `v.len()` lets
+    /// the elision recognize `idx < v.len()` and skip the upper-half of
+    /// `compile_vec_index`'s bounds check on a matching `v[idx]` site.
+    /// Cleared / replaced as bindings shadow; the simple HashMap shape is
+    /// load-bearing because tracked Vec names don't shadow each other in
+    /// practice — refine to scope-keyed if a counter-example surfaces.
+    len_alias: HashMap<String, String>,
+    /// Asserted bounds in the current emission scope — facts established
+    /// by a dominating `while`-guard or `for`-range that the bounds-check
+    /// emission can rely on. Each entry asserts one half of a Vec-index
+    /// safety fact; `compile_vec_index` consults this stack at the
+    /// indexing site and elides the matching half of the bounds check.
+    /// The stack discipline (push on body-entry, pop on body-exit) maps
+    /// directly onto the source-level lexical scope of the guard.
+    asserted_index_bounds: Vec<AssertedIndexBound>,
     /// Per-variable Vec element type tracking (variable name → element LLVM type).
     vec_elem_types: HashMap<String, BasicTypeEnum<'ctx>>,
     /// Per-variable Slice element type tracking (variable name → element LLVM type).
@@ -1916,6 +1959,8 @@ impl<'ctx> Codegen<'ctx> {
             free_fn,
             exit_fn,
             memcmp_fn,
+            len_alias: HashMap::new(),
+            asserted_index_bounds: Vec::new(),
             vec_elem_types: HashMap::new(),
             slice_elem_types: HashMap::new(),
             fn_param_slice_elem: HashMap::new(),
@@ -6140,6 +6185,27 @@ impl<'ctx> Codegen<'ctx> {
                             self.slice_elem_types.insert(var_name.clone(), elem);
                         }
                     }
+                    // Bounds-check-elision len-alias tracking: `let n = v.len()`
+                    // records `n → v`, so a later `while ... and i < n and ...`
+                    // guard parsed in compile_while can resolve `n` back to
+                    // `v.len()` and assert `v[i]`'s upper bound. Limited to
+                    // bare-identifier receivers — `v[k].len()` and other
+                    // non-trivial receivers aren't tracked.
+                    if let ExprKind::MethodCall {
+                        object,
+                        method,
+                        args: method_args,
+                        ..
+                    } = &value.kind
+                    {
+                        if method == "len" && method_args.is_empty() {
+                            if let ExprKind::Identifier(vec_name) = &object.kind {
+                                if self.vec_elem_types.contains_key(vec_name.as_str()) {
+                                    self.len_alias.insert(var_name.clone(), vec_name.clone());
+                                }
+                            }
+                        }
+                    }
                 }
                 // SoA layout: if variable matches a layout name and RHS is Vec::new(),
                 // produce the SoA struct type instead of the normal Vec.
@@ -10236,6 +10302,38 @@ impl<'ctx> Codegen<'ctx> {
                     "opt",
                 );
                 Ok(agg)
+            }
+            // `Vec[T].get_unchecked(i: i64) -> T` — direct-index read with
+            // NO bounds check. UB on out-of-range. Mirrors the `"get"` arm's
+            // GEP+load lead but skips the `oob_bb` / `valid_bb` CFG split
+            // and returns the loaded element directly rather than wrapping
+            // in `Option`. The unsafe-block requirement is enforced upstream
+            // by `unsafe_lint::build_unsafe_fn_registry`; reaching this arm
+            // implies the caller already passed that check.
+            "get_unchecked" => {
+                if args.is_empty() {
+                    return Err("Vec.get_unchecked requires an index argument".to_string());
+                }
+                let idx_val = self.compile_expr(&args[0].value)?.into_int_value();
+                let data_ptr_ptr = self
+                    .builder
+                    .build_struct_gep(vec_ty, data_ptr, 0, "vec.data.ptr")
+                    .unwrap();
+                let data = self
+                    .builder
+                    .build_load(ptr_ty, data_ptr_ptr, "data")
+                    .unwrap()
+                    .into_pointer_value();
+                let elem_ptr = unsafe {
+                    self.builder
+                        .build_gep(elem_ty, data, &[idx_val], "v.unchecked.elem.ptr")
+                        .unwrap()
+                };
+                let val = self
+                    .builder
+                    .build_load(elem_ty, elem_ptr, "v.unchecked.elem")
+                    .unwrap();
+                Ok(val)
             }
             "sort_by" => {
                 if args.len() != 1 {
@@ -15823,7 +15921,6 @@ impl<'ctx> Codegen<'ctx> {
         name: &str,
         index: &Expr,
     ) -> Result<BasicValueEnum<'ctx>, String> {
-        let i64_t = self.context.i64_type();
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let vec_ty = self.vec_struct_type();
         let elem_ty = self.vec_elem_type_for_var(name);
@@ -15831,17 +15928,16 @@ impl<'ctx> Codegen<'ctx> {
         let vec_ptr = self
             .get_data_ptr(name)
             .ok_or_else(|| format!("Undefined Vec variable '{}' in index expression", name))?;
+        // Source-level elision: if the index is a bare identifier whose
+        // bounds are proven by a dominating loop guard (recorded in
+        // `asserted_index_bounds`), drop the matching half(s) of the
+        // bounds check. Captured here BEFORE compiling the index so we
+        // don't pay for the lookup when it can't fire (compound indices,
+        // method-call indices, etc. immediately default to no elision).
+        let (lower_proven, upper_proven) = self.index_bounds_already_proven(index, name);
+
         let idx_val = self.compile_expr(index)?.into_int_value();
 
-        let len_ptr = self
-            .builder
-            .build_struct_gep(vec_ty, vec_ptr, 1, "v.len.ptr")
-            .unwrap();
-        let len = self
-            .builder
-            .build_load(i64_t, len_ptr, "v.len")
-            .unwrap()
-            .into_int_value();
         let data_pp = self
             .builder
             .build_struct_gep(vec_ty, vec_ptr, 0, "v.data.ptr")
@@ -15852,22 +15948,12 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap()
             .into_pointer_value();
 
-        let fn_val = self.current_fn.unwrap();
-        let oob_bb = self.context.append_basic_block(fn_val, "vidx.oob");
-        let ok_bb = self.context.append_basic_block(fn_val, "vidx.ok");
-        let cmp = self
-            .builder
-            .build_int_compare(inkwell::IntPredicate::UGE, idx_val, len, "bounds")
-            .unwrap();
-        self.builder
-            .build_conditional_branch(cmp, oob_bb, ok_bb)
-            .unwrap();
+        // Emit whichever halves of the bounds check the source-level
+        // analysis didn't prove. The runtime panic path is reachable iff
+        // some unproven half fails; both halves proven → no runtime
+        // check at all (status quo for `unsafe { v.get_unchecked(i) }`).
+        self.emit_split_bounds_check("vidx", idx_val, vec_ty, vec_ptr, lower_proven, upper_proven);
 
-        self.builder.position_at_end(oob_bb);
-        self.emit_panic("vec index out of bounds");
-        self.builder.build_unreachable().unwrap();
-
-        self.builder.position_at_end(ok_bb);
         let elem_ptr = unsafe {
             self.builder
                 .build_gep(elem_ty, data, &[idx_val], "v.elem.ptr")
@@ -15880,30 +15966,163 @@ impl<'ctx> Codegen<'ctx> {
         Ok(val)
     }
 
+    /// Decide whether the dominating loop guard already proves either half
+    /// of a `vec_var[idx]` safety check. Returns `(lower_proven, upper_proven)`:
+    /// `lower_proven` ⇒ `idx >= 0` known; the negative-idx half can be
+    /// dropped. `upper_proven` ⇒ `idx < vec_var.len()` known; the
+    /// out-of-range half can be dropped.
+    ///
+    /// Only fires for bare-identifier indices (`v[i]`, never `v[i + 1]`).
+    /// The kata's `chars[lo]` / `chars[hi]` shape passes; compound forms
+    /// fall through to the full runtime check. Tightening to handle
+    /// `v[i ± k]` for small known k is a follow-up; many real workloads
+    /// don't need it (e.g. iterator-driven loops use bare-identifier
+    /// indices), and the conservative default just means "no elision",
+    /// not "wrong".
+    fn index_bounds_already_proven(&self, index: &Expr, vec_var: &str) -> (bool, bool) {
+        let idx_name = match &index.kind {
+            ExprKind::Identifier(name) => name.as_str(),
+            _ => return (false, false),
+        };
+        let mut lower = false;
+        let mut upper = false;
+        for fact in &self.asserted_index_bounds {
+            match fact {
+                AssertedIndexBound::LowerBound { idx_var } if idx_var == idx_name => {
+                    lower = true;
+                }
+                AssertedIndexBound::UpperBound {
+                    idx_var,
+                    vec_var: bound_vec,
+                } if idx_var == idx_name && bound_vec == vec_var => {
+                    upper = true;
+                }
+                _ => {}
+            }
+        }
+        (lower, upper)
+    }
+
+    /// Emit the runtime bounds check for `vec_ptr[idx]`, dropping
+    /// whichever half(s) the caller's `lower_proven` / `upper_proven`
+    /// flags say are already established. The remaining branches still
+    /// route OOB cases through `emit_panic("vec index out of bounds")`
+    /// for safety; only the redundant compares are elided.
+    ///
+    /// When both halves are proven, this emits no bounds-check code at
+    /// all — the caller's GEP+load runs straight through, matching the
+    /// shape of `Vec.get_unchecked` for safe code that the source-level
+    /// guard already justifies.
+    fn emit_split_bounds_check(
+        &mut self,
+        label_prefix: &str,
+        idx_val: inkwell::values::IntValue<'ctx>,
+        vec_ty: StructType<'ctx>,
+        vec_ptr: PointerValue<'ctx>,
+        lower_proven: bool,
+        upper_proven: bool,
+    ) {
+        let i64_t = self.context.i64_type();
+        let fn_val = self.current_fn.unwrap();
+
+        // No check at all — both halves are pre-proven. Saves the load of
+        // len and any branch / panic-block emission.
+        if lower_proven && upper_proven {
+            return;
+        }
+
+        // Lower-bound half: `idx < 0`. Skipped when the guard proved
+        // `idx >= 0`; the load of `len` below is then loop-invariant
+        // and LLVM will likely hoist it if both halves are emitted but
+        // only the upper one is reached on the hot path.
+        if !lower_proven {
+            let oob_bb = self
+                .context
+                .append_basic_block(fn_val, &format!("{label_prefix}.oob.neg"));
+            let ok_bb = self
+                .context
+                .append_basic_block(fn_val, &format!("{label_prefix}.lower.ok"));
+            let neg = self
+                .builder
+                .build_int_compare(
+                    inkwell::IntPredicate::SLT,
+                    idx_val,
+                    i64_t.const_zero(),
+                    "bounds.neg",
+                )
+                .unwrap();
+            self.builder
+                .build_conditional_branch(neg, oob_bb, ok_bb)
+                .unwrap();
+            self.builder.position_at_end(oob_bb);
+            self.emit_panic("vec index out of bounds");
+            self.builder.build_unreachable().unwrap();
+            self.builder.position_at_end(ok_bb);
+        }
+
+        // Upper-bound half: `idx >= len`. Skipped when the guard proved
+        // `idx < vec_var.len()`. The signed `sge` predicate matches the
+        // source-level signed loop guard's `slt` — LLVM's instcombine
+        // folds the per-iteration redundant compare with the loop guard's
+        // back-edge cmp when both have the same operands and predicate
+        // family, which is the structural fix the `llvm.assume` spike
+        // failed to trigger.
+        if !upper_proven {
+            let len_ptr = self
+                .builder
+                .build_struct_gep(vec_ty, vec_ptr, 1, "v.len.ptr")
+                .unwrap();
+            let len = self
+                .builder
+                .build_load(i64_t, len_ptr, "v.len")
+                .unwrap()
+                .into_int_value();
+            let oob_bb = self
+                .context
+                .append_basic_block(fn_val, &format!("{label_prefix}.oob.upper"));
+            let ok_bb = self
+                .context
+                .append_basic_block(fn_val, &format!("{label_prefix}.upper.ok"));
+            let upper = if lower_proven {
+                // Guard proved `idx >= 0`, so `idx u>= len` is equivalent
+                // to `idx s>= len`. Use the signed form to match the
+                // loop guard's predicate family for CSE.
+                self.builder
+                    .build_int_compare(inkwell::IntPredicate::SGE, idx_val, len, "bounds.upper")
+                    .unwrap()
+            } else {
+                // Negative idx is still possible (lower half above
+                // panicked it, but we're past that block — keep the
+                // unsigned compare so this branch alone is sound).
+                self.builder
+                    .build_int_compare(inkwell::IntPredicate::UGE, idx_val, len, "bounds")
+                    .unwrap()
+            };
+            self.builder
+                .build_conditional_branch(upper, oob_bb, ok_bb)
+                .unwrap();
+            self.builder.position_at_end(oob_bb);
+            self.emit_panic("vec index out of bounds");
+            self.builder.build_unreachable().unwrap();
+            self.builder.position_at_end(ok_bb);
+        }
+    }
+
     fn compile_vec_index_store(
         &mut self,
         var_name: &str,
         index: &Expr,
         val: BasicValueEnum<'ctx>,
     ) -> Result<(), String> {
-        let i64_t = self.context.i64_type();
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let vec_ty = self.vec_struct_type();
         let elem_ty = self.vec_elem_type_for_var(var_name);
         let vec_ptr = self
             .get_data_ptr(var_name)
             .ok_or_else(|| format!("Undefined Vec variable '{}' in index store", var_name))?;
+        let (lower_proven, upper_proven) = self.index_bounds_already_proven(index, var_name);
         let idx_val = self.compile_expr(index)?.into_int_value();
 
-        let len_ptr = self
-            .builder
-            .build_struct_gep(vec_ty, vec_ptr, 1, "v.st.len.ptr")
-            .unwrap();
-        let len = self
-            .builder
-            .build_load(i64_t, len_ptr, "v.st.len")
-            .unwrap()
-            .into_int_value();
         let data_pp = self
             .builder
             .build_struct_gep(vec_ty, vec_ptr, 0, "v.st.data.ptr")
@@ -15914,21 +16133,7 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap()
             .into_pointer_value();
 
-        let fn_val = self.current_fn.unwrap();
-        let oob_bb = self.context.append_basic_block(fn_val, "v.st.oob");
-        let ok_bb = self.context.append_basic_block(fn_val, "v.st.ok");
-        let cmp = self
-            .builder
-            .build_int_compare(inkwell::IntPredicate::UGE, idx_val, len, "bounds")
-            .unwrap();
-        self.builder
-            .build_conditional_branch(cmp, oob_bb, ok_bb)
-            .unwrap();
-        self.builder.position_at_end(oob_bb);
-        self.emit_panic("vec index out of bounds");
-        self.builder.build_unreachable().unwrap();
-
-        self.builder.position_at_end(ok_bb);
+        self.emit_split_bounds_check("v.st", idx_val, vec_ty, vec_ptr, lower_proven, upper_proven);
         let elem_ptr = unsafe {
             self.builder
                 .build_gep(elem_ty, data, &[idx_val], "v.st.elem.ptr")
@@ -16557,10 +16762,34 @@ impl<'ctx> Codegen<'ctx> {
             .build_conditional_branch(lhs_val, true_dest, false_dest)
             .unwrap();
 
+        // Bounds-check-elision propagation: when the RHS of `lhs and rhs`
+        // fires, we've branch-proved that lhs holds. Any index-safety fact
+        // asserted by lhs is in scope for rhs's compilation. This is how
+        // the kata's `while lo >= 0 and hi < n and chars[lo] == chars[hi]`
+        // pattern lets the indexing in the third conjunct skip its
+        // bounds check — `lo >= 0` and `hi < n` are conjuncts evaluated
+        // first under short-circuit, so by the time chars[lo] / chars[hi]
+        // lower (in compile_vec_index), the facts are on the stack.
+        let pushed = if matches!(op, BinOp::And) {
+            let facts = self.collect_asserted_bounds_from_guard(left);
+            let n = facts.len();
+            self.asserted_index_bounds.extend(facts);
+            n
+        } else {
+            0
+        };
+
         self.builder.position_at_end(rhs_bb);
         let rhs_val = self.compile_expr(right)?.into_int_value();
         let rhs_end_bb = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+        // Pop the temporarily-asserted facts so the merge / surrounding
+        // scope sees only its own bounds. Compile_while's body-entry push
+        // re-establishes them for body code on the long-lived path.
+        for _ in 0..pushed {
+            self.asserted_index_bounds.pop();
+        }
 
         self.builder.position_at_end(merge_bb);
         let bool_ty = self.context.bool_type();
@@ -19355,7 +19584,20 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap();
 
         self.builder.position_at_end(body_bb);
+        // Bounds-check-elision: the guard is true at body entry, so every
+        // signed comparison conjunct that establishes an index bound can be
+        // pushed as an asserted fact. `compile_vec_index` consults the stack
+        // and drops the matching half of its runtime bounds check.
+        let pushed_bounds = self.collect_asserted_bounds_from_guard(condition);
+        let pushed_count = pushed_bounds.len();
+        self.asserted_index_bounds.extend(pushed_bounds);
         self.compile_block(body)?;
+        // Pop the bounds we pushed for this loop; restore the surrounding
+        // scope's stack untouched. Nested loops therefore see only their
+        // own and outer-loop bounds, never inner-loop leftovers.
+        for _ in 0..pushed_count {
+            self.asserted_index_bounds.pop();
+        }
         if self
             .builder
             .get_insert_block()
@@ -19369,6 +19611,151 @@ impl<'ctx> Codegen<'ctx> {
         self.loop_stack.pop();
         self.builder.position_at_end(exit_bb);
         Ok(self.context.i64_type().const_int(0, false).into())
+    }
+
+    /// Walk a boolean expression that holds true at the entry to a body
+    /// block (e.g. a `while` guard or an `if` cond) and return the
+    /// index-safety facts it asserts. Only handles `and`-chained signed
+    /// comparisons against identifiers or zero — the conservative subset
+    /// that the kata-5 elision pass needs. Unrecognized shapes are silently
+    /// ignored (the bounds check stays as-is for the corresponding index).
+    fn collect_asserted_bounds_from_guard(&self, cond: &Expr) -> Vec<AssertedIndexBound> {
+        let mut out = Vec::new();
+        self.walk_guard_conjuncts(cond, &mut out);
+        out
+    }
+
+    fn walk_guard_conjuncts(&self, cond: &Expr, out: &mut Vec<AssertedIndexBound>) {
+        if let ExprKind::Binary { op, left, right } = &cond.kind {
+            // Recurse through `and`-chained conjuncts so multi-clause
+            // guards like `lo >= 0 and hi < n and chars[lo] == chars[hi]`
+            // contribute each conjunct's fact independently.
+            if matches!(op, BinOp::And) {
+                self.walk_guard_conjuncts(left, out);
+                self.walk_guard_conjuncts(right, out);
+                return;
+            }
+            if let Some(fact) = self.extract_index_bound_from_binop(op, left, right) {
+                out.push(fact);
+            }
+        }
+        // The typechecker rewrites integer comparisons through trait-method
+        // dispatch (e.g. `lo >= 0` → `i64::ge(lo, 0)`), so the post-lowering
+        // AST carries `>=` / `<=` / sometimes `<` / `>` as `Call` nodes whose
+        // callee is a `Path { segments: ["<int>", "ge"|"le"|"lt"|"gt"], .. }`.
+        // The Binary form above still handles the cases the lowering leaves
+        // alone (which empirically includes `<` between two same-typed i64s);
+        // this Call arm catches the rest.
+        if let ExprKind::Call { callee, args } = &cond.kind {
+            if let ExprKind::Path { segments, .. } = &callee.kind {
+                if segments.len() == 2 && args.len() == 2 {
+                    let op = match segments[1].as_str() {
+                        "ge" => Some(BinOp::GtEq),
+                        "le" => Some(BinOp::LtEq),
+                        "lt" => Some(BinOp::Lt),
+                        "gt" => Some(BinOp::Gt),
+                        _ => None,
+                    };
+                    if let Some(op) = op {
+                        if let Some(fact) =
+                            self.extract_index_bound_from_binop(&op, &args[0].value, &args[1].value)
+                        {
+                            out.push(fact);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Match a single binary comparison and decode whichever index-safety
+    /// fact (if any) it establishes. Recognizes the four normal forms
+    /// the kata's `while`-guard surface produces:
+    ///   - `idx >= 0`  /  `0 <= idx`           → LowerBound { idx }
+    ///   - `idx < vec.len()`                    → UpperBound { idx, vec }
+    ///   - `idx < n` where n aliases vec.len()  → UpperBound { idx, vec }
+    /// Strict-less only — `idx <= n-1` would be sound but isn't a shape
+    /// the kata surface produces, and conservatively skipping it now keeps
+    /// the elision predicate small.
+    fn extract_index_bound_from_binop(
+        &self,
+        op: &BinOp,
+        left: &Expr,
+        right: &Expr,
+    ) -> Option<AssertedIndexBound> {
+        match op {
+            // `idx >= 0`
+            BinOp::GtEq => {
+                if let (ExprKind::Identifier(idx), ExprKind::Integer(0, _)) =
+                    (&left.kind, &right.kind)
+                {
+                    return Some(AssertedIndexBound::LowerBound {
+                        idx_var: idx.clone(),
+                    });
+                }
+                None
+            }
+            // `0 <= idx`
+            BinOp::LtEq => {
+                if let (ExprKind::Integer(0, _), ExprKind::Identifier(idx)) =
+                    (&left.kind, &right.kind)
+                {
+                    return Some(AssertedIndexBound::LowerBound {
+                        idx_var: idx.clone(),
+                    });
+                }
+                None
+            }
+            // `idx < n` where n is either `vec.len()` (resolved here) or a
+            // local binding to one (resolved via `len_alias`).
+            BinOp::Lt => {
+                if let ExprKind::Identifier(idx) = &left.kind {
+                    let vec_var = self.resolve_len_origin(right)?;
+                    return Some(AssertedIndexBound::UpperBound {
+                        idx_var: idx.clone(),
+                        vec_var,
+                    });
+                }
+                None
+            }
+            // `n > idx` — same fact as `idx < n`.
+            BinOp::Gt => {
+                if let ExprKind::Identifier(idx) = &right.kind {
+                    let vec_var = self.resolve_len_origin(left)?;
+                    return Some(AssertedIndexBound::UpperBound {
+                        idx_var: idx.clone(),
+                        vec_var,
+                    });
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve an expression to the Vec variable whose `.len()` it computes,
+    /// if any. Handles:
+    ///   - Direct `vec.len()` method call (Identifier receiver).
+    ///   - A bare Identifier whose binding was previously recorded in
+    ///     `len_alias` by the let-site tracking pass.
+    fn resolve_len_origin(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } if method == "len" && args.is_empty() => {
+                if let ExprKind::Identifier(vec_name) = &object.kind {
+                    if self.vec_elem_types.contains_key(vec_name.as_str()) {
+                        return Some(vec_name.clone());
+                    }
+                }
+                None
+            }
+            ExprKind::Identifier(name) => self.len_alias.get(name.as_str()).cloned(),
+            _ => None,
+        }
     }
 
     fn compile_loop(
