@@ -5286,6 +5286,94 @@ fn main() {
         }
     }
 
+    // ── Monomorphized Map[K, V] symbols (Slice 1) ──────────────────
+    //
+    // Slice 1a wires `compile_map_method` to route `Map[i64,
+    // i64].len()` through a per-K/V mono symbol
+    // (`karac_map_i64_i64_len`) emitted with `LinkOnceODR` linkage.
+    // Slice 1a's wrapper body forwards 1:1 to the erased
+    // `karac_map_len` runtime; Slice 1b replaces hot-path bodies
+    // (insert_old, get) with fully inlined LLVM. These tests pin the
+    // emission, mangling, linkage, and dispatch wiring — the
+    // foundation for Slices 1b-1c.
+
+    #[test]
+    fn test_ir_map_i64_i64_len_uses_mono_symbol() {
+        // The mono symbol must be emitted and called from the main
+        // body; the erased `karac_map_len` is allowed to remain
+        // declared (the mono wrapper body delegates to it in 1a) but
+        // the user-facing `m.len()` site routes through mono.
+        let ir = ir_for(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    println(m.len());
+}
+"#,
+        );
+        assert!(
+            ir.contains("@karac_map_i64_i64_len"),
+            "mono len symbol should be emitted; IR:\n{}",
+            ir
+        );
+        assert!(
+            ir.contains("call i64 @karac_map_i64_i64_len"),
+            "user-facing m.len() should dispatch through mono symbol; IR:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_ir_map_i64_i64_len_has_linkonce_odr() {
+        // §3.2 locked decision: every monomorphized collection symbol
+        // gets `LinkOnceODR` linkage so cross-crate / cross-TU dupes
+        // collapse at link time.
+        let ir = ir_for(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    println(m.len());
+}
+"#,
+        );
+        // LLVM IR shape: `define linkonce_odr i64 @karac_map_i64_i64_len(ptr ...)`.
+        let define_line = ir
+            .lines()
+            .find(|l| l.contains("@karac_map_i64_i64_len") && l.starts_with("define"))
+            .unwrap_or_else(|| panic!("could not find define for mono len; IR:\n{}", ir));
+        assert!(
+            define_line.contains("linkonce_odr"),
+            "mono len should have linkonce_odr linkage; saw: {}",
+            define_line
+        );
+    }
+
+    #[test]
+    fn test_ir_map_i64_i64_len_emitted_once_per_module() {
+        // Multiple `m.len()` sites on Map[i64, i64] should share a
+        // single emission (the side-table cache returns the cached
+        // FunctionValue on second hit).
+        let ir = ir_for(
+            r#"
+fn main() {
+    let mut a: Map[i64, i64] = Map.new();
+    let mut b: Map[i64, i64] = Map.new();
+    println(a.len());
+    println(b.len());
+}
+"#,
+        );
+        let define_count = ir
+            .lines()
+            .filter(|l| l.contains("@karac_map_i64_i64_len") && l.starts_with("define"))
+            .count();
+        assert_eq!(
+            define_count, 1,
+            "mono len should be defined exactly once; IR:\n{}",
+            ir
+        );
+    }
+
     #[test]
     fn test_e2e_map_i64_for_loop_sum() {
         // Sum all values; key sum is deterministic (single entry)

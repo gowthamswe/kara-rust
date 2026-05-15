@@ -888,6 +888,36 @@ struct SpawnSiteRecord {
     worker_count: Option<u32>,
 }
 
+/// Per-(K, V) cache of monomorphized `Map[K, V]` method symbols.
+///
+/// Slice 1 of the monomorphized-collections work (see
+/// [`wip-monomorphized-collections.md`](../docs/implementation_checklist/wip-monomorphized-collections.md)
+/// § Slice 1) replaces the type-erased `karac_map_*` runtime dispatch
+/// — which routes every operation through function pointers consulting
+/// a byte-blob storage — with per-K/V LLVM symbols compiled into the
+/// user crate. Each emitted function has `LinkOnceODR` linkage so
+/// cross-crate / cross-TU duplication collapses at link time
+/// (locked design § 3.2).
+///
+/// Slice 1 ships `Map[i64, i64]` only (the smallest realistic K/V).
+/// `linkonce_odr`-emitted symbols that have no callers get DCE'd at
+/// link time, so the cache is keyed by the K/V mangle pair and
+/// emission is gated on the dispatch site at `compile_map_method`
+/// finding the corresponding mono symbol via
+/// `should_use_mono_map_for(key_ty, val_ty)`.
+///
+/// All wrapper bodies in Slice 1a delegate to the existing erased
+/// `karac_map_*` runtime (1:1 forwarding) — the per-K/V symbol exists
+/// at this slice purely to validate emission, mangling, and dispatch.
+/// Slice 1b replaces the hot-path bodies (`insert_old`, `get`) with
+/// fully-inlined LLVM bodies (direct i64 hash + icmp eq, no extern
+/// call) and locks the bench gain.
+#[derive(Copy, Clone)]
+struct MapMonoMethods<'ctx> {
+    /// `i64 karac_map_<keymangle>_<valmangle>_len(map: ptr)`.
+    len_fn: FunctionValue<'ctx>,
+}
+
 // ── Codegen ────────────────────────────────────────────────────
 
 struct Codegen<'ctx> {
@@ -1362,6 +1392,17 @@ struct Codegen<'ctx> {
     /// it has no production caller until the consumer lands.
     #[allow(dead_code)]
     drop_fn_cache: HashMap<String, FunctionValue<'ctx>>,
+    /// Per-(K, V) cache of monomorphized `Map[K, V]` method symbols.
+    /// Keyed by the mangled `"{key_mangle}_{val_mangle}"` token (e.g.
+    /// `"i64_i64"`) produced by `mono_map_cache_key`. Lazily populated
+    /// by `get_or_emit_map_mono_methods` on the first request for a
+    /// given K/V tuple. Per-method `FunctionValue`s have `LinkOnceODR`
+    /// linkage so cross-crate / cross-TU duplicates collapse at link
+    /// time (locked design § 3.2). Slice 1 ships `Map[i64, i64]` only;
+    /// the gating predicate `should_use_mono_map_for` returns `false`
+    /// for every other K/V tuple, leaving them on the erased fallback
+    /// per § 3.6.
+    map_mono_methods: HashMap<String, MapMonoMethods<'ctx>>,
     /// Per-type Display function cache. Keyed by the canonical type name
     /// (e.g. `"i64"`, `"String"`, `"Vec_i64"`, `"Map_String_i64"`). Each
     /// emitted fn has signature `void karac_display_<typename>(ptr)` and
@@ -1932,6 +1973,7 @@ impl<'ctx> Codegen<'ctx> {
             karac_string_clone_fn,
             clone_fn_cache: HashMap::new(),
             drop_fn_cache: HashMap::new(),
+            map_mono_methods: HashMap::new(),
             display_fn_cache: HashMap::new(),
             karac_error_trace_push_fn,
             karac_error_trace_clear_fn,
@@ -13142,9 +13184,17 @@ impl<'ctx> Codegen<'ctx> {
 
         match method {
             "len" => {
+                // Slice 1a: route Map[i64, i64].len through the
+                // monomorphized symbol family; every other K/V tuple
+                // stays on the erased fallback per § 3.6 coexist.
+                let len_fn = if self.should_use_mono_map_for(key_ty, val_ty) {
+                    self.get_or_emit_map_mono_methods(key_ty, val_ty).len_fn
+                } else {
+                    self.karac_map_len_fn
+                };
                 let len = self
                     .builder
-                    .build_call(self.karac_map_len_fn, &[map_handle.into()], "map.len")
+                    .build_call(len_fn, &[map_handle.into()], "map.len")
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_basic();
@@ -22583,6 +22633,106 @@ impl<'ctx> Codegen<'ctx> {
             BasicTypeEnum::StructType(_) => "struct".to_string(),
             _ => "opaque".to_string(),
         }
+    }
+
+    // ── Monomorphized Map[K, V] symbol emission (Slice 1) ───────
+
+    /// Cache key for the monomorphized Map[K, V] symbol family —
+    /// `"{key_mangle}_{val_mangle}"` (e.g. `"i64_i64"`). Mirrors the
+    /// content-addressed scheme used by `mangle_mono_name` for user
+    /// generic fns, expressed in terms of `llvm_type_to_mangle_str`'s
+    /// stable token set so distinct K/V tuples never collide.
+    fn mono_map_cache_key(
+        &self,
+        key_ty: BasicTypeEnum<'ctx>,
+        val_ty: BasicTypeEnum<'ctx>,
+    ) -> String {
+        format!(
+            "{}_{}",
+            self.llvm_type_to_mangle_str(key_ty),
+            self.llvm_type_to_mangle_str(val_ty),
+        )
+    }
+
+    /// Gate predicate: does this K/V tuple route through the
+    /// monomorphized Map path? Slice 1 ships `Map[i64, i64]` only;
+    /// every other tuple falls through to the erased `karac_map_*`
+    /// runtime per § 3.6 coexist-during-migration. Slices 2-4 widen
+    /// the predicate; Slice 5 deletes the erased fallback entirely.
+    fn should_use_mono_map_for(
+        &self,
+        key_ty: BasicTypeEnum<'ctx>,
+        val_ty: BasicTypeEnum<'ctx>,
+    ) -> bool {
+        let i64_t = self.context.i64_type();
+        matches!(key_ty, BasicTypeEnum::IntType(t) if t == i64_t)
+            && matches!(val_ty, BasicTypeEnum::IntType(t) if t == i64_t)
+    }
+
+    /// Lazily emit the monomorphized `Map[K, V]` method-symbol family
+    /// for a given K/V tuple and return the cached handles. Each
+    /// per-method `FunctionValue` is emitted with `LinkOnceODR`
+    /// linkage so cross-crate / cross-TU duplicates collapse at link
+    /// time (locked design § 3.2).
+    ///
+    /// Slice 1a ships **wrapper bodies only**: each mono method
+    /// forwards to the corresponding erased `karac_map_*` runtime
+    /// function 1:1. The wrapper exists at this slice to validate
+    /// emission, mangling, dispatch wiring, and `linkonce_odr`
+    /// linkage — `nm | grep karac_map_i64_i64_len | wc -l == 1`
+    /// after the slice lands. Slice 1b replaces hot-path bodies
+    /// (`insert_old`, `get`) with fully-inlined LLVM (direct i64
+    /// hash + icmp eq), unlocking the bench gain.
+    fn get_or_emit_map_mono_methods(
+        &mut self,
+        key_ty: BasicTypeEnum<'ctx>,
+        val_ty: BasicTypeEnum<'ctx>,
+    ) -> MapMonoMethods<'ctx> {
+        let cache_key = self.mono_map_cache_key(key_ty, val_ty);
+        if let Some(entry) = self.map_mono_methods.get(&cache_key) {
+            return *entry;
+        }
+
+        let saved_bb = self.builder.get_insert_block();
+
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+
+        // len wrapper: forwards to `karac_map_len`. Direct-load of the
+        // KaracMap.len field is blocked on exposing the runtime
+        // struct layout at codegen — deferred to a later slice that
+        // either reps the struct as `#[repr(C)]` with a known offset
+        // or pivots to a fully-LLVM-emitted storage. Wrapper-only is
+        // sufficient for Slice 1a's "validate emission" goal.
+        let len_name = format!("karac_map_{cache_key}_len");
+        let len_fn = match self.module.get_function(&len_name) {
+            Some(f) => f,
+            None => {
+                let len_ty = i64_t.fn_type(&[ptr_ty.into()], false);
+                let f = self
+                    .module
+                    .add_function(&len_name, len_ty, Some(Linkage::LinkOnceODR));
+                let entry = self.context.append_basic_block(f, "entry");
+                self.builder.position_at_end(entry);
+                let map_arg = f.get_nth_param(0).unwrap().into_pointer_value();
+                let len = self
+                    .builder
+                    .build_call(self.karac_map_len_fn, &[map_arg.into()], "mono.len")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                self.builder.build_return(Some(&len)).unwrap();
+                f
+            }
+        };
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        let methods = MapMonoMethods { len_fn };
+        self.map_mono_methods.insert(cache_key, methods);
+        methods
     }
 
     // ── Helpers ─────────────────────────────────────────────────
