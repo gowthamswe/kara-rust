@@ -757,6 +757,7 @@ fn module_defines_local_item(module: &Module, name: &str) -> bool {
         Item::ExternFunction(e) => e.name == name,
         Item::ExternBlock(b) => b.items.iter().any(|it| match it {
             ExternItem::Function(f) => f.name == name,
+            ExternItem::OpaqueType(o) => o.name == name,
         }),
         Item::EffectResource(r) => r.name == name,
         Item::EffectGroup(g) => g.name == name,
@@ -860,6 +861,9 @@ pub fn canonical_item_visibility(
                     match it {
                         ExternItem::Function(f) if f.name == origin_name => {
                             return Some(f.visibility());
+                        }
+                        ExternItem::OpaqueType(o) if o.name == origin_name => {
+                            return Some(o.visibility());
                         }
                         _ => {}
                     }

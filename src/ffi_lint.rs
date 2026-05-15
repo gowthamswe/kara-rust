@@ -57,6 +57,9 @@ fn collect_ffi_float_fns(program: &Program) -> std::collections::HashSet<String>
                 for it in &b.items {
                     match it {
                         ExternItem::Function(ef) => record_if_float_return(ef, &mut set),
+                        // Opaque foreign types have no return type to
+                        // inspect; they are type definitions, not calls.
+                        ExternItem::OpaqueType(_) => {}
                     }
                 }
             }

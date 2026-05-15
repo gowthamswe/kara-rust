@@ -88,6 +88,13 @@ pub enum SymbolKind {
     ExternFunction,
     Primitive,
     DistinctType,
+    /// Opaque foreign type declared inside an `unsafe extern "ABI" { ... }`
+    /// block: `type Name;`. The Kāra side knows the name but neither the
+    /// size, alignment, nor field layout — values of the type can only
+    /// appear behind a pointer (`*const`/`*mut`) or reference
+    /// (`ref`/`mut ref`). The typechecker rejects by-value uses with
+    /// `E_OPAQUE_TYPE_REQUIRES_INDIRECTION`.
+    OpaqueForeignType,
 }
 
 #[derive(Debug, Clone)]
@@ -536,6 +543,7 @@ fn module_top_level_names_for_id(tree: &ProgramTree, id: ModuleId) -> Vec<String
                 for it in &b.items {
                     match it {
                         ExternItem::Function(f) => names.push(f.name.clone()),
+                        ExternItem::OpaqueType(o) => names.push(o.name.clone()),
                     }
                 }
             }
@@ -765,6 +773,7 @@ impl<'a> Resolver<'a> {
                     for it in &b.items {
                         match it {
                             ExternItem::Function(f) => self.collect_extern_function(f),
+                            ExternItem::OpaqueType(o) => self.collect_opaque_foreign_type(o),
                         }
                     }
                 }
@@ -1518,6 +1527,17 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    fn collect_opaque_foreign_type(&mut self, o: &OpaqueTypeDecl) {
+        if let Err(err) = self.table.define(
+            o.name.clone(),
+            SymbolKind::OpaqueForeignType,
+            o.span.clone(),
+            true,
+        ) {
+            self.errors.push(err);
+        }
+    }
+
     /// Extract a simple name from a type expression (for impl block target types).
     fn type_expr_name(&self, ty: &TypeExpr) -> Option<String> {
         match &ty.kind {
@@ -1564,6 +1584,10 @@ impl<'a> Resolver<'a> {
                     for it in &b.items {
                         match it {
                             ExternItem::Function(f) => self.resolve_extern_function(f),
+                            // Opaque foreign type declarations have no
+                            // body to resolve — the name was registered
+                            // in the collection pass; nothing else to do.
+                            ExternItem::OpaqueType(_) => {}
                         }
                     }
                 }

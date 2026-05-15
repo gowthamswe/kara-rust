@@ -685,6 +685,11 @@ impl<'a> EffectChecker<'a> {
                             ExternItem::Function(e) => {
                                 self.register_extern_function_effects(e);
                             }
+                            // Opaque foreign type declarations carry no
+                            // effects — they are type definitions, not
+                            // operations. Per design.md § Opaque Foreign
+                            // Types > Effect integration.
+                            ExternItem::OpaqueType(_) => {}
                         }
                     }
                 }

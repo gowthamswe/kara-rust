@@ -1574,6 +1574,36 @@ fn test_extern_function_types() {
 }
 
 #[test]
+fn test_extern_block_opaque_type_declaration() {
+    // Slice 1: `type Foo;` inside `unsafe extern { }` parses, registers
+    // the name in the type env, and does not produce a typecheck error
+    // on the declaration alone. Use-site precision (E_OPAQUE_TYPE_*)
+    // ships in slice 1b alongside raw-pointer surface syntax.
+    typecheck_ok(
+        "unsafe extern \"C\" {\n\
+             pub type File;\n\
+         }\n\
+         fn main() {}",
+    );
+}
+
+#[test]
+fn test_extern_block_opaque_type_alongside_function() {
+    // The mixed-shape block typechecks: opaque type is registered, and
+    // a sibling function in the same block continues to typecheck
+    // independently.
+    typecheck_ok(
+        "unsafe extern \"C\" {\n\
+             pub type Sqlite3;\n\
+             pub fn sqlite3_open(path: i64) -> i32;\n\
+         }\n\
+         fn main() {\n\
+             let rc: i32 = sqlite3_open(0);\n\
+         }",
+    );
+}
+
+#[test]
 fn test_char_literal_type() {
     typecheck_ok("fn main() { let c: char = 'x'; }");
 }

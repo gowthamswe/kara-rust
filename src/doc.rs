@@ -16,8 +16,8 @@
 //! have all shipped against this skeleton.
 
 use crate::ast::{
-    EffectVerbKind, EnumDef, ExternFunction, ExternItem, Function, Item, StructDef, StructField,
-    TypeExpr, Variant, VariantKind,
+    EffectVerbKind, EnumDef, ExternFunction, ExternItem, Function, Item, OpaqueTypeDecl, StructDef,
+    StructField, TypeExpr, Variant, VariantKind,
 };
 use crate::module::{ModulePath, ProgramTree};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -281,6 +281,7 @@ pub enum ItemKind {
     TypeAlias,
     DistinctType,
     ExternFn,
+    ExternOpaqueType,
     Layout,
 }
 
@@ -295,6 +296,7 @@ impl ItemKind {
             ItemKind::TypeAlias => "type",
             ItemKind::DistinctType => "distinct",
             ItemKind::ExternFn => "extern fn",
+            ItemKind::ExternOpaqueType => "extern type",
             ItemKind::Layout => "layout",
         }
     }
@@ -324,6 +326,9 @@ enum Documentable<'a> {
         abi: &'a str,
         function: &'a ExternFunction,
     },
+    ExternBlockOpaqueType {
+        opaque_type: &'a OpaqueTypeDecl,
+    },
 }
 
 /// Walk `items` in source order, expanding each `Item::ExternBlock`
@@ -342,6 +347,9 @@ fn documentables(items: &[Item]) -> Vec<Documentable<'_>> {
                             abi: &block.abi,
                             function: f,
                         }),
+                        ExternItem::OpaqueType(o) => {
+                            out.push(Documentable::ExternBlockOpaqueType { opaque_type: o })
+                        }
                     }
                 }
             }
@@ -369,6 +377,7 @@ fn documentable_doc(d: Documentable<'_>) -> Option<&str> {
             _ => None,
         },
         Documentable::ExternBlockChild { function, .. } => function.doc_comment.as_deref(),
+        Documentable::ExternBlockOpaqueType { opaque_type } => opaque_type.doc_comment.as_deref(),
     }
 }
 
@@ -387,6 +396,7 @@ fn documentable_name(d: Documentable<'_>) -> &str {
             _ => "",
         },
         Documentable::ExternBlockChild { function, .. } => &function.name,
+        Documentable::ExternBlockOpaqueType { opaque_type } => &opaque_type.name,
     }
 }
 
@@ -405,6 +415,7 @@ fn documentable_kind(d: Documentable<'_>) -> ItemKind {
             _ => ItemKind::Function,
         },
         Documentable::ExternBlockChild { .. } => ItemKind::ExternFn,
+        Documentable::ExternBlockOpaqueType { .. } => ItemKind::ExternOpaqueType,
     }
 }
 
@@ -425,6 +436,9 @@ fn render_signature(
         Documentable::Top(item) => item,
         Documentable::ExternBlockChild { abi, function } => {
             return format!("extern \"{abi}\" fn {}", function.name);
+        }
+        Documentable::ExternBlockOpaqueType { opaque_type } => {
+            return format!("extern type {}", opaque_type.name);
         }
     };
     match item {
@@ -484,6 +498,9 @@ fn render_item_extras(
         // through the parser today; matches pre-block standalone-form
         // parity. Lift if param-doc surface lands for extern fns.
         Documentable::ExternBlockChild { .. } => return String::new(),
+        // Opaque foreign types have no fields, methods, or derives —
+        // the signature line is the entire structural surface.
+        Documentable::ExternBlockOpaqueType { .. } => return String::new(),
     };
     match item {
         Item::StructDef(s) => render_struct_extras(s, link_table, page_dir, doc_root),

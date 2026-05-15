@@ -130,6 +130,9 @@ pub fn visit_item_spans(item: &Item, visit: &mut impl FnMut(&Span)) {
                             visit_type(rt, visit);
                         }
                     }
+                    ExternItem::OpaqueType(o) => {
+                        visit(&o.span);
+                    }
                 }
             }
         }

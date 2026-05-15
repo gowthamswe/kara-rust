@@ -1876,7 +1876,9 @@ fn test_extern_function() {
     };
     assert_eq!(b.abi, "C");
     assert_eq!(b.items.len(), 1);
-    let ExternItem::Function(f) = &b.items[0];
+    let ExternItem::Function(f) = &b.items[0] else {
+        panic!("expected ExternItem::Function");
+    };
     assert_eq!(f.abi, "C");
     assert_eq!(f.name, "write");
     assert_eq!(f.params.len(), 3);
@@ -1896,7 +1898,9 @@ fn test_extern_function_accepts_pub_and_attributes() {
     let Item::ExternBlock(b) = &prog.items[0] else {
         panic!("expected ExternBlock");
     };
-    let ExternItem::Function(f) = &b.items[0];
+    let ExternItem::Function(f) = &b.items[0] else {
+        panic!("expected ExternItem::Function");
+    };
     assert!(f.is_pub, "pub should be threaded to the inner fn");
     assert_eq!(f.attributes.len(), 1, "attribute should be captured");
     assert_eq!(f.attributes[0].name, "link_name");
@@ -1924,7 +1928,9 @@ fn test_unsafe_extern_block_multiple_items() {
         .items
         .iter()
         .map(|it| {
-            let ExternItem::Function(f) = it;
+            let ExternItem::Function(f) = it else {
+                panic!("expected ExternItem::Function");
+            };
             f.name.as_str()
         })
         .collect();
@@ -1949,7 +1955,9 @@ fn test_unsafe_extern_block_propagates_block_level_noblock() {
     };
     assert!(b.attributes.iter().any(|a| a.name == "noblock"));
     for it in &b.items {
-        let ExternItem::Function(f) = it;
+        let ExternItem::Function(f) = it else {
+            panic!("expected ExternItem::Function");
+        };
         assert!(
             f.attributes.iter().any(|a| a.name == "noblock"),
             "block-level @noblock should pre-merge into each item"
@@ -2047,6 +2055,204 @@ fn test_unsafe_followed_by_invalid_token_at_module_scope_rejected() {
     assert!(
         errors_contain(&errors, "expected `extern` or `fn` after `unsafe`"),
         "expected focused diagnostic; got {errors:?}"
+    );
+}
+
+// ── Opaque foreign type declarations ──────────────────────────────────────
+
+#[test]
+fn test_extern_block_opaque_type_parses() {
+    // `type Name;` inside an `unsafe extern "ABI" { ... }` block —
+    // CN-8 forward-declaration form for opaque foreign types per
+    // design.md § Opaque Foreign Types.
+    let prog = parse_ok(
+        r#"
+        unsafe extern "C" {
+            type File;
+        }
+        "#,
+    );
+    let Item::ExternBlock(b) = &prog.items[0] else {
+        panic!("expected ExternBlock, got {:?}", &prog.items[0]);
+    };
+    assert_eq!(b.abi, "C");
+    assert_eq!(b.items.len(), 1);
+    let ExternItem::OpaqueType(o) = &b.items[0] else {
+        panic!("expected ExternItem::OpaqueType");
+    };
+    assert_eq!(o.name, "File");
+    assert!(!o.is_pub);
+    assert!(o.doc_comment.is_none());
+}
+
+#[test]
+fn test_extern_block_opaque_type_pub_doc_attributes() {
+    // Opaque-type declarations compose with `pub`, `///` doc comments,
+    // and attributes exactly like other extern items.
+    let prog = parse_ok(
+        r#"
+        unsafe extern "C" {
+            /// Opaque handle to an open file.
+            #[link_name = "_FILE"]
+            pub type File;
+        }
+        "#,
+    );
+    let Item::ExternBlock(b) = &prog.items[0] else {
+        panic!("expected ExternBlock");
+    };
+    let ExternItem::OpaqueType(o) = &b.items[0] else {
+        panic!("expected ExternItem::OpaqueType");
+    };
+    assert!(o.is_pub);
+    assert_eq!(o.name, "File");
+    assert_eq!(
+        o.doc_comment.as_deref(),
+        Some("Opaque handle to an open file.")
+    );
+    assert_eq!(o.attributes.len(), 1);
+    assert_eq!(o.attributes[0].name, "link_name");
+}
+
+#[test]
+fn test_extern_block_mixed_fn_and_opaque_type() {
+    // Functions and opaque-type declarations may be interleaved within
+    // the same block; the dispatcher routes each to the right parser.
+    let prog = parse_ok(
+        r#"
+        unsafe extern "C" {
+            type File;
+            pub fn fopen(path: i64, mode: i64) -> i64;
+            type Sqlite3;
+            pub fn sqlite3_open(path: i64) -> i32;
+        }
+        "#,
+    );
+    let Item::ExternBlock(b) = &prog.items[0] else {
+        panic!("expected ExternBlock");
+    };
+    assert_eq!(b.items.len(), 4);
+    let kinds: Vec<&'static str> = b
+        .items
+        .iter()
+        .map(|it| match it {
+            ExternItem::Function(_) => "fn",
+            ExternItem::OpaqueType(_) => "type",
+        })
+        .collect();
+    assert_eq!(kinds, vec!["type", "fn", "type", "fn"]);
+}
+
+#[test]
+fn test_extern_block_opaque_type_kara_name_skips_class_check() {
+    // CN-8: `#[kara_name = "..."]` rebinds the foreign symbol name
+    // and should suppress the Kāra-side identifier-class check
+    // (mirrors the existing `kara_name` escape on extern fn names).
+    let prog = parse_ok(
+        r#"
+        unsafe extern "C" {
+            #[kara_name = "FILE"]
+            pub type File;
+        }
+        "#,
+    );
+    let Item::ExternBlock(b) = &prog.items[0] else {
+        panic!("expected ExternBlock");
+    };
+    let ExternItem::OpaqueType(o) = &b.items[0] else {
+        panic!("expected ExternItem::OpaqueType");
+    };
+    assert_eq!(o.name, "File");
+    assert!(o.attributes.iter().any(|a| a.name == "kara_name"));
+}
+
+#[test]
+fn test_extern_block_opaque_type_non_pascal_case_rejected() {
+    // CN-1 + CN-8: the Kāra-visible name must be Type-class (PascalCase).
+    // `FILE` (Const-class) is rejected with a focused diagnostic that
+    // suggests the rebind path.
+    let (_, errors) = parse_with_errors(
+        r#"
+        unsafe extern "C" {
+            type FILE;
+        }
+        "#,
+    );
+    assert!(!errors.is_empty());
+    assert!(
+        errors_contain(&errors, "opaque foreign type"),
+        "expected opaque-foreign-type CN-1 diagnostic; got {errors:?}"
+    );
+}
+
+#[test]
+fn test_extern_block_opaque_type_generics_rejected() {
+    // C does not have generic types; `type Foo[T];` is a parse error
+    // with a focused diagnostic suggesting a wrapper type.
+    let (_, errors) = parse_with_errors(
+        r#"
+        unsafe extern "C" {
+            type Container[T];
+        }
+        "#,
+    );
+    assert!(!errors.is_empty());
+    assert!(
+        errors_contain(&errors, "cannot be generic"),
+        "expected focused 'cannot be generic' diagnostic; got {errors:?}"
+    );
+}
+
+#[test]
+fn test_extern_block_opaque_type_body_rejected() {
+    // Opaque types have no fields; the `type Name { ... }` form is
+    // rejected with a redirect to `#[repr(C)] struct`.
+    let (_, errors) = parse_with_errors(
+        r#"
+        unsafe extern "C" {
+            type Foo { x: i32 }
+        }
+        "#,
+    );
+    assert!(!errors.is_empty());
+    assert!(
+        errors_contain(&errors, "no body"),
+        "expected focused 'no body' diagnostic; got {errors:?}"
+    );
+}
+
+#[test]
+fn test_extern_block_opaque_type_missing_semicolon_rejected() {
+    // The form requires a trailing `;`. Missing semicolon → standard
+    // expect-semicolon diagnostic.
+    let (_, errors) = parse_with_errors(
+        r#"
+        unsafe extern "C" {
+            type FILE
+        }
+        "#,
+    );
+    assert!(
+        !errors.is_empty(),
+        "expected rejection of missing semicolon"
+    );
+}
+
+#[test]
+fn test_extern_block_invalid_item_kind_rejected() {
+    // Only `fn` and `type` are legal inside an extern block. Anything
+    // else (e.g. `struct` or `const`) gets a focused dispatcher error.
+    let (_, errors) = parse_with_errors(
+        r#"
+        unsafe extern "C" {
+            const X: i32 = 0;
+        }
+        "#,
+    );
+    assert!(!errors.is_empty());
+    assert!(
+        errors_contain(&errors, "expected `fn` or `type`"),
+        "expected focused dispatcher diagnostic; got {errors:?}"
     );
 }
 

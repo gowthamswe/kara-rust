@@ -630,6 +630,37 @@ fn test_extern_function() {
 }
 
 #[test]
+fn test_extern_block_opaque_type_collected() {
+    // Opaque foreign type names register as type-namespace symbols so
+    // sibling extern fns referencing them by reference type resolve
+    // cleanly. The resolver-level coverage here only asserts no
+    // undefined-name error escapes; typechecker tests cover env-side
+    // registration.
+    let result = resolve_ok(
+        "unsafe extern \"C\" {\n\
+             pub type File;\n\
+         }",
+    );
+    let _ = result;
+}
+
+#[test]
+fn test_extern_block_opaque_type_duplicate_in_same_block_rejected() {
+    // Two `type Name;` declarations with the same name inside one
+    // block collide via the resolver's standard duplicate-name path.
+    let errors = resolve_errors(
+        "unsafe extern \"C\" {\n\
+             pub type File;\n\
+             pub type File;\n\
+         }",
+    );
+    assert!(
+        !errors.is_empty(),
+        "expected duplicate-definition diagnostic"
+    );
+}
+
+#[test]
 fn test_const_in_expression() {
     resolve_ok(
         "const MAX: i64 = 100;\n\

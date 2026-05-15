@@ -4156,6 +4156,13 @@ impl<'ctx> Codegen<'ctx> {
                     for it in &b.items {
                         match it {
                             ExternItem::Function(ext) => self.declare_one_extern_function(ext),
+                            // Opaque foreign types lower naturally — the
+                            // type's name is never used as a value (only
+                            // as the element of `ref Foo` / `mut ref Foo`,
+                            // which lower as sized pointers via existing
+                            // reference-type machinery). No LLVM emission
+                            // needed at the declaration site.
+                            ExternItem::OpaqueType(_) => {}
                         }
                     }
                 }

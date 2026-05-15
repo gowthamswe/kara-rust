@@ -1925,8 +1925,61 @@ impl Parser {
 
         let mut items = Vec::new();
         while !self.check(&Token::RightBrace) && !self.is_at_end() {
-            let item = self.parse_extern_block_item_fn(&abi, &block_attributes)?;
-            items.push(ExternItem::Function(item));
+            let item_start = self.current_span();
+
+            // Per-item leading doc + attributes (in addition to block-level).
+            self.collect_leading_doc_comments();
+            let per_item_attrs = self.parse_attributes();
+            let mut attributes = block_attributes.clone();
+            attributes.extend(per_item_attrs);
+
+            // Take the item-level doc *now*, before descending into a
+            // param list — per-param doc collection inside `parse_param`
+            // would otherwise overwrite it.
+            let doc_comment = self.take_pending_doc();
+
+            let is_pub = self.eat(&Token::Pub);
+            let is_private = if !is_pub {
+                self.eat(&Token::Private)
+            } else {
+                false
+            };
+
+            // Dispatch on the next significant token: `fn` for a foreign
+            // function declaration, `type` for an opaque foreign type
+            // declaration. Anything else is a focused diagnostic.
+            match self.peek_token() {
+                Token::Fn => {
+                    let item = self.parse_extern_block_item_fn(
+                        &abi,
+                        attributes,
+                        doc_comment,
+                        is_pub,
+                        is_private,
+                        item_start,
+                    )?;
+                    items.push(ExternItem::Function(Box::new(item)));
+                }
+                Token::Type => {
+                    let item = self.parse_extern_block_item_opaque_type(
+                        attributes,
+                        doc_comment,
+                        is_pub,
+                        is_private,
+                        item_start,
+                    )?;
+                    items.push(ExternItem::OpaqueType(item));
+                }
+                _ => {
+                    self.error(
+                        "expected `fn` or `type` inside `unsafe extern { ... }` block — \
+                         only foreign function declarations (`fn name(...) -> T;`) and \
+                         opaque foreign type declarations (`type Name;`) are legal here. \
+                         See design.md § FFI > `unsafe extern { ... }` block requirement.",
+                    );
+                    return None;
+                }
+            }
         }
         self.expect(&Token::RightBrace)?;
 
@@ -1940,31 +1993,20 @@ impl Parser {
     }
 
     /// Parse a single `fn name(...) -> T effects;` item *inside* an
-    /// `unsafe extern { ... }` block. `block_abi` and `block_attributes`
-    /// come from the enclosing block; the block's attributes are
-    /// pre-merged into the item's `attributes` so downstream phases
-    /// (which today read only the item's own attribute set) see the
-    /// effective union without needing a block-aware code path.
+    /// `unsafe extern { ... }` block. The leading doc / attributes /
+    /// visibility have already been consumed by the dispatcher in
+    /// `parse_unsafe_extern_block`; this function picks up at the `fn`
+    /// keyword. `attributes` is the union of the block's pre-merged
+    /// attributes and any per-item attributes.
     fn parse_extern_block_item_fn(
         &mut self,
         block_abi: &str,
-        block_attributes: &[Attribute],
+        attributes: Vec<Attribute>,
+        doc_comment: Option<String>,
+        is_pub: bool,
+        is_private: bool,
+        start: Span,
     ) -> Option<ExternFunction> {
-        let start = self.current_span();
-
-        // Per-item leading doc + attributes (in addition to block-level).
-        self.collect_leading_doc_comments();
-        let per_item_attrs = self.parse_attributes();
-        let mut attributes = block_attributes.to_vec();
-        attributes.extend(per_item_attrs);
-
-        let is_pub = self.eat(&Token::Pub);
-        let is_private = if !is_pub {
-            self.eat(&Token::Private)
-        } else {
-            false
-        };
-
         self.expect(&Token::Fn)?;
         let name = self.expect_identifier()?;
         // Skip naming check when `#[kara_name]` is present — the C-side
@@ -1974,10 +2016,6 @@ impl Parser {
             let name_span = self.span_from(&start);
             self.check_ident_class(&name, IdentClass::Value, "extern function", name_span);
         }
-        // Take the item-level doc *before* descending into the param
-        // list — per-param doc collection inside `parse_param` would
-        // otherwise overwrite it.
-        let doc_comment = self.take_pending_doc();
         self.expect(&Token::LeftParen)?;
 
         self.fn_context_stack.push(FnContext::Function);
@@ -2011,6 +2049,73 @@ impl Parser {
             params,
             return_type,
             effects,
+        })
+    }
+
+    /// Parse a single `type Name;` opaque foreign type declaration
+    /// inside an `unsafe extern { ... }` block. The leading doc /
+    /// attributes / visibility have already been consumed by the
+    /// dispatcher in `parse_unsafe_extern_block`; this function picks
+    /// up at the `type` keyword.
+    ///
+    /// Rejects `type Name[T];` (generics — `E_OPAQUE_TYPE_GENERIC_FORBIDDEN`
+    /// per design.md) and `type Name { ... }` (body — opaque types have
+    /// no fields by definition). Requires a trailing `;`.
+    fn parse_extern_block_item_opaque_type(
+        &mut self,
+        attributes: Vec<Attribute>,
+        doc_comment: Option<String>,
+        is_pub: bool,
+        is_private: bool,
+        start: Span,
+    ) -> Option<OpaqueTypeDecl> {
+        self.expect(&Token::Type)?;
+        let name_start = self.current_span();
+        let name = self.expect_identifier()?;
+        // Opaque foreign type names follow CN-1 (Type-class identifier)
+        // when surfaced on the Kāra side; `#[kara_name = "..."]` rebinds
+        // a non-conforming foreign name per CN-8.
+        if !attributes.iter().any(|a| a.name == "kara_name") {
+            let name_span = self.span_from(&name_start);
+            self.check_ident_class(&name, IdentClass::Type, "opaque foreign type", name_span);
+        }
+
+        // Reject generics: `type Name[T];`. C does not have generic
+        // types; if the binding needs to be generic on Kāra's side,
+        // the wrapper type carries the parameter (per design.md).
+        if self.check(&Token::LeftBracket) {
+            self.error(
+                "opaque foreign type declarations cannot be generic. \
+                 C does not have generic types — if the binding needs to \
+                 be parameterised on the Kāra side, declare a wrapper type \
+                 (`distinct type` or `struct`) that carries the parameter \
+                 and stores a `*mut Foo` internally.",
+            );
+            return None;
+        }
+
+        // Reject body: `type Name { ... }`. Opaque types have no fields,
+        // no methods, no derives — that's the entire point of the form.
+        if self.check(&Token::LeftBrace) {
+            self.error(
+                "opaque foreign type declarations have no body. \
+                 The form is `type Name;` — the type's layout is private \
+                 to the foreign library, so there are no fields, methods, \
+                 or derives. Use `#[repr(C)] struct Name { ... }` instead \
+                 if the C side publishes the layout.",
+            );
+            return None;
+        }
+
+        self.expect(&Token::Semicolon)?;
+
+        Some(OpaqueTypeDecl {
+            span: self.span_from(&start),
+            attributes,
+            doc_comment,
+            is_pub,
+            is_private,
+            name,
         })
     }
 

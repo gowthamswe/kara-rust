@@ -279,6 +279,7 @@ impl_vis!(EnumDef);
 impl_vis!(TraitDef);
 impl_vis!(ConstDecl);
 impl_vis!(ExternFunction);
+impl_vis!(OpaqueTypeDecl);
 impl_vis!(TypeAliasDef);
 impl_vis!(DistinctTypeDef);
 
@@ -685,7 +686,33 @@ pub struct ExternBlock {
 
 #[derive(Debug, Clone)]
 pub enum ExternItem {
-    Function(ExternFunction),
+    /// Boxed to keep the `ExternItem` enum compact: `ExternFunction`
+    /// is ~344 bytes (params, return type, effects, attributes) while
+    /// `OpaqueTypeDecl` is ~112 bytes — boxing the larger variant
+    /// keeps the discriminated union shrinkwrap to one pointer per
+    /// item without churning size on the rare `OpaqueType` arm.
+    Function(Box<ExternFunction>),
+    /// Opaque foreign type declaration: `type Name;` inside an
+    /// `unsafe extern "ABI" { ... }` block. Names a C-side type whose
+    /// layout is unknown to Kāra (`FILE`, `xmlNode`, `sqlite3`, etc.) —
+    /// see [`OpaqueTypeDecl`] and design.md § FFI > Opaque Foreign Types.
+    OpaqueType(OpaqueTypeDecl),
+}
+
+/// `type Name;` declaration inside an `unsafe extern "ABI" { ... }` block.
+/// Carries no fields, no methods, no derives, no body — the type's
+/// layout is private to the foreign library. The Kāra side may only
+/// reference it behind a pointer (`*const`/`*mut`) or reference
+/// (`ref`/`mut ref`); by-value uses are rejected at typecheck.
+#[derive(Debug, Clone)]
+pub struct OpaqueTypeDecl {
+    pub span: Span,
+    pub attributes: Vec<Attribute>,
+    /// Joined contents of `///` doc comments preceding the decl.
+    pub doc_comment: Option<String>,
+    pub is_pub: bool,
+    pub is_private: bool,
+    pub name: String,
 }
 
 // ── Type Aliases ─────────────────────────────────────────────────

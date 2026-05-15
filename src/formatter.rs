@@ -818,6 +818,7 @@ impl Formatter {
         for item in &b.items {
             match item {
                 ExternItem::Function(f) => self.format_extern_block_item_fn(f),
+                ExternItem::OpaqueType(o) => self.format_extern_block_item_opaque_type(o),
             }
         }
         self.indent -= 1;
@@ -846,6 +847,15 @@ impl Formatter {
             self.format_type_expr(rt);
         }
         self.format_effects(&e.effects);
+        self.write_str(";\n");
+    }
+
+    fn format_extern_block_item_opaque_type(&mut self, o: &OpaqueTypeDecl) {
+        self.format_attributes(&o.attributes);
+        self.write_indent();
+        self.write_visibility(o.visibility());
+        self.write_str("type ");
+        self.write_ident(&o.name);
         self.write_str(";\n");
     }
 

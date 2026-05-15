@@ -2510,6 +2510,13 @@ pub struct TypeEnv {
     pub enums: HashMap<String, EnumInfo>,
     /// Derived traits for each `distinct type` declaration.
     pub distinct_types: HashMap<String, HashSet<String>>,
+    /// Names of opaque foreign types declared inside `unsafe extern "ABI" { ... }`
+    /// blocks (`type Foo;`). Tracked so type-resolution can distinguish
+    /// these from unknown names (slice 1) and so the future use-site
+    /// polish can emit `E_OPAQUE_TYPE_REQUIRES_INDIRECTION` /
+    /// `E_OPAQUE_TYPE_NO_FIELDS` / `E_OPAQUE_TYPE_NO_KNOWN_SIZE` from
+    /// design.md § Opaque Foreign Types (slice 1b).
+    pub opaque_foreign_types: HashSet<String>,
     pub functions: HashMap<String, FunctionSig>,
     pub constants: HashMap<String, Type>,
     pub type_aliases: HashMap<String, Type>,
@@ -2568,6 +2575,7 @@ impl TypeEnv {
             structs: HashMap::new(),
             enums: HashMap::new(),
             distinct_types: HashMap::new(),
+            opaque_foreign_types: HashSet::new(),
             functions: HashMap::new(),
             constants: HashMap::new(),
             type_aliases: HashMap::new(),
@@ -4866,6 +4874,7 @@ impl<'a> TypeChecker<'a> {
                     for it in &b.items {
                         match it {
                             ExternItem::Function(f) => self.env_add_extern_function(f),
+                            ExternItem::OpaqueType(o) => self.env_add_opaque_foreign_type(o),
                         }
                     }
                 }
@@ -6301,6 +6310,18 @@ impl<'a> TypeChecker<'a> {
         self.env.distinct_types.insert(d.name.clone(), derived);
     }
 
+    fn env_add_opaque_foreign_type(&mut self, o: &crate::ast::OpaqueTypeDecl) {
+        // Slice 1: register the name so downstream type-resolution sees
+        // the identifier as a known type (not an unknown-symbol error).
+        // Use-site precision (E_OPAQUE_TYPE_REQUIRES_INDIRECTION etc.)
+        // ships in slice 1b alongside raw-pointer surface syntax — the
+        // current consumer surface for opaque foreign types is the `ref`
+        // / `mut ref` reference form, which already lowers correctly via
+        // the existing reference-type machinery without inspecting the
+        // underlying name.
+        self.env.opaque_foreign_types.insert(o.name.clone());
+    }
+
     fn env_add_extern_function(&mut self, e: &ExternFunction) {
         let param_names: Vec<Option<String>> = e
             .params
@@ -6628,6 +6649,10 @@ impl<'a> TypeChecker<'a> {
                                 }
                             }
                             ExternItem::Function(_) => {}
+                            // Opaque foreign type declarations have no
+                            // type-expression surface to visibility-check
+                            // — the declaration *is* the type.
+                            ExternItem::OpaqueType(_) => {}
                         }
                     }
                 }
