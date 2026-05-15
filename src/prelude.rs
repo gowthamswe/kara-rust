@@ -438,6 +438,13 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
     ),
     // Slice F (`std.json`).
     ("json.kara", include_str!("../runtime/stdlib/json.kara")),
+    // Compile-time layout introspection — `size_of[T]()` / `align_of[T]()`
+    // (the `offset_of[T](field)` arm is a parser special-form, not a
+    // stdlib function — see `runtime/stdlib/intrinsics.kara`).
+    (
+        "intrinsics.kara",
+        include_str!("../runtime/stdlib/intrinsics.kara"),
+    ),
 ];
 
 /// Parsed AST of every entry in [`STDLIB_SOURCES`]. Parsed lazily on first
@@ -490,6 +497,18 @@ pub const PRELUDE_FUNCTIONS: &[&str] = &[
     // interpreter intercepts the `with_provider[R](p, || body)` call shape
     // to push/pop a provider frame (see Interpreter::match_with_provider).
     "with_provider",
+    // Compile-time layout introspection intrinsics — see
+    // `runtime/stdlib/intrinsics.kara`. The typechecker intercepts every
+    // call site (`infer_layout_query_intrinsic`) to validate the type
+    // argument and emit `E_OPAQUE_TYPE_NO_KNOWN_SIZE` for opaque foreign
+    // types; codegen intercepts (`compile_layout_query_intrinsic`) to
+    // emit the LLVM size / ABI-alignment constant. The prelude entry
+    // here is what makes the resolver accept the bare identifier — baked
+    // stdlib bypasses the resolver per the comment in
+    // `register_baked_stdlib`, so the resolver-side registration is
+    // additive on top of the typechecker / codegen wiring.
+    "size_of",
+    "align_of",
 ];
 
 /// Synthetic span used for every stub item the prelude module emits. The

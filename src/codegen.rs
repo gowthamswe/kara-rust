@@ -12,7 +12,7 @@ use inkwell::context::Context;
 use inkwell::module::Linkage;
 use inkwell::module::Module;
 use inkwell::targets::{
-    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine,
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, StructType};
 use inkwell::values::{
@@ -34,6 +34,36 @@ use crate::token::{FloatSuffix, IntSuffix, Span};
 /// const-arg shapes (binary expressions, identifier references) are
 /// not yet supported at the codegen call-site surface — slice 3 wires
 /// the typechecker's evaluator into call-site solving.
+/// Convert an `Expr` parsed in value position back to a `TypeExpr` when
+/// the expression actually denotes a type. Codegen-side mirror of the
+/// typechecker's `expr_as_type_expr`; used by the layout-query
+/// intrinsic intercept in `compile_call`.
+fn expr_as_type_expr_codegen(expr: &Expr) -> Option<TypeExpr> {
+    use crate::ast::PathExpr;
+    match &expr.kind {
+        ExprKind::Identifier(name) => Some(TypeExpr {
+            kind: TypeKind::Path(PathExpr {
+                segments: vec![name.clone()],
+                generic_args: None,
+                span: expr.span.clone(),
+            }),
+            span: expr.span.clone(),
+        }),
+        ExprKind::Path {
+            segments,
+            generic_args,
+        } => Some(TypeExpr {
+            kind: TypeKind::Path(PathExpr {
+                segments: segments.clone(),
+                generic_args: generic_args.clone(),
+                span: expr.span.clone(),
+            }),
+            span: expr.span.clone(),
+        }),
+        _ => None,
+    }
+}
+
 fn const_value_from_literal_expr(expr: &Expr) -> Option<crate::prelude::ConstValue> {
     use crate::prelude::ConstValue;
     match &expr.kind {
@@ -1324,6 +1354,14 @@ struct Codegen<'ctx> {
     /// so a recovered earlier propagation doesn't leak frames into a later
     /// failure.
     karac_error_trace_clear_fn: FunctionValue<'ctx>,
+    /// Lazily-initialized `TargetData` consumed by the layout-introspection
+    /// intrinsics (`align_of[T]()`, `offset_of[T](field)`). Constructed
+    /// via `create_target_machine().get_target_data()` on first use; the
+    /// rest of codegen never reads it. Held as `Option` because the
+    /// host-target initialization pulls in `Target::initialize_native`,
+    /// which we want to avoid in the (common) path where no layout
+    /// intrinsic is invoked.
+    target_data: Option<TargetData>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -1847,7 +1885,21 @@ impl<'ctx> Codegen<'ctx> {
             display_fn_cache: HashMap::new(),
             karac_error_trace_push_fn,
             karac_error_trace_clear_fn,
+            target_data: None,
         }
+    }
+
+    /// Lazily build (and cache) the host-target `TargetData` used by the
+    /// layout-introspection intrinsics. Most modules never invoke
+    /// `align_of[T]()` / `offset_of[T](field)`, so we pay the
+    /// `Target::initialize_native` + `create_target_machine` cost only
+    /// when the first such intrinsic is lowered.
+    fn ensure_target_data(&mut self) -> Result<&TargetData, String> {
+        if self.target_data.is_none() {
+            let tm = create_target_machine()?;
+            self.target_data = Some(tm.get_target_data());
+        }
+        Ok(self.target_data.as_ref().unwrap())
     }
 
     /// Populate RC-fallback data from an ownership check result.
@@ -4151,11 +4203,13 @@ impl<'ctx> Codegen<'ctx> {
     fn declare_extern_functions(&mut self, program: &Program) -> Result<(), String> {
         for item in &program.items {
             match item {
-                Item::ExternFunction(ext) => self.declare_one_extern_function(ext),
+                Item::ExternFunction(ext) => self.declare_one_extern_function(ext, &[]),
                 Item::ExternBlock(b) => {
                     for it in &b.items {
                         match it {
-                            ExternItem::Function(ext) => self.declare_one_extern_function(ext),
+                            ExternItem::Function(ext) => {
+                                self.declare_one_extern_function(ext, &b.attributes)
+                            }
                             // Opaque foreign types lower naturally — the
                             // type's name is never used as a value (only
                             // as the element of `ref Foo` / `mut ref Foo`,
@@ -4172,7 +4226,7 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
-    fn declare_one_extern_function(&mut self, ext: &ExternFunction) {
+    fn declare_one_extern_function(&mut self, ext: &ExternFunction, block_attrs: &[Attribute]) {
         let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = ext
             .params
             .iter()
@@ -4206,7 +4260,11 @@ impl<'ctx> Codegen<'ctx> {
             .module
             .add_function(&ext.name, fn_type, Some(Linkage::External));
         // `#[link_section]`, `#[no_mangle]`, `#[used]` attached to an
-        // `extern` declaration apply to the symbol as imported.
+        // `extern` declaration apply to the symbol as imported. Block-
+        // level attributes (when the extern is inside an
+        // `unsafe extern { ... }` block) apply to every item; per-item
+        // attributes win on conflict via order (block first, item last).
+        self.apply_linker_attrs(fn_val, block_attrs);
         self.apply_linker_attrs(fn_val, &ext.attributes);
     }
 
@@ -6695,8 +6753,84 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::Question(inner) => self.compile_question(inner, &expr.span),
             ExprKind::Path { segments, .. } => self.compile_path_expr(segments),
             ExprKind::LabeledBlock { label, body, .. } => self.compile_labeled_block(label, body),
+            ExprKind::OffsetOf { ty, field_path } => self.compile_offset_of(ty, field_path),
             _ => Ok(self.context.i64_type().const_int(0, false).into()),
         }
+    }
+
+    /// Lower `offset_of[T](field.path)` to a compile-time `usize` constant.
+    /// The typechecker has already validated that `T` is a struct and the
+    /// path is well-typed; here we walk the lowered LLVM struct types to
+    /// chain `TargetData::offset_of_element` across nested-path segments.
+    /// Returns the byte offset as an `i64` constant.
+    fn compile_offset_of(
+        &mut self,
+        ty: &TypeExpr,
+        field_path: &[String],
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let i64_ty = self.context.i64_type();
+        // Recover the initial struct name from the type expression.
+        let TypeKind::Path(path) = &ty.kind else {
+            return Err("offset_of: target must be a path-named struct".to_string());
+        };
+        let mut current_struct_name = path
+            .segments
+            .last()
+            .ok_or_else(|| "offset_of: empty type path".to_string())?
+            .clone();
+        let mut total_offset: u64 = 0;
+        for segment_name in field_path {
+            let struct_ty = self
+                .struct_types
+                .get(&current_struct_name)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "offset_of: struct '{current_struct_name}' has no LLVM \
+                         type registration"
+                    )
+                })?;
+            let field_names = self
+                .struct_field_names
+                .get(&current_struct_name)
+                .ok_or_else(|| {
+                    format!(
+                        "offset_of: struct '{current_struct_name}' has no field-name \
+                         table"
+                    )
+                })?
+                .clone();
+            let field_idx = field_names
+                .iter()
+                .position(|n| n == segment_name)
+                .ok_or_else(|| {
+                    format!(
+                        "offset_of: field '{segment_name}' not found on struct \
+                         '{current_struct_name}'"
+                    )
+                })?;
+            let target_data = self.ensure_target_data()?;
+            let segment_offset = target_data
+                .offset_of_element(&struct_ty, field_idx as u32)
+                .ok_or_else(|| {
+                    format!(
+                        "offset_of: TargetData rejected element index {field_idx} \
+                         on struct '{current_struct_name}'"
+                    )
+                })?;
+            total_offset += segment_offset;
+            // Chase the field's type for the next segment.
+            let field_type_names = self
+                .struct_field_type_names
+                .get(&current_struct_name)
+                .cloned();
+            if let Some(ftns) = field_type_names {
+                if let Some(Some(next_name)) = ftns.get(field_idx) {
+                    current_struct_name = next_name.clone();
+                }
+            }
+        }
+        Ok(i64_ty.const_int(total_offset, false).into())
     }
 
     /// Compile a `Type.Variant` path expression. The parser emits `Color.Red`
@@ -16343,6 +16477,49 @@ impl<'ctx> Codegen<'ctx> {
 
     // ── Call ──────────────────────────────────────────────────────
 
+    /// Lower a `size_of[T]()` / `align_of[T]()` call to the matching
+    /// LLVM constant. `size_of` uses inkwell's `BasicTypeEnum::size_of()`
+    /// (a constant-expr returning i64). `align_of` uses
+    /// `TargetData::get_abi_alignment()` (a `u32` ABI alignment for the
+    /// host target) materialized as an i64 constant. Both return `usize`
+    /// to match the typechecker's signature, which lowers to i64 on the
+    /// 64-bit-only target the rest of codegen assumes.
+    fn compile_layout_query_intrinsic(
+        &mut self,
+        name: &str,
+        explicit_args: &[GenericArg],
+        args: &[CallArg],
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        // The typechecker has already validated argument shape; do a
+        // defensive check here so a divergent path (e.g., direct codegen
+        // invocation in tests) doesn't crash.
+        for arg in args {
+            self.compile_expr(&arg.value)?;
+        }
+        let ty_expr = match explicit_args {
+            [GenericArg::Type(te)] => te,
+            _ => {
+                return Ok(self.context.i64_type().const_int(0, false).into());
+            }
+        };
+        let llvm_ty = self.llvm_type_for_type_expr(ty_expr);
+        let i64_ty = self.context.i64_type();
+        match name {
+            "size_of" => {
+                let size = llvm_ty
+                    .size_of()
+                    .ok_or_else(|| "size_of[T]: type is not sized".to_string())?;
+                Ok(size.into())
+            }
+            "align_of" => {
+                let target_data = self.ensure_target_data()?;
+                let align = target_data.get_abi_alignment(&llvm_ty);
+                Ok(i64_ty.const_int(u64::from(align), false).into())
+            }
+            _ => unreachable!("compile_layout_query_intrinsic dispatched on unknown name"),
+        }
+    }
+
     fn compile_call(
         &mut self,
         callee: &Expr,
@@ -16396,6 +16573,25 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
+        // Layout-introspection intrinsics (`size_of[T]()` / `align_of[T]()`)
+        // single-arg shape. The parser produces `Call { Index { Ident,
+        // T_expr } }` because `lookahead_generic_args_call` requires a
+        // top-level comma; recover the type expression from the value-
+        // position `Expr` and dispatch the intrinsic. The typechecker
+        // handles the matching shape in `infer_call`; this codegen mirror
+        // is here so the placeholder body in
+        // `runtime/stdlib/intrinsics.kara` is never lowered.
+        if let ExprKind::Index { object, index } = &callee.kind {
+            if let ExprKind::Identifier(name) = &object.kind {
+                if (name == "size_of" || name == "align_of") && args.is_empty() {
+                    if let Some(te) = expr_as_type_expr_codegen(index) {
+                        let synth = vec![GenericArg::Type(te)];
+                        return self.compile_layout_query_intrinsic(name, &synth, args);
+                    }
+                }
+            }
+        }
+
         // Associated function calls: Vec::new(), etc. Theme 6 sub-step 4
         // intercepts `R.method(args)` where R is an `effect resource R: T`
         // before assoc-call dispatch: those go through the runtime stack
@@ -16429,6 +16625,18 @@ impl<'ctx> Codegen<'ctx> {
 
         if name == "println" || name == "print" {
             return self.compile_print(&name, args);
+        }
+
+        // Layout-introspection intrinsics. Intercepted before the
+        // generic-call lookup so the `{ 0 }` placeholder body in
+        // `runtime/stdlib/intrinsics.kara` is never lowered. The
+        // typechecker has already rejected opaque foreign type args
+        // with `E_OPAQUE_TYPE_NO_KNOWN_SIZE`, so the type lowered here
+        // is sized by construction.
+        if name == "size_of" || name == "align_of" {
+            if let Some(ga) = explicit_generic_args.as_deref() {
+                return self.compile_layout_query_intrinsic(&name, ga, args);
+            }
         }
 
         // Check if this is an enum variant constructor (tuple variant)

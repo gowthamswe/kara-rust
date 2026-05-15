@@ -229,6 +229,25 @@ impl Formatter {
     fn format_attributes(&mut self, attrs: &[Attribute]) {
         for attr in attrs {
             self.write_indent();
+            // Linker attributes that carry trust-boundary obligations
+            // re-emit with their `#[unsafe(...)]` wrap (per design.md
+            // § Linker Control Attributes). Internal storage strips the
+            // wrap so downstream consumers stay simple; the formatter
+            // restores it for round-trip idempotence and for the visual
+            // grep-for-`#[unsafe(` review pattern the spec describes.
+            let unsafe_wrapped = matches!(attr.name.as_str(), "no_mangle" | "link_section");
+            if unsafe_wrapped {
+                self.write_str("#[unsafe(");
+                self.write_ident(&attr.name);
+                if let Some(ref s) = attr.string_value {
+                    self.write_str("(\"");
+                    self.write_str(s);
+                    self.write_str("\")");
+                }
+                self.write_str(")]\n");
+                continue;
+            }
+
             self.write_str("#[");
             self.write_ident(&attr.name);
             if !attr.args.is_empty() {
@@ -807,11 +826,11 @@ impl Formatter {
     }
 
     fn format_extern_block(&mut self, b: &ExternBlock) {
-        // Block-level attributes are pre-merged into each child's
-        // `attributes` at parse time, so rendering them here would
-        // duplicate. Each item's attribute set already contains them;
-        // round-trip therefore desugars `#[noblock] unsafe extern { fn a; }`
-        // to `unsafe extern { #[noblock] fn a; }` — semantically equivalent.
+        // Block-level attributes are stored on the block (not pre-merged
+        // into per-item attributes) so the formatter renders them at the
+        // block-header position, preserving round-trip idempotence:
+        // `@noblock unsafe extern "C" { fn a; }` formats back to itself.
+        self.format_attributes(&b.attributes);
         self.write_indent();
         writeln!(self.output, "unsafe extern \"{}\" {{", b.abi).unwrap();
         self.indent += 1;
@@ -1626,6 +1645,18 @@ impl Formatter {
                 self.write_indent();
                 self.write_str("} in ");
                 self.format_block(body);
+            }
+            ExprKind::OffsetOf { ty, field_path } => {
+                self.write_str("offset_of[");
+                self.format_type_expr(ty);
+                self.write_str("](");
+                for (i, segment) in field_path.iter().enumerate() {
+                    if i > 0 {
+                        self.write_str(".");
+                    }
+                    self.write_ident(segment);
+                }
+                self.write_str(")");
             }
             ExprKind::Error => self.write_str("/* error */"),
         }

@@ -905,6 +905,7 @@ impl<'a> ConcurrencyChecker<'a> {
             | ExprKind::Return(None)
             | ExprKind::Break { value: None, .. }
             | ExprKind::PipePlaceholder
+            | ExprKind::OffsetOf { .. }
             | ExprKind::Error => {}
         }
     }
@@ -1281,6 +1282,7 @@ impl<'a> ConcurrencyChecker<'a> {
             | ExprKind::Return(None)
             | ExprKind::Break { value: None, .. }
             | ExprKind::PipePlaceholder
+            | ExprKind::OffsetOf { .. }
             | ExprKind::Error => {}
         }
     }

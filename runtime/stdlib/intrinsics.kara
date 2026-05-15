@@ -1,0 +1,27 @@
+// runtime/stdlib/intrinsics.kara
+//
+// Compile-time layout introspection intrinsics from `design.md § Field
+// Offsets`. The two free functions below are the size-query half of the
+// family (`size_of[T]()` / `align_of[T]()`); the field-offset arm
+// (`offset_of[T](field)`) is a parser special-form because its second
+// argument is a field-name path rather than a value expression — it
+// lowers via `ExprKind::OffsetOf` rather than a regular function call,
+// so it has no stdlib declaration here.
+//
+// Bodies are `{ 0 }` placeholders — every call site is intercepted by:
+//   - typechecker: special-cases the call in `infer_call` to validate
+//     the type argument (rejecting opaque foreign types with
+//     `error[E_OPAQUE_TYPE_NO_KNOWN_SIZE]`) and return `usize` directly;
+//   - codegen: emits the LLVM size / ABI-alignment constant in
+//     `compile_call` before the regular generic-call path runs.
+//
+// The placeholder body is reached only if both intercepts ever fail
+// (defense in depth). Calls return `0` in that path — the `usize`
+// return type matches the placeholder so the body still typechecks
+// under the existing `#[compiler_builtin]` body-skip rule.
+
+#[compiler_builtin]
+pub fn size_of[T]() -> usize { 0 }
+
+#[compiler_builtin]
+pub fn align_of[T]() -> usize { 0 }

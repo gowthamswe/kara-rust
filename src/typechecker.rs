@@ -1689,6 +1689,39 @@ fn substitute_const_idents_in_expr(expr: &Expr, subst: &HashMap<String, i64>) ->
     }
 }
 
+/// Convert an `Expr` parsed in value position back to a `TypeExpr` when
+/// the expression actually denotes a type. Used by the layout-query
+/// intrinsic intercept (`size_of[T]()` / `align_of[T]()`) where the
+/// parser produces `Call { callee: Index { Ident, T_expr } }` for the
+/// single-arg shape because `lookahead_generic_args_call` requires a
+/// top-level comma to disambiguate from `arr[i]()`. Returns `None` for
+/// expression shapes that don't denote a type (literals, calls, binary
+/// ops, etc.) — the caller emits a focused diagnostic in that branch.
+fn expr_as_type_expr(expr: &Expr) -> Option<TypeExpr> {
+    match &expr.kind {
+        ExprKind::Identifier(name) => Some(TypeExpr {
+            kind: TypeKind::Path(PathExpr {
+                segments: vec![name.clone()],
+                generic_args: None,
+                span: expr.span.clone(),
+            }),
+            span: expr.span.clone(),
+        }),
+        ExprKind::Path {
+            segments,
+            generic_args,
+        } => Some(TypeExpr {
+            kind: TypeKind::Path(PathExpr {
+                segments: segments.clone(),
+                generic_args: generic_args.clone(),
+                span: expr.span.clone(),
+            }),
+            span: expr.span.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// Slice 1c / 3c: recognize a literal const-arg expression shape at a
 /// call-site bracket position. Integer / bool / char literals plus
 /// `Unary { Neg, Integer }` (negative-integer literals) qualify.
@@ -7709,6 +7742,7 @@ impl<'a> TypeChecker<'a> {
             | ExprKind::Path { .. }
             | ExprKind::SelfType
             | ExprKind::PipePlaceholder
+            | ExprKind::OffsetOf { .. }
             | ExprKind::Error => {}
 
             ExprKind::Binary { left, right, .. }
@@ -10191,8 +10225,144 @@ impl<'a> TypeChecker<'a> {
                 Type::Error
             }
 
+            ExprKind::OffsetOf { ty, field_path } => {
+                self.infer_offset_of(ty, field_path, &expr.span)
+            }
+
             ExprKind::Error => Type::Error,
         }
+    }
+
+    /// Type-check `offset_of[T](field.path)`. Per `design.md § Field
+    /// Offsets`, the target type must be a struct (concrete or
+    /// generic-with-fully-resolved args); opaque foreign types and
+    /// generic type parameters are rejected at the first segment.
+    /// Each path segment must name a field of the type at the previous
+    /// segment's resolved type. Returns `usize` (also `Type::Error` on
+    /// failure for downstream tolerance).
+    fn infer_offset_of(&mut self, ty: &TypeExpr, field_path: &[String], span: &Span) -> Type {
+        let usize_ty = Type::UInt(UIntSize::Usize);
+        // Lower the target with `parent_is_ref = true` so the slice-1b
+        // walker doesn't fire E_OPAQUE_TYPE_REQUIRES_INDIRECTION; this
+        // intrinsic emits E_OFFSET_OF_OPAQUE_TYPE instead.
+        let resolved = self.lower_type_expr_inner(ty, &[], true);
+        let (mut current_struct_name, _initial_args) = match &resolved {
+            Type::Named { name, args } => (name.clone(), args.clone()),
+            // Per design.md, generic type-parameter targets are rejected:
+            // the typechecker can't see a layout without a concrete
+            // instantiation. `Type::TypeParam` and other non-Named
+            // shapes route here.
+            Type::TypeParam(name) => {
+                self.type_error(
+                    format!(
+                        "error[E_OFFSET_OF_GENERIC_PARAM]: offset_of requires a \
+                         concrete type; the type parameter '{name}' is not \
+                         resolvable to a layout at this call site"
+                    ),
+                    ty.span.clone(),
+                    TypeErrorKind::TypeMismatch,
+                );
+                return Type::Error;
+            }
+            _ => {
+                self.type_error(
+                    format!(
+                        "error[E_OFFSET_OF_NON_STRUCT_TARGET]: offset_of requires a \
+                         struct target; got '{}'",
+                        type_display(&resolved)
+                    ),
+                    ty.span.clone(),
+                    TypeErrorKind::TypeMismatch,
+                );
+                return Type::Error;
+            }
+        };
+        if self.env.opaque_foreign_types.contains(&current_struct_name) {
+            self.type_error(
+                format!(
+                    "error[E_OFFSET_OF_OPAQUE_TYPE]: offset_of cannot be applied to \
+                     opaque foreign type '{current_struct_name}'; the type's layout \
+                     is unknown to Kāra"
+                ),
+                ty.span.clone(),
+                TypeErrorKind::TypeMismatch,
+            );
+            return Type::Error;
+        }
+        if field_path.is_empty() {
+            self.type_error(
+                "error[E_OFFSET_OF_INVALID_PATH]: offset_of requires at least \
+                 one field-name segment"
+                    .to_string(),
+                span.clone(),
+                TypeErrorKind::WrongNumberOfArgs,
+            );
+            return Type::Error;
+        }
+        // Walk each segment, validating membership in the current struct's
+        // declared field set and chasing the field's type for the next
+        // segment. At each segment, the current struct is looked up by
+        // name in `env.structs`; if absent (e.g., the surface type is an
+        // enum or a primitive), `E_OFFSET_OF_NON_STRUCT_TARGET` fires.
+        for (segment_idx, segment_name) in field_path.iter().enumerate() {
+            let Some(info) = self.env.structs.get(&current_struct_name).cloned() else {
+                self.type_error(
+                    format!(
+                        "error[E_OFFSET_OF_NON_STRUCT_TARGET]: offset_of cannot \
+                         walk into '{current_struct_name}'; only struct types \
+                         have field offsets"
+                    ),
+                    ty.span.clone(),
+                    TypeErrorKind::TypeMismatch,
+                );
+                return Type::Error;
+            };
+            let mut found = None;
+            for (fname, ftype, is_pub) in &info.fields {
+                if fname == segment_name {
+                    found = Some((ftype.clone(), *is_pub));
+                    break;
+                }
+            }
+            let Some((field_ty, is_pub)) = found else {
+                let available: Vec<&str> = info.fields.iter().map(|(n, _, _)| n.as_str()).collect();
+                self.type_error(
+                    format!(
+                        "error[E_OFFSET_OF_UNKNOWN_FIELD]: type '{current_struct_name}' \
+                         has no field '{segment_name}'; available fields are: {}",
+                        available.join(", ")
+                    ),
+                    span.clone(),
+                    TypeErrorKind::UndefinedField,
+                );
+                return Type::Error;
+            };
+            if !is_pub {
+                self.check_cross_module_field_access(&current_struct_name, segment_name, span);
+            }
+            // If this is the last segment, we're done — return usize.
+            if segment_idx + 1 == field_path.len() {
+                return usize_ty;
+            }
+            // Otherwise, the field's type must itself be a struct so the
+            // next segment can walk into it.
+            current_struct_name = match field_ty {
+                Type::Named { name, .. } => name,
+                _ => {
+                    self.type_error(
+                        format!(
+                            "error[E_OFFSET_OF_NON_STRUCT_TARGET]: field \
+                             '{segment_name}' is not a struct type; cannot walk \
+                             further into the offset_of path"
+                        ),
+                        span.clone(),
+                        TypeErrorKind::TypeMismatch,
+                    );
+                    return Type::Error;
+                }
+            };
+        }
+        usize_ty
     }
 
     // ── Identifier Resolution ───────────────────────────────────
@@ -10671,6 +10841,77 @@ impl<'a> TypeChecker<'a> {
         )
     }
 
+    /// Type-check a call to a layout-introspection intrinsic
+    /// (`size_of[T]()` / `align_of[T]()`). Both share the same shape:
+    /// exactly one type argument, no value arguments, returns `usize`.
+    /// Per `design.md § Field Offsets`, opaque foreign types are
+    /// rejected with `error[E_OPAQUE_TYPE_NO_KNOWN_SIZE]` since their
+    /// layout is unknown to Kāra.
+    ///
+    /// The type argument is lowered via `lower_type_expr_inner(_, _, true)`
+    /// so the slice-1b walker's `E_OPAQUE_TYPE_REQUIRES_INDIRECTION`
+    /// emission is suppressed — for layout queries, "wrap in `ref T`"
+    /// is the wrong remediation hint (`size_of[ref Foo]()` measures
+    /// the reference, not Foo). The `parent_is_ref = true` flag is a
+    /// minor semantic misnomer here ("opaque is allowed at this leaf
+    /// because the caller will check it explicitly"), but reusing the
+    /// existing flag keeps `lower_type_expr_inner` from sprouting a
+    /// second control parameter.
+    fn infer_layout_query_intrinsic(
+        &mut self,
+        name: &str,
+        explicit_args: &[GenericArg],
+        args: &[CallArg],
+        span: &Span,
+    ) -> Type {
+        if !args.is_empty() {
+            self.type_error(
+                format!(
+                    "error[E_LAYOUT_QUERY_TAKES_NO_ARGS]: `{name}` takes a type \
+                     argument only — call shape is `{name}[T]()`, no value arguments"
+                ),
+                span.clone(),
+                TypeErrorKind::WrongNumberOfArgs,
+            );
+            for a in args {
+                self.infer_expr(&a.value);
+            }
+        }
+        let usize_ty = Type::UInt(UIntSize::Usize);
+        let type_arg_expr = match explicit_args {
+            [GenericArg::Type(te)] => te,
+            _ => {
+                self.type_error(
+                    format!(
+                        "error[E_LAYOUT_QUERY_TYPE_ARG_REQUIRED]: `{name}` requires \
+                         exactly one type argument — call shape is `{name}[T]()`"
+                    ),
+                    span.clone(),
+                    TypeErrorKind::WrongNumberOfArgs,
+                );
+                return usize_ty;
+            }
+        };
+        let resolved = self.lower_type_expr_inner(type_arg_expr, &[], true);
+        if let Type::Named {
+            name: ref ty_name, ..
+        } = resolved
+        {
+            if self.env.opaque_foreign_types.contains(ty_name) {
+                self.type_error(
+                    format!(
+                        "error[E_OPAQUE_TYPE_NO_KNOWN_SIZE]: `{name}` cannot be \
+                         applied to opaque foreign type '{ty_name}'; the type's \
+                         size and alignment are unknown to Kāra"
+                    ),
+                    type_arg_expr.span.clone(),
+                    TypeErrorKind::TypeMismatch,
+                );
+            }
+        }
+        usize_ty
+    }
+
     fn infer_call(&mut self, callee: &Expr, args: &[CallArg], span: &Span) -> Type {
         // Const generics slice 1b + 1c: explicit-generic-args call
         // shapes. Two forms reach here:
@@ -10691,6 +10932,55 @@ impl<'a> TypeChecker<'a> {
         // `check_call_args_with_substitution_full` so the inference
         // solver pre-binds each ConstVar / TypeVar to its
         // user-supplied value before arg-position unification.
+        // Layout-introspection intrinsics: `size_of[T]()` / `align_of[T]()`.
+        // Intercepted before the regular generic-call dispatch so the
+        // slice-1b walker's `E_OPAQUE_TYPE_REQUIRES_INDIRECTION` emission
+        // on the type argument is suppressed (the "wrap in `ref T`" hint
+        // would be misleading for a layout query — `size_of[ref Foo]()`
+        // measures the reference, not Foo). The intrinsic emits the
+        // focused `E_OPAQUE_TYPE_NO_KNOWN_SIZE` instead. See
+        // `runtime/stdlib/intrinsics.kara` for the placeholder
+        // declarations and `compile_call` for the codegen counterpart.
+        //
+        // Two AST shapes reach here. Multi-arg generic calls
+        // (`size_of[T, _]()`, never used today but kept symmetric) parse
+        // as `Path { generic_args: Some([T]) }` because
+        // `lookahead_generic_args_call` requires a top-level comma.
+        // Single-arg `size_of[T]()` cannot be disambiguated from
+        // `arr[i]()` so it parses as `Call { callee: Index { Ident, T } }`
+        // — `T` is a value-position `Expr` that actually denotes a type.
+        if let ExprKind::Path {
+            segments,
+            generic_args: Some(ga),
+        } = &callee.kind
+        {
+            if segments.len() == 1 {
+                let name = &segments[0];
+                if name == "size_of" || name == "align_of" {
+                    return self.infer_layout_query_intrinsic(name, ga, args, span);
+                }
+            }
+        }
+        if let ExprKind::Index { object, index } = &callee.kind {
+            if let ExprKind::Identifier(name) = &object.kind {
+                if name == "size_of" || name == "align_of" {
+                    if let Some(te) = expr_as_type_expr(index) {
+                        let synth = vec![GenericArg::Type(te)];
+                        return self.infer_layout_query_intrinsic(name, &synth, args, span);
+                    }
+                    self.type_error(
+                        format!(
+                            "error[E_LAYOUT_QUERY_TYPE_ARG_REQUIRED]: `{name}` requires \
+                             a type argument — call shape is `{name}[T]()`"
+                        ),
+                        callee.span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                    return Type::UInt(UIntSize::Usize);
+                }
+            }
+        }
+
         if let Some((name, explicit_args)) = match &callee.kind {
             ExprKind::Path {
                 segments,

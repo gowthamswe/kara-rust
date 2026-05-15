@@ -1552,6 +1552,7 @@ fn collect_free_idents_expr(expr: &Expr, bound: &mut HashSet<String>, out: &mut 
         | ExprKind::SelfType
         | ExprKind::PipePlaceholder
         | ExprKind::Continue { .. }
+        | ExprKind::OffsetOf { .. }
         | ExprKind::Error => {}
         ExprKind::InterpolatedStringLit(parts) => {
             for part in parts {

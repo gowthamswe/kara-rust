@@ -678,12 +678,12 @@ impl<'a> EffectChecker<'a> {
                     self.function_visibility.insert(f.name.clone(), f.is_pub);
                     self.function_spans.insert(f.name.clone(), f.span.clone());
                 }
-                Item::ExternFunction(e) => self.register_extern_function_effects(e),
+                Item::ExternFunction(e) => self.register_extern_function_effects(e, &[]),
                 Item::ExternBlock(b) => {
                     for it in &b.items {
                         match it {
                             ExternItem::Function(e) => {
-                                self.register_extern_function_effects(e);
+                                self.register_extern_function_effects(e, &b.attributes);
                             }
                             // Opaque foreign type declarations carry no
                             // effects — they are type definitions, not
@@ -1627,6 +1627,7 @@ impl<'a> EffectChecker<'a> {
             | ExprKind::Return(None)
             | ExprKind::Break { value: None, .. }
             | ExprKind::PipePlaceholder
+            | ExprKind::OffsetOf { .. }
             | ExprKind::Error => {}
         }
     }
@@ -3200,6 +3201,7 @@ impl<'a> EffectChecker<'a> {
             | ExprKind::Return(None)
             | ExprKind::Break { value: None, .. }
             | ExprKind::PipePlaceholder
+            | ExprKind::OffsetOf { .. }
             | ExprKind::Error => {}
         }
     }
@@ -3316,11 +3318,13 @@ impl<'a> EffectChecker<'a> {
     ///
     /// Never rejects — linter advice only.
     /// Per-`ExternFunction` effect-set registration. Used at both the
-    /// (now-dead) top-level `Item::ExternFunction` arm and the per-item
-    /// arm inside an `Item::ExternBlock`. Block-level attributes are
-    /// pre-merged into each item's `attributes` at parse time, so the
-    /// `@noblock` check below sees the union of block + per-item attrs.
-    fn register_extern_function_effects(&mut self, e: &ExternFunction) {
+    /// (now-dead) top-level `Item::ExternFunction` arm (with
+    /// `block_attrs = &[]`) and the per-item arm inside an
+    /// `Item::ExternBlock` (with `block_attrs = &b.attributes`).
+    /// Block-level attributes are NOT pre-merged into per-item
+    /// `attributes` — they're passed through here so the `@noblock`
+    /// check sees the union of block + per-item attrs.
+    fn register_extern_function_effects(&mut self, e: &ExternFunction, block_attrs: &[Attribute]) {
         // ABI-keyed default effect set (trust-not-verify: extern has no body).
         // `extern "C"` → {blocks}; `extern "C-unwind"` → {blocks, panics}.
         // `@noblock` removes blocks from the default (e.g. a pure-CPU C++ fn).
@@ -3330,7 +3334,8 @@ impl<'a> EffectChecker<'a> {
             offset: 0,
             length: 0,
         };
-        let has_noblock = e.attributes.iter().any(|a| a.name == "noblock");
+        let has_noblock = e.attributes.iter().any(|a| a.name == "noblock")
+            || block_attrs.iter().any(|a| a.name == "noblock");
         let mut abi_defaults = EffectSet::new();
         match e.abi.as_str() {
             "C" if !has_noblock => {

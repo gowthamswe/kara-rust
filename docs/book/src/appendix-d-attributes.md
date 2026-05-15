@@ -70,31 +70,35 @@ extern "C" fn sqrt(x: f64) -> f64;
 
 ## Linker control
 
-### `#[no_mangle]`
+### `#[unsafe(no_mangle)]`
 
 Use the Kāra identifier as the exported symbol name without any name mangling. Required when a foreign caller (C, linker script, debugger) must reference the symbol by its exact Kāra name. Does not imply `extern "C"` — the calling convention is independent.
 
+The `#[unsafe(...)]` wrap is mandatory: disabling name mangling can collide with foreign symbols, an obligation the compiler cannot verify. Bare `#[no_mangle]` is rejected at parse time.
+
 ```kara
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn kara_entry() { ... }
 ```
 
 ### `#[used]`
 
-Prevent dead-code elimination for the annotated symbol even if no Kāra code references it. Use for linker-section entries, interrupt vectors, or other symbols that are referenced only from outside the compiler's visibility (linker scripts, hardware, debuggers).
+Prevent dead-code elimination for the annotated symbol even if no Kāra code references it. Use for linker-section entries, interrupt vectors, or other symbols that are referenced only from outside the compiler's visibility (linker scripts, hardware, debuggers). Stays plain (no `#[unsafe(...)]` wrap) — `#[used]` only suppresses DCE, no soundness obligation.
 
 ```kara
-#[link_section(".vectors")]
+#[unsafe(link_section(".vectors"))]
 #[used]
 let interrupt_table: [fn(); 16] = [...];
 ```
 
-### `#[link_section("name")]`
+### `#[unsafe(link_section("name"))]`
 
 Place the annotated symbol in a named linker section. Required for embedded targets that map specific sections to specific memory regions (flash, DTCM RAM, etc.).
 
+The `#[unsafe(...)]` wrap is mandatory: section placement carries layout and aliasing obligations the compiler cannot verify. Bare `#[link_section(...)]` is rejected at parse time.
+
 ```kara
-#[link_section(".dtcmram")]
+#[unsafe(link_section(".dtcmram"))]
 let fast_buffer: [u8; 1024] = [0; 1024];
 ```
 

@@ -466,6 +466,7 @@ fn walk_expr_for_with_provider(expr: &Expr, out: &mut Vec<WithProviderSite>) {
         | ExprKind::Return(None)
         | ExprKind::Break { value: None, .. }
         | ExprKind::Continue { .. }
+        | ExprKind::OffsetOf { .. }
         | ExprKind::Error => {}
     }
 }

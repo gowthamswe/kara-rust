@@ -1869,9 +1869,11 @@ impl Parser {
     /// Parse an `unsafe extern "ABI" { ... }` block at module scope.
     /// The leading `unsafe` keyword has not yet been consumed; the
     /// `pending_doc` slot holds any `///` lines that preceded the
-    /// block. `attributes` is the set of `#[...]` / `@...` attributes
-    /// the caller already parsed (block-level attributes — these
-    /// pre-merge into every contained item).
+    /// block. `block_attributes` is the set of `#[...]` / `@...`
+    /// attributes the caller already parsed — they live on the
+    /// `ExternBlock` itself; downstream consumers (effectchecker,
+    /// codegen) read both the block-level set and per-item set so the
+    /// formatter can round-trip the block-level position faithfully.
     fn parse_unsafe_extern_block(
         &mut self,
         block_attributes: Vec<Attribute>,
@@ -1927,11 +1929,14 @@ impl Parser {
         while !self.check(&Token::RightBrace) && !self.is_at_end() {
             let item_start = self.current_span();
 
-            // Per-item leading doc + attributes (in addition to block-level).
+            // Per-item leading doc + attributes. Block-level attributes
+            // live on the `ExternBlock` and are NOT pre-merged here; the
+            // round-trip through the formatter must preserve which
+            // attributes were written at the block level vs. per-item.
+            // Downstream consumers that need the union (effectchecker,
+            // codegen) take both sets explicitly.
             self.collect_leading_doc_comments();
-            let per_item_attrs = self.parse_attributes();
-            let mut attributes = block_attributes.clone();
-            attributes.extend(per_item_attrs);
+            let attributes = self.parse_attributes();
 
             // Take the item-level doc *now*, before descending into a
             // param list — per-param doc collection inside `parse_param`
@@ -2269,7 +2274,42 @@ impl Parser {
         let start = self.current_span();
         self.expect(&Token::Pound)?;
         self.expect(&Token::LeftBracket)?;
+
+        // `#[unsafe(...)]` wrap (design.md § Linker Control Attributes)
+        // — the soundness-affecting linker attributes (`no_mangle`,
+        // `link_section`) must be authored inside an `unsafe(...)`
+        // wrap. The wrap is a visual trust-boundary marker; the parser
+        // unwraps it into a plain attribute so downstream consumers
+        // (codegen `apply_linker_attrs`) keep working unchanged. The
+        // formatter re-emits the wrap when rendering — see
+        // `format_attributes` for the canonical rendering.
+        if self.check(&Token::Unsafe) {
+            return self.parse_unsafe_wrapped_attribute(start);
+        }
+
         let name = self.expect_identifier()?;
+
+        // Bare `#[no_mangle]` / `#[link_section(...)]` — reject with a
+        // focused diagnostic suggesting the `#[unsafe(...)]` wrap.
+        // Errors do NOT bail; we keep parsing so error recovery remains
+        // useful and the rest of the file still type-checks.
+        if name == "no_mangle" {
+            self.error(
+                "bare `#[no_mangle]` is not allowed — write `#[unsafe(no_mangle)]` \
+                 instead. The `unsafe(...)` wrap is a visual trust-boundary marker: \
+                 disabling name mangling can collide with foreign symbols and is an \
+                 obligation the compiler cannot verify. \
+                 See design.md § Linker Control Attributes.",
+            );
+        } else if name == "link_section" {
+            self.error(
+                "bare `#[link_section(...)]` is not allowed — write \
+                 `#[unsafe(link_section(\"...\"))]` instead. The `unsafe(...)` wrap \
+                 is a visual trust-boundary marker: section placement carries layout \
+                 and aliasing obligations the compiler cannot verify. \
+                 See design.md § Linker Control Attributes.",
+            );
+        }
 
         // #[name = "string"] form
         let (args, string_value) = if self.eat(&Token::Equal) {
@@ -2331,6 +2371,75 @@ impl Parser {
             name,
             args,
             string_value,
+        })
+    }
+
+    /// Parse the `#[unsafe(NAME)]` / `#[unsafe(NAME("string"))]` wrap.
+    /// `start` is the span of the leading `#`. The opening `#[` has
+    /// already been consumed; the current token is `unsafe`.
+    ///
+    /// Currently the only inner names accepted are `no_mangle` and
+    /// `link_section("name")` (per design.md § Linker Control Attributes).
+    /// Any other inner name is rejected with a focused diagnostic — `used`
+    /// in particular stays plain (`#[used]`) and is rejected here so a
+    /// reader writing `#[unsafe(used)]` gets a helpful redirect rather
+    /// than silent acceptance.
+    ///
+    /// The wrap is unwrapped at parse time: the resulting `Attribute`
+    /// has `name == "no_mangle"` or `name == "link_section"` so existing
+    /// downstream consumers (codegen `apply_linker_attrs`) keep working
+    /// unchanged. The formatter re-emits the wrap on output.
+    fn parse_unsafe_wrapped_attribute(&mut self, start: Span) -> Option<Attribute> {
+        self.expect(&Token::Unsafe)?;
+        self.expect(&Token::LeftParen)?;
+        let inner_name = self.expect_identifier()?;
+
+        let attr_string_value = match inner_name.as_str() {
+            "no_mangle" => {
+                // No further arguments accepted inside the wrap.
+                None
+            }
+            "link_section" => {
+                self.expect(&Token::LeftParen)?;
+                let s = match self.peek_token() {
+                    Token::StringLiteral(s) => {
+                        let s = s.clone();
+                        self.advance();
+                        s
+                    }
+                    _ => {
+                        self.error(
+                            "expected a string literal section name inside \
+                             `#[unsafe(link_section(...))]`, e.g. \
+                             `#[unsafe(link_section(\".init_array\"))]`",
+                        );
+                        return None;
+                    }
+                };
+                self.expect(&Token::RightParen)?;
+                Some(s)
+            }
+            _ => {
+                self.error(&format!(
+                    "unknown attribute inside `#[unsafe(...)]`: `{inner_name}`. The \
+                     `#[unsafe(...)]` wrap is reserved for soundness-affecting linker \
+                     attributes — `no_mangle` and `link_section(\"...\")`. Plain \
+                     attributes (e.g. `#[used]`, `#[noblock]`, `#[kara_name = \"...\"]`) \
+                     are written without the wrap. \
+                     See design.md § Linker Control Attributes."
+                ));
+                return None;
+            }
+        };
+
+        self.expect(&Token::RightParen)?;
+        self.expect(&Token::RightBracket)?;
+
+        Some(Attribute {
+            span: self.span_from(&start),
+            name: inner_name,
+            args: Vec::new(),
+            string_value: attr_string_value,
         })
     }
 
@@ -3044,6 +3153,75 @@ impl Parser {
         Some(Expr {
             span: self.span_from(&start),
             kind: ExprKind::Providers { bindings, body },
+        })
+    }
+
+    /// Parse the contextual special form `offset_of[T](field.path)`.
+    /// `T` is a regular `TypeExpr` (so `offset_of[Vec[i64]](len)` works
+    /// transparently); the paren contents are an identifier-only path
+    /// `IDENT (. IDENT)*`. Any non-identifier expression form in the
+    /// path position emits a focused diagnostic and returns `None`.
+    /// See design.md § Field Offsets for the spec; the typechecker
+    /// validates the path against `T`'s field set.
+    fn parse_offset_of_special_form(&mut self, start: Span) -> Option<Expr> {
+        self.expect(&Token::LeftBracket)?;
+        let ty = self.parse_type()?;
+        self.expect(&Token::RightBracket)?;
+        self.expect(&Token::LeftParen)?;
+
+        let mut field_path: Vec<String> = Vec::new();
+        match self.peek_token() {
+            Token::Identifier { .. } => {
+                field_path.push(self.expect_identifier()?);
+            }
+            _ => {
+                self.error(
+                    "error[E_OFFSET_OF_INVALID_PATH]: offset_of accepts a field-name path \
+                     (e.g. `offset_of[T](field)` or `offset_of[T](inner.y)`); expression \
+                     forms (literals, calls, indexing, dereferences) are not legal here",
+                );
+                return None;
+            }
+        }
+        loop {
+            match self.peek_token() {
+                Token::Dot => {
+                    self.advance();
+                    match self.peek_token() {
+                        Token::Identifier { .. } => {
+                            field_path.push(self.expect_identifier()?);
+                        }
+                        _ => {
+                            self.error(
+                                "error[E_OFFSET_OF_INVALID_PATH]: each segment of the offset_of \
+                                 field path must be a bare identifier; indexing, method calls, \
+                                 and dereferences are not legal here",
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Token::RightParen => break,
+                // `field[0]` (indexing), `field()` (call), `*field` (deref),
+                // and any other expression-form continuation are rejected
+                // with a focused diagnostic. The generic "Expected
+                // RightParen" message would point at the wrong intent.
+                _ => {
+                    self.error(
+                        "error[E_OFFSET_OF_INVALID_PATH]: offset_of accepts a field-name path \
+                         (e.g. `offset_of[T](field)` or `offset_of[T](inner.y)`); indexing, \
+                         method calls, dereferences, and other expression forms are not legal \
+                         here",
+                    );
+                    return None;
+                }
+            }
+        }
+        self.expect(&Token::RightParen)?;
+
+        Some(Expr {
+            span: self.span_from(&start),
+            kind: ExprKind::OffsetOf { ty, field_path },
         })
     }
 
@@ -4743,6 +4921,18 @@ impl Parser {
         // shape today. See design.md § `providers { } in { }` Block.
         if name == "providers" && self.check(&Token::LeftBrace) {
             return self.parse_providers_block(start);
+        }
+
+        // Contextual keyword: `offset_of[T](field.path)` — compile-time
+        // byte offset of a field from a value of type `T`. The bracket
+        // contents are a `TypeExpr` (not an `Expr`), and the paren
+        // contents are an identifier-only field path (not value
+        // arguments) per design.md § Field Offsets. Recognised here at
+        // the bareword + `[` shape so the call site lowers as a single
+        // `ExprKind::OffsetOf` AST node, bypassing the regular call
+        // routing entirely.
+        if name == "offset_of" && self.check(&Token::LeftBracket) {
+            return self.parse_offset_of_special_form(start);
         }
 
         // Check for labeled loop / labeled block: `label: while/for/loop`

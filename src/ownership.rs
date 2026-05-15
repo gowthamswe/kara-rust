@@ -3741,6 +3741,7 @@ impl<'a> OwnershipChecker<'a> {
             | ExprKind::Return(None)
             | ExprKind::Break { value: None, .. }
             | ExprKind::PipePlaceholder
+            | ExprKind::OffsetOf { .. }
             | ExprKind::Error => {}
         }
     }

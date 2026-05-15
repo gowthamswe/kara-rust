@@ -311,6 +311,7 @@ fn walk_expr(expr: &Expr, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagno
         | ExprKind::Return(None)
         | ExprKind::Break { value: None, .. }
         | ExprKind::Continue { .. }
+        | ExprKind::OffsetOf { .. }
         | ExprKind::Error => {}
     }
 }

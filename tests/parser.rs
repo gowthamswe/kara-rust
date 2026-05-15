@@ -1938,9 +1938,12 @@ fn test_unsafe_extern_block_multiple_items() {
 }
 
 #[test]
-fn test_unsafe_extern_block_propagates_block_level_noblock() {
-    // Block-level `@noblock` pre-merges into each child's attributes at parse
-    // time so downstream consumers (effectchecker) see the union.
+fn test_unsafe_extern_block_keeps_block_level_attribute_separate() {
+    // Block-level `@noblock` lives on the `ExternBlock` itself; per-item
+    // `attributes` lists hold ONLY per-item attributes (no pre-merge),
+    // so the formatter can round-trip the block-header position
+    // faithfully. Downstream consumers (effectchecker, codegen) take both
+    // sets explicitly and union them per item.
     let prog = parse_ok(
         r#"
         @noblock
@@ -1953,16 +1956,169 @@ fn test_unsafe_extern_block_propagates_block_level_noblock() {
     let Item::ExternBlock(b) = &prog.items[0] else {
         panic!("expected ExternBlock");
     };
-    assert!(b.attributes.iter().any(|a| a.name == "noblock"));
+    assert!(
+        b.attributes.iter().any(|a| a.name == "noblock"),
+        "block-level @noblock should live on ExternBlock.attributes"
+    );
     for it in &b.items {
         let ExternItem::Function(f) = it else {
             panic!("expected ExternItem::Function");
         };
         assert!(
-            f.attributes.iter().any(|a| a.name == "noblock"),
-            "block-level @noblock should pre-merge into each item"
+            !f.attributes.iter().any(|a| a.name == "noblock"),
+            "block-level @noblock must NOT be pre-merged into per-item attributes"
         );
     }
+}
+
+#[test]
+fn test_unsafe_extern_block_per_item_attribute_stays_per_item() {
+    // Per-item attributes inside an `unsafe extern { }` block stay on
+    // the item, not on the block — symmetric to the block-level case.
+    let prog = parse_ok(
+        r#"
+        unsafe extern "C" {
+            @noblock
+            fn abs(x: i32) -> i32;
+            fn sqrt(x: f64) -> f64;
+        }
+        "#,
+    );
+    let Item::ExternBlock(b) = &prog.items[0] else {
+        panic!("expected ExternBlock");
+    };
+    assert!(
+        !b.attributes.iter().any(|a| a.name == "noblock"),
+        "per-item @noblock must NOT bubble up to ExternBlock.attributes"
+    );
+    let ExternItem::Function(abs) = &b.items[0] else {
+        panic!("expected ExternItem::Function");
+    };
+    assert!(abs.attributes.iter().any(|a| a.name == "noblock"));
+    let ExternItem::Function(sqrt) = &b.items[1] else {
+        panic!("expected ExternItem::Function");
+    };
+    assert!(!sqrt.attributes.iter().any(|a| a.name == "noblock"));
+}
+
+#[test]
+fn test_unsafe_extern_block_round_trips_block_level_attribute_position() {
+    // Round-trip: source with a block-level attribute formats back with
+    // the attribute still at the block-header position, not migrated
+    // onto each child item. Closes the slice-1 round-trip non-idempotence
+    // caveat (phase-5-diagnostics.md line 299). The `@noblock` sugar form
+    // already normalises to `#[noblock]` via the existing attribute
+    // renderer; this test pins the *position* (block-level vs per-item),
+    // which is the load-bearing property.
+    let src = "#[noblock]\nunsafe extern \"C\" {\n    fn abs(x: i32) -> i32;\n    fn sqrt(x: f64) -> f64;\n}\n";
+    let prog = parse_ok(src);
+    let formatted = karac::formatter::format_program(&prog);
+    assert_eq!(formatted, src, "round-trip mismatch:\n{formatted}");
+}
+
+// ── #[unsafe(...)] wrap on linker control attributes ────────────────
+//
+// `#[unsafe(no_mangle)]` and `#[unsafe(link_section("..."))]` are the
+// canonical authoring form (design.md § Linker Control Attributes).
+// Bare `#[no_mangle]` and `#[link_section(...)]` are rejected at parse
+// time; `#[used]` stays plain.
+
+#[test]
+fn test_unsafe_no_mangle_wrap_parses() {
+    let prog = parse_ok("#[unsafe(no_mangle)]\nfn keep_me() -> i64 { 42 }");
+    let f = match &prog.items[0] {
+        Item::Function(f) => f,
+        _ => panic!("expected function"),
+    };
+    assert_eq!(f.attributes.len(), 1);
+    assert_eq!(f.attributes[0].name, "no_mangle");
+    assert!(f.attributes[0].args.is_empty());
+    assert!(f.attributes[0].string_value.is_none());
+}
+
+#[test]
+fn test_unsafe_link_section_wrap_parses() {
+    let prog = parse_ok("#[unsafe(link_section(\".init_array\"))]\nfn ctor() -> i64 { 1 }");
+    let f = match &prog.items[0] {
+        Item::Function(f) => f,
+        _ => panic!("expected function"),
+    };
+    assert_eq!(f.attributes.len(), 1);
+    assert_eq!(f.attributes[0].name, "link_section");
+    assert_eq!(f.attributes[0].string_value.as_deref(), Some(".init_array"));
+}
+
+#[test]
+fn test_bare_no_mangle_rejected_with_focused_diagnostic() {
+    let (_, errors) = parse_with_errors("#[no_mangle]\nfn f() {}");
+    assert!(
+        !errors.is_empty(),
+        "expected rejection of bare #[no_mangle]"
+    );
+    assert!(
+        errors_contain(&errors, "#[unsafe(no_mangle)]"),
+        "diagnostic should suggest the wrap; got {errors:?}"
+    );
+}
+
+#[test]
+fn test_bare_link_section_rejected_with_focused_diagnostic() {
+    let (_, errors) = parse_with_errors("#[link_section(\".x\")]\nfn f() {}");
+    assert!(
+        !errors.is_empty(),
+        "expected rejection of bare #[link_section(...)]"
+    );
+    assert!(
+        errors_contain(&errors, "#[unsafe(link_section"),
+        "diagnostic should suggest the wrap; got {errors:?}"
+    );
+}
+
+#[test]
+fn test_unsafe_wrap_unknown_inner_attribute_rejected() {
+    // `#[unsafe(foo)]` — `foo` isn't one of the wrapped attributes;
+    // emit a focused diagnostic naming the legal options. Catches a
+    // user reaching for the wrap on something it doesn't apply to
+    // (e.g. `#[unsafe(used)]` — `used` stays plain).
+    let (_, errors) = parse_with_errors("#[unsafe(used)]\nfn f() {}");
+    assert!(
+        !errors.is_empty(),
+        "expected rejection of unknown #[unsafe(...)] inner attribute"
+    );
+    assert!(
+        errors_contain(&errors, "no_mangle"),
+        "diagnostic should name the legal wrapped attributes; got {errors:?}"
+    );
+}
+
+#[test]
+fn test_used_attribute_stays_plain() {
+    // `#[used]` only suppresses DCE — no soundness obligation, no wrap.
+    let prog = parse_ok("#[used]\nfn keep() -> i64 { 7 }");
+    let f = match &prog.items[0] {
+        Item::Function(f) => f,
+        _ => panic!("expected function"),
+    };
+    assert_eq!(f.attributes.len(), 1);
+    assert_eq!(f.attributes[0].name, "used");
+}
+
+#[test]
+fn test_unsafe_no_mangle_round_trips_through_formatter() {
+    // The wrap is the canonical authoring form, so formatter output
+    // must re-emit `#[unsafe(no_mangle)]` (round-trip idempotence).
+    let src = "#[unsafe(no_mangle)]\nfn keep_me() -> i64 {\n    42\n}\n";
+    let prog = parse_ok(src);
+    let formatted = karac::formatter::format_program(&prog);
+    assert_eq!(formatted, src, "round-trip mismatch:\n{formatted}");
+}
+
+#[test]
+fn test_unsafe_link_section_round_trips_through_formatter() {
+    let src = "#[unsafe(link_section(\".init_array\"))]\nfn ctor() -> i64 {\n    1\n}\n";
+    let prog = parse_ok(src);
+    let formatted = karac::formatter::format_program(&prog);
+    assert_eq!(formatted, src, "round-trip mismatch:\n{formatted}");
 }
 
 #[test]
@@ -5380,7 +5536,7 @@ fn test_doc_comment_attaches_to_enum() {
 #[test]
 fn test_doc_comment_before_attribute_works() {
     // /// comment then #[attr] then item — the doc must still attach.
-    let p = parse_ok("/// Documented.\n#[no_mangle]\nfn f() {}");
+    let p = parse_ok("/// Documented.\n#[unsafe(no_mangle)]\nfn f() {}");
     let f = match &p.items[0] {
         Item::Function(f) => f,
         _ => panic!("expected function"),

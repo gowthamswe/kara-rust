@@ -626,6 +626,111 @@ fn main() {
         }
     }
 
+    // ── Layout introspection intrinsics ──────────────────────────
+    //
+    // `size_of[T]()` lowers to inkwell's `BasicTypeEnum::size_of()`
+    // (compile-time constant); `align_of[T]()` queries the host
+    // `TargetData::get_abi_alignment()`. Both return `usize` (i64 on
+    // the 64-bit-only target). Slice 1b NO_KNOWN_SIZE pull.
+
+    #[test]
+    fn test_e2e_size_of_i64_is_8() {
+        let out = run_program("fn main() { println(size_of[i64]()); }");
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "8");
+        }
+    }
+
+    #[test]
+    fn test_e2e_size_of_i32_is_4() {
+        let out = run_program("fn main() { println(size_of[i32]()); }");
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "4");
+        }
+    }
+
+    #[test]
+    fn test_e2e_size_of_i8_is_1() {
+        let out = run_program("fn main() { println(size_of[i8]()); }");
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "1");
+        }
+    }
+
+    #[test]
+    fn test_e2e_align_of_i64_is_8() {
+        let out = run_program("fn main() { println(align_of[i64]()); }");
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "8");
+        }
+    }
+
+    #[test]
+    fn test_e2e_align_of_i32_is_4() {
+        let out = run_program("fn main() { println(align_of[i32]()); }");
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "4");
+        }
+    }
+
+    #[test]
+    fn test_e2e_align_of_i8_is_1() {
+        let out = run_program("fn main() { println(align_of[i8]()); }");
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "1");
+        }
+    }
+
+    #[test]
+    fn test_e2e_size_of_user_struct() {
+        // `struct Point { x: i64, y: i64 }` → 16 bytes on a 64-bit target.
+        let out = run_program(
+            "struct Point { x: i64, y: i64 }\n\
+             fn main() { println(size_of[Point]()); }",
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "16");
+        }
+    }
+
+    #[test]
+    fn test_e2e_offset_of_first_field_is_0() {
+        let out = run_program(
+            "struct Point { x: i64, y: i64 }\n\
+             fn main() { println(offset_of[Point](x)); }",
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "0");
+        }
+    }
+
+    #[test]
+    fn test_e2e_offset_of_second_field() {
+        // `y` follows `x: i64` → offset 8.
+        let out = run_program(
+            "struct Point { x: i64, y: i64 }\n\
+             fn main() { println(offset_of[Point](y)); }",
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "8");
+        }
+    }
+
+    #[test]
+    fn test_e2e_offset_of_nested_path() {
+        // `offset_of[Outer](inner.y)` = offset(inner inside Outer) + offset(y inside Inner).
+        let out = run_program(
+            "struct Inner { x: i32, y: i32 }\n\
+             struct Outer { a: i32, inner: Inner, c: i32 }\n\
+             fn main() { println(offset_of[Outer](inner.y)); }",
+        );
+        if let Some(out) = out {
+            // a: i32 occupies bytes 0-3; inner: Inner starts at 4 (i32-aligned);
+            // y is the second i32 field of Inner → +4 inside Inner → byte 8.
+            assert_eq!(out.trim(), "8");
+        }
+    }
+
     #[test]
     fn test_e2e_and_short_circuit_skips_rhs_call() {
         // `false and boom()` must not call boom() at runtime.
@@ -4919,7 +5024,7 @@ fn main() {
         // `#[no_mangle]` is a no-op at the codegen layer (the compiler already
         // uses the source-level name as the LLVM symbol name) but we verify
         // the function still emits with its plain name.
-        let ir = ir_for("#[no_mangle]\nfn keep_me() -> i64 { 42 }");
+        let ir = ir_for("#[unsafe(no_mangle)]\nfn keep_me() -> i64 { 42 }");
         assert!(
             ir.contains("@keep_me"),
             "function symbol should appear as @keep_me; IR: {}",
@@ -4935,7 +5040,7 @@ fn main() {
         // the supplied name doesn't already contain one — so we accept
         // both `section ".init_array"` (ELF) and `section ",.init_array"`
         // (Mach-O fallback).
-        let ir = ir_for("#[link_section(\".init_array\")]\nfn ctor() -> i64 { 1 }");
+        let ir = ir_for("#[unsafe(link_section(\".init_array\"))]\nfn ctor() -> i64 { 1 }");
         assert!(
             ir.contains("section \".init_array\"") || ir.contains("section \",.init_array\""),
             "expected section directive on @ctor; IR: {}",

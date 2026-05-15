@@ -2235,7 +2235,7 @@ ATTRIBUTE  = "#" "[" ATTR_PATH [ "(" ATTR_ARGS ")" ] "]"
            | "#" "[" ATTR_PATH "=" STRING "]"
              // e.g., #[must_use = "reason"]
 ATTR_PATH  = IDENT { "::" IDENT }
-             // bare names: #[derive(Eq)], #[no_mangle]
+             // bare names: #[derive(Eq)], #[used]
              // namespaced:  #[diagnostic::on_unimplemented(...)],
              //              #[rustfmt::skip]
 ATTR_ARGS  = ATTR_ARG { "," ATTR_ARG }
@@ -2314,8 +2314,8 @@ Known attributes:
 | `#[cyclic]` | Trait | Mark trait as used in cyclic `shared struct` graphs — compiler enforces `weak` on back-edges |
 | `#[interrupt(NAME)]` | Function | ISR handler ABI — compiler generates interrupt entry/exit sequence |
 | `#[used]` | Static/Const | Prevent dead-code elimination (linker keeps the symbol) |
-| `#[no_mangle]` | Function/Static | Disable name mangling for FFI export |
-| `#[link_section("name")]` | Function/Static | Place symbol in a specific linker section |
+| `#[unsafe(no_mangle)]` | Function/Static | Disable name mangling for FFI export. `#[unsafe(...)]` wrap mandatory; bare `#[no_mangle]` rejected at parse time. See design.md § Linker Control Attributes. |
+| `#[unsafe(link_section("name"))]` | Function/Static | Place symbol in a specific linker section. `#[unsafe(...)]` wrap mandatory; bare `#[link_section(...)]` rejected at parse time. See design.md § Linker Control Attributes. |
 | `#[allow(pure_loop_in_par)]` | Function/Block | Suppress pure-tight-loop-in-par warning |
 | `#[property(cases: N)]` | Test function | Property-based test with custom iteration count |
 | `#[snapshot]` | Test function | Snapshot test (output compared against saved baseline) |

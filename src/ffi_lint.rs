@@ -319,6 +319,7 @@ fn walk_expr(
         | ExprKind::Return(None)
         | ExprKind::Break { value: None, .. }
         | ExprKind::Continue { .. }
+        | ExprKind::OffsetOf { .. }
         | ExprKind::Error => {}
     }
 }

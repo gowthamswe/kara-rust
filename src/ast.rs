@@ -671,10 +671,12 @@ pub struct ExternFunction {
 #[derive(Debug, Clone)]
 pub struct ExternBlock {
     pub span: Span,
-    /// Block-level attributes (e.g. block-scoped `@noblock`). Already
-    /// pre-merged into each item's `attributes` at parse time; kept on
-    /// the block too for lint / doc surfaces that care about block
-    /// identity.
+    /// Block-level attributes (e.g. block-scoped `@noblock`). Held
+    /// here at the block level and NOT pre-merged into per-item
+    /// `attributes` — formatter round-trip needs to preserve which
+    /// attributes were authored block-level vs. per-item. Downstream
+    /// consumers (effectchecker, codegen) that need the effective union
+    /// for a given item take both sets explicitly.
     pub attributes: Vec<Attribute>,
     /// Joined contents of `///` doc-comments preceding the block. The
     /// `undocumented_unsafe` lint reads this to enforce a `# Safety`
@@ -1094,6 +1096,21 @@ pub enum ExprKind {
     Cast {
         expr: Box<Expr>,
         ty: TypeExpr,
+    },
+
+    /// `offset_of[T](field.path)` — compile-time byte offset of a field
+    /// (or nested field path) from the start of a value of type `T`.
+    /// Parser special form because the second argument is a field-name
+    /// path, not a value expression. The typechecker walks `field_path`
+    /// against `T`'s declared fields, validating each segment and
+    /// emitting `E_OFFSET_OF_OPAQUE_TYPE` / `E_OFFSET_OF_GENERIC_PARAM`
+    /// / `E_OFFSET_OF_UNKNOWN_FIELD` / `E_OFFSET_OF_PRIVATE_FIELD` /
+    /// `E_OFFSET_OF_ENUM_VARIANT` as appropriate. The codegen lowers
+    /// to inkwell's `TargetData::offset_of_element` (chained for
+    /// nested paths). Returns `usize`. See `design.md § Field Offsets`.
+    OffsetOf {
+        ty: TypeExpr,
+        field_path: Vec<String>,
     },
 
     // Range — start and/or end may be absent for half-open forms.

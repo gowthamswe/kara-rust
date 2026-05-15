@@ -1791,6 +1791,204 @@ fn test_trait_impl_on_opaque_type_rejected() {
     );
 }
 
+// ── Layout introspection intrinsics: size_of[T]() / align_of[T]() ─
+//
+// Slice 1b NO_KNOWN_SIZE pull. The intrinsics live in
+// `runtime/stdlib/intrinsics.kara` as `#[compiler_builtin]`
+// placeholders; the real type-check happens in
+// `infer_layout_query_intrinsic` (rejecting opaque foreign type args
+// with `E_OPAQUE_TYPE_NO_KNOWN_SIZE`) and the real codegen happens in
+// `compile_layout_query_intrinsic`. The walker's
+// `E_OPAQUE_TYPE_REQUIRES_INDIRECTION` is suppressed for these calls
+// — the "wrap in `ref T`" hint would mis-direct a layout query.
+
+#[test]
+fn test_size_of_primitive_returns_usize() {
+    typecheck_ok(
+        "fn main() {\n\
+             let s: usize = size_of[i64]();\n\
+         }",
+    );
+}
+
+#[test]
+fn test_align_of_primitive_returns_usize() {
+    typecheck_ok(
+        "fn main() {\n\
+             let a: usize = align_of[i64]();\n\
+         }",
+    );
+}
+
+#[test]
+fn test_size_of_user_struct_returns_usize() {
+    typecheck_ok(
+        "struct Point { x: i64, y: i64 }\n\
+         fn main() {\n\
+             let s: usize = size_of[Point]();\n\
+         }",
+    );
+}
+
+#[test]
+fn test_size_of_opaque_type_rejected() {
+    let errors = typecheck_errors(
+        "unsafe extern \"C\" {\n\
+             type Foo;\n\
+         }\n\
+         fn main() {\n\
+             let s: usize = size_of[Foo]();\n\
+         }",
+    );
+    assert_error_code_present(&errors, "E_OPAQUE_TYPE_NO_KNOWN_SIZE");
+    // Confirm the misleading REQUIRES_INDIRECTION did NOT fire — the
+    // walker is suppressed for layout-query type args.
+    assert!(
+        errors
+            .iter()
+            .all(|e| !e.message.contains("E_OPAQUE_TYPE_REQUIRES_INDIRECTION")),
+        "REQUIRES_INDIRECTION must be suppressed for layout queries; got: {:?}",
+        errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_align_of_opaque_type_rejected() {
+    let errors = typecheck_errors(
+        "unsafe extern \"C\" {\n\
+             type Foo;\n\
+         }\n\
+         fn main() {\n\
+             let a: usize = align_of[Foo]();\n\
+         }",
+    );
+    assert_error_code_present(&errors, "E_OPAQUE_TYPE_NO_KNOWN_SIZE");
+}
+
+#[test]
+fn test_size_of_with_value_arg_rejected() {
+    let errors = typecheck_errors(
+        "fn main() {\n\
+             let s: usize = size_of[i64](42);\n\
+         }",
+    );
+    assert_error_code_present(&errors, "E_LAYOUT_QUERY_TAKES_NO_ARGS");
+}
+
+// ── offset_of[T](field) — special-form intrinsic ─────────────────
+//
+// Parser special form because the second argument is a field path,
+// not a value expression. The typechecker walks the path against the
+// resolved struct's fields, emitting `E_OFFSET_OF_OPAQUE_TYPE`,
+// `E_OFFSET_OF_GENERIC_PARAM`, `E_OFFSET_OF_UNKNOWN_FIELD`,
+// `E_OFFSET_OF_NON_STRUCT_TARGET`, or `E_OFFSET_OF_INVALID_PATH`
+// per design.md § Field Offsets. Returns `usize`.
+
+#[test]
+fn test_offset_of_returns_usize() {
+    typecheck_ok(
+        "struct Point { x: i64, y: i64 }\n\
+         fn main() { let off: usize = offset_of[Point](y); }",
+    );
+}
+
+#[test]
+fn test_offset_of_first_field() {
+    typecheck_ok(
+        "struct Point { x: i64, y: i64 }\n\
+         fn main() { let off: usize = offset_of[Point](x); }",
+    );
+}
+
+#[test]
+fn test_offset_of_nested_path() {
+    typecheck_ok(
+        "struct Inner { x: i32, y: i32 }\n\
+         struct Outer { a: i32, inner: Inner, c: i32 }\n\
+         fn main() { let off: usize = offset_of[Outer](inner.y); }",
+    );
+}
+
+#[test]
+fn test_offset_of_unknown_field_rejected() {
+    let errors = typecheck_errors(
+        "struct Point { x: i64, y: i64 }\n\
+         fn main() { let off: usize = offset_of[Point](z); }",
+    );
+    assert_error_code_present(&errors, "E_OFFSET_OF_UNKNOWN_FIELD");
+}
+
+#[test]
+fn test_offset_of_opaque_type_rejected() {
+    let errors = typecheck_errors(
+        "unsafe extern \"C\" {\n\
+             type Foo;\n\
+         }\n\
+         fn main() { let off: usize = offset_of[Foo](field); }",
+    );
+    assert_error_code_present(&errors, "E_OFFSET_OF_OPAQUE_TYPE");
+}
+
+#[test]
+fn test_offset_of_non_struct_rejected() {
+    let errors = typecheck_errors("fn main() { let off: usize = offset_of[i64](field); }");
+    assert_error_code_present(&errors, "E_OFFSET_OF_NON_STRUCT_TARGET");
+}
+
+#[test]
+fn test_offset_of_walk_into_non_struct_rejected() {
+    let errors = typecheck_errors(
+        "struct Point { x: i64, y: i64 }\n\
+         fn main() { let off: usize = offset_of[Point](x.foo); }",
+    );
+    assert_error_code_present(&errors, "E_OFFSET_OF_NON_STRUCT_TARGET");
+}
+
+#[test]
+fn test_offset_of_invalid_path_indexing_rejected() {
+    // `offset_of[T](field[0])` — indexing in a path segment is rejected
+    // at parse time before the typechecker sees it.
+    let parsed = karac::parse(
+        "struct Frame { hdr: i64 }\n\
+         fn main() { let off: usize = offset_of[Frame](hdr[0]); }",
+    );
+    assert!(
+        !parsed.errors.is_empty(),
+        "expected parse errors for offset_of[T](field[0]), got none"
+    );
+    assert!(
+        parsed
+            .errors
+            .iter()
+            .any(|e| format!("{}", e).contains("E_OFFSET_OF_INVALID_PATH")),
+        "expected E_OFFSET_OF_INVALID_PATH, got: {:?}",
+        parsed.errors
+    );
+}
+
+#[test]
+fn test_offset_of_invalid_path_call_rejected() {
+    let parsed = karac::parse(
+        "struct Frame { hdr: i64 }\n\
+         fn main() { let off: usize = offset_of[Frame](hdr.foo()); }",
+    );
+    assert!(
+        !parsed.errors.is_empty(),
+        "expected parse errors for offset_of[T](field.foo()), got none"
+    );
+    assert!(
+        parsed
+            .errors
+            .iter()
+            .any(|e| format!("{}", e).contains("E_OFFSET_OF_INVALID_PATH")),
+        "expected E_OFFSET_OF_INVALID_PATH, got: {:?}",
+        parsed.errors
+    );
+}
+
 #[test]
 fn test_char_literal_type() {
     typecheck_ok("fn main() { let c: char = 'x'; }");
@@ -9756,13 +9954,16 @@ fn test_compiler_builtin_existing_intrinsic_dbg_round_trip() {
 #[test]
 fn test_compiler_builtin_empty_in_user_only_program() {
     // Sanity pin: a user-only program (without with_stdlib_source) cannot
-    // populate compiler_builtins — slice 1 rejects the attribute outright,
-    // and the resolver-gate check fires before the typechecker sees it.
-    // Confirm the registry is empty for an ordinary program.
+    // populate compiler_builtins with its own functions — slice 1 rejects
+    // the attribute outright, and the resolver-gate check fires before
+    // the typechecker sees it. The baked stdlib may register its own
+    // entries (e.g., `runtime/stdlib/intrinsics.kara` registers `size_of`
+    // / `align_of`), so the assertion is on absence of the user's name
+    // rather than emptiness of the whole registry.
     let result = typecheck_ok("fn ordinary() -> i64 { 0 }");
     assert!(
-        result.compiler_builtins.is_empty(),
-        "expected empty registry for user-only program, got: {:?}",
+        !result.compiler_builtins.contains("ordinary"),
+        "user-defined fn 'ordinary' must not enter compiler_builtins, got: {:?}",
         result.compiler_builtins
     );
 }

@@ -315,6 +315,7 @@ impl<'a> Lowerer<'a> {
             | ExprKind::SelfValue
             | ExprKind::SelfType
             | ExprKind::PipePlaceholder
+            | ExprKind::OffsetOf { .. }
             | ExprKind::Error => {}
         }
 

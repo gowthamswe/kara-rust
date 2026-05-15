@@ -2489,6 +2489,13 @@ impl<'a> Resolver<'a> {
                 self.resolve_expr(inner);
                 self.resolve_type_expr(ty);
             }
+            ExprKind::OffsetOf { ty, field_path: _ } => {
+                // Resolve the type expression so the typechecker sees a
+                // canonical Type. The field path is identifier-only and
+                // resolves against `ty`'s declared fields at typecheck
+                // time, not at name resolution.
+                self.resolve_type_expr(ty);
+            }
 
             ExprKind::Range { start, end, .. } => {
                 if let Some(s) = start {

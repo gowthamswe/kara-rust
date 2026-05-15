@@ -281,6 +281,7 @@ fn walk_expr_children(expr: &Expr, diags: &mut Vec<LintDiagnostic>) {
         | ExprKind::Return(None)
         | ExprKind::Continue { .. }
         | ExprKind::Break { value: None, .. }
+        | ExprKind::OffsetOf { .. }
         | ExprKind::Error => {}
     }
 }

@@ -442,6 +442,9 @@ fn visit_expr(e: &Expr, visit: &mut impl FnMut(&Span)) {
             visit_expr(expr, visit);
             visit_type(ty, visit);
         }
+        ExprKind::OffsetOf { ty, field_path: _ } => {
+            visit_type(ty, visit);
+        }
         ExprKind::Range { start, end, .. } => {
             if let Some(s) = start {
                 visit_expr(s, visit);

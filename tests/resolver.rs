@@ -660,6 +660,66 @@ fn test_extern_block_opaque_type_duplicate_in_same_block_rejected() {
     );
 }
 
+// ── unsafe extern { } slice 3: block items resolve at module scope ──
+//
+// The block is a syntactic + trust-boundary marker, not a separate
+// namespace. Each child name binds at module scope exactly as a
+// top-level item would; two-pass resolution sees the children
+// through the flat module symbol table.
+
+#[test]
+fn test_unsafe_extern_block_function_visible_at_module_scope() {
+    // Sibling top-level fn calls the extern fn by bareword — no
+    // block-qualified path needed, because the block introduces no
+    // namespace.
+    resolve_ok(
+        "unsafe extern \"C\" { fn libc_strlen(s: i64) -> i64; }\n\
+         fn count(s: i64) -> i64 { libc_strlen(s) }",
+    );
+}
+
+#[test]
+fn test_unsafe_extern_block_function_collides_with_top_level_function() {
+    // Module-scope `fn write` followed by `unsafe extern { fn write }`
+    // collides because both names define into the same module scope.
+    let errors = resolve_errors(
+        "fn write(x: i32) {}\n\
+         unsafe extern \"C\" { fn write(fd: i32, buf: i64, count: i64) -> i64; }",
+    );
+    assert!(
+        errors.iter().any(|e| e.message.contains("already defined")),
+        "expected duplicate-definition error across module-scope fn and extern fn, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_unsafe_extern_block_function_collides_across_separate_blocks() {
+    // Block boundaries do not shield names — two `unsafe extern { }`
+    // blocks both declaring `fn read` collide at module scope.
+    let errors = resolve_errors(
+        "unsafe extern \"C\" { fn read(fd: i32) -> i64; }\n\
+         unsafe extern \"C\" { fn read(handle: i64) -> i64; }",
+    );
+    assert!(
+        errors.iter().any(|e| e.message.contains("already defined")),
+        "expected duplicate-definition error across two extern blocks, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_unsafe_extern_block_resolves_type_reference_against_module_scope() {
+    // The block doesn't introduce a fresh type namespace — type
+    // expressions inside extern fn signatures resolve against the
+    // outer module scope (here: a struct defined at module scope
+    // before the block).
+    resolve_ok(
+        "struct Buf { len: i64, ptr: i64 }\n\
+         unsafe extern \"C\" { fn fill(b: ref Buf, value: u8); }",
+    );
+}
+
 #[test]
 fn test_const_in_expression() {
     resolve_ok(
