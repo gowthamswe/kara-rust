@@ -1273,6 +1273,16 @@ struct Codegen<'ctx> {
     /// (`Set[(i64, String)]`, `Set[Vec[T]]`) compose through the
     /// TypeExpr-aware hash/eq/Display paths.
     set_elem_type_exprs: HashMap<String, TypeExpr>,
+    /// Variables whose surface type is `String`. Disambiguates Strings from
+    /// `Vec[u8]` at iteration time — both share the `{ptr, i64, i64}`
+    /// physical layout and are both registered in `vec_elem_types` with
+    /// element-LLVM-type `i8`, so the for-loop dispatcher otherwise can't
+    /// tell which iteration shape to emit. `for c in s` and `for c in
+    /// s.chars()` on a String iterate per Unicode scalar value via the
+    /// `karac_string_decode_char` runtime helper; `for b in v` on a
+    /// `Vec[u8]` iterates per byte. Populated alongside the existing
+    /// `vec_elem_types` insertion at every String-registration site.
+    string_vars: HashSet<String>,
     /// HTTP handler ABI trampoline (2026-05-09): cache of per-handler-fn
     /// `extern "C"` shims. Key is the user handler's mangled fn name (e.g.
     /// `"handle"`); value is the synthesized shim function. Sharing the
@@ -1307,6 +1317,11 @@ struct Codegen<'ctx> {
     karac_map_iter_new_fn: FunctionValue<'ctx>,
     karac_map_iter_next_fn: FunctionValue<'ctx>,
     karac_map_iter_free_fn: FunctionValue<'ctx>,
+    /// `i64 karac_string_decode_char(*const u8 data, i64 len, i64 byte_offset, *mut u32 out_cp)`.
+    /// Returns the byte offset after the decoded char and writes the
+    /// codepoint through the out-param. Drives `for c in s` / `for c in
+    /// s.chars()` lowering — see `compile_for_string_chars`.
+    karac_string_decode_char_fn: FunctionValue<'ctx>,
     /// `karac_map_entry(map: ptr, key: ptr, out_slot_ptr: ptr) -> i1` —
     /// probe-and-insert-on-vacant. Used by entry chains whose terminal is
     /// `or_insert` / `or_insert_with` — codegen will write a default through
@@ -1735,6 +1750,21 @@ impl<'ctx> Codegen<'ctx> {
             Some(Linkage::External),
         );
 
+        // karac_string_decode_char(data: ptr, len: i64, byte_offset: i64,
+        //                          out_codepoint: ptr) -> i64
+        // Drives `for c in s` / `for c in s.chars()` lowering. Returns the
+        // byte offset after the decoded char; writes the codepoint to
+        // `out_codepoint`.
+        let i64_md: BasicMetadataTypeEnum = context.i64_type().into();
+        let string_decode_char_ty = context
+            .i64_type()
+            .fn_type(&[ptr_md, i64_md, i64_md, ptr_md], false);
+        let karac_string_decode_char_fn = module.add_function(
+            "karac_string_decode_char",
+            string_decode_char_ty,
+            Some(Linkage::External),
+        );
+
         // karac_map_entry(map: ptr, key: ptr, out_slot_ptr: ptr) -> i1
         let map_entry_ty = context
             .bool_type()
@@ -1865,6 +1895,7 @@ impl<'ctx> Codegen<'ctx> {
             set_elem_types: HashMap::new(),
             set_elem_type_names: HashMap::new(),
             set_elem_type_exprs: HashMap::new(),
+            string_vars: HashSet::new(),
             http_shim_cache: HashMap::new(),
             karac_map_new_fn,
             karac_map_free_fn,
@@ -1878,6 +1909,7 @@ impl<'ctx> Codegen<'ctx> {
             karac_map_iter_new_fn,
             karac_map_iter_next_fn,
             karac_map_iter_free_fn,
+            karac_string_decode_char_fn,
             karac_map_entry_fn,
             karac_map_lookup_slot_fn,
             karac_string_clone_fn,
@@ -2484,6 +2516,7 @@ impl<'ctx> Codegen<'ctx> {
         if self.is_string_type_expr(te) {
             self.vec_elem_types
                 .insert(var_name.to_string(), self.context.i8_type().into());
+            self.string_vars.insert(var_name.to_string());
             return;
         }
         if let Some(elem_ty) = self.extract_slice_elem_type(te) {
@@ -5216,6 +5249,7 @@ impl<'ctx> Codegen<'ctx> {
                         if self.is_string_type_expr(inner) {
                             self.vec_elem_types
                                 .insert(param_name.clone(), self.context.i8_type().into());
+                            self.string_vars.insert(param_name.clone());
                         }
                     }
                 }
@@ -5246,6 +5280,7 @@ impl<'ctx> Codegen<'ctx> {
                     if self.is_string_type_expr(&param.ty) {
                         self.vec_elem_types
                             .insert(param_name.clone(), self.context.i8_type().into());
+                        self.string_vars.insert(param_name.clone());
                     }
                 }
                 // Track Map params: both K and V LLVM types + per-position
@@ -5914,6 +5949,7 @@ impl<'ctx> Codegen<'ctx> {
                         if self.is_string_type_expr(te) {
                             self.vec_elem_types
                                 .insert(var_name.clone(), self.context.i8_type().into());
+                            self.string_vars.insert(var_name.clone());
                             detected = true;
                         }
                         if let Some(elem_ty) = self.extract_slice_elem_type(te) {
@@ -5988,6 +6024,7 @@ impl<'ctx> Codegen<'ctx> {
                     {
                         self.vec_elem_types
                             .insert(var_name.clone(), self.context.i8_type().into());
+                        self.string_vars.insert(var_name.clone());
                     }
                     // Debugger Contract slice 5: register `let v =
                     // Runtime.list_par_blocks()` / `Runtime.list_tasks()`
@@ -17249,6 +17286,15 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 return self.compile_for(label, pattern, object, body);
             }
+            // `for c in s.chars()` — peel `.chars()` off and recurse on
+            // the bare String receiver. The Identifier arm below dispatches
+            // through `string_vars` to `compile_for_string_chars`. Same
+            // shape as the `.iter()` / `.into_iter()` peel-off above —
+            // codegen iterators are dispatch points, not runtime values
+            // (design.md § Iterator Adaptors v1 surface).
+            if args.is_empty() && method == "chars" {
+                return self.compile_for(label, pattern, object, body);
+            }
             // `for j in (start..end).step_by(n)` — the only chained
             // iterator-adaptor codegen surface supported in v1.
             // Lowers to a Range loop with a custom step (default 1).
@@ -17291,6 +17337,28 @@ impl<'ctx> Codegen<'ctx> {
                     .collect::<Result<_, _>>()?;
                 self.compile_for_array_values(pattern, &elems, body)
             }
+            ExprKind::StringLit(_) | ExprKind::InterpolatedStringLit(_) => {
+                // Bare string literal or f-string as the iterable —
+                // `for c in "abc"` / `for c in "abc".chars()` (after the
+                // peel-off above). Compile the literal to a {ptr, len, cap}
+                // String struct, extract data + len, drive the per-char
+                // loop. No alloca needed: the struct is value-form and the
+                // backing buffer is the program's read-only string pool
+                // (cap=0 indicates static, no scope-exit free).
+                let val = self.compile_expr(iterable)?;
+                let sv = val.into_struct_value();
+                let data = self
+                    .builder
+                    .build_extract_value(sv, 0, "for.s.lit.data")
+                    .unwrap()
+                    .into_pointer_value();
+                let len = self
+                    .builder
+                    .build_extract_value(sv, 1, "for.s.lit.len")
+                    .unwrap()
+                    .into_int_value();
+                self.compile_for_string_chars_inner(label, pattern, data, len, body)
+            }
             ExprKind::Identifier(name) => {
                 if let Some(slot) = self.variables.get(name.as_str()).copied() {
                     // Owned array
@@ -17303,7 +17371,17 @@ impl<'ctx> Codegen<'ctx> {
                         let arr_ptr = self.get_data_ptr(name).unwrap();
                         return self.compile_for_array_var(label, pattern, arr_ptr, at, body);
                     }
-                    // Vec/String iteration (owned or ref)
+                    // String iteration — per Unicode scalar value. Must
+                    // come before the `vec_elem_types` arm: String vars
+                    // are *also* registered in `vec_elem_types` (with i8
+                    // element type, matching the `{ptr, i64, i64}` byte
+                    // buffer), but `for c in s` iterates chars (i32), not
+                    // bytes (i8). `string_vars` is the disambiguator.
+                    // Design pin: design.md § Character type (line 2299).
+                    if self.string_vars.contains(name.as_str()) {
+                        return self.compile_for_string_chars(label, pattern, name, body);
+                    }
+                    // Vec iteration (owned or ref)
                     if self.vec_elem_types.contains_key(name.as_str()) {
                         return self.compile_for_vec_var(label, pattern, name, body);
                     }
@@ -17667,6 +17745,161 @@ impl<'ctx> Codegen<'ctx> {
         let one = i64_t.const_int(1, false);
         let next = self.builder.build_int_add(cur, one, "incr").unwrap();
         self.builder.build_store(counter, next).unwrap();
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        self.loop_stack.pop();
+        self.builder.position_at_end(exit_bb);
+        Ok(self.context.i64_type().const_int(0, false).into())
+    }
+
+    /// Compile `for <pattern> in <s>` and `for <pattern> in <s>.chars()` for
+    /// a String variable `<s>`. Loads the `{ptr, len}` from the variable's
+    /// String struct alloca and delegates to `compile_for_string_chars_inner`
+    /// which emits the actual per-Unicode-scalar-value loop.
+    fn compile_for_string_chars(
+        &mut self,
+        label: Option<&str>,
+        pattern: &Pattern,
+        var_name: &str,
+        body: &Block,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let i64_t = self.context.i64_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let vec_ty = self.vec_struct_type();
+        let str_ptr = self.get_data_ptr(var_name).unwrap();
+        let len_ptr = self
+            .builder
+            .build_struct_gep(vec_ty, str_ptr, 1, "for.s.len.ptr")
+            .unwrap();
+        let data_ptr_ptr = self
+            .builder
+            .build_struct_gep(vec_ty, str_ptr, 0, "for.s.data.ptr")
+            .unwrap();
+        let len = self
+            .builder
+            .build_load(i64_t, len_ptr, "for.s.len")
+            .unwrap()
+            .into_int_value();
+        let data = self
+            .builder
+            .build_load(ptr_ty, data_ptr_ptr, "for.s.data")
+            .unwrap()
+            .into_pointer_value();
+        self.compile_for_string_chars_inner(label, pattern, data, len, body)
+    }
+
+    /// Inner per-char loop driver — takes already-extracted `data` and `len`
+    /// from any String value (variable alloca, string literal, interpolated
+    /// string, function return). Iterates per Unicode scalar value via the
+    /// `karac_string_decode_char` runtime helper. The codepoint is bound as
+    /// `i32` (LLVM type for `char`).
+    ///
+    /// Shape:
+    /// - `byte_offset` alloca, initialised to 0.
+    /// - `out_codepoint` alloca (i32), populated each iteration by the helper.
+    /// - cond block: `byte_offset < len`.
+    /// - body block: call `karac_string_decode_char(data, len, byte_offset,
+    ///   &out_codepoint)`; bind the pattern to the loaded `i32` codepoint;
+    ///   run the user body; store the returned byte offset back.
+    /// - incr block: branch back to cond.
+    fn compile_for_string_chars_inner(
+        &mut self,
+        label: Option<&str>,
+        pattern: &Pattern,
+        data: PointerValue<'ctx>,
+        len: IntValue<'ctx>,
+        body: &Block,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let fn_val = self.current_fn.unwrap();
+        let i64_t = self.context.i64_type();
+        let i32_t = self.context.i32_type();
+
+        let byte_offset = self.create_entry_alloca(fn_val, "for.s.offset", i64_t.into());
+        self.builder
+            .build_store(byte_offset, i64_t.const_int(0, false))
+            .unwrap();
+        let out_codepoint = self.create_entry_alloca(fn_val, "for.s.cp", i32_t.into());
+
+        let cond_bb = self.context.append_basic_block(fn_val, "for.s.cond");
+        let body_bb = self.context.append_basic_block(fn_val, "for.s.body");
+        let incr_bb = self.context.append_basic_block(fn_val, "for.s.incr");
+        let exit_bb = self.context.append_basic_block(fn_val, "for.s.exit");
+
+        self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+        self.loop_stack.push(LoopFrame {
+            label: label.map(str::to_string),
+            continue_bb: incr_bb,
+            break_bb: exit_bb,
+            result_slot: None,
+        });
+
+        // Condition: byte_offset < len. (Empty string: len == 0, falls
+        // straight through to exit.)
+        self.builder.position_at_end(cond_bb);
+        let cur_off = self
+            .builder
+            .build_load::<BasicTypeEnum<'ctx>>(i64_t.into(), byte_offset, "for.s.off")
+            .unwrap()
+            .into_int_value();
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, cur_off, len, "for.s.cond")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(cond, body_bb, exit_bb)
+            .unwrap();
+
+        // Body: decode the next char, bind, execute. The decode helper
+        // returns the post-char byte offset; stash it for the incr block
+        // via the alloca write below.
+        self.builder.position_at_end(body_bb);
+        let cur_off = self
+            .builder
+            .build_load::<BasicTypeEnum<'ctx>>(i64_t.into(), byte_offset, "for.s.off")
+            .unwrap()
+            .into_int_value();
+        let new_off = self
+            .builder
+            .build_call(
+                self.karac_string_decode_char_fn,
+                &[
+                    data.into(),
+                    len.into(),
+                    cur_off.into(),
+                    out_codepoint.into(),
+                ],
+                "for.s.decode",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        let cp_val = self
+            .builder
+            .build_load(i32_t, out_codepoint, "for.s.cp.load")
+            .unwrap();
+        self.bind_pattern(pattern, cp_val)?;
+        self.compile_block(body)?;
+        if self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_terminator()
+            .is_none()
+        {
+            // Stash new_off in the offset alloca so the incr block picks
+            // it up. Written here at body-tail rather than at the call
+            // site so a mid-body `break` doesn't corrupt the offset
+            // (the break path skips this store and exits via exit_bb).
+            self.builder.build_store(byte_offset, new_off).unwrap();
+            self.builder.build_unconditional_branch(incr_bb).unwrap();
+        }
+
+        // Increment: no-op — body already wrote the new offset. Kept as
+        // a separate block so `continue` (which branches to incr_bb)
+        // routes through one stable label.
+        self.builder.position_at_end(incr_bb);
         self.builder.build_unconditional_branch(cond_bb).unwrap();
 
         self.loop_stack.pop();

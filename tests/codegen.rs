@@ -5658,6 +5658,135 @@ fn main() {
     }
 
     #[test]
+    fn test_e2e_for_in_string_chars_count() {
+        // `for c in s.chars()` over a String variable. The codegen peels
+        // `.chars()` off and dispatches the String variable through
+        // `compile_for_string_chars`, iterating one Unicode scalar per
+        // step. Counts 5 chars in "hello".
+        let out = run_program(
+            r#"
+fn main() {
+    let s = "hello";
+    let mut n: i64 = 0_i64;
+    for _c in s.chars() {
+        n = n + 1_i64;
+    }
+    println(n);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "5");
+        }
+    }
+
+    #[test]
+    fn test_e2e_for_in_string_variable_iterates_chars() {
+        // `for c in s` on a bare String variable — design.md § Character
+        // type (line 2299) pins this as the semantic peer of `s.chars()`.
+        // Before this slice, the variable went through
+        // `compile_for_vec_var` (byte iteration with elem=i8), producing
+        // i8 byte values instead of i32 codepoints.
+        let out = run_program(
+            r#"
+fn main() {
+    let s = "abc";
+    let mut sum: i64 = 0_i64;
+    for c in s {
+        sum = sum + (c as i64);
+    }
+    println(sum);
+}
+"#,
+        );
+        if let Some(out) = out {
+            // 'a' + 'b' + 'c' = 97 + 98 + 99 = 294
+            assert_eq!(out.trim(), "294");
+        }
+    }
+
+    #[test]
+    fn test_e2e_for_in_string_literal_chars() {
+        // String-literal iterable (no variable binding) — verifies the
+        // `ExprKind::StringLit` arm in the for-loop dispatcher that the
+        // `.chars()` peel-off recurses into. Sums the codepoints.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut sum: i64 = 0_i64;
+    for c in "xyz".chars() {
+        sum = sum + (c as i64);
+    }
+    println(sum);
+}
+"#,
+        );
+        if let Some(out) = out {
+            // 'x' + 'y' + 'z' = 120 + 121 + 122 = 363
+            assert_eq!(out.trim(), "363");
+        }
+    }
+
+    #[test]
+    fn test_e2e_for_in_empty_string_zero_iterations() {
+        // Empty string — the byte-offset cond (`offset < len`) is false
+        // at entry, so the body never runs. Pins the empty-edge case.
+        let out = run_program(
+            r#"
+fn main() {
+    let s = "";
+    let mut n: i64 = 0_i64;
+    for _c in s.chars() {
+        n = n + 1_i64;
+    }
+    println(n);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "0");
+        }
+    }
+
+    #[test]
+    fn test_e2e_for_in_string_chars_into_map_char_key() {
+        // The LeetCode #3 idiom — char keys feeding a `Map[char, i64]`.
+        // Inserts decoded chars from one pass and looks them up via
+        // decoded chars from a second pass. Pins that the codepoint
+        // values produced by the chars-iteration codegen are consistent
+        // across calls (same hash, same key identity) — same shape the
+        // sliding-window kata relies on. Uses only for-loop-bound char
+        // values; mixing in `char` *literals* in `compile_expr` position
+        // currently lowers to const_int(0) (pre-existing gap unrelated
+        // to this slice — `ExprKind::CharLit` has no runtime arm in
+        // `compile_expr`, only the const-eval table at line 83).
+        let out = run_program(
+            r#"
+fn main() {
+    let mut last_idx: Map[char, i64] = Map.new();
+    let mut i: i64 = 0_i64;
+    for c in "abca".chars() {
+        last_idx.insert(c, i);
+        i = i + 1_i64;
+    }
+    // Second pass: for each char in "abc", report its last-seen index.
+    // 'a' was overwritten at index 3 (last position in "abca"); 'b' at 1; 'c' at 2.
+    for c in "abc".chars() {
+        match last_idx.get(c) {
+            Some(v) => println(v),
+            None => println(-1_i64),
+        }
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["3", "1", "2"]);
+        }
+    }
+
+    #[test]
     fn test_e2e_for_in_map_string_keys_use_len() {
         // `for (k, _v) in m` where K = String should bind `k` as a String
         // so `k.len()` dispatches correctly. Map iteration order is
