@@ -966,6 +966,54 @@ pub fn type_to_concrete_or_param_name(ty: &Type) -> Option<String> {
 /// Primitives are keyed under their stringified name (`"i32"`, `"f64"`,
 /// `"bool"`, …) by `register_stdlib_impls` with empty args. Named types
 /// return their nominal head name and the recursive argument list.
+/// Normalize a function's inline generic-param bounds (`fn f[T: Hash + Eq]`)
+/// into the where-clause representation (`WhereConstraint::TypeBound`),
+/// merged with any existing where-clause constraints. Returns `None` when
+/// there are no constraints from either source.
+///
+/// Used at FunctionSig construction (`src/typechecker.rs:6130` /
+/// `src/typechecker.rs:6253`) so the call-site bound-discharge engine
+/// (`discharge_type_bounds`) sees inline and where-clause bounds through
+/// one uniform API.
+///
+/// Slice 0.a, sub-step 1 of monomorphized collections prereq
+/// ([`phase-7-codegen.md`](../docs/implementation_checklist/phase-7-codegen.md)).
+fn normalize_bounds_into_where_clause(
+    generic_params: &Option<GenericParams>,
+    where_clause: &Option<WhereClause>,
+) -> Option<WhereClause> {
+    let mut constraints: Vec<WhereConstraint> = Vec::new();
+    if let Some(ref gp) = generic_params {
+        for param in &gp.params {
+            if param.is_const || param.bounds.is_empty() {
+                continue;
+            }
+            constraints.push(WhereConstraint::TypeBound {
+                type_name: param.name.clone(),
+                bounds: param.bounds.clone(),
+                span: param.span.clone(),
+            });
+        }
+    }
+    if let Some(ref wc) = where_clause {
+        constraints.extend(wc.constraints.iter().cloned());
+    }
+    if constraints.is_empty() {
+        return None;
+    }
+    let span = where_clause
+        .as_ref()
+        .map(|wc| wc.span.clone())
+        .or(generic_params.as_ref().map(|gp| gp.span.clone()))
+        .unwrap_or(Span {
+            line: 0,
+            column: 0,
+            offset: 0,
+            length: 0,
+        });
+    Some(WhereClause { constraints, span })
+}
+
 /// Returns `None` for type variables, function types, slices, tuples,
 /// etc. — none of which can satisfy a nominal trait bound today. Strips
 /// outer `ref` / `mut ref` so a borrowed receiver discharges against
@@ -6132,7 +6180,13 @@ impl<'a> TypeChecker<'a> {
                 param_names,
                 params,
                 return_type,
-                where_clause: f.where_clause.clone(),
+                // Normalize inline param bounds into the where-clause so the
+                // call-site discharge engine sees both forms uniformly.
+                // Slice 0.a, sub-step 1 of monomorphized collections prereq.
+                where_clause: normalize_bounds_into_where_clause(
+                    &f.generic_params,
+                    &f.where_clause,
+                ),
             },
         );
         if f.attributes.iter().any(|a| a.name == "compiler_builtin") {
@@ -6257,7 +6311,15 @@ impl<'a> TypeChecker<'a> {
                     param_names,
                     params,
                     return_type,
-                    where_clause: method.where_clause.clone(),
+                    // Method-level inline bounds normalize alongside the
+                    // method's own where-clause; impl-level inline bounds
+                    // are tracked separately on `ImplInfo.generic_params`
+                    // and discharged by `impl_bounds_discharge` at the
+                    // dispatch site — NOT folded in here.
+                    where_clause: normalize_bounds_into_where_clause(
+                        &method.generic_params,
+                        &method.where_clause,
+                    ),
                 },
             );
         }
@@ -9273,9 +9335,119 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             self.discharge_const_predicates(wc, &const_arg_subst, discharge_span);
+            // Trait-bounds-at-codegen enforcement (slice 0.a, sub-step 1
+            // of monomorphized collections prereq). Walks
+            // `WhereConstraint::TypeBound` predicates in the same where-
+            // clause and verifies each formal type-param's concrete
+            // binding satisfies its declared bounds. Inline param bounds
+            // (`fn f[T: Hash + Eq](...)`) were normalized into the
+            // where-clause at FunctionSig construction
+            // (`normalize_bounds_into_where_clause`) so this single
+            // discharge call covers both inline and where-clause surfaces.
+            self.discharge_type_bounds(wc, &solutions, discharge_span);
         }
 
         ret
+    }
+
+    /// Walk a where-clause and discharge each `TypeBound { T: Trait, ... }`
+    /// predicate against the resolved type substitution. For each formal
+    /// type-param T bound to a concrete type via `solutions`, check that
+    /// the concrete type satisfies the trait. Emits a `TypeMismatch`
+    /// diagnostic on miss.
+    ///
+    /// Built-in trait coverage (Hash / Eq / PartialEq / Ord / PartialOrd /
+    /// Display on primitives, plus `#[derive(...)]` on named struct/enum
+    /// types) flows through `type_satisfies_bound`, which consults the
+    /// existing `type_supports_*` helpers before falling back to the
+    /// `env.impls` table lookup.
+    ///
+    /// Slice 0.a, sub-step 1 of monomorphized collections prereq
+    /// ([`phase-7-codegen.md`](../docs/implementation_checklist/phase-7-codegen.md)).
+    /// Counterpart to `discharge_const_predicates` for ConstPredicate
+    /// where-clauses (const generics slice 3c).
+    fn discharge_type_bounds(
+        &mut self,
+        where_clause: &WhereClause,
+        solutions: &HashMap<String, Type>,
+        discharge_span: &Span,
+    ) {
+        for constraint in &where_clause.constraints {
+            let WhereConstraint::TypeBound {
+                type_name, bounds, ..
+            } = constraint
+            else {
+                continue;
+            };
+            let Some(concrete_ty) = solutions.get(type_name) else {
+                // Param unbound at this call site — the unsolved-T
+                // diagnostic (slice 2a) handles this; don't double-report.
+                continue;
+            };
+            if matches!(
+                concrete_ty,
+                Type::TypeParam(_) | Type::TypeVar(_) | Type::Error
+            ) {
+                // Unresolved metavar / propagating-param / already-error —
+                // upstream diagnostics handle. Avoid noise.
+                continue;
+            }
+            for bound in bounds {
+                let Some(trait_name) = bound.path.last() else {
+                    continue;
+                };
+                if self.type_satisfies_bound(concrete_ty, trait_name) {
+                    continue;
+                }
+                self.type_error(
+                    format!(
+                        "trait bound `{}: {}` is not satisfied; `{}` does not implement `{}`",
+                        type_name,
+                        trait_name,
+                        type_display(concrete_ty),
+                        trait_name
+                    ),
+                    discharge_span.clone(),
+                    TypeErrorKind::TypeMismatch,
+                );
+            }
+        }
+    }
+
+    /// Check whether `ty` satisfies the named trait. Consults three
+    /// sources in order:
+    ///
+    /// 1. **Built-in primitive coverage** for standard traits (Hash, Eq,
+    ///    PartialEq, Ord, PartialOrd, Display) — primitives like `i64` /
+    ///    `char` / `bool` satisfy these implicitly. The existing
+    ///    `type_supports_*` helpers carry this knowledge, including
+    ///    `#[derive(...)]`-driven satisfaction on named struct / enum types.
+    /// 2. **Other named traits** via the impl table — direct impl lookup
+    ///    plus supertrait closure walk via `env.type_satisfies_trait`.
+    ///
+    /// Returns `false` for types that can't satisfy nominal trait bounds
+    /// (function types, raw pointers, type variables) — the discharge
+    /// engine guards `TypeVar` / `TypeParam` / `Error` upstream so those
+    /// don't reach here in practice.
+    fn type_satisfies_bound(&self, ty: &Type, trait_name: &str) -> bool {
+        // Built-in coverage via the type_supports_* helpers — these
+        // recognize primitives implicitly + named types via
+        // `#[derive(Trait)]` registration.
+        match trait_name {
+            "Hash" => return self.type_supports_hash(ty),
+            "Eq" => return self.type_supports_eq(ty),
+            "PartialEq" => return self.type_supports_partial_eq(ty),
+            "Ord" => return self.type_supports_ord(ty),
+            "PartialOrd" => return self.type_supports_partial_ord(ty),
+            "Display" => return self.type_supports_display(ty),
+            _ => {}
+        }
+        // Other traits: explicit impl in the table, with supertrait closure.
+        let Some((ty_name, ty_args)) = impl_table_key(ty) else {
+            return false;
+        };
+        self.env
+            .type_satisfies_trait(&ty_name, &ty_args, trait_name)
     }
 
     /// Walk a where-clause and discharge each `ConstPredicate(expr)`

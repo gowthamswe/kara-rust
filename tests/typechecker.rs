@@ -2139,6 +2139,115 @@ fn test_eq_on_enum_without_derive_eq() {
     );
 }
 
+// ── Trait bounds on generic parameters (call-site enforcement) ───
+//
+// Slice 0.a, sub-step 1 of monomorphized collections prereq
+// (phase-7-codegen.md). The discharge engine in
+// check_call_args_with_substitution_full walks each formal type-param's
+// inline + where-clause bounds against the resolved substitution and
+// emits TypeMismatch when the concrete type doesn't satisfy.
+
+#[test]
+fn test_generic_call_inline_bound_eq_accepts_derive_eq_struct() {
+    // Positive: fn f[T: Eq](x: T) called with a #[derive(Eq)] struct.
+    let result = typecheck_ok(
+        r#"#[derive(Eq)]
+           struct P { x: i64 }
+           fn use_eq[T: Eq](_x: T) {}
+           fn main() {
+               let p = P { x: 1 };
+               use_eq(p);
+           }"#,
+    );
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_generic_call_inline_bound_eq_rejects_non_eq_struct() {
+    // Negative: same fn called with a struct lacking #[derive(Eq)].
+    // Should fire TypeMismatch at the call-site span.
+    let errors = typecheck_errors(
+        r#"struct P { x: i64 }
+           fn use_eq[T: Eq](_x: T) {}
+           fn main() {
+               let p = P { x: 1 };
+               use_eq(p);
+           }"#,
+    );
+    assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch
+            && e.message.contains("trait bound")
+            && e.message.contains("Eq")),
+        "Expected TypeMismatch for missing Eq bound, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_generic_call_inline_bound_hash_accepts_primitive() {
+    // Built-in primitive coverage: i64 satisfies Hash via
+    // type_supports_hash without an explicit impl.
+    let result = typecheck_ok(
+        r#"fn use_hash[T: Hash](_x: T) {}
+           fn main() {
+               use_hash(42_i64);
+           }"#,
+    );
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_generic_call_where_clause_bound_rejects_non_hash_struct() {
+    // Where-clause form (parallel to inline) on a struct that doesn't
+    // derive Hash — should fire TypeMismatch.
+    let errors = typecheck_errors(
+        r#"struct P { x: i64 }
+           fn use_hash[T](_x: T) where T: Hash {}
+           fn main() {
+               let p = P { x: 1 };
+               use_hash(p);
+           }"#,
+    );
+    assert!(
+        errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch
+            && e.message.contains("trait bound")
+            && e.message.contains("Hash")),
+        "Expected TypeMismatch for missing Hash bound via where-clause, got: {:?}",
+        errors
+    );
+}
+
+#[test]
+fn test_generic_call_multiple_bounds_each_checked() {
+    // fn f[T: Hash + Eq](x: T) with a struct that has Hash but not Eq
+    // — Eq miss should fire even though Hash is satisfied.
+    let errors = typecheck_errors(
+        r#"#[derive(Hash)]
+           struct P { x: i64 }
+           fn use_both[T: Hash + Eq](_x: T) {}
+           fn main() {
+               let p = P { x: 1 };
+               use_both(p);
+           }"#,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::TypeMismatch && e.message.contains("Eq")),
+        "Expected TypeMismatch naming Eq, got: {:?}",
+        errors
+    );
+    // Hash is satisfied, so no Hash-named diagnostic should fire.
+    assert!(
+        !errors.iter().any(|e| e.kind == TypeErrorKind::TypeMismatch
+            && e.message.contains("trait bound")
+            && e.message.contains("Hash")
+            && !e.message.contains("Eq")),
+        "Hash should be satisfied by #[derive(Hash)]; got: {:?}",
+        errors
+    );
+}
+
 // ── Destructuring in function/closure parameters ─────────────────
 
 #[test]
