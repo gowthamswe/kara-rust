@@ -1345,6 +1345,23 @@ struct Codegen<'ctx> {
     /// provides both source and destination addresses, callee writes the
     /// cloned value into the destination slot. Mirror of `display_fn_cache`.
     clone_fn_cache: HashMap<String, FunctionValue<'ctx>>,
+    /// Per-type Drop function cache. Keyed by the canonical type name
+    /// (e.g. `"i64"`, `"String"`, `"Vec_i64"`, `"Map_String_i64"`). Each
+    /// emitted fn has signature `void karac_drop_<typename>(*mut T)` and
+    /// releases any heap owned by the value (for primitives: no-op; for
+    /// String: free the data buffer if cap > 0; for Vec: per-element drop
+    /// then free; for tuple: per-field drop; for Map/Set: delegate to the
+    /// existing `karac_map_free*` runtime as a placeholder pending the
+    /// monomorphized Map layout in Slice 1+). Mirror of `clone_fn_cache`.
+    /// See [`wip-monomorphized-collections.md`](../docs/implementation_checklist/wip-monomorphized-collections.md) §3.3.
+    ///
+    /// `#[allow(dead_code)]` until Slice 1 lands the first production
+    /// consumer (monomorphized `Map[i64, i64]` drop, per
+    /// [`phase-7-codegen.md`](../docs/implementation_checklist/phase-7-codegen.md)
+    /// "Monomorphized collections" entry). The framework is foundation;
+    /// it has no production caller until the consumer lands.
+    #[allow(dead_code)]
+    drop_fn_cache: HashMap<String, FunctionValue<'ctx>>,
     /// Per-type Display function cache. Keyed by the canonical type name
     /// (e.g. `"i64"`, `"String"`, `"Vec_i64"`, `"Map_String_i64"`). Each
     /// emitted fn has signature `void karac_display_<typename>(ptr)` and
@@ -1914,6 +1931,7 @@ impl<'ctx> Codegen<'ctx> {
             karac_map_lookup_slot_fn,
             karac_string_clone_fn,
             clone_fn_cache: HashMap::new(),
+            drop_fn_cache: HashMap::new(),
             display_fn_cache: HashMap::new(),
             karac_error_trace_push_fn,
             karac_error_trace_clear_fn,
@@ -13926,6 +13944,453 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.position_at_end(bb);
         }
         clone_fn
+    }
+
+    // ── Drop fn framework (per-type drop emitters, mirror of clone) ──
+
+    /// Emit (or fetch) `karac_drop_<typename>(value: *mut T)` for a given
+    /// `TypeExpr`. Mirrors `emit_clone_fn_for_type_expr` (`src/codegen.rs:13367`)
+    /// — same dispatcher shape with per-shape sub-emitters and the same
+    /// cache-by-`display_mangle_te(te)` pattern.
+    ///
+    /// The emitted fn has signature `void karac_drop_<typename>(*mut T)`.
+    /// Body releases any heap the value owns:
+    /// - Primitives: no-op (`ret void`).
+    /// - String: free the data buffer when `cap > 0` (skips static-literal
+    ///   strings whose data lives in the program's read-only string pool).
+    /// - Vec[T]: iterate `0..len` calling `emit_drop_fn_for_type_expr(T)` on
+    ///   each element, then free the data buffer when `cap > 0`. Improvement
+    ///   over the existing `CleanupAction::FreeVecBuffer` cleanup which only
+    ///   recurses one level (`Vec[Vec[T]]` works; `Vec[Vec[Vec[T]]]`
+    ///   previously leaked the innermost buffers — tracked in `deferred.md`).
+    /// - Tuple: iterate fields, calling each field's drop fn through the
+    ///   tuple's `build_struct_gep` offsets.
+    /// - Map[K, V] / Set[T]: **placeholder this slice (0.c)** — delegates to
+    ///   the existing `karac_map_free` runtime. Per-K/V specialization
+    ///   happens in Slice 1+ alongside the monomorphized Map layout.
+    ///
+    /// Caller convention: takes a pointer to the value's storage (not the
+    /// value itself). The pointer-by-reference shape mirrors clone so the
+    /// dispatcher returns a uniform signature regardless of type shape.
+    ///
+    /// See [`wip-monomorphized-collections.md`](../docs/implementation_checklist/wip-monomorphized-collections.md)
+    /// §3.3 for the locked design position.
+    ///
+    /// `#[allow(dead_code)]` (and on each sub-emitter below) until Slice 1
+    /// lands the first production consumer. End-to-end tests come with
+    /// that slice; the framework is foundation only.
+    #[allow(dead_code)]
+    fn emit_drop_fn_for_type_expr(&mut self, te: &TypeExpr) -> FunctionValue<'ctx> {
+        let type_name = Self::display_mangle_te(te);
+        if let Some(&f) = self.drop_fn_cache.get(&type_name) {
+            return f;
+        }
+        let fn_name = format!("karac_drop_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            self.drop_fn_cache.insert(type_name, f);
+            return f;
+        }
+        match &te.kind {
+            TypeKind::Tuple(elems) if !elems.is_empty() => self.emit_tuple_drop_fn(elems),
+            TypeKind::Path(p) => {
+                let head = p.segments.first().map(String::as_str);
+                if head == Some("Vec") {
+                    if let Some(GenericArg::Type(elem_te)) =
+                        p.generic_args.as_ref().and_then(|a| a.first()).cloned()
+                    {
+                        return self.emit_vec_drop_fn(&elem_te);
+                    }
+                }
+                if head == Some("Map") {
+                    let args = p.generic_args.as_ref();
+                    let k_te = args.and_then(|a| a.first()).and_then(|a| match a {
+                        GenericArg::Type(t) => Some(t.clone()),
+                        _ => None,
+                    });
+                    let v_te = args.and_then(|a| a.get(1)).and_then(|a| match a {
+                        GenericArg::Type(t) => Some(t.clone()),
+                        _ => None,
+                    });
+                    if let (Some(k), Some(v)) = (k_te, v_te) {
+                        return self.emit_map_drop_fn(&k, &v);
+                    }
+                }
+                if head == Some("Set") {
+                    if let Some(GenericArg::Type(elem_te)) =
+                        p.generic_args.as_ref().and_then(|a| a.first()).cloned()
+                    {
+                        // Per §3.4 lock: Set[T] drops as Map[T, ()] — same
+                        // delegation pattern emit_clone_fn_for_type_expr
+                        // uses at line 13402–13416.
+                        let unit_te = TypeExpr {
+                            kind: TypeKind::Tuple(Vec::new()),
+                            span: elem_te.span.clone(),
+                        };
+                        return self.emit_map_drop_fn(&elem_te, &unit_te);
+                    }
+                }
+                if head == Some("String") {
+                    return self.emit_string_drop_fn();
+                }
+                self.emit_primitive_drop_fn(&type_name)
+            }
+            _ => self.emit_primitive_drop_fn(&type_name),
+        }
+    }
+
+    /// Emit `karac_drop_<typename>` for a primitive (Copy-by-memcpy) type.
+    /// Body is `ret void` — primitives don't own heap. Cache-keyed on
+    /// `type_name` so repeat callers reuse the same fn.
+    #[allow(dead_code)]
+    fn emit_primitive_drop_fn(&mut self, type_name: &str) -> FunctionValue<'ctx> {
+        let fn_name = format!("karac_drop_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            self.drop_fn_cache.insert(type_name.to_string(), f);
+            return f;
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let saved_bb = self.builder.get_insert_block();
+        let drop_fn_ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let drop_fn = self
+            .module
+            .add_function(&fn_name, drop_fn_ty, Some(Linkage::Internal));
+        self.drop_fn_cache.insert(type_name.to_string(), drop_fn);
+
+        let entry_bb = self.context.append_basic_block(drop_fn, "entry");
+        self.builder.position_at_end(entry_bb);
+        self.builder.build_return(None).unwrap();
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+        drop_fn
+    }
+
+    /// Emit `karac_drop_String` — read `cap`; if `cap > 0`, load `data` and
+    /// call `free(data)`. Mirrors the existing scope-exit String cleanup's
+    /// cap-zero static-buffer skip (see `CleanupAction::FreeVecBuffer`
+    /// handling at `src/codegen.rs:3216+`). Does NOT zero out the `{data,
+    /// len, cap}` fields after free — caller's responsibility if the slot
+    /// is reused; in scope-exit usage the slot is dead anyway.
+    #[allow(dead_code)]
+    fn emit_string_drop_fn(&mut self) -> FunctionValue<'ctx> {
+        let type_name = "String".to_string();
+        if let Some(&f) = self.drop_fn_cache.get(&type_name) {
+            return f;
+        }
+        let fn_name = "karac_drop_String".to_string();
+        if let Some(f) = self.module.get_function(&fn_name) {
+            self.drop_fn_cache.insert(type_name, f);
+            return f;
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let vec_ty = self.vec_struct_type();
+        let saved_bb = self.builder.get_insert_block();
+        let drop_fn_ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let drop_fn = self
+            .module
+            .add_function(&fn_name, drop_fn_ty, Some(Linkage::Internal));
+        self.drop_fn_cache.insert(type_name, drop_fn);
+
+        let entry_bb = self.context.append_basic_block(drop_fn, "entry");
+        let free_bb = self.context.append_basic_block(drop_fn, "free");
+        let exit_bb = self.context.append_basic_block(drop_fn, "exit");
+
+        self.builder.position_at_end(entry_bb);
+        let val = drop_fn.get_nth_param(0).unwrap().into_pointer_value();
+        let cap_p = self
+            .builder
+            .build_struct_gep(vec_ty, val, 2, "cap.p")
+            .unwrap();
+        let cap = self
+            .builder
+            .build_load(i64_t, cap_p, "cap")
+            .unwrap()
+            .into_int_value();
+        let is_heap = self
+            .builder
+            .build_int_compare(IntPredicate::UGT, cap, i64_t.const_zero(), "is.heap")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(is_heap, free_bb, exit_bb)
+            .unwrap();
+
+        self.builder.position_at_end(free_bb);
+        let data_pp = self
+            .builder
+            .build_struct_gep(vec_ty, val, 0, "data.pp")
+            .unwrap();
+        let data = self
+            .builder
+            .build_load(ptr_ty, data_pp, "data")
+            .unwrap()
+            .into_pointer_value();
+        self.builder
+            .build_call(self.free_fn, &[data.into()], "")
+            .unwrap();
+        self.builder.build_unconditional_branch(exit_bb).unwrap();
+
+        self.builder.position_at_end(exit_bb);
+        self.builder.build_return(None).unwrap();
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+        drop_fn
+    }
+
+    /// Emit `karac_drop_Vec_<elem>` — iterate `0..len` calling the per-
+    /// element drop fn on each `data[i]`, then `free(data)` when `cap > 0`.
+    /// Strictly recursive: nested `Vec[Vec[T]]` correctly recurses through
+    /// the cache to drop every level, closing the deeper-nesting leak the
+    /// existing `FreeVecBuffer` cleanup carries (tracked in `deferred.md` §
+    /// *Recursive Drop for Heap-Owned Collection Elements*).
+    #[allow(dead_code)]
+    fn emit_vec_drop_fn(&mut self, elem_te: &TypeExpr) -> FunctionValue<'ctx> {
+        let elem_name = Self::display_mangle_te(elem_te);
+        let type_name = format!("Vec_{elem_name}");
+        if let Some(&f) = self.drop_fn_cache.get(&type_name) {
+            return f;
+        }
+        let fn_name = format!("karac_drop_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            self.drop_fn_cache.insert(type_name, f);
+            return f;
+        }
+
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let vec_ty = self.vec_struct_type();
+        let elem_ty = self.llvm_type_for_type_expr(elem_te);
+        // Recurse first — sub-emitter may switch the builder's insert block.
+        let elem_drop = self.emit_drop_fn_for_type_expr(elem_te);
+
+        let saved_bb = self.builder.get_insert_block();
+        let drop_fn_ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let drop_fn = self
+            .module
+            .add_function(&fn_name, drop_fn_ty, Some(Linkage::Internal));
+        self.drop_fn_cache.insert(type_name, drop_fn);
+
+        let entry_bb = self.context.append_basic_block(drop_fn, "entry");
+        let loop_cond_bb = self.context.append_basic_block(drop_fn, "loop.cond");
+        let loop_body_bb = self.context.append_basic_block(drop_fn, "loop.body");
+        let loop_incr_bb = self.context.append_basic_block(drop_fn, "loop.incr");
+        let after_loop_bb = self.context.append_basic_block(drop_fn, "after.loop");
+        let free_bb = self.context.append_basic_block(drop_fn, "free");
+        let exit_bb = self.context.append_basic_block(drop_fn, "exit");
+
+        self.builder.position_at_end(entry_bb);
+        let val = drop_fn.get_nth_param(0).unwrap().into_pointer_value();
+        let data_pp = self
+            .builder
+            .build_struct_gep(vec_ty, val, 0, "data.pp")
+            .unwrap();
+        let len_p = self
+            .builder
+            .build_struct_gep(vec_ty, val, 1, "len.p")
+            .unwrap();
+        let cap_p = self
+            .builder
+            .build_struct_gep(vec_ty, val, 2, "cap.p")
+            .unwrap();
+        let data = self
+            .builder
+            .build_load(ptr_ty, data_pp, "data")
+            .unwrap()
+            .into_pointer_value();
+        let len = self
+            .builder
+            .build_load(i64_t, len_p, "len")
+            .unwrap()
+            .into_int_value();
+        let cap = self
+            .builder
+            .build_load(i64_t, cap_p, "cap")
+            .unwrap()
+            .into_int_value();
+        let counter = self.create_entry_alloca(drop_fn, "i", i64_t.into());
+        self.builder
+            .build_store(counter, i64_t.const_zero())
+            .unwrap();
+        self.builder
+            .build_unconditional_branch(loop_cond_bb)
+            .unwrap();
+
+        // Loop: for i in 0..len { drop(data[i]); }
+        self.builder.position_at_end(loop_cond_bb);
+        let cur = self
+            .builder
+            .build_load(i64_t, counter, "i.cur")
+            .unwrap()
+            .into_int_value();
+        let lt = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, cur, len, "i.lt.len")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(lt, loop_body_bb, after_loop_bb)
+            .unwrap();
+
+        self.builder.position_at_end(loop_body_bb);
+        let elem_ptr = unsafe {
+            self.builder
+                .build_gep(elem_ty, data, &[cur], "elem.ptr")
+                .unwrap()
+        };
+        self.builder
+            .build_call(elem_drop, &[elem_ptr.into()], "")
+            .unwrap();
+        self.builder
+            .build_unconditional_branch(loop_incr_bb)
+            .unwrap();
+
+        self.builder.position_at_end(loop_incr_bb);
+        let next = self
+            .builder
+            .build_int_add(cur, i64_t.const_int(1, false), "i.next")
+            .unwrap();
+        self.builder.build_store(counter, next).unwrap();
+        self.builder
+            .build_unconditional_branch(loop_cond_bb)
+            .unwrap();
+
+        // After the per-element loop, free the data buffer if cap > 0
+        // (static-literal Vecs with cap=0 skip the free — same convention
+        // as the existing FreeVecBuffer cleanup).
+        self.builder.position_at_end(after_loop_bb);
+        let is_heap = self
+            .builder
+            .build_int_compare(IntPredicate::UGT, cap, i64_t.const_zero(), "is.heap")
+            .unwrap();
+        self.builder
+            .build_conditional_branch(is_heap, free_bb, exit_bb)
+            .unwrap();
+
+        self.builder.position_at_end(free_bb);
+        self.builder
+            .build_call(self.free_fn, &[data.into()], "")
+            .unwrap();
+        self.builder.build_unconditional_branch(exit_bb).unwrap();
+
+        self.builder.position_at_end(exit_bb);
+        self.builder.build_return(None).unwrap();
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+        drop_fn
+    }
+
+    /// Emit `karac_drop_tuple_<f0>_<f1>_...` — iterate fields calling each
+    /// field's drop fn through `build_struct_gep` offsets. Empty tuples
+    /// (unit type `()`) are handled at the dispatcher by the
+    /// `TypeKind::Tuple(elems) if !elems.is_empty()` guard — they fall
+    /// through to `emit_primitive_drop_fn` with `type_name = "unit"` (or
+    /// whatever `display_mangle_te` produces) and emit a `ret void` no-op.
+    #[allow(dead_code)]
+    fn emit_tuple_drop_fn(&mut self, elems: &[TypeExpr]) -> FunctionValue<'ctx> {
+        let elems_owned: Vec<TypeExpr> = elems.to_vec();
+        let parts: Vec<String> = elems_owned.iter().map(Self::display_mangle_te).collect();
+        let type_name = format!("tuple_{}", parts.join("_"));
+        if let Some(&f) = self.drop_fn_cache.get(&type_name) {
+            return f;
+        }
+        let fn_name = format!("karac_drop_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            self.drop_fn_cache.insert(type_name, f);
+            return f;
+        }
+
+        // Recurse first — sub-emitters may switch the builder's insert block.
+        let child_fns: Vec<FunctionValue<'ctx>> = elems_owned
+            .iter()
+            .map(|e| self.emit_drop_fn_for_type_expr(e))
+            .collect();
+        let field_tys: Vec<BasicTypeEnum<'ctx>> = elems_owned
+            .iter()
+            .map(|e| self.llvm_type_for_type_expr(e))
+            .collect();
+        let tuple_ty = self.context.struct_type(&field_tys, false);
+
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let saved_bb = self.builder.get_insert_block();
+        let drop_fn_ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let drop_fn = self
+            .module
+            .add_function(&fn_name, drop_fn_ty, Some(Linkage::Internal));
+        self.drop_fn_cache.insert(type_name, drop_fn);
+
+        let entry_bb = self.context.append_basic_block(drop_fn, "entry");
+        self.builder.position_at_end(entry_bb);
+        let val = drop_fn.get_nth_param(0).unwrap().into_pointer_value();
+        for (i, child_fn) in child_fns.iter().enumerate() {
+            let field_ptr = self
+                .builder
+                .build_struct_gep(tuple_ty, val, i as u32, &format!("t.f{i}"))
+                .unwrap();
+            self.builder
+                .build_call(*child_fn, &[field_ptr.into()], "")
+                .unwrap();
+        }
+        self.builder.build_return(None).unwrap();
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+        drop_fn
+    }
+
+    /// Emit `karac_drop_Map_<K>_<V>` — **placeholder this slice (0.c)**.
+    /// Body delegates to the existing `karac_map_free` runtime, preserving
+    /// today's type-erased Map drop behavior. Slice 1+ replaces this body
+    /// (per K/V tuple) with a monomorphized drop sequence that inlines the
+    /// per-K and per-V drops without going through the runtime fn.
+    ///
+    /// The placeholder exists so the framework is complete enough that
+    /// callers can request a drop fn for any TypeExpr; it does not commit
+    /// to the monomorphized layout.
+    #[allow(dead_code)]
+    fn emit_map_drop_fn(&mut self, key_te: &TypeExpr, val_te: &TypeExpr) -> FunctionValue<'ctx> {
+        let k_name = Self::display_mangle_te(key_te);
+        let v_name = Self::display_mangle_te(val_te);
+        let type_name = format!("Map_{k_name}_{v_name}");
+        if let Some(&f) = self.drop_fn_cache.get(&type_name) {
+            return f;
+        }
+        let fn_name = format!("karac_drop_{type_name}");
+        if let Some(f) = self.module.get_function(&fn_name) {
+            self.drop_fn_cache.insert(type_name, f);
+            return f;
+        }
+
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let saved_bb = self.builder.get_insert_block();
+        let drop_fn_ty = self.context.void_type().fn_type(&[ptr_ty.into()], false);
+        let drop_fn = self
+            .module
+            .add_function(&fn_name, drop_fn_ty, Some(Linkage::Internal));
+        self.drop_fn_cache.insert(type_name, drop_fn);
+
+        let entry_bb = self.context.append_basic_block(drop_fn, "entry");
+        self.builder.position_at_end(entry_bb);
+        let val = drop_fn.get_nth_param(0).unwrap().into_pointer_value();
+        // Load the Map handle from the alloca and pass to karac_map_free.
+        let handle = self
+            .builder
+            .build_load(ptr_ty, val, "map.handle")
+            .unwrap()
+            .into_pointer_value();
+        self.builder
+            .build_call(self.karac_map_free_fn, &[handle.into()], "")
+            .unwrap();
+        self.builder.build_return(None).unwrap();
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+        drop_fn
     }
 
     /// Lower `<receiver>.clone()` for an identifier-bound collection
