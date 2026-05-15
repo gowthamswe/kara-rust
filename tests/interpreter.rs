@@ -5173,6 +5173,51 @@ fn test_string_sorted_empty() {
 }
 
 #[test]
+fn test_string_chars_for_loop_prints_each() {
+    // The canonical `for c in s.chars()` shape; verifies the explicit
+    // chars() iterator yields one Value::Char per Unicode scalar.
+    let output = run(r#"fn main() { for c in "abc".chars() { println(c); } }"#);
+    assert_eq!(output, "a\nb\nc\n");
+}
+
+#[test]
+fn test_string_for_loop_iterates_chars() {
+    // design.md § Character type (line 2299) pins `for c in s` and
+    // `s.chars()` as semantic peers. Same output as the chars() variant.
+    let output = run(r#"fn main() { for c in "abc" { println(c); } }"#);
+    assert_eq!(output, "a\nb\nc\n");
+}
+
+#[test]
+fn test_string_chars_empty_iterates_zero_times() {
+    let output = run(r#"fn main() {
+            let mut n = 0i64;
+            for _ in "".chars() { n = n + 1; }
+            println(n);
+        }"#);
+    assert_eq!(output, "0\n");
+}
+
+#[test]
+fn test_string_chars_with_map_char_as_key() {
+    // Locks down the LeetCode #3 idiom — chars feeding a Map[char, i64]
+    // last-index map. The sliding-window kata is the natural-pull that
+    // surfaced this gap; this test guards against regression.
+    let output = run(r#"fn main() {
+            let mut last_idx: Map[char, i64] = Map.new();
+            let mut i = 0i64;
+            for c in "abca".chars() {
+                last_idx.insert(c, i);
+                i = i + 1;
+            }
+            match last_idx.get('a') { Some(v) => println(v), None => println(-1) }
+            match last_idx.get('b') { Some(v) => println(v), None => println(-1) }
+            match last_idx.get('c') { Some(v) => println(v), None => println(-1) }
+        }"#);
+    assert_eq!(output, "3\n1\n2\n");
+}
+
+#[test]
 fn test_string_sorted_by_closure_descending() {
     let output = run(
         r#"fn main() { let s = "dcba"; println(s.sorted_by(|a, b| if a < b { Ordering.Greater } else if a > b { Ordering.Less } else { Ordering.Equal })); }"#,

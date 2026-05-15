@@ -12978,13 +12978,37 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Str
             }
+            "chars" => {
+                // chars() -> Iterator[char]. Peer of design.md § Character type
+                // (line 2299): `for c in s` and `s.chars()` both iterate the
+                // string's Unicode scalar values. Tree-walk interpreter
+                // implements the same in eval_method_call's "chars" arm; a
+                // for-loop on a bare String falls back through the same path.
+                if !args.is_empty() {
+                    self.type_error(
+                        "'chars' takes no arguments".to_string(),
+                        span.clone(),
+                        TypeErrorKind::WrongNumberOfArgs,
+                    );
+                }
+                Type::Named {
+                    name: "Iterator".to_string(),
+                    args: vec![Type::Char],
+                }
+            }
             // Unknown string method — typo-suggestion diagnostic if close to
             // a known name, silent otherwise (`len`, `contains`, `is_empty`,
             // … are runtime-only and not yet wired through the typechecker).
             // Flip to always-error once enumeration catches up to the
             // interpreter's String surface — design.md § Method Resolution
             // Step 7.
-            _ => self.require_known_method("String", method, &["sorted", "sorted_by"], args, span),
+            _ => self.require_known_method(
+                "String",
+                method,
+                &["chars", "sorted", "sorted_by"],
+                args,
+                span,
+            ),
         }
     }
 

@@ -7533,6 +7533,39 @@ fn test_string_sorted_wrong_arity_rejects() {
     );
 }
 
+#[test]
+fn test_string_chars_returns_iterator_char() {
+    // The canonical s.chars() shape — design.md § Character type
+    // (line 2299) pins it as the iterator peer of `for c in s`.
+    // Returning the inferred element through a map adaptor (`map`
+    // requires the receiver to be Iterator[T] and pushes T into
+    // the closure parameter) is the structural assertion: if chars()
+    // returned anything other than Iterator[char], the closure body
+    // `c == 'a'` would mismatch on `c`.
+    let result = typecheck_ok(
+        r#"fn f() -> i64 {
+            let mut n = 0i64;
+            for c in "abc".chars() {
+                if c == 'a' { n = n + 1; }
+            }
+            n
+        }"#,
+    );
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+}
+
+#[test]
+fn test_string_chars_rejects_arguments() {
+    let errors = typecheck_errors(r#"fn f() { let s = "hello"; s.chars(1); }"#);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::WrongNumberOfArgs),
+        "Expected WrongNumberOfArgs for chars with arg, got: {:?}",
+        errors
+    );
+}
+
 // ── Numeric literal promotion (Q4) ────────────────────────────────────────
 
 #[test]

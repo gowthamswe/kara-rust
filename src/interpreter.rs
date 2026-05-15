@@ -2926,6 +2926,11 @@ impl<'a> Interpreter<'a> {
                         .into_iter()
                         .map(|(k, v)| Value::Tuple(vec![k, v]))
                         .collect(),
+                    // String iterates per Unicode scalar value, matching the
+                    // canonical `s.chars()` surface — design.md § Character
+                    // type (line 2299) pins `for c in s` and `s.chars()` as
+                    // semantic peers.
+                    Value::String(s) => s.chars().map(Value::Char).collect(),
                     // Iterator: drain via repeated `iterator_step` so adaptor
                     // closures (Map / Filter / future) fire per element. The
                     // for-loop walks the resulting Vec uniformly with the
@@ -6017,6 +6022,29 @@ impl<'a> Interpreter<'a> {
                     // Note: Map also handled via Map.len() match above
                     _ => unreachable!(
                         "len() on unsupported type at {}:{}; should be caught by typechecker",
+                        span.line, span.column
+                    ),
+                };
+            }
+            "chars" => {
+                // `String.chars() -> Iterator[char]`. Snapshot the chars
+                // eagerly into a Value::Iterator so adaptor chains (`map`,
+                // `filter`, …) and `for c in s.chars()` go through the same
+                // step-machine as other collections. Peer of design.md
+                // § Character type (line 2299): the design pins `for c in s`
+                // and `s.chars()` as semantic peers; both route here in the
+                // tree-walk interpreter (the `for` site dispatches on
+                // `Value::String` directly via the same `s.chars()` shape).
+                return match &obj {
+                    Value::String(s) => {
+                        let items: Vec<Value> = s.chars().map(Value::Char).collect();
+                        Value::Iterator {
+                            source: IteratorSource::Eager { items, cursor: 0 },
+                            steps: Vec::new(),
+                        }
+                    }
+                    _ => unreachable!(
+                        "chars() on unsupported type at {}:{}; should be caught by typechecker",
                         span.line, span.column
                     ),
                 };
