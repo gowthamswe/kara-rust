@@ -5501,6 +5501,79 @@ fn main() {
     }
 
     #[test]
+    fn test_ir_map_i64_i64_get_uses_mono_symbol_with_inline_probe() {
+        // Slice 1b.3 — Map[i64, i64].get routes through the mono
+        // `karac_map_i64_i64_get` symbol with the same inline-probe
+        // shape as insert_old: direct `karac_hash_i64` call, inline
+        // status `load i8`, inline `icmp eq i64`. Get has no
+        // load-factor branch (never resizes) and no tombstone-
+        // tracking PHI — simpler than insert_old but same hot-path
+        // pattern.
+        let ir = ir_for(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    m.insert(1_i64, 100_i64);
+    match m.get(1_i64) {
+        Some(v) => println(v),
+        None => println(0_i64),
+    }
+}
+"#,
+        );
+        assert!(
+            ir.contains("@karac_map_i64_i64_get"),
+            "mono get symbol should be emitted; IR:\n{}",
+            ir
+        );
+        let define_line = ir
+            .lines()
+            .find(|l| l.contains("@karac_map_i64_i64_get(") && l.starts_with("define"))
+            .unwrap_or_else(|| panic!("could not find define for mono get; IR:\n{}", ir));
+        assert!(
+            define_line.contains("linkonce_odr"),
+            "mono get should have linkonce_odr linkage; saw: {}",
+            define_line
+        );
+        assert!(
+            ir.contains("call i1 @karac_map_i64_i64_get"),
+            "user-facing m.get(...) should dispatch through mono symbol; IR:\n{}",
+            ir
+        );
+        // Extract the mono get body and pin the inline-probe shape.
+        let mut in_body = false;
+        let mut body_lines: Vec<&str> = Vec::new();
+        for line in ir.lines() {
+            if line.starts_with("define") && line.contains("@karac_map_i64_i64_get(") {
+                in_body = true;
+                continue;
+            }
+            if in_body {
+                if line.starts_with('}') {
+                    break;
+                }
+                body_lines.push(line);
+            }
+        }
+        let body = body_lines.join("\n");
+        assert!(
+            body.contains("call i64 @karac_hash_i64"),
+            "mono get should call karac_hash_i64 directly; body:\n{}",
+            body
+        );
+        assert!(
+            body.contains("load i8"),
+            "mono get should load status byte inline; body:\n{}",
+            body
+        );
+        assert!(
+            body.contains("icmp eq i64"),
+            "mono get should inline the i64 eq check; body:\n{}",
+            body
+        );
+    }
+
+    #[test]
     fn test_ir_map_i64_i64_len_emitted_once_per_module() {
         // Multiple `m.len()` sites on Map[i64, i64] should share a
         // single emission (the side-table cache returns the cached
