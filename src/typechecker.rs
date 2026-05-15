@@ -10770,10 +10770,18 @@ impl<'a> TypeChecker<'a> {
             }
             UnaryOp::Deref => match ty {
                 Type::Ref(inner) | Type::MutRef(inner) => *inner,
+                // Raw-pointer dereference (`*const T` / `*mut T`) typechecks
+                // to the pointee type. The operation itself is *unsafe* — the
+                // `unsafe_op_in_unsafe_fn` lint (`src/unsafe_lint.rs`) rejects
+                // it outside an `unsafe { }` block. Soundness lives at the
+                // lint layer, not the type layer, so callers can still reason
+                // about the deref's result type.
+                Type::Pointer { inner, .. } => *inner,
                 _ => {
                     self.type_error(
                         format!(
-                            "unary '*' requires 'ref T' or 'mut ref T', found '{}'",
+                            "unary '*' requires 'ref T', 'mut ref T', or a raw pointer \
+                             ('*const T' / '*mut T'), found '{}'",
                             type_display(&ty)
                         ),
                         span.clone(),

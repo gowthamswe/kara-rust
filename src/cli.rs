@@ -2041,6 +2041,29 @@ fn cmd_run(filename: &str, output: OutputMode, sequential: bool) {
                 diag.message
             );
         }
+        // Lint: unsafe_op_in_unsafe_fn (slice 3) — walks every fn body
+        // and rejects raw-pointer deref / unsafe-fn calls outside an
+        // `unsafe { }` block. Runs post-typecheck because raw-ptr deref
+        // detection consults `expr_types` and method-call dispatch reads
+        // `method_callee_types`.
+        for diag in crate::unsafe_lint::check_unsafe_op_in_unsafe_fn(
+            &pipeline.parsed.program,
+            pipeline.typed.as_ref(),
+        ) {
+            eprintln!(
+                "{}[{}]: {}:{}:{}: {}",
+                if diag.level == crate::unsafe_lint::LintLevel::Error {
+                    "error"
+                } else {
+                    "warning"
+                },
+                diag.lint_name,
+                filename,
+                diag.span.line,
+                diag.span.column,
+                diag.message
+            );
+        }
         // Lint: ffi_float_eq
         for diag in crate::ffi_lint::check_ffi_float_eq(&pipeline.parsed.program) {
             eprintln!(

@@ -19,10 +19,13 @@
 //!   - `#[deny(undocumented_unsafe)]` promotes the warning to an error.
 
 use crate::ast::{
-    Attribute, Block, Expr, ExprKind, ExternBlock, FieldInit, Item, MatchArm, Program, Stmt,
-    StmtKind,
+    Attribute, Block, Expr, ExprKind, ExternBlock, FieldInit, ImplItem, Item, MatchArm, Program,
+    Stmt, StmtKind, TraitItem, TypeKind, UnaryOp,
 };
+use crate::resolver::SpanKey;
 use crate::token::Span;
+use crate::typechecker::{Type, TypeCheckResult};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LintLevel {
@@ -385,4 +388,389 @@ fn walk_match_arm(arm: &MatchArm, lines: &[&str], deny: bool, diags: &mut Vec<Li
 
 fn walk_field_init(f: &FieldInit, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagnostic>) {
     walk_expr(&f.value, lines, deny, diags);
+}
+
+// ── Slice 3: `unsafe_op_in_unsafe_fn` operation lint ───────────────
+//
+// Walks every fn body (free functions, impl methods, trait-method
+// default bodies) tracking `in_unsafe_block` context. Emits an error at
+// every operation that requires an `unsafe { ... }` wrap when it appears
+// outside one:
+//   - Raw-pointer dereference (`*ptr` where ptr: `*const T` / `*mut T`).
+//   - Call to another `unsafe fn` (free function or impl method).
+//
+// The rule applies uniformly inside `unsafe fn` bodies — declaring a
+// function `unsafe` is a precondition for the *caller*, not an implicit
+// `unsafe { }` wrap around the body. Calls into `unsafe extern { }`
+// blocks are NOT in the unsafe-required set: the trust boundary is the
+// block, not the call site.
+//
+// Slice 3 v1 covers raw-ptr deref + unsafe-fn calls. Asm-intrinsic
+// calls, `volatile_read` / `volatile_write` intrinsics, and union field
+// access are deferred to their respective producer features (no surface
+// exists yet). Trait-method dispatch through a generic bound is also
+// deferred — slice 3 v1 handles concrete impl-method dispatch via
+// `TypeCheckResult.method_callee_types`.
+
+/// Names of fn / impl-method declarations that carry `unsafe fn`. Calls
+/// resolved against these targets require an `unsafe { ... }` wrap at the
+/// call site. Functions declared inside `unsafe extern { ... }` blocks are
+/// intentionally excluded — the trust boundary is the block.
+struct UnsafeFnRegistry {
+    top_level_unsafe: HashSet<String>,
+    impl_method_unsafe: HashSet<(String, String)>,
+}
+
+fn build_unsafe_fn_registry(program: &Program) -> UnsafeFnRegistry {
+    let mut top_level_unsafe: HashSet<String> = HashSet::new();
+    let mut impl_method_unsafe: HashSet<(String, String)> = HashSet::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) if f.is_unsafe => {
+                top_level_unsafe.insert(f.name.clone());
+            }
+            Item::ImplBlock(imp) => {
+                let recv = match &imp.target_type.kind {
+                    TypeKind::Path(p) => p.segments.last().cloned(),
+                    _ => None,
+                };
+                if let Some(recv) = recv {
+                    for it in &imp.items {
+                        if let ImplItem::Method(m) = it {
+                            if m.is_unsafe {
+                                impl_method_unsafe.insert((recv.clone(), m.name.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    UnsafeFnRegistry {
+        top_level_unsafe,
+        impl_method_unsafe,
+    }
+}
+
+/// Run the `unsafe_op_in_unsafe_fn` operation lint.
+///
+/// `typed` is optional: when absent, raw-pointer-deref and method-call
+/// detection are skipped (those rely on the typechecker's expression-type
+/// and method-callee tables). Top-level `unsafe fn` call detection works
+/// without typecheck info.
+pub fn check_unsafe_op_in_unsafe_fn(
+    program: &Program,
+    typed: Option<&TypeCheckResult>,
+) -> Vec<LintDiagnostic> {
+    let registry = build_unsafe_fn_registry(program);
+    let mut diags: Vec<LintDiagnostic> = Vec::new();
+    {
+        let mut walker = OpWalker {
+            registry: &registry,
+            typed,
+            diags: &mut diags,
+        };
+        for item in &program.items {
+            match item {
+                Item::Function(f) => walker.walk_block(&f.body, false),
+                Item::ImplBlock(imp) => {
+                    for it in &imp.items {
+                        if let ImplItem::Method(m) = it {
+                            walker.walk_block(&m.body, false);
+                        }
+                    }
+                }
+                Item::TraitDef(t) => {
+                    for ti in &t.items {
+                        if let TraitItem::Method(m) = ti {
+                            if let Some(body) = &m.body {
+                                walker.walk_block(body, false);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    diags
+}
+
+struct OpWalker<'a> {
+    registry: &'a UnsafeFnRegistry,
+    typed: Option<&'a TypeCheckResult>,
+    diags: &'a mut Vec<LintDiagnostic>,
+}
+
+impl OpWalker<'_> {
+    fn walk_block(&mut self, block: &Block, in_unsafe: bool) {
+        for stmt in &block.stmts {
+            self.walk_stmt(stmt, in_unsafe);
+        }
+        if let Some(tail) = &block.final_expr {
+            self.walk_expr(tail, in_unsafe);
+        }
+    }
+
+    fn walk_stmt(&mut self, stmt: &Stmt, in_unsafe: bool) {
+        match &stmt.kind {
+            StmtKind::Let { value, .. } => self.walk_expr(value, in_unsafe),
+            StmtKind::LetUninit { .. } => {}
+            StmtKind::LetElse {
+                value, else_block, ..
+            } => {
+                self.walk_expr(value, in_unsafe);
+                self.walk_block(else_block, in_unsafe);
+            }
+            StmtKind::Expr(e) => self.walk_expr(e, in_unsafe),
+            StmtKind::Assign { target, value } | StmtKind::CompoundAssign { target, value, .. } => {
+                self.walk_expr(target, in_unsafe);
+                self.walk_expr(value, in_unsafe);
+            }
+            StmtKind::Defer { body } | StmtKind::ErrDefer { body, .. } => {
+                self.walk_block(body, in_unsafe);
+            }
+        }
+    }
+
+    fn walk_expr(&mut self, expr: &Expr, in_unsafe: bool) {
+        match &expr.kind {
+            ExprKind::Unsafe(block) => {
+                // Entering an `unsafe { }` block flips the context for its
+                // body — ops inside are accepted, ops outside still aren't.
+                self.walk_block(block, true);
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                operand,
+            } => {
+                if !in_unsafe && self.is_raw_pointer_deref(operand) {
+                    self.diags.push(LintDiagnostic {
+                        level: LintLevel::Error,
+                        span: expr.span.clone(),
+                        message: "raw-pointer dereference requires an `unsafe { ... }` block — \
+                                  `unsafe fn` declares a precondition for callers but does not \
+                                  implicitly wrap its body"
+                            .to_string(),
+                        lint_name: "unsafe_op_in_unsafe_fn".to_string(),
+                    });
+                }
+                self.walk_expr(operand, in_unsafe);
+            }
+            ExprKind::Call { callee, args } => {
+                if !in_unsafe {
+                    if let ExprKind::Identifier(name) = &callee.kind {
+                        if self.registry.top_level_unsafe.contains(name) {
+                            self.diags.push(LintDiagnostic {
+                                level: LintLevel::Error,
+                                span: expr.span.clone(),
+                                message: format!(
+                                    "call to `unsafe fn {name}` requires an `unsafe {{ ... }}` \
+                                     block — the callee declares a precondition the caller must \
+                                     assert"
+                                ),
+                                lint_name: "unsafe_op_in_unsafe_fn".to_string(),
+                            });
+                        }
+                    }
+                }
+                self.walk_expr(callee, in_unsafe);
+                for a in args {
+                    self.walk_expr(&a.value, in_unsafe);
+                }
+            }
+            ExprKind::MethodCall { object, args, .. } => {
+                if !in_unsafe {
+                    if let Some((recv, m)) = self.method_callee(&expr.span) {
+                        if self
+                            .registry
+                            .impl_method_unsafe
+                            .contains(&(recv.clone(), m.clone()))
+                        {
+                            self.diags.push(LintDiagnostic {
+                                level: LintLevel::Error,
+                                span: expr.span.clone(),
+                                message: format!(
+                                    "call to `unsafe fn {recv}.{m}` requires an `unsafe \
+                                     {{ ... }}` block — the callee declares a precondition the \
+                                     caller must assert"
+                                ),
+                                lint_name: "unsafe_op_in_unsafe_fn".to_string(),
+                            });
+                        }
+                    }
+                }
+                self.walk_expr(object, in_unsafe);
+                for a in args {
+                    self.walk_expr(&a.value, in_unsafe);
+                }
+            }
+            ExprKind::OptionalChain {
+                object,
+                args: Some(args),
+                ..
+            } => {
+                self.walk_expr(object, in_unsafe);
+                for a in args {
+                    self.walk_expr(&a.value, in_unsafe);
+                }
+            }
+            ExprKind::OptionalChain {
+                object, args: None, ..
+            } => {
+                self.walk_expr(object, in_unsafe);
+            }
+            ExprKind::Block(block)
+            | ExprKind::Loop { body: block, .. }
+            | ExprKind::LabeledBlock { body: block, .. }
+            | ExprKind::Seq(block)
+            | ExprKind::Par(block)
+            | ExprKind::Try(block) => self.walk_block(block, in_unsafe),
+            ExprKind::Lock { body, .. } | ExprKind::Providers { body, .. } => {
+                self.walk_block(body, in_unsafe)
+            }
+            ExprKind::If {
+                condition,
+                then_block,
+                else_branch,
+            } => {
+                self.walk_expr(condition, in_unsafe);
+                self.walk_block(then_block, in_unsafe);
+                if let Some(e) = else_branch {
+                    self.walk_expr(e, in_unsafe);
+                }
+            }
+            ExprKind::IfLet {
+                value,
+                then_block,
+                else_branch,
+                ..
+            } => {
+                self.walk_expr(value, in_unsafe);
+                self.walk_block(then_block, in_unsafe);
+                if let Some(e) = else_branch {
+                    self.walk_expr(e, in_unsafe);
+                }
+            }
+            ExprKind::While {
+                condition, body, ..
+            }
+            | ExprKind::WhileLet {
+                value: condition,
+                body,
+                ..
+            } => {
+                self.walk_expr(condition, in_unsafe);
+                self.walk_block(body, in_unsafe);
+            }
+            ExprKind::For { iterable, body, .. } => {
+                self.walk_expr(iterable, in_unsafe);
+                self.walk_block(body, in_unsafe);
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.walk_expr(scrutinee, in_unsafe);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        self.walk_expr(guard, in_unsafe);
+                    }
+                    self.walk_expr(&arm.body, in_unsafe);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.walk_expr(left, in_unsafe);
+                self.walk_expr(right, in_unsafe);
+            }
+            ExprKind::Unary { operand, .. } => self.walk_expr(operand, in_unsafe),
+            ExprKind::NilCoalesce { left, right } | ExprKind::Pipe { left, right } => {
+                self.walk_expr(left, in_unsafe);
+                self.walk_expr(right, in_unsafe);
+            }
+            ExprKind::FieldAccess { object, .. } | ExprKind::TupleIndex { object, .. } => {
+                self.walk_expr(object, in_unsafe);
+            }
+            ExprKind::Index { object, index } => {
+                self.walk_expr(object, in_unsafe);
+                self.walk_expr(index, in_unsafe);
+            }
+            ExprKind::Closure { body, .. } => self.walk_expr(body, in_unsafe),
+            ExprKind::Return(Some(e)) | ExprKind::Question(e) | ExprKind::Cast { expr: e, .. } => {
+                self.walk_expr(e, in_unsafe);
+            }
+            ExprKind::Break { value: Some(e), .. } => self.walk_expr(e, in_unsafe),
+            ExprKind::Tuple(elems) | ExprKind::ArrayLiteral(elems) => {
+                for e in elems {
+                    self.walk_expr(e, in_unsafe);
+                }
+            }
+            ExprKind::RepeatLiteral { value, count, .. } => {
+                self.walk_expr(value, in_unsafe);
+                self.walk_expr(count, in_unsafe);
+            }
+            ExprKind::PrefixCollectionLiteral { items, .. } => {
+                for e in items {
+                    self.walk_expr(e, in_unsafe);
+                }
+            }
+            ExprKind::MapLiteral(pairs) => {
+                for (k, v) in pairs {
+                    self.walk_expr(k, in_unsafe);
+                    self.walk_expr(v, in_unsafe);
+                }
+            }
+            ExprKind::StructLiteral { fields, spread, .. } => {
+                for f in fields {
+                    self.walk_expr(&f.value, in_unsafe);
+                }
+                if let Some(s) = spread {
+                    self.walk_expr(s, in_unsafe);
+                }
+            }
+            ExprKind::Range { start, end, .. } => {
+                if let Some(s) = start {
+                    self.walk_expr(s, in_unsafe);
+                }
+                if let Some(e) = end {
+                    self.walk_expr(e, in_unsafe);
+                }
+            }
+            ExprKind::Integer(..)
+            | ExprKind::Float(..)
+            | ExprKind::CharLit(..)
+            | ExprKind::StringLit(..)
+            | ExprKind::MultiStringLit(..)
+            | ExprKind::InterpolatedStringLit(..)
+            | ExprKind::Bool(..)
+            | ExprKind::Identifier(..)
+            | ExprKind::Path { .. }
+            | ExprKind::SelfValue
+            | ExprKind::SelfType
+            | ExprKind::PipePlaceholder
+            | ExprKind::Return(None)
+            | ExprKind::Break { value: None, .. }
+            | ExprKind::Continue { .. }
+            | ExprKind::OffsetOf { .. }
+            | ExprKind::Error => {}
+        }
+    }
+
+    fn is_raw_pointer_deref(&self, operand: &Expr) -> bool {
+        let Some(typed) = self.typed else {
+            return false;
+        };
+        let key = SpanKey::from_span(&operand.span);
+        matches!(typed.expr_types.get(&key), Some(Type::Pointer { .. }))
+    }
+
+    /// Returns the `(receiver_type, method)` resolved by the typechecker for
+    /// a method-call expression, parsing the canonical `"Type.method"` form
+    /// stored in `method_callee_types`. Returns `None` if typecheck info is
+    /// unavailable or the call wasn't resolved (e.g. on an upstream error).
+    fn method_callee(&self, call_span: &Span) -> Option<(String, String)> {
+        let typed = self.typed?;
+        let key = SpanKey::from_span(call_span);
+        let s = typed.method_callee_types.get(&key)?;
+        let (recv, m) = s.split_once('.')?;
+        Some((recv.to_string(), m.to_string()))
+    }
 }
