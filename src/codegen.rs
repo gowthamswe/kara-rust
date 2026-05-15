@@ -22637,6 +22637,18 @@ impl<'ctx> Codegen<'ctx> {
 
     // ── Monomorphized Map[K, V] symbol emission (Slice 1) ───────
 
+    /// Byte offset of `KaracMap.len` in the runtime's `#[repr(C)]`
+    /// layout (`runtime/src/map.rs`). Codegen-emitted monomorphized
+    /// `Map[K, V].len` symbols load this field by direct GEP +
+    /// load against a `*mut KaracMap` opaque pointer rather than
+    /// calling through the type-erased `karac_map_len` runtime
+    /// function. Pinned by the runtime-side unit test
+    /// `karac_map_field_offsets_match_codegen` — any drift trips
+    /// the runtime test before the binary can diverge. Slices 1b.2
+    /// and 1b.3 will add sibling constants for `status` / `kv` /
+    /// `capacity` once `insert_old` / `get` need them.
+    const KARAC_MAP_LEN_OFFSET: u64 = 24;
+
     /// Cache key for the monomorphized Map[K, V] symbol family —
     /// `"{key_mangle}_{val_mangle}"` (e.g. `"i64_i64"`). Mirrors the
     /// content-addressed scheme used by `mangle_mono_name` for user
@@ -22698,12 +22710,11 @@ impl<'ctx> Codegen<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_t = self.context.i64_type();
 
-        // len wrapper: forwards to `karac_map_len`. Direct-load of the
-        // KaracMap.len field is blocked on exposing the runtime
-        // struct layout at codegen — deferred to a later slice that
-        // either reps the struct as `#[repr(C)]` with a known offset
-        // or pivots to a fully-LLVM-emitted storage. Wrapper-only is
-        // sufficient for Slice 1a's "validate emission" goal.
+        // len: direct GEP + load against the runtime's `#[repr(C)]`
+        // `KaracMap.len` field. Drops the function-pointer indirection
+        // and the extern call overhead the erased fallback's
+        // `karac_map_len` carried. Offset pinned by the runtime-side
+        // `karac_map_field_offsets_match_codegen` unit test.
         let len_name = format!("karac_map_{cache_key}_len");
         let len_fn = match self.module.get_function(&len_name) {
             Some(f) => f,
@@ -22715,12 +22726,17 @@ impl<'ctx> Codegen<'ctx> {
                 let entry = self.context.append_basic_block(f, "entry");
                 self.builder.position_at_end(entry);
                 let map_arg = f.get_nth_param(0).unwrap().into_pointer_value();
+                let i8_t = self.context.i8_type();
+                let offset = i64_t.const_int(Self::KARAC_MAP_LEN_OFFSET, false);
+                let len_field_ptr = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(i8_t, map_arg, &[offset], "mono.len.field.ptr")
+                        .unwrap()
+                };
                 let len = self
                     .builder
-                    .build_call(self.karac_map_len_fn, &[map_arg.into()], "mono.len")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
+                    .build_load(i64_t, len_field_ptr, "mono.len")
+                    .unwrap();
                 self.builder.build_return(Some(&len)).unwrap();
                 f
             }

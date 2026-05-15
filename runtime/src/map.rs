@@ -32,6 +32,16 @@ const BUCKET_EMPTY: u8 = 0;
 const BUCKET_OCCUPIED: u8 = 1;
 const BUCKET_TOMBSTONE: u8 = 2;
 
+/// `#[repr(C)]` is load-bearing — codegen-side monomorphized
+/// `Map[K, V]` symbols (`src/codegen.rs`, see
+/// [`wip-monomorphized-collections.md`](../../docs/implementation_checklist/wip-monomorphized-collections.md))
+/// load the `len` / `capacity` / `status` / `kv` fields by direct
+/// GEP + load against this layout. Reordering or inserting fields
+/// here is an ABI break against codegen; the offsets are pinned by
+/// the `karac_map_field_offsets_match_codegen` unit test below.
+/// Slice 5's atomic delete of the erased runtime will untether
+/// codegen from this layout.
+#[repr(C)]
 struct KaracMap {
     status: *mut u8,
     kv: *mut u8,
@@ -544,5 +554,28 @@ pub unsafe extern "C" fn karac_map_iter_next(
 pub unsafe extern "C" fn karac_map_iter_free(iter: *mut c_void) {
     if !iter.is_null() {
         drop(Box::from_raw(iter as *mut KaracMapIter));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KaracMap;
+    use std::mem::offset_of;
+
+    /// Codegen-side monomorphized `Map[K, V]` symbols load
+    /// `KaracMap.len` / `KaracMap.capacity` / `KaracMap.status` /
+    /// `KaracMap.kv` by direct GEP + load against this struct's
+    /// `#[repr(C)]` layout. The offsets are hardcoded in
+    /// `src/codegen.rs` (see `KARAC_MAP_LEN_OFFSET` etc.). Any
+    /// reorder / insert / type-change of `KaracMap` fields breaks
+    /// the ABI; this test catches the drift before runtime/binary
+    /// diverge.
+    #[test]
+    fn karac_map_field_offsets_match_codegen() {
+        assert_eq!(offset_of!(KaracMap, status), 0);
+        assert_eq!(offset_of!(KaracMap, kv), 8);
+        assert_eq!(offset_of!(KaracMap, capacity), 16);
+        assert_eq!(offset_of!(KaracMap, len), 24);
+        assert_eq!(offset_of!(KaracMap, tombstones), 32);
     }
 }

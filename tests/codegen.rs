@@ -5349,6 +5349,55 @@ fn main() {
     }
 
     #[test]
+    fn test_ir_map_i64_i64_len_body_is_direct_field_load() {
+        // Slice 1b.1 — the mono len body drops the wrapper call to
+        // `karac_map_len` and reads the KaracMap.len field directly
+        // (offset 24, `#[repr(C)]` layout pinned by the runtime-side
+        // `karac_map_field_offsets_match_codegen` unit test). The IR
+        // for the mono len's body should contain a load i64 and no
+        // call to the erased `karac_map_len` extern.
+        let ir = ir_for(
+            r#"
+fn main() {
+    let mut m: Map[i64, i64] = Map.new();
+    println(m.len());
+}
+"#,
+        );
+        // Walk just the mono len's define block.
+        let mut in_body = false;
+        let mut body_lines: Vec<&str> = Vec::new();
+        for line in ir.lines() {
+            if line.starts_with("define") && line.contains("@karac_map_i64_i64_len") {
+                in_body = true;
+                continue;
+            }
+            if in_body {
+                if line.starts_with('}') {
+                    break;
+                }
+                body_lines.push(line);
+            }
+        }
+        assert!(
+            !body_lines.is_empty(),
+            "could not extract mono len body; IR:\n{}",
+            ir
+        );
+        let body = body_lines.join("\n");
+        assert!(
+            body.contains("load i64"),
+            "mono len should load the len field directly; body:\n{}",
+            body
+        );
+        assert!(
+            !body.contains("call") || !body.contains("@karac_map_len"),
+            "mono len should not call the erased karac_map_len extern; body:\n{}",
+            body
+        );
+    }
+
+    #[test]
     fn test_ir_map_i64_i64_len_emitted_once_per_module() {
         // Multiple `m.len()` sites on Map[i64, i64] should share a
         // single emission (the side-table cache returns the cached
