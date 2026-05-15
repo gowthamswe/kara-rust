@@ -10588,11 +10588,31 @@ impl<'ctx> Codegen<'ctx> {
 
     // ── Map codegen ───────────────────────────────────────────────
 
-    /// Emit an FNV-1a byte loop over `byte_count` bytes starting at `data_ptr`.
-    /// Appends basic blocks to `hash_fn_val`. Builder must be positioned just before
-    /// the first block of the loop; on return it is positioned at the exit block.
+    /// FxHash multiplier — rustc-hash style. Picked by the
+    /// `bench/hash_quality/` investigation (2026-05-15) as the
+    /// fastest non-cryptographic hash on karac's per-K hash bench
+    /// matrix (4-8× faster than FNV-1a on common workloads;
+    /// geometric mean 0.56× of FNV-1a baseline across 18 cells).
+    /// Mixed via rotate-left-5 + XOR + multiply per chunk.
+    const FXHASH_SEED: u64 = 0x517c_c1b7_2722_0a95;
+    const FXHASH_ROTATE: u64 = 5;
+
+    /// Emit an FxHash byte loop over `byte_count` bytes starting at
+    /// `data_ptr`. Per-byte step is `h = h.rotate_left(5) ^ byte;
+    /// h = h * FXHASH_SEED`. Appends basic blocks to `hash_fn_val`.
+    /// Builder must be positioned just before the first block of
+    /// the loop; on return it is positioned at the exit block.
     /// Returns the accumulated hash `IntValue` (i64).
-    fn emit_fnv1a_over_bytes(
+    ///
+    /// For fixed-size `≤8`-byte primitive keys, prefer the inline
+    /// fast-path in `emit_hash_fn_for_type` (one zext + one
+    /// multiply, no loop) — it produces the same hash output as
+    /// this byte loop when the loop runs the same byte count from
+    /// an all-zero initial accumulator, because `rotate_left(0, 5)
+    /// = 0` and the loop body collapses to `h = byte * SEED` on
+    /// iteration 0. Wider primitives and variable-length keys
+    /// (Vec, String, Slice) fall through to this byte loop.
+    fn emit_fxhash_over_bytes(
         &mut self,
         hash_fn_val: FunctionValue<'ctx>,
         data_ptr: PointerValue<'ctx>,
@@ -10600,26 +10620,27 @@ impl<'ctx> Codegen<'ctx> {
     ) -> IntValue<'ctx> {
         let i64_t = self.context.i64_type();
         let i8_t = self.context.i8_type();
-        let fnv_basis = i64_t.const_int(14695981039346656037_u64, false);
-        let fnv_prime = i64_t.const_int(1099511628211_u64, false);
+        let seed = i64_t.const_int(Self::FXHASH_SEED, false);
+        let rotate_amt = i64_t.const_int(Self::FXHASH_ROTATE, false);
+        let rotate_inv = i64_t.const_int(64 - Self::FXHASH_ROTATE, false);
 
         let pre_bb = self.builder.get_insert_block().unwrap();
-        let hdr_bb = self.context.append_basic_block(hash_fn_val, "fnv.hdr");
-        let bdy_bb = self.context.append_basic_block(hash_fn_val, "fnv.bdy");
-        let exit_bb = self.context.append_basic_block(hash_fn_val, "fnv.exit");
+        let hdr_bb = self.context.append_basic_block(hash_fn_val, "fx.hdr");
+        let bdy_bb = self.context.append_basic_block(hash_fn_val, "fx.bdy");
+        let exit_bb = self.context.append_basic_block(hash_fn_val, "fx.exit");
 
         self.builder.build_unconditional_branch(hdr_bb).unwrap();
 
         self.builder.position_at_end(hdr_bb);
-        let i_phi = self.builder.build_phi(i64_t, "fnv.i").unwrap();
-        let hash_phi = self.builder.build_phi(i64_t, "fnv.hash").unwrap();
+        let i_phi = self.builder.build_phi(i64_t, "fx.i").unwrap();
+        let hash_phi = self.builder.build_phi(i64_t, "fx.hash").unwrap();
         i_phi.add_incoming(&[(&i64_t.const_zero(), pre_bb)]);
-        hash_phi.add_incoming(&[(&fnv_basis, pre_bb)]);
+        hash_phi.add_incoming(&[(&i64_t.const_zero(), pre_bb)]);
         let i_val = i_phi.as_basic_value().into_int_value();
         let hash_val = hash_phi.as_basic_value().into_int_value();
         let cond = self
             .builder
-            .build_int_compare(IntPredicate::ULT, i_val, byte_count, "fnv.cond")
+            .build_int_compare(IntPredicate::ULT, i_val, byte_count, "fx.cond")
             .unwrap();
         self.builder
             .build_conditional_branch(cond, bdy_bb, exit_bb)
@@ -10628,26 +10649,33 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(bdy_bb);
         let byte_ptr = unsafe {
             self.builder
-                .build_gep(i8_t, data_ptr, &[i_val], "fnv.bp")
+                .build_gep(i8_t, data_ptr, &[i_val], "fx.bp")
                 .unwrap()
         };
         let byte = self
             .builder
-            .build_load(i8_t, byte_ptr, "fnv.b")
+            .build_load(i8_t, byte_ptr, "fx.b")
             .unwrap()
             .into_int_value();
         let byte64 = self
             .builder
-            .build_int_z_extend(byte, i64_t, "fnv.b64")
+            .build_int_z_extend(byte, i64_t, "fx.b64")
             .unwrap();
-        let xored = self.builder.build_xor(hash_val, byte64, "fnv.xor").unwrap();
-        let new_hash = self
+        // rotate_left(h, 5) == (h << 5) | (h >> 59)
+        let shl = self
             .builder
-            .build_int_mul(xored, fnv_prime, "fnv.mul")
+            .build_left_shift(hash_val, rotate_amt, "fx.shl")
             .unwrap();
+        let shr = self
+            .builder
+            .build_right_shift(hash_val, rotate_inv, false, "fx.shr")
+            .unwrap();
+        let rotated = self.builder.build_or(shl, shr, "fx.rot").unwrap();
+        let xored = self.builder.build_xor(rotated, byte64, "fx.xor").unwrap();
+        let new_hash = self.builder.build_int_mul(xored, seed, "fx.mul").unwrap();
         let i_next = self
             .builder
-            .build_int_add(i_val, i64_t.const_int(1, false), "fnv.i1")
+            .build_int_add(i_val, i64_t.const_int(1, false), "fx.i1")
             .unwrap();
         i_phi.add_incoming(&[(&i_next, bdy_bb)]);
         hash_phi.add_incoming(&[(&new_hash, bdy_bb)]);
@@ -10659,9 +10687,25 @@ impl<'ctx> Codegen<'ctx> {
 
     /// Emit (or reuse) a module-level `karac_hash_{type_name}(ptr) -> i64` function.
     ///
-    /// - Integer/float primitives: FNV-1a over the raw `sizeof(K)` bytes.
-    /// - `String`: loads `{ ptr data, i64 len }` from the struct and hashes `data[0..len]`.
-    /// - Structs/other: FNV-1a over the raw struct bytes (correct for value-only structs).
+    /// Per the `bench/hash_quality/` investigation (2026-05-15),
+    /// karac's per-K hash is **FxHash** (rustc-hash style
+    /// rotate-xor-multiply over 8-byte chunks). Geometric mean
+    /// across 18 bench cells: 0.56× of the prior FNV-1a baseline
+    /// (1.8× faster overall, up to 4-8× faster on integer keys).
+    ///
+    /// - **Integer primitives `≤8` bytes** (i8, i16, i32, i64,
+    ///   char, bool): inline fast path — load value, zero-extend
+    ///   to i64, multiply by `FXHASH_SEED`. One zext + one mul,
+    ///   no loop. The initial accumulator is 0, so the per-byte
+    ///   shape `h.rotate_left(5) ^ byte; h * SEED` collapses to
+    ///   `value * SEED` when processed as a single chunk.
+    /// - **`String`**: loads `{ ptr data, i64 len }` from the
+    ///   struct and runs the FxHash byte loop over `data[0..len]`.
+    /// - **Float primitives** (f32, f64) and **wider integers**
+    ///   (i128, u128): byte loop over `sizeof(K)` raw bytes.
+    /// - **Structs / other**: byte loop over raw struct bytes
+    ///   (correct for value-only structs; tuple combiner in
+    ///   `emit_hash_fn_for_tuple` per-field-recurses).
     fn emit_hash_fn_for_type(
         &mut self,
         type_name: &str,
@@ -10707,10 +10751,52 @@ impl<'ctx> Codegen<'ctx> {
                 .build_load(i64_t, len_p, "s.len")
                 .unwrap()
                 .into_int_value();
-            let hash = self.emit_fnv1a_over_bytes(hash_fn, data_ptr, len);
+            let hash = self.emit_fxhash_over_bytes(hash_fn, data_ptr, len);
             self.builder.build_return(Some(&hash)).unwrap();
+        } else if let BasicTypeEnum::IntType(int_ty) = key_ty {
+            // Integer primitive fast path: load value, zext to
+            // i64, multiply by FXHASH_SEED. Matches the byte-loop
+            // output for the i==0 case from an all-zero
+            // accumulator (rotate(0, 5) = 0 → 0 ^ value = value;
+            // value * SEED).
+            let bit_width = int_ty.get_bit_width();
+            if bit_width <= 64 {
+                let raw = self
+                    .builder
+                    .build_load(int_ty, key_ptr, "fx.prim.raw")
+                    .unwrap()
+                    .into_int_value();
+                let value64 = if bit_width == 64 {
+                    raw
+                } else {
+                    self.builder
+                        .build_int_z_extend(raw, i64_t, "fx.prim.zext")
+                        .unwrap()
+                };
+                let seed = i64_t.const_int(Self::FXHASH_SEED, false);
+                let hash = self
+                    .builder
+                    .build_int_mul(value64, seed, "fx.prim.mul")
+                    .unwrap();
+                self.builder.build_return(Some(&hash)).unwrap();
+            } else {
+                // Wider integers (i128 / u128): fall back to byte loop.
+                let raw_size = key_ty
+                    .size_of()
+                    .unwrap_or_else(|| i64_t.const_int(8, false));
+                let size64 = if raw_size.get_type().get_bit_width() == 64 {
+                    raw_size
+                } else {
+                    self.builder
+                        .build_int_z_extend(raw_size, i64_t, "ksz64")
+                        .unwrap()
+                };
+                let hash = self.emit_fxhash_over_bytes(hash_fn, key_ptr, size64);
+                self.builder.build_return(Some(&hash)).unwrap();
+            }
         } else {
-            // All other types: FNV-1a over sizeof(K) raw bytes.
+            // Float primitives, structs, other compound types:
+            // FxHash byte loop over `sizeof(K)` raw bytes.
             let raw_size = key_ty
                 .size_of()
                 .unwrap_or_else(|| i64_t.const_int(8, false));
@@ -10721,7 +10807,7 @@ impl<'ctx> Codegen<'ctx> {
                     .build_int_z_extend(raw_size, i64_t, "ksz64")
                     .unwrap()
             };
-            let hash = self.emit_fnv1a_over_bytes(hash_fn, key_ptr, size64);
+            let hash = self.emit_fxhash_over_bytes(hash_fn, key_ptr, size64);
             self.builder.build_return(Some(&hash)).unwrap();
         }
 
@@ -11431,8 +11517,10 @@ impl<'ctx> Codegen<'ctx> {
     /// Emit a per-field-recursive hash function for an n-tuple. Each field's
     /// hash is computed by recursing into `emit_hash_fn_for_type_expr` (so
     /// `(String, i64)` correctly hashes the String contents, not the struct
-    /// bytes), then combined into a running state via the FNV tail-mix
-    /// `state = (state * FNV_PRIME) ^ field_hash`.
+    /// bytes), then combined into a running state via the FxHash tail-mix
+    /// `state = (state.rotate_left(5) ^ field_hash) * FXHASH_SEED`. Matches
+    /// the per-K hash emission shape selected by the
+    /// `bench/hash_quality/` investigation.
     fn emit_hash_fn_for_tuple(
         &mut self,
         type_name: &str,
@@ -11466,9 +11554,16 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(entry_bb);
         let key_ptr = hash_fn.get_nth_param(0).unwrap().into_pointer_value();
 
-        let fnv_basis = i64_t.const_int(14695981039346656037_u64, false);
-        let fnv_prime = i64_t.const_int(1099511628211_u64, false);
-        let mut state: IntValue<'ctx> = fnv_basis;
+        // FxHash tail-mix: state = (state.rotate_left(5) ^
+        // field_hash) * FXHASH_SEED. Initial state = 0 collapses
+        // the first field's mix to `field_hash_0 * SEED`,
+        // matching the inline primitive fast path for a 1-element
+        // "tuple". For n>1 fields, subsequent fields rotate and
+        // chain.
+        let seed = i64_t.const_int(Self::FXHASH_SEED, false);
+        let rotate_amt = i64_t.const_int(Self::FXHASH_ROTATE, false);
+        let rotate_inv = i64_t.const_int(64 - Self::FXHASH_ROTATE, false);
+        let mut state: IntValue<'ctx> = i64_t.const_zero();
         for (i, child_fn) in child_fns.iter().enumerate() {
             let field_ptr = self
                 .builder
@@ -11481,13 +11576,25 @@ impl<'ctx> Codegen<'ctx> {
                 .try_as_basic_value()
                 .unwrap_basic()
                 .into_int_value();
-            let mul = self
+            let shl = self
                 .builder
-                .build_int_mul(state, fnv_prime, &format!("t.f{i}.mul"))
+                .build_left_shift(state, rotate_amt, &format!("t.f{i}.shl"))
+                .unwrap();
+            let shr = self
+                .builder
+                .build_right_shift(state, rotate_inv, false, &format!("t.f{i}.shr"))
+                .unwrap();
+            let rotated = self
+                .builder
+                .build_or(shl, shr, &format!("t.f{i}.rot"))
+                .unwrap();
+            let xored = self
+                .builder
+                .build_xor(rotated, elem_hash, &format!("t.f{i}.xor"))
                 .unwrap();
             state = self
                 .builder
-                .build_xor(mul, elem_hash, &format!("t.f{i}.xor"))
+                .build_int_mul(xored, seed, &format!("t.f{i}.mul"))
                 .unwrap();
         }
         self.builder.build_return(Some(&state)).unwrap();
