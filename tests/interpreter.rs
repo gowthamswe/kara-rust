@@ -5170,39 +5170,168 @@ fn test_process_command_env_records_kv() {
 }
 
 #[test]
-fn test_process_spawn_returns_err_placeholder() {
-    // The v1 surface compiles and runs; the placeholder `spawn` body
-    // returns `Err(IoError.NotFound)`. When the follow-up intrinsic
-    // lands, this test flips to the success path with a real Child.
+fn test_process_spawn_nonexistent_program_returns_not_found() {
+    // Real intrinsic exercise: spawning a path that doesn't exist
+    // surfaces `IoError.NotFound` (mapped from `std::io::ErrorKind::NotFound`
+    // in `try_eval_process_method`). Tests the error-path of the intrinsic
+    // and that `IoError` variants reach user pattern matches at scope-0.
     let output = run(r#"fn main() {
-         let cmd = Command.new("nonexistent");
+         let cmd = Command.new("/no/such/path/karac-test-nonexistent");
          match cmd.spawn() {
-             Ok(_) => println("ok"),
-             Err(_) => println("err"),
+             Ok(_) => println("ok??"),
+             Err(IoError.NotFound) => println("not_found"),
+             Err(IoError.Other(_)) => println("other"),
+             Err(_) => println("other_err"),
          }
      }"#);
-    assert_eq!(output, "err\n");
+    assert_eq!(output, "not_found\n");
 }
 
 #[test]
 fn test_process_user_can_declare_sends_process_table_effect() {
     // `ProcessTable` is registered as a prelude effect resource so
     // user wrappers can declare `with sends(ProcessTable)` without an
-    // explicit `effect resource ProcessTable;`. The body of this
-    // wrapper just forwards to `spawn` (which carries the same
-    // effect), so the effect declaration's verification path lights up.
+    // explicit `effect resource ProcessTable;`. The wrapper forwards
+    // to `spawn` (same effect), exercising the effect-declaration
+    // verification path.
     let output = run(
         r#"fn run_cmd(prog: String) -> Result[Child, IoError] with sends(ProcessTable) {
              Command.new(prog).spawn()
          }
          fn main() {
-             match run_cmd("ls") {
+             match run_cmd("/no/such/path/karac-test-nonexistent") {
                  Ok(_) => println("ok"),
                  Err(_) => println("err"),
              }
          }"#,
     );
     assert_eq!(output, "err\n");
+}
+
+#[test]
+fn test_process_spawn_real_command_and_wait_for_zero_exit() {
+    // End-to-end intrinsic check: spawn a real OS process, wait for
+    // it, verify ExitStatus { code: 0, success: true }. Using
+    // `/usr/bin/true` (POSIX-ubiquitous, exits 0 silently) keeps the
+    // test runner's terminal clean — `/bin/echo` would inherit-print
+    // to runner stdout, which is cosmetically noisy. The Kāra child
+    // handle's wait status is what we actually verify.
+    let output = run(r#"fn main() {
+         let cmd = Command.new("/usr/bin/true");
+         match cmd.spawn() {
+             Ok(child) => {
+                 match child.wait() {
+                     Ok(status) => {
+                         println(status.code);
+                         println(status.success);
+                     }
+                     Err(_) => println("wait_err"),
+                 }
+             }
+             Err(_) => println("spawn_err"),
+         }
+     }"#);
+    assert_eq!(output, "0\ntrue\n");
+}
+
+#[test]
+fn test_process_try_wait_returns_none_for_still_running_child() {
+    // Spawn a child that sleeps long enough that try_wait sees it
+    // still running. /bin/sleep is POSIX-ubiquitous. 0.5s is short
+    // enough to keep the test fast but long enough that try_wait
+    // fires before exit (interpreter wall-clock has zero scheduling
+    // jitter compared to the OS spawn latency).
+    let output = run(r#"fn main() {
+         let cmd = Command.new("/bin/sleep").arg("0.5");
+         match cmd.spawn() {
+             Ok(child) => {
+                 match child.try_wait() {
+                     Ok(None) => println("still_running"),
+                     Ok(Some(_)) => println("already_exited"),
+                     Err(_) => println("err"),
+                 }
+                 match child.wait() {
+                     Ok(_) => println("waited"),
+                     Err(_) => println("wait_err"),
+                 }
+             }
+             Err(_) => println("spawn_err"),
+         }
+     }"#);
+    assert_eq!(output, "still_running\nwaited\n");
+}
+
+#[test]
+fn test_process_kill_terminates_child_and_wait_reports_failure() {
+    // Spawn /bin/sleep 60 (way longer than test runtime), kill it,
+    // then wait. kill returns Ok(Unit); wait returns Ok(status) with
+    // success=false (terminated by signal). The child is reaped by
+    // the wait call after the kill (`kill` itself leaves the table
+    // entry in place per the spec — the caller still needs wait()).
+    let output = run(r#"fn main() {
+         let cmd = Command.new("/bin/sleep").arg("60");
+         match cmd.spawn() {
+             Ok(child) => {
+                 match child.kill() {
+                     Ok(_) => println("killed"),
+                     Err(_) => println("kill_err"),
+                 }
+                 match child.wait() {
+                     Ok(status) => println(status.success),
+                     Err(_) => println("wait_err"),
+                 }
+             }
+             Err(_) => println("spawn_err"),
+         }
+     }"#);
+    assert_eq!(output, "killed\nfalse\n");
+}
+
+#[test]
+fn test_process_env_vars_propagate_to_child() {
+    // The .env() builder method propagates to the spawned process.
+    // Child stdout inherits the parent fd, so it doesn't show up in
+    // Kāra's `captured_output` — instead, verify env var propagation
+    // by having the child's shell `test` the var against the expected
+    // value and exit 0 / 1 accordingly. The wait-status's `success`
+    // field is the signal.
+    let output = run(r#"fn main() {
+         let cmd = Command.new("/bin/sh")
+             .arg("-c")
+             .arg("test \"$MY_VAR\" = \"kara-env-witness\"")
+             .env("MY_VAR", "kara-env-witness");
+         match cmd.spawn() {
+             Ok(child) => {
+                 match child.wait() {
+                     Ok(s) => println(s.success),
+                     Err(_) => println("wait_err"),
+                 }
+             }
+             Err(_) => println("spawn_err"),
+         }
+     }"#);
+    assert_eq!(
+        output, "true\n",
+        "expected env var to propagate (exit 0); got: {output}"
+    );
+}
+
+#[test]
+fn test_process_wait_on_unknown_child_returns_not_found() {
+    // If a Child handle's pid isn't in the interpreter's side-table
+    // (e.g., the user fabricated a Child struct manually), wait()
+    // returns IoError.NotFound rather than panic. Defensive against
+    // user code that hand-constructs Child values to side-step the
+    // builder.
+    let output = run(r#"fn main() {
+         let fake = Child { pid: 999999999 };
+         match fake.wait() {
+             Ok(_) => println("ok??"),
+             Err(IoError.NotFound) => println("not_found"),
+             Err(_) => println("other_err"),
+         }
+     }"#);
+    assert_eq!(output, "not_found\n");
 }
 
 // ── Pool[T] — connection-pool primitive surface ────────────────────

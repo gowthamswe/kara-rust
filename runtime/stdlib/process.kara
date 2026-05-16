@@ -4,39 +4,26 @@
 // (v64 backend-platform lift, 2026-05-09). Spec at
 // `phase-8-stdlib-floor.md § Backend Platform > P1 std.process`.
 //
-// v1 surface (this slice): the `Command` builder, the `Child` handle,
-// the `ExitStatus` shape, and the `ProcessTable` effect resource that
-// `spawn` / `wait` / `try_wait` / `kill` declare against. Builder
-// methods (`new` / `arg` / `env`) are pure-Kāra; the OS-touching
-// methods (`spawn`, the three `Child` methods) currently return
-// `Err(IoError.NotFound)` as placeholders — they typecheck cleanly
-// against the v1 surface so user code can build against the API today,
-// and the real implementations land in a follow-up slice that swaps
-// these bodies for an interpreter intrinsic wired to
-// `std::process::Command` (Rust). `IoError.NotFound` is chosen over
-// `IoError.Other(...)` because constructing tuple-variant payloads
-// from baked-stdlib method bodies doesn't fall on the path that the
-// interpreter's enum-variant evaluator resolves through today —
-// fieldless variants like `NotFound` go through the prelude variant
-// list (`PRELUDE_VARIANTS`) and resolve uniformly. The error code
-// becomes more specific when the real intrinsic lands.
-//
-// **Why ship the surface ahead of the implementation:** the v1
-// commitment is that the user-visible builder shape is stable —
-// `Command::new(prog).arg(...).env(...).spawn()`. Pinning this in
-// stdlib lets downstream code (test harnesses, build scripts, the
-// `karac` toolchain itself) target the canonical API while the
-// intrinsic catches up. This mirrors the std.tracing decision to
-// land the trait/data surface ahead of the active-span propagation.
+// v1 surface: the `Command` builder, the `Child` handle, the
+// `ExitStatus` shape, and the `ProcessTable` effect resource. Builder
+// methods (`new` / `arg` / `env`) are pure-Kāra. The OS-touching
+// methods (`spawn`, the three `Child` methods) are
+// `#[compiler_builtin]` — dispatched through the interpreter's
+// `try_eval_process_method` arm in
+// `src/interpreter/method_call_process.rs`, which wires through to
+// `std::process::Command` and a pid-keyed `Child` side-table on the
+// interpreter. The placeholder bodies the typechecker sees only
+// matter if the intrinsic dispatch is ever removed — they return
+// `Err(IoError.NotFound)` so the surface stays well-typed in that
+// failure mode.
 //
 // **Effects on the OS-touching methods.** All four declare
 // `sends(ProcessTable)` per the spec — every interaction with the OS
 // process table is a write to that resource. The execution verbs
 // (`blocks` on `wait` for the synchronous form; `suspends` on the
-// future async form) are deferred to the follow-up that wires the
-// real implementation, since the placeholder bodies don't actually
-// block. Adding the execution verbs at that point is non-breaking —
-// they widen the declared effect set, not narrow it.
+// future async form) are deferred to the slice that wires `wait()`
+// through the event loop. Adding the execution verbs at that point
+// is non-breaking — they widen the declared effect set, not narrow it.
 
 // `ProcessTable` — effect resource for child-process operations.
 // `Command.spawn` / `Child.wait` / `Child.try_wait` / `Child.kill`
@@ -107,36 +94,40 @@ impl Command {
         }
     }
 
-    // Placeholder. The follow-up slice wires
-    // `std::process::Command::new(prog).args(...).envs(...).spawn()`
-    // through an interpreter intrinsic; here the surface lands so
-    // user code can typecheck against the v1 API shape. The
-    // `#[compiler_builtin]` attribute skips body type-checking and
-    // routes the call through the interpreter dispatch table —
-    // until the intrinsic lands, the call returns the body's
-    // placeholder Err.
+    // Real spawn: dispatched through `try_eval_process_method` in
+    // the interpreter, which calls `std::process::Command::new(prog)
+    // .args(...).envs(...).spawn()` and stores the resulting `Child`
+    // in a pid-keyed side table on the interpreter so subsequent
+    // `wait` / `try_wait` / `kill` calls can locate it. The body
+    // here is a typecheck-only placeholder.
+    #[compiler_builtin]
     fn spawn(ref self) -> Result[Child, IoError] with sends(ProcessTable) {
         Err(IoError.NotFound)
     }
 }
 
 impl Child {
-    // Placeholder. The follow-up slice fills in the real wait
-    // (blocking on `std::process::Child::wait`); execution verb
-    // `blocks` will be added at that point.
+    // Block until the child exits and reap it (entry removed from
+    // the side table on the Ok path). Execution verb `blocks` is
+    // deferred until the event-loop slice — adding it later widens
+    // the effect set, not narrow.
+    #[compiler_builtin]
     fn wait(ref self) -> Result[ExitStatus, IoError] with sends(ProcessTable) {
         Err(IoError.NotFound)
     }
 
-    // Placeholder. Non-blocking poll — returns Ok(Some(status)) if
-    // the child has exited, Ok(None) if still running, Err on
-    // wait-error. Bodies land in the same follow-up slice as spawn.
+    // Non-blocking poll. Returns `Ok(Some(status))` and reaps the
+    // child when it has exited; `Ok(None)` while it's still running;
+    // `Err` on wait-error.
+    #[compiler_builtin]
     fn try_wait(ref self) -> Result[Option[ExitStatus], IoError] with sends(ProcessTable) {
         Err(IoError.NotFound)
     }
 
-    // Placeholder. Sends SIGKILL to the child; the real
-    // implementation lands in the same follow-up slice.
+    // Send SIGKILL (or platform equivalent) to the child. The child
+    // is not reaped — the caller still needs `wait` / `try_wait`
+    // to remove the entry from the side table.
+    #[compiler_builtin]
     fn kill(ref self) -> Result[Unit, IoError] with sends(ProcessTable) {
         Err(IoError.NotFound)
     }

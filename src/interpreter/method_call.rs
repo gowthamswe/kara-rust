@@ -198,6 +198,9 @@ impl<'a> super::Interpreter<'a> {
         if let Some(v) = self.try_eval_regex_method(method, obj.clone(), args, span) {
             return v;
         }
+        if let Some(v) = self.try_eval_process_method(method, obj.clone(), args, span) {
+            return v;
+        }
         if let Some(v) = self.try_eval_set_method(method, object, obj.clone(), args, span) {
             return v;
         }

@@ -20,6 +20,7 @@ mod method_call_http;
 mod method_call_iter;
 mod method_call_map;
 mod method_call_optres;
+mod method_call_process;
 mod method_call_regex;
 mod method_call_seq;
 mod method_call_set;
@@ -140,6 +141,16 @@ pub struct Interpreter<'a> {
     /// parent's buffer is mirrored into each branch and merged on
     /// join (same pattern as `captured_output`).
     pub captured_dbg: Option<Vec<String>>,
+    /// `std.process` intrinsic side-table — keyed by OS pid, holds the
+    /// `std::process::Child` handle so subsequent `child.wait()` /
+    /// `try_wait()` / `kill()` calls can locate the same OS process.
+    /// `Command.spawn` populates this; `wait` removes the entry on
+    /// success; `try_wait` removes only when the child has exited;
+    /// `kill` leaves the entry in place (caller still needs to wait
+    /// to reap). Entries that outlive the interpreter become zombie
+    /// processes — same behavior as a Rust `Child` that's dropped
+    /// without `wait`. See `src/interpreter/method_call_process.rs`.
+    pub(crate) child_table: HashMap<i64, std::process::Child>,
 }
 
 /// Format mode for [`Interpreter`]'s `dbg()` output. See design.md §
@@ -229,6 +240,7 @@ impl<'a> Interpreter<'a> {
             current_task_id: None,
             task_id_counter: Arc::new(AtomicU64::new(0)),
             captured_dbg: None,
+            child_table: HashMap::new(),
         }
     }
 
