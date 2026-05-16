@@ -1,0 +1,276 @@
+// runtime/stdlib/cli.kara
+//
+// `std.cli` — argument parser with a clap-inspired builder API. Phase 8
+// floor (v66 graduation, 2026-05-11). Spec: `deferred.md § std.cli`.
+//
+// Surface:
+//   - `Parser.new(name) -> Parser`
+//   - `.about(s) -> Parser`
+//   - `.arg(name, Arg) -> Parser`
+//   - `.flag(name, short, help) -> Parser`
+//   - `.parse() -> Result[Args, CliError]`   with `reads(Env)`
+//   - `Arg.string() / .required() / .help(s)`
+//   - `args.get_string(name) -> Result[String, CliError]`
+//   - `args.get_flag(name) -> bool`
+//
+// Subcommands and automatic `--help` / `--version` are deferred to a
+// follow-up slice. v1 perfection is not required; canonicality of the
+// builder surface is — this file establishes the import path so user
+// code and the wider ecosystem standardize on it from day one.
+//
+// Pure-Kāra implementation: methods are inferred through the impl-table
+// dispatch path; no compiler intrinsic hooks are required for any of
+// these methods. Effect on `parse()` is declared explicitly because it
+// is a public fn.
+
+struct CliError {
+    message: String,
+}
+
+// Builder-side handle returned by `Arg.string()` and chained through
+// `.required()` / `.help(...)`. Holds the configuration that gets
+// flattened into a `Parser.args` entry when `parser.arg(name, a)`
+// consumes it.
+struct Arg {
+    is_required: bool,
+    help_text: String,
+}
+
+// One row per declared named argument. Stored inside the parser
+// because Kāra has no struct-stored hashmap at scope-0; lookup is
+// linear over `Parser.args`.
+struct ArgEntry {
+    name: String,
+    is_required: bool,
+    help_text: String,
+}
+
+// One row per declared flag. `has_short` distinguishes flags declared
+// with a single-letter alias (`-v`) from name-only flags.
+struct FlagEntry {
+    name: String,
+    short_char: char,
+    has_short: bool,
+    help_text: String,
+}
+
+// One row per parsed `--name value` pair. Lookup is linear over
+// `Args.values` from `get_string`.
+struct ParsedValue {
+    name: String,
+    value: String,
+}
+
+// Result of `parser.parse()` — captures every recognized value, every
+// set flag, and every positional token the parse loop encountered.
+struct Args {
+    values: Vec[ParsedValue],
+    flags_set: Vec[String],
+    positional: Vec[String],
+}
+
+struct Parser {
+    program_name: String,
+    about_text: String,
+    args: Vec[ArgEntry],
+    flags: Vec[FlagEntry],
+}
+
+impl Arg {
+    fn string() -> Arg {
+        Arg { is_required: false, help_text: "" }
+    }
+
+    fn required(self) -> Arg {
+        Arg { is_required: true, help_text: self.help_text }
+    }
+
+    fn help(self, h: String) -> Arg {
+        Arg { is_required: self.is_required, help_text: h }
+    }
+}
+
+impl Parser {
+    fn new(name: String) -> Parser {
+        Parser {
+            program_name: name,
+            about_text: "",
+            args: Vec.new(),
+            flags: Vec.new(),
+        }
+    }
+
+    fn about(self, description: String) -> Parser {
+        Parser {
+            program_name: self.program_name,
+            about_text: description,
+            args: self.args,
+            flags: self.flags,
+        }
+    }
+
+    fn arg(self, name: String, a: Arg) -> Parser {
+        let mut new_args = self.args;
+        new_args.push(ArgEntry {
+            name: name,
+            is_required: a.is_required,
+            help_text: a.help_text,
+        });
+        Parser {
+            program_name: self.program_name,
+            about_text: self.about_text,
+            args: new_args,
+            flags: self.flags,
+        }
+    }
+
+    fn flag(self, name: String, short: char, help: String) -> Parser {
+        let mut new_flags = self.flags;
+        new_flags.push(FlagEntry {
+            name: name,
+            short_char: short,
+            has_short: true,
+            help_text: help,
+        });
+        Parser {
+            program_name: self.program_name,
+            about_text: self.about_text,
+            args: self.args,
+            flags: new_flags,
+        }
+    }
+
+    // Walk `Env.args()` (skipping argv[0] = program name) and bucket
+    // each token into named-value pairs, set flags, or positional
+    // tokens. Required args missing from the input produce an error;
+    // unknown tokens become positionals (clap's permissive default).
+    fn parse(ref self) -> Result[Args, CliError] with reads(Env) {
+        let argv = Env.args();
+        let n = argv.len();
+        let mut values: Vec[ParsedValue] = Vec.new();
+        let mut flags_set: Vec[String] = Vec.new();
+        let mut positional: Vec[String] = Vec.new();
+        let mut i: i64 = 1;
+        while i < n {
+            match argv.get(i) {
+                Some(token) => {
+                    let mut matched: bool = false;
+                    let mut j: i64 = 0;
+                    while j < self.args.len() {
+                        match self.args.get(j) {
+                            Some(entry) => {
+                                if entry.name == token {
+                                    i = i + 1;
+                                    match argv.get(i) {
+                                        Some(val) => {
+                                            values.push(ParsedValue {
+                                                name: entry.name,
+                                                value: val,
+                                            });
+                                        }
+                                        None => {
+                                            return Err(CliError {
+                                                message: "missing value for argument",
+                                            });
+                                        }
+                                    }
+                                    matched = true;
+                                }
+                            }
+                            None => { }
+                        }
+                        j = j + 1;
+                    }
+                    if not matched {
+                        let mut k: i64 = 0;
+                        while k < self.flags.len() {
+                            match self.flags.get(k) {
+                                Some(fentry) => {
+                                    if fentry.name == token {
+                                        flags_set.push(fentry.name);
+                                        matched = true;
+                                    }
+                                }
+                                None => { }
+                            }
+                            k = k + 1;
+                        }
+                    }
+                    if not matched {
+                        positional.push(token);
+                    }
+                }
+                None => { }
+            }
+            i = i + 1;
+        }
+        let mut r: i64 = 0;
+        while r < self.args.len() {
+            match self.args.get(r) {
+                Some(entry) => {
+                    if entry.is_required {
+                        let mut found: bool = false;
+                        let mut v: i64 = 0;
+                        while v < values.len() {
+                            match values.get(v) {
+                                Some(pv) => {
+                                    if pv.name == entry.name {
+                                        found = true;
+                                    }
+                                }
+                                None => { }
+                            }
+                            v = v + 1;
+                        }
+                        if not found {
+                            return Err(CliError {
+                                message: "missing required argument",
+                            });
+                        }
+                    }
+                }
+                None => { }
+            }
+            r = r + 1;
+        }
+        Ok(Args {
+            values: values,
+            flags_set: flags_set,
+            positional: positional,
+        })
+    }
+}
+
+impl Args {
+    fn get_string(ref self, name: String) -> Result[String, CliError] {
+        let mut i: i64 = 0;
+        while i < self.values.len() {
+            match self.values.get(i) {
+                Some(pv) => {
+                    if pv.name == name {
+                        return Ok(pv.value);
+                    }
+                }
+                None => { }
+            }
+            i = i + 1;
+        }
+        Err(CliError { message: "argument not found" })
+    }
+
+    fn get_flag(ref self, name: String) -> bool {
+        let mut i: i64 = 0;
+        while i < self.flags_set.len() {
+            match self.flags_set.get(i) {
+                Some(f) => {
+                    if f == name {
+                        return true;
+                    }
+                }
+                None => { }
+            }
+            i = i + 1;
+        }
+        false
+    }
+}

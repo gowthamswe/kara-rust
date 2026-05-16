@@ -4732,6 +4732,122 @@ fn test_regex_replace_all() {
     assert_eq!(output, "abc NUM def NUM\n");
 }
 
+// ── std.cli — builder-style argument parser ────────────────────────
+
+#[test]
+fn test_cli_builder_records_state() {
+    let output = run(r#"fn main() {
+         let p = Parser.new("greet")
+             .about("Greets a name")
+             .arg("--name", Arg.string().required())
+             .flag("--verbose", short: 'v', help: "verbose");
+         println(p.program_name);
+         println(p.about_text);
+         println(p.args.len());
+         println(p.flags.len());
+     }"#);
+    assert_eq!(output, "greet\nGreets a name\n1\n1\n");
+}
+
+#[test]
+fn test_cli_parse_named_arg_returns_value() {
+    let output = run(r#"struct FakeEnv {}
+         impl FakeEnv { fn args(self) -> Vec[String] { ["prog", "--name", "alice"] } }
+         fn main() {
+             with_provider[Env](FakeEnv {}, || {
+                 let p = Parser.new("greet")
+                     .arg("--name", Arg.string().required());
+                 match p.parse() {
+                     Ok(args) => {
+                         match args.get_string("--name") {
+                             Ok(n) => println(n),
+                             Err(e) => println(e.message),
+                         }
+                     }
+                     Err(e) => println(e.message),
+                 }
+             });
+         }"#);
+    assert_eq!(output, "alice\n");
+}
+
+#[test]
+fn test_cli_parse_flag_set_returns_true() {
+    let output = run(r#"struct FakeEnv {}
+         impl FakeEnv { fn args(self) -> Vec[String] { ["prog", "--verbose"] } }
+         fn main() {
+             with_provider[Env](FakeEnv {}, || {
+                 let p = Parser.new("greet")
+                     .flag("--verbose", short: 'v', help: "");
+                 match p.parse() {
+                     Ok(args) => println(args.get_flag("--verbose")),
+                     Err(e) => println(e.message),
+                 }
+             });
+         }"#);
+    assert_eq!(output, "true\n");
+}
+
+#[test]
+fn test_cli_parse_flag_unset_returns_false() {
+    let output = run(r#"struct FakeEnv {}
+         impl FakeEnv { fn args(self) -> Vec[String] { ["prog"] } }
+         fn main() {
+             with_provider[Env](FakeEnv {}, || {
+                 let p = Parser.new("greet")
+                     .flag("--verbose", short: 'v', help: "");
+                 match p.parse() {
+                     Ok(args) => println(args.get_flag("--verbose")),
+                     Err(e) => println(e.message),
+                 }
+             });
+         }"#);
+    assert_eq!(output, "false\n");
+}
+
+#[test]
+fn test_cli_parse_missing_required_arg_errors() {
+    let output = run(r#"struct FakeEnv {}
+         impl FakeEnv { fn args(self) -> Vec[String] { ["prog"] } }
+         fn main() {
+             with_provider[Env](FakeEnv {}, || {
+                 let p = Parser.new("greet")
+                     .arg("--name", Arg.string().required());
+                 match p.parse() {
+                     Ok(_) => println("ok"),
+                     Err(e) => println("err"),
+                 }
+             });
+         }"#);
+    assert_eq!(output, "err\n");
+}
+
+#[test]
+fn test_cli_parse_unknown_token_becomes_positional() {
+    let output = run(r#"struct FakeEnv {}
+         impl FakeEnv { fn args(self) -> Vec[String] { ["prog", "extra1", "extra2"] } }
+         fn main() {
+             with_provider[Env](FakeEnv {}, || {
+                 let p = Parser.new("greet");
+                 match p.parse() {
+                     Ok(args) => println(args.positional.len()),
+                     Err(e) => println(e.message),
+                 }
+             });
+         }"#);
+    assert_eq!(output, "2\n");
+}
+
+#[test]
+fn test_cli_arg_builder_chains() {
+    let output = run(r#"fn main() {
+         let a = Arg.string().required().help("a help");
+         println(a.is_required);
+         println(a.help_text);
+     }"#);
+    assert_eq!(output, "true\na help\n");
+}
+
 // ── Stats namespace ───────────────────────────────────────────────
 
 #[test]

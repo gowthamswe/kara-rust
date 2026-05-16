@@ -119,6 +119,19 @@ pub const PRELUDE_TYPES: &[&str] = &[
     // and pattern-match on the `JsonError` fields without an explicit import.
     "Json",
     "JsonError",
+    // `std.cli` (v66 graduation, 2026-05-11): builder-style argument parser.
+    // `Parser` / `Arg` / `Args` / `CliError` are the user-facing surface;
+    // `ArgEntry` / `FlagEntry` / `ParsedValue` are internal row types that
+    // back the parser's per-arg / per-flag / per-value storage and need
+    // scope-0 visibility because their literal constructions appear in the
+    // baked `runtime/stdlib/cli.kara` source. See `deferred.md § std.cli`.
+    "Parser",
+    "Arg",
+    "Args",
+    "CliError",
+    "ArgEntry",
+    "FlagEntry",
+    "ParsedValue",
 ];
 
 /// Operator and conversion trait names visible without import. Lets
@@ -438,6 +451,8 @@ pub const STDLIB_SOURCES: &[(&str, &str)] = &[
     ),
     // Slice F (`std.json`).
     ("json.kara", include_str!("../runtime/stdlib/json.kara")),
+    // `std.cli` builder-style argument parser (v66 graduation).
+    ("cli.kara", include_str!("../runtime/stdlib/cli.kara")),
     // Compile-time layout introspection — `size_of[T]()` / `align_of[T]()`
     // (the `offset_of[T](field)` arm is a parser special-form, not a
     // stdlib function — see `runtime/stdlib/intrinsics.kara`).
