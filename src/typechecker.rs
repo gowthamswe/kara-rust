@@ -33,6 +33,7 @@ mod inference;
 mod items;
 mod lowering;
 mod patterns;
+mod stdlib_iter;
 mod stdlib_methods;
 #[cfg(test)]
 mod tests;
