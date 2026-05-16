@@ -35,7 +35,7 @@ pub struct ParseResult {
 /// Surrounding signature kind for parameter parsing — selects between the
 /// trait-method and free-function anonymous-parameter diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FnContext {
+pub(crate) enum FnContext {
     /// `fn` inside a `trait { ... }` body. Drives `E_TRAIT_METHOD_ANONYMOUS_PARAM`.
     TraitMethod,
     /// Free function, impl method, or extern function. Drives
@@ -58,9 +58,9 @@ fn starts_upper(s: &str) -> bool {
 // ── Parser ───────────────────────────────────────────────────────
 
 pub struct Parser {
-    tokens: Vec<SpannedToken>,
-    pos: usize,
-    errors: Vec<ParseError>,
+    pub(crate) tokens: Vec<SpannedToken>,
+    pub(crate) pos: usize,
+    pub(crate) errors: Vec<ParseError>,
     /// Active labels for disambiguating `break label` vs `break value` and
     /// for routing labeled-block label scopes. Each entry carries a
     /// `LabelKind` tag (`Loop` for labeled loops, `Block` for labeled
@@ -68,20 +68,20 @@ pub struct Parser {
     /// but the parser tracks it so that `is_known_label` lookups (which
     /// disambiguate `break label expr`) work uniformly across both label
     /// kinds. Pushed at the entry to a labeled construct, popped on exit.
-    loop_labels: Vec<(String, LabelKind)>,
+    pub(crate) loop_labels: Vec<(String, LabelKind)>,
     /// Doc-comment text accumulated by the leading-`///` collection at the
     /// top of `parse_item`. Each item-construction site calls
     /// `Self::take_pending_doc` when filling the new node's `doc_comment`
     /// field. Cleared after consumption so a subsequent item without docs
     /// gets `None`.
-    pending_doc: Option<String>,
+    pub(crate) pending_doc: Option<String>,
     /// Stack of `FnContext`s for the function-like signature we are currently
     /// parsing parameters for. Drives the anonymous-parameter focused
     /// diagnostic: trait-method bodies emit `E_TRAIT_METHOD_ANONYMOUS_PARAM`
     /// while free / impl / extern function bodies emit
     /// `E_FN_ANONYMOUS_PARAM`. Empty when we are not inside a parameter
     /// list (e.g., parsing a struct field or top-level expression).
-    fn_context_stack: Vec<FnContext>,
+    pub(crate) fn_context_stack: Vec<FnContext>,
     /// Stack of effect-variable names declared in the enclosing function /
     /// trait method's `[with E]` generic params. Pushed when entering a
     /// signature with declared effect vars; popped when leaving. Consulted
@@ -90,7 +90,7 @@ pub struct Parser {
     /// instead of `EffectItem::Group(E)`. Empty top frame means no
     /// effect variables in scope (parser treats all `with X` items as
     /// group references).
-    effect_var_stack: Vec<Vec<String>>,
+    pub(crate) effect_var_stack: Vec<Vec<String>>,
 }
 
 impl Parser {
