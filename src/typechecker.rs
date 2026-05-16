@@ -24,6 +24,7 @@ mod const_eval;
 mod derives;
 pub mod env;
 mod env_build;
+mod expr_method_call;
 mod exprs;
 mod fields;
 mod inference;
