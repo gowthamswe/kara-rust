@@ -206,55 +206,13 @@ impl<'a> super::Interpreter<'a> {
         if let Some(v) = self.try_eval_map_method(method, object, obj.clone(), args, span) {
             return v;
         }
+        if let Some(v) = self.try_eval_option_result_method(method, object, obj.clone(), args, span)
+        {
+            return v;
+        }
 
         // Built-in methods
         match method {
-            "unwrap" => {
-                return match &obj {
-                    Value::EnumVariant {
-                        variant,
-                        data: EnumData::Tuple(vals),
-                        ..
-                    } if variant == "Ok" || variant == "Some" => {
-                        vals.first().cloned().unwrap_or(Value::Unit)
-                    }
-                    Value::EnumVariant { variant, .. } if variant == "Err" || variant == "None" => {
-                        return self
-                            .record_runtime_error(format!("called unwrap() on {}", variant), span);
-                    }
-                    other => other.clone(),
-                };
-            }
-            "expect" => {
-                let msg = if let Some(arg) = args.first() {
-                    match self.eval_expr_inner(&arg.value) {
-                        Value::String(s) => s,
-                        v => format!("{}", v),
-                    }
-                } else {
-                    String::new()
-                };
-                return match &obj {
-                    Value::EnumVariant {
-                        variant,
-                        data: EnumData::Tuple(vals),
-                        ..
-                    } if variant == "Ok" || variant == "Some" => {
-                        vals.first().cloned().unwrap_or(Value::Unit)
-                    }
-                    Value::EnumVariant { variant, .. } if variant == "Err" || variant == "None" => {
-                        return self.record_runtime_error(
-                            if msg.is_empty() {
-                                format!("expect() called on {}", variant)
-                            } else {
-                                format!("{}: {}", msg, variant)
-                            },
-                            span,
-                        );
-                    }
-                    other => other.clone(),
-                };
-            }
             "len" => {
                 return match &obj {
                     Value::Array(rc) => Value::Int(rc.read().unwrap().len() as i64),
@@ -354,52 +312,6 @@ impl<'a> super::Interpreter<'a> {
             "push_back" | "push_front" | "pop_back" | "pop_front" => {
                 if matches!(&obj, Value::Array(_)) {
                     return self.eval_vec_deque_method(method, &obj, object, args);
-                }
-            }
-            "is_some" => {
-                return match &obj {
-                    Value::EnumVariant { variant, .. } if variant == "Some" => Value::Bool(true),
-                    Value::EnumVariant { variant, .. } if variant == "None" => Value::Bool(false),
-                    _ => Value::Bool(true),
-                };
-            }
-            "is_none" => {
-                return match &obj {
-                    Value::EnumVariant { variant, .. } if variant == "None" => Value::Bool(true),
-                    _ => Value::Bool(false),
-                };
-            }
-            "is_ok" => {
-                return match &obj {
-                    Value::EnumVariant { variant, .. } if variant == "Ok" => Value::Bool(true),
-                    _ => Value::Bool(false),
-                };
-            }
-            "is_err" => {
-                return match &obj {
-                    Value::EnumVariant { variant, .. } if variant == "Err" => Value::Bool(true),
-                    _ => Value::Bool(false),
-                };
-            }
-            // Atomic[T] methods
-            "load" => {
-                if let Value::Atomic(inner) = &obj {
-                    // Ordering argument accepted but ignored (no concurrency in tree-walk interpreter)
-                    return *inner.clone();
-                }
-            }
-            "store" => {
-                if let Value::Atomic(_) = &obj {
-                    let val = if let Some(arg) = args.first() {
-                        self.eval_expr_inner(&arg.value)
-                    } else {
-                        Value::Unit
-                    };
-                    // Update the atomic in the environment
-                    if let ExprKind::Identifier(name) = &object.kind {
-                        self.env.set(name, Value::Atomic(Box::new(val)));
-                    }
-                    return Value::Unit;
                 }
             }
             // ── Slice[T] / Vec[T] / Array[T,N] shared read-only methods ──────────
