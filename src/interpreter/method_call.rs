@@ -3,7 +3,6 @@
 //!
 //! Lives in a sibling `impl<'a> super::Interpreter<'a>` block.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::ast::*;
@@ -199,6 +198,9 @@ impl<'a> super::Interpreter<'a> {
             return v;
         }
         if let Some(v) = self.try_eval_regex_method(method, obj.clone(), args, span) {
+            return v;
+        }
+        if let Some(v) = self.try_eval_set_method(method, object, obj.clone(), args, span) {
             return v;
         }
 
@@ -1305,115 +1307,6 @@ impl<'a> super::Interpreter<'a> {
                         key,
                         slot_idx,
                     };
-                }
-            }
-            "clear" => {
-                if let Value::Map(_) = obj {
-                    if let ExprKind::Identifier(name) = &object.kind {
-                        self.env.set(name, Value::Map(Vec::new()));
-                    }
-                    return Value::Unit;
-                }
-            }
-            "min" => {
-                if let Value::SortedSet(ref set) = obj {
-                    return match set.keys().next() {
-                        Some(k) => Value::EnumVariant {
-                            enum_name: "Option".to_string(),
-                            variant: "Some".to_string(),
-                            data: EnumData::Tuple(vec![k.0.clone()]),
-                        },
-                        None => Value::EnumVariant {
-                            enum_name: "Option".to_string(),
-                            variant: "None".to_string(),
-                            data: EnumData::Unit,
-                        },
-                    };
-                }
-            }
-            "max" => {
-                if let Value::SortedSet(ref set) = obj {
-                    return match set.keys().next_back() {
-                        Some(k) => Value::EnumVariant {
-                            enum_name: "Option".to_string(),
-                            variant: "Some".to_string(),
-                            data: EnumData::Tuple(vec![k.0.clone()]),
-                        },
-                        None => Value::EnumVariant {
-                            enum_name: "Option".to_string(),
-                            variant: "None".to_string(),
-                            data: EnumData::Unit,
-                        },
-                    };
-                }
-            }
-            "union" => {
-                let other = args
-                    .first()
-                    .map(|a| self.eval_expr_inner(&a.value))
-                    .unwrap_or(Value::Unit);
-                if let (Value::SortedSet(ref a_set), Value::SortedSet(ref b_set)) = (&obj, &other) {
-                    #[allow(clippy::mutable_key_type)]
-                    let mut result = a_set.clone();
-                    for (k, _v) in b_set.iter() {
-                        result.insert(k.clone(), ());
-                    }
-                    return Value::SortedSet(result);
-                }
-                if let (Value::Set(ref a_set), Value::Set(ref b_set)) = (&obj, &other) {
-                    let mut result = a_set.clone();
-                    for v in b_set {
-                        if !result.contains(v) {
-                            result.push(v.clone());
-                        }
-                    }
-                    return Value::Set(result);
-                }
-            }
-            "intersection" => {
-                let other = args
-                    .first()
-                    .map(|a| self.eval_expr_inner(&a.value))
-                    .unwrap_or(Value::Unit);
-                if let (Value::SortedSet(ref a_set), Value::SortedSet(ref b_set)) = (&obj, &other) {
-                    #[allow(clippy::mutable_key_type)]
-                    let result: BTreeMap<OrdValue, ()> = a_set
-                        .iter()
-                        .filter(|(k, _)| b_set.contains_key(*k))
-                        .map(|(k, v)| (k.clone(), *v))
-                        .collect();
-                    return Value::SortedSet(result);
-                }
-                if let (Value::Set(ref a_set), Value::Set(ref b_set)) = (&obj, &other) {
-                    let result: Vec<Value> = a_set
-                        .iter()
-                        .filter(|v| b_set.contains(v))
-                        .cloned()
-                        .collect();
-                    return Value::Set(result);
-                }
-            }
-            "difference" => {
-                let other = args
-                    .first()
-                    .map(|a| self.eval_expr_inner(&a.value))
-                    .unwrap_or(Value::Unit);
-                if let (Value::SortedSet(ref a_set), Value::SortedSet(ref b_set)) = (&obj, &other) {
-                    #[allow(clippy::mutable_key_type)]
-                    let result: BTreeMap<OrdValue, ()> = a_set
-                        .iter()
-                        .filter(|(k, _)| !b_set.contains_key(*k))
-                        .map(|(k, v)| (k.clone(), *v))
-                        .collect();
-                    return Value::SortedSet(result);
-                }
-                if let (Value::Set(ref a_set), Value::Set(ref b_set)) = (&obj, &other) {
-                    let result: Vec<Value> = a_set
-                        .iter()
-                        .filter(|v| !b_set.contains(v))
-                        .cloned()
-                        .collect();
-                    return Value::Set(result);
                 }
             }
             _ => {}
