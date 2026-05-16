@@ -174,37 +174,37 @@ fn normalize_bounds_into_where_clause(
 /// detection lines up with the legacy ownership-side detector. Round
 /// 12.44 (Step 2 — once-callability inference at construction).
 #[derive(Copy, Clone, Eq, PartialEq)]
-enum CaptureWalkMode {
+pub(super) enum CaptureWalkMode {
     Reading,
     Consuming,
 }
 
-struct LocalTypeScope {
-    scopes: Vec<HashMap<String, Type>>,
+pub(super) struct LocalTypeScope {
+    pub(super) scopes: Vec<HashMap<String, Type>>,
 }
 
 impl LocalTypeScope {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         LocalTypeScope {
             scopes: vec![HashMap::new()],
         }
     }
 
-    fn push(&mut self) {
+    pub(super) fn push(&mut self) {
         self.scopes.push(HashMap::new());
     }
 
-    fn pop(&mut self) {
+    pub(super) fn pop(&mut self) {
         self.scopes.pop();
     }
 
-    fn insert(&mut self, name: String, ty: Type) {
+    pub(super) fn insert(&mut self, name: String, ty: Type) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, ty);
         }
     }
 
-    fn lookup(&self, name: &str) -> Option<&Type> {
+    pub(super) fn lookup(&self, name: &str) -> Option<&Type> {
         for scope in self.scopes.iter().rev() {
             if let Some(ty) = scope.get(name) {
                 return Some(ty);
@@ -482,16 +482,16 @@ fn find_struct_def<'m>(module: &'m crate::module::Module, name: &str) -> Option<
 // ── Type Checker ────────────────────────────────────────────────
 
 pub struct TypeChecker<'a> {
-    program: &'a Program,
-    resolve_result: &'a ResolveResult,
+    pub(super) program: &'a Program,
+    pub(super) resolve_result: &'a ResolveResult,
     /// Optional project-wide tree for cross-module checks (CR-24 slice 6b):
     /// extends `E0221 PrivateTypeInPublicSignature` to imported types and
     /// turns on field-access rejection for cross-module struct fields.
-    tree: Option<&'a crate::module::ProgramTree>,
+    pub(super) tree: Option<&'a crate::module::ProgramTree>,
     /// The id of the module being typechecked, when `tree` is set. Used to
     /// scope cross-module visibility checks — an access is "cross-module"
     /// when the accessed item's origin differs from `current_module`.
-    current_module: Option<crate::module::ModuleId>,
+    pub(super) current_module: Option<crate::module::ModuleId>,
     /// Local name → (canonical origin module path, canonical item name,
     /// declared visibility) for items imported into the current module from
     /// elsewhere in the tree. Slice 7: re-exports collapse to the canonical
@@ -499,13 +499,13 @@ pub struct TypeChecker<'a> {
     /// `("X" → (["a","b"], "X", ...))`, and an alias `import M.Y as Z` maps
     /// `"Z" → (["a","b"], "Y", ...)`. Populated during `build_type_env` when
     /// `tree` is set.
-    type_origins: HashMap<String, (Vec<String>, String, Visibility)>,
-    env: TypeEnv,
-    local_scope: LocalTypeScope,
-    errors: Vec<TypeError>,
-    warnings: Vec<TypeError>,
-    expr_types: HashMap<SpanKey, Type>,
-    current_return_type: Option<Type>,
+    pub(super) type_origins: HashMap<String, (Vec<String>, String, Visibility)>,
+    pub(super) env: TypeEnv,
+    pub(super) local_scope: LocalTypeScope,
+    pub(super) errors: Vec<TypeError>,
+    pub(super) warnings: Vec<TypeError>,
+    pub(super) expr_types: HashMap<SpanKey, Type>,
+    pub(super) current_return_type: Option<Type>,
     /// LB3 — per-label collector stack for labeled-block break-with-value
     /// LUB inference. Pushed at labeled-block entry; each `Break { label:
     /// Some(name), value: Some(e) }` site appends `infer_expr(e)` to the
@@ -517,30 +517,30 @@ pub struct TypeChecker<'a> {
     /// default behavior — loop-LUB inference is a separate slice that
     /// will reuse the same machinery once the design entry promotes
     /// (out-of-scope here).
-    break_value_types: Vec<(String, Vec<Type>)>,
-    current_self_type: Option<Type>,
+    pub(super) break_value_types: Vec<(String, Vec<Type>)>,
+    pub(super) current_self_type: Option<Type>,
     /// True when type-checking inside a defer/errdefer block.
-    in_defer: bool,
+    pub(super) in_defer: bool,
     /// `?` cross-error From conversions (span → target error type name).
-    question_conversions: HashMap<SpanKey, String>,
+    pub(super) question_conversions: HashMap<SpanKey, String>,
     /// `x.into()` conversions (span of the MethodCall → target type name).
-    into_conversions: HashMap<SpanKey, String>,
+    pub(super) into_conversions: HashMap<SpanKey, String>,
     /// `x.try_into()` conversions (span of the MethodCall → target type name,
     /// where target is the `T` extracted from `Result[T, E]`).
-    try_into_conversions: HashMap<SpanKey, String>,
+    pub(super) try_into_conversions: HashMap<SpanKey, String>,
     /// Enum names that derive `Display(snake_case)`. Populated during
     /// `env_add_enum`; transferred to `TypeCheckResult`.
-    display_snake_case_enums: HashSet<String>,
+    pub(super) display_snake_case_enums: HashSet<String>,
     /// MethodCall span → `Type.method` canonical callee key. See the
     /// matching field on `TypeCheckResult` for the full rationale.
-    method_callee_types: HashMap<SpanKey, String>,
+    pub(super) method_callee_types: HashMap<SpanKey, String>,
     /// Bare-call expected-type dispatch resolutions: call-expression span →
     /// resolved target type name (e.g. `"Wrapper"`). Populated when
     /// `try_apply_expected_assoc_fn_inference` resolves a bare `name(args)`
     /// call against a concrete expected type. The lowering pass rewrites
     /// these to `Target.name(args)` so the interpreter / codegen can dispatch
     /// through the existing `Type.method` impl table.
-    bare_assoc_fn_targets: HashMap<SpanKey, String>,
+    pub(super) bare_assoc_fn_targets: HashMap<SpanKey, String>,
     /// Per-call-site type substitutions: call-expression span → name → resolved
     /// type name (concrete struct/enum, or another generic param if the caller
     /// is itself generic and propagates the binding). Populated by `infer_call`
@@ -548,18 +548,18 @@ pub struct TypeChecker<'a> {
     /// zero-arg generic calls. Consumed by the interpreter at each call: it
     /// pushes the resolved frame so `T.method()` and bare-method calls inside
     /// the callee's body can look up `T`'s concrete binding.
-    call_type_subs: HashMap<SpanKey, HashMap<String, String>>,
+    pub(super) call_type_subs: HashMap<SpanKey, HashMap<String, String>>,
     /// Pattern-binding name → canonical type name. See the public copy on
     /// `TypeCheckResult` for the consumer doc.
-    pattern_binding_types: HashMap<SpanKey, String>,
+    pub(super) pattern_binding_types: HashMap<SpanKey, String>,
     /// Pattern-binding span → inner element `TypeExpr` for `Vec[T]` / `Slice[T]`
     /// bindings. Sibling to `pattern_binding_types`. See the public copy on
     /// `TypeCheckResult` for the full rationale (PB sibling slice 2026-05-09).
-    pattern_binding_inner_types: HashMap<SpanKey, TypeExpr>,
+    pub(super) pattern_binding_inner_types: HashMap<SpanKey, TypeExpr>,
     /// Internal mirror of the public table; written by `check_pattern_against`
     /// at every leaf-binding site (and at struct shorthand fields) when
     /// the scrutinee mode is non-Owned. Surfaced in `check()`.
-    pattern_binding_borrow_modes: HashMap<SpanKey, crate::ast::PatternBindingBorrow>,
+    pub(super) pattern_binding_borrow_modes: HashMap<SpanKey, crate::ast::PatternBindingBorrow>,
     /// Parallel to `pattern_binding_inner_types`, storing the raw `Type`
     /// (which may contain unresolved `Type::TypeVar`) captured at the
     /// recording site. After body inference completes, `finalize_pattern_
@@ -569,7 +569,7 @@ pub struct TypeChecker<'a> {
     /// VecDeque.new(); q.push_back(x);` writes the inner-type entry at
     /// the let site (where `?T0` is still unsolved), and the resulting
     /// `TypeKind::Error` strands codegen with the wrong element type.
-    pattern_binding_inner_unresolved: HashMap<SpanKey, Type>,
+    pub(super) pattern_binding_inner_unresolved: HashMap<SpanKey, Type>,
     /// Trait bounds for the generic parameters in the current enclosing scope
     /// (impl-level + function/method-level). Indexed by the param's textual
     /// name so it pairs naturally with `Type::TypeParam(name)`. Populated on
@@ -577,7 +577,7 @@ pub struct TypeChecker<'a> {
     /// the enclosing-generic-name list threaded through the lower / check
     /// path. Used to resolve bare `method(args)` calls at expected-type
     /// positions when the expected type is a generic param.
-    enclosing_bounds: HashMap<String, Vec<crate::ast::TraitBound>>,
+    pub(super) enclosing_bounds: HashMap<String, Vec<crate::ast::TraitBound>>,
     /// Name of the enclosing trait declaration when type-checking a default
     /// method body. Populated on entering `check_trait_def`, cleared on exit.
     /// Consumed by `dispatch_self_receiver_method` (slice 3.5 of the
@@ -588,13 +588,13 @@ pub struct TypeChecker<'a> {
     /// is `None` and `Self` falls through to the silent pre-existing path
     /// (impl-method bodies bind `Self` to the impl's target type via
     /// `current_self_type`, a different mechanism).
-    enclosing_trait: Option<String>,
+    pub(super) enclosing_trait: Option<String>,
     /// Closure expression span → reason that closure became once-callable.
     /// Populated by `closure_type_with_capture_inference` when the body walk
     /// finds a captured-non-Copy consume; consumed by `check_assignable` so
     /// `E_ONCE_FN_INTO_FN_SLOT` can name the consumed binding when a closure
     /// literal is rejected at a `Fn` slot. Round 12.45 (Step 3).
-    closure_once_reasons: HashMap<SpanKey, OnceReason>,
+    pub(super) closure_once_reasons: HashMap<SpanKey, OnceReason>,
 }
 
 /// Why a closure is `OnceFunction`-typed: which captured outer binding the
@@ -602,14 +602,14 @@ pub struct TypeChecker<'a> {
 /// the once-callability walker when it flips its first identifier-leaf in
 /// `Consuming` mode that resolves to an outer non-Copy binding.
 #[derive(Debug, Clone)]
-struct OnceReason {
+pub(super) struct OnceReason {
     /// The outer binding name (or `"self"`) that the closure body consumed.
-    consumed_binding: String,
+    pub(super) consumed_binding: String,
     /// The body span where the consume occurred (the identifier-leaf, not
     /// the enclosing call). Used for diagnostics; not currently surfaced in
     /// the rejection message but kept for future polish in Step 5.
     #[allow(dead_code)]
-    consumed_span: Span,
+    pub(super) consumed_span: Span,
 }
 
 impl<'a> TypeChecker<'a> {
