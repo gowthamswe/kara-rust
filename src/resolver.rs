@@ -619,20 +619,20 @@ fn visibility_allows_access(vis: Visibility, def_path: &[String], use_path: &[St
 // ── Resolver ────────────────────────────────────────────────────
 
 pub struct Resolver<'a> {
-    program: &'a Program,
+    pub(crate) program: &'a Program,
     /// Optional multi-module context. When set, `import` declarations are
     /// validated against the project-wide `ProgramTree`; when unset (single-
     /// file mode), imports are silently registered without cross-module
     /// lookup. CR-24 slice 5.
-    tree: Option<&'a ProgramTree>,
+    pub(crate) tree: Option<&'a ProgramTree>,
     /// The id of the module being resolved, used to exclude self from
     /// sibling-lookup diagnostics. Set iff `tree` is set.
-    current_module: Option<ModuleId>,
-    table: SymbolTable,
-    resolutions: HashMap<SpanKey, SymbolId>,
-    errors: Vec<ResolveError>,
+    pub(crate) current_module: Option<ModuleId>,
+    pub(crate) table: SymbolTable,
+    pub(crate) resolutions: HashMap<SpanKey, SymbolId>,
+    pub(crate) errors: Vec<ResolveError>,
     /// The target type name when inside an impl block.
-    current_impl_type: Option<String>,
+    pub(crate) current_impl_type: Option<String>,
     /// Stack of label-stack entries for validating `break` / `continue`
     /// targets. Each entry is `(name, kind)` where `name: Option<String>`
     /// is `None` for an unlabeled loop and `Some(label)` for a labeled
@@ -642,13 +642,13 @@ pub struct Resolver<'a> {
     /// reset to empty at each closure boundary (LB4 — labels are lexical
     /// to the function-body control flow; closure bodies cannot target
     /// outer labels).
-    loop_labels: Vec<(Option<String>, LabelKind)>,
+    pub(crate) loop_labels: Vec<(Option<String>, LabelKind)>,
     /// True iff the program being resolved is the synthetic stdlib package
     /// (baked into the compiler binary by CR-202 slice 3). When false,
     /// `#[compiler_builtin]` on any item is rejected with `E0237`. The flag
     /// has no other effect — name resolution semantics are otherwise
     /// identical between user code and stdlib source.
-    is_stdlib_source: bool,
+    pub(crate) is_stdlib_source: bool,
 }
 
 impl<'a> Resolver<'a> {
