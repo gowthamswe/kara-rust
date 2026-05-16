@@ -15,6 +15,7 @@ mod exec;
 mod helpers;
 mod iter_eval;
 mod method_call;
+mod method_call_http;
 mod method_call_iter;
 mod pattern_match;
 mod resource_method;
