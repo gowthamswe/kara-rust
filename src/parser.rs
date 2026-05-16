@@ -4458,7 +4458,10 @@ impl Parser {
             // Return
             Token::Return => {
                 self.advance();
-                let value = if !self.check(&Token::Semicolon) && !self.check(&Token::RightBrace) {
+                let value = if !self.check(&Token::Semicolon)
+                    && !self.check(&Token::RightBrace)
+                    && !self.check(&Token::Comma)
+                {
                     Some(Box::new(self.parse_expression()?))
                 } else {
                     None
@@ -4714,7 +4717,8 @@ impl Parser {
 
             self.expect(&Token::FatArrow)?;
 
-            let body = if self.check(&Token::LeftBrace) {
+            let body_is_block = self.check(&Token::LeftBrace);
+            let body = if body_is_block {
                 let block = self.parse_block()?;
                 Expr {
                     span: block.span.clone(),
@@ -4731,7 +4735,9 @@ impl Parser {
                 span: self.span_from(&arm_start),
             });
 
-            if !self.eat(&Token::Comma) {
+            // Comma is required after non-block arm bodies, optional after
+            // block-bodied arms (mirrors Rust's match arm grammar).
+            if !self.eat(&Token::Comma) && !body_is_block {
                 break;
             }
         }
@@ -5537,7 +5543,10 @@ impl Parser {
 
     /// Parse break arguments: `break [label] [expr]`
     fn parse_break_args(&mut self) -> (Option<String>, Option<Box<Expr>>) {
-        if self.check(&Token::Semicolon) || self.check(&Token::RightBrace) {
+        if self.check(&Token::Semicolon)
+            || self.check(&Token::RightBrace)
+            || self.check(&Token::Comma)
+        {
             return (None, None);
         }
         if let Token::Identifier { ref name, .. } = self.peek_token() {
@@ -5545,14 +5554,18 @@ impl Parser {
             let is_known_label = self.loop_labels.iter().any(|(n, _)| n == &name);
             if self.pos + 1 < self.tokens.len() {
                 let after = &self.tokens[self.pos + 1].token;
-                if is_known_label && matches!(after, Token::Semicolon | Token::RightBrace) {
-                    // `break label;` — known loop label, no value
+                if is_known_label
+                    && matches!(after, Token::Semicolon | Token::RightBrace | Token::Comma)
+                {
+                    // `break label;` / `break label,` — known loop label, no value
                     self.advance();
                     return (Some(name), None);
                 }
-                // `break label expr` — identifier NOT followed by ; or }
+                // `break label expr` — identifier NOT followed by ; , or }
                 // means label + value (only if it's a known label)
-                if is_known_label && !matches!(after, Token::Semicolon | Token::RightBrace) {
+                if is_known_label
+                    && !matches!(after, Token::Semicolon | Token::RightBrace | Token::Comma)
+                {
                     self.advance();
                     let value = self.parse_expression().map(Box::new);
                     return (Some(name), value);
