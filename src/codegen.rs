@@ -121,42 +121,42 @@ pub fn compile_to_object_with_options(
 
 // ── Codegen ────────────────────────────────────────────────────
 
-struct Codegen<'ctx> {
-    context: &'ctx Context,
-    module: Module<'ctx>,
-    builder: Builder<'ctx>,
+pub(super) struct Codegen<'ctx> {
+    pub(crate) context: &'ctx Context,
+    pub(crate) module: Module<'ctx>,
+    pub(crate) builder: Builder<'ctx>,
     /// Maps variable name → (alloca pointer, value type).
-    variables: HashMap<String, VarSlot<'ctx>>,
+    pub(crate) variables: HashMap<String, VarSlot<'ctx>>,
     /// Maps variable name → Kāra type name (for struct/enum field resolution).
-    var_type_names: HashMap<String, String>,
-    current_fn: Option<FunctionValue<'ctx>>,
-    printf_fn: FunctionValue<'ctx>,
+    pub(crate) var_type_names: HashMap<String, String>,
+    pub(crate) current_fn: Option<FunctionValue<'ctx>>,
+    pub(crate) printf_fn: FunctionValue<'ctx>,
     /// `int snprintf(char* buf, size_t n, const char* fmt, ...)` — used by f-string
     /// codegen to convert integers and floats to their decimal string forms.
-    snprintf_fn: FunctionValue<'ctx>,
+    pub(crate) snprintf_fn: FunctionValue<'ctx>,
     /// LLVM struct types for Kāra structs (struct name → LLVM type).
-    struct_types: HashMap<String, StructType<'ctx>>,
+    pub(crate) struct_types: HashMap<String, StructType<'ctx>>,
     /// Field names in declaration order (struct name → field names).
-    struct_field_names: HashMap<String, Vec<String>>,
+    pub(crate) struct_field_names: HashMap<String, Vec<String>>,
     /// Field type-names in declaration order (struct name → per-field
     /// user-type name, or `None` if the field's declared type isn't a
     /// path / isn't a known user struct). Used to recover the inner
     /// type of chained field accesses (`o.inner.name` requires knowing
     /// the type of `o.inner` to resolve `name`'s field index in
     /// `compile_field_access` / `field_index_for`).
-    struct_field_type_names: HashMap<String, Vec<Option<String>>>,
+    pub(crate) struct_field_type_names: HashMap<String, Vec<Option<String>>>,
     /// Enum layouts for tagged-union codegen (enum name → layout).
-    enum_layouts: HashMap<String, EnumLayout<'ctx>>,
+    pub(crate) enum_layouts: HashMap<String, EnumLayout<'ctx>>,
     /// Nested loop stack — innermost frame is last.
-    loop_stack: Vec<LoopFrame<'ctx>>,
+    pub(crate) loop_stack: Vec<LoopFrame<'ctx>>,
     // ── Generic monomorphization ──────────────────────────────────
     /// Generic function AST nodes keyed by name. Not compiled until instantiated.
-    generic_fns: HashMap<String, Function>,
+    pub(crate) generic_fns: HashMap<String, Function>,
     /// Already-generated monomorphizations (mangled name → done). Prevents duplicate codegen.
-    generated_monos: HashSet<String>,
+    pub(crate) generated_monos: HashSet<String>,
     /// Active type-parameter substitution during a monomorphization pass.
     /// Maps generic param name (e.g. `"T"`) → concrete LLVM type.
-    type_subst: HashMap<String, BasicTypeEnum<'ctx>>,
+    pub(crate) type_subst: HashMap<String, BasicTypeEnum<'ctx>>,
     /// Active const-parameter substitution during a monomorphization
     /// pass (const generics slice 4). Maps const-generic param name
     /// (e.g. `"N"`) → its bound `ConstValue`. Used by
@@ -168,40 +168,40 @@ struct Codegen<'ctx> {
     /// `compile_generic_call`'s mango-key mango step; slice 4
     /// extends the save/restore around `compile_mono_function` so the
     /// body lowering sees the same bindings.
-    const_subst: HashMap<String, crate::prelude::ConstValue>,
+    pub(crate) const_subst: HashMap<String, crate::prelude::ConstValue>,
     // ── Closure compilation ────────────────────────────────────────
     /// Monotonic counter used to generate unique closure function names.
-    closure_counter: u32,
+    pub(crate) closure_counter: u32,
     /// Monotonic counter for synthesized identifier names emitted by the
     /// indexed-receiver method-dispatch lowering (`__indexed_elem_<n>`).
     /// Each call site that lowers an `Index { object, index }` receiver
     /// allocates one synth name, registers it in the variable + element-type
     /// registries pointing into the outer container's storage, dispatches the
     /// method through the existing identifier path, and cleans up after.
-    indexed_elem_counter: u32,
+    pub(crate) indexed_elem_counter: u32,
     /// Maps local variable names that hold closure fat-pointers to their LLVM function type.
     /// Required for indirect calls: `build_indirect_call` needs the callee's function type.
-    closure_fn_types: HashMap<String, FunctionType<'ctx>>,
+    pub(crate) closure_fn_types: HashMap<String, FunctionType<'ctx>>,
     /// Staging slot — set by `compile_closure` so the surrounding `let` binding can record
     /// the function type under the newly bound name.
-    pending_closure_fn_type: Option<FunctionType<'ctx>>,
+    pub(crate) pending_closure_fn_type: Option<FunctionType<'ctx>>,
     /// Staging slot — caller-supplied LLVM types for a closure's parameters,
     /// consulted by `compile_closure` when the source has no type annotation
     /// to refine. Used by `Vec.sort_by` to push the element type into
     /// `|a, b|` closures so tuple receivers don't collapse to bare `i64`.
     /// Taken once and cleared on entry to `compile_closure`.
-    pending_closure_param_hints: Option<Vec<BasicTypeEnum<'ctx>>>,
+    pub(crate) pending_closure_param_hints: Option<Vec<BasicTypeEnum<'ctx>>>,
     // ── Shared types (RC) ─────────────────────────────────────────
     /// Shared type metadata (struct/enum name → heap layout info).
-    shared_types: HashMap<String, SharedTypeInfo<'ctx>>,
+    pub(crate) shared_types: HashMap<String, SharedTypeInfo<'ctx>>,
     /// malloc function for heap allocation.
-    malloc_fn: FunctionValue<'ctx>,
+    pub(crate) malloc_fn: FunctionValue<'ctx>,
     /// free function for heap deallocation.
-    free_fn: FunctionValue<'ctx>,
+    pub(crate) free_fn: FunctionValue<'ctx>,
     /// exit function for runtime panics.
-    exit_fn: FunctionValue<'ctx>,
+    pub(crate) exit_fn: FunctionValue<'ctx>,
     /// memcmp for string comparison.
-    memcmp_fn: FunctionValue<'ctx>,
+    pub(crate) memcmp_fn: FunctionValue<'ctx>,
     /// Local bindings that alias `vec_var.len()` — populated at let-sites of
     /// the form `let n = v.len()` where `v` is a Vec identifier in scope.
     /// Consulted by the bounds-check-elision pass when parsing while-guard
@@ -211,7 +211,7 @@ struct Codegen<'ctx> {
     /// Cleared / replaced as bindings shadow; the simple HashMap shape is
     /// load-bearing because tracked Vec names don't shadow each other in
     /// practice — refine to scope-keyed if a counter-example surfaces.
-    len_alias: HashMap<String, String>,
+    pub(crate) len_alias: HashMap<String, String>,
     /// Asserted bounds in the current emission scope — facts established
     /// by a dominating `while`-guard or `for`-range that the bounds-check
     /// emission can rely on. Each entry asserts one half of a Vec-index
@@ -219,40 +219,40 @@ struct Codegen<'ctx> {
     /// indexing site and elides the matching half of the bounds check.
     /// The stack discipline (push on body-entry, pop on body-exit) maps
     /// directly onto the source-level lexical scope of the guard.
-    asserted_index_bounds: Vec<AssertedIndexBound>,
+    pub(crate) asserted_index_bounds: Vec<AssertedIndexBound>,
     /// Per-variable Vec element type tracking (variable name → element LLVM type).
-    vec_elem_types: HashMap<String, BasicTypeEnum<'ctx>>,
+    pub(crate) vec_elem_types: HashMap<String, BasicTypeEnum<'ctx>>,
     /// Per-variable Slice element type tracking (variable name → element LLVM type).
     /// Entries only exist for values whose LLVM representation is the
     /// 2-field slice struct `{ptr, i64}`; used to dispatch indexing and
     /// iteration lowering.
-    slice_elem_types: HashMap<String, BasicTypeEnum<'ctx>>,
+    pub(crate) slice_elem_types: HashMap<String, BasicTypeEnum<'ctx>>,
     /// Variables that are ref parameters (name → inner LLVM type for dereferencing).
-    ref_params: HashMap<String, BasicTypeEnum<'ctx>>,
+    pub(crate) ref_params: HashMap<String, BasicTypeEnum<'ctx>>,
     /// SoA layout metadata (layout name → SoaLayout).
-    soa_layouts: HashMap<String, SoaLayout>,
+    pub(crate) soa_layouts: HashMap<String, SoaLayout>,
     /// Function parameter ref-ness (function name → vec of is_ref per param).
-    fn_param_ref: HashMap<String, Vec<bool>>,
+    pub(crate) fn_param_ref: HashMap<String, Vec<bool>>,
     /// Function parameter slice element type (function name → per-param
     /// Some(elem_ty) if that param is Slice[T] / mut Slice[T], else None).
     /// Used at call sites to emit Array → Slice and Vec → Slice coercions.
-    fn_param_slice_elem: HashMap<String, Vec<Option<BasicTypeEnum<'ctx>>>>,
+    pub(crate) fn_param_slice_elem: HashMap<String, Vec<Option<BasicTypeEnum<'ctx>>>>,
     /// Per-scope cleanup stack.  Each inner `Vec` is one scope frame; entries
     /// are emitted in reverse-push order at scope exit (innermost first).
-    scope_cleanup_actions: Vec<Vec<CleanupAction<'ctx>>>,
+    pub(crate) scope_cleanup_actions: Vec<Vec<CleanupAction<'ctx>>>,
     /// Set by `compile_match` when the scrutinee is a borrow-returning
     /// call (`Map.get`, `Vec.first`, ...) — used by `bind_pattern_values`
     /// to suppress `track_vec_var` for the bound name, since the payload
     /// aliases the container's storage and the container's own cleanup
     /// already covers the buffer.
-    pattern_binding_is_borrow: bool,
+    pub(crate) pattern_binding_is_borrow: bool,
     /// Phase 7.2 Slice DP — per-enum drop function cache (enum name →
     /// `__karac_drop_<EnumName>` `FunctionValue`). Lazily populated by
     /// `emit_enum_drop_switch` on first registration of a value-type
     /// enum binding via `track_enum_var`. One drop fn per enum type;
     /// reused across all registration sites for that type. Mirrors the
     /// existing `display_fn_cache` / `clone_fn_cache` lazy-synth pattern.
-    enum_drop_fns: HashMap<String, FunctionValue<'ctx>>,
+    pub(crate) enum_drop_fns: HashMap<String, FunctionValue<'ctx>>,
     /// Per-struct lazy drop-fn cache (struct name → `__karac_drop_struct_<Name>`
     /// `FunctionValue`). Lazily populated by `emit_struct_drop_synthesis` on
     /// first registration of a non-shared struct binding via `track_struct_var`.
@@ -261,14 +261,14 @@ struct Codegen<'ctx> {
     /// buffers + invokes `karac_map_free` on Map/Set handle fields. Structs
     /// with no heap-owning fields don't get an entry (the synthesis fn returns
     /// `None`) and don't reach `CleanupAction::StructDrop`.
-    struct_drop_fns: HashMap<String, FunctionValue<'ctx>>,
+    pub(crate) struct_drop_fns: HashMap<String, FunctionValue<'ctx>>,
     /// Cross-error-type conversion targets at `?` sites — populated from
     /// `Program.question_conversions` (set by the lowering pass from the
     /// typechecker's `question_conversions` map). Key: `(span.offset,
     /// span.length)` of the `?` expression. Value: target type name (e.g.
     /// `"AppError"`). When present, `compile_question` emits `Target.from(e)`
     /// against the inner err payload before the propagation early-return.
-    question_conversions: HashMap<(usize, usize), String>,
+    pub(crate) question_conversions: HashMap<(usize, usize), String>,
     /// Per-callee effectfulness side-table — populated from
     /// `Program.callee_effectful` (set by the cli pipeline after effectcheck).
     /// Key: callable's canonical name (free fn `name`, assoc/method
@@ -277,7 +277,7 @@ struct Codegen<'ctx> {
     /// to skip the cooperative cancel atomic load when we can prove the
     /// callee is non-observably-effectful. Absent callees are treated as
     /// potentially effectful (fall back to the conservative MVP behavior).
-    callee_effectful: HashMap<String, bool>,
+    pub(crate) callee_effectful: HashMap<String, bool>,
     /// Per-method-call → `Type.method` callee key side-table — populated
     /// from `Program.method_callee_types` (set by the lowering pass from
     /// `TypeCheckResult.expr_types`). Key: `(span.offset, span.length)` of
@@ -285,7 +285,7 @@ struct Codegen<'ctx> {
     /// usable as a lookup into `callee_effectful`. Lets
     /// `compile_method_call` apply the same narrowing that `compile_call`
     /// applies to free-function and `Type.assoc` calls.
-    method_callee_types: HashMap<(usize, usize), String>,
+    pub(crate) method_callee_types: HashMap<(usize, usize), String>,
     /// Per-pattern-binding surface type table — populated from
     /// `Program.pattern_binding_types` (set by the lowering pass from
     /// `TypeCheckResult.pattern_binding_types`). Key: pattern's
@@ -294,7 +294,7 @@ struct Codegen<'ctx> {
     /// payloads from the i64 word when the surface binding type is a
     /// struct, so subsequent `.field` access dispatches through the right
     /// struct shape.
-    pattern_binding_types: HashMap<(usize, usize), String>,
+    pub(crate) pattern_binding_types: HashMap<(usize, usize), String>,
     /// Sibling to `pattern_binding_types` carrying the inner element
     /// `TypeExpr` for `Vec[T]` / `Slice[T]` pattern bindings only. Populated
     /// from `Program.pattern_binding_inner_types`. Read by
@@ -305,7 +305,7 @@ struct Codegen<'ctx> {
     /// `xs[0]` / `xs.push(...)`) on a pattern-bound `Vec` / `Slice` payload
     /// routes through the right element-typed path. PB sibling slice
     /// (2026-05-09).
-    pattern_binding_inner_types: HashMap<(usize, usize), TypeExpr>,
+    pub(crate) pattern_binding_inner_types: HashMap<(usize, usize), TypeExpr>,
     /// Per-leaf-binding borrow mode populated from
     /// `Program.pattern_binding_borrow_modes`. Consumed by
     /// `bind_pattern_values` (Binding arm) to wrap a value-typed leaf
@@ -313,7 +313,8 @@ struct Codegen<'ctx> {
     /// alloca's address, registered in `ref_params` — so call sites
     /// expecting `ref T` / `mut ref T` receive the right ABI shape.
     /// Empty for owned bindings. Slice 3a, 2026-05-14.
-    pattern_binding_borrow_modes: HashMap<(usize, usize), crate::ast::PatternBindingBorrow>,
+    pub(crate) pattern_binding_borrow_modes:
+        HashMap<(usize, usize), crate::ast::PatternBindingBorrow>,
     /// Top-level `const NAME: T = value` declarations, populated by
     /// `compile_program` from `Item::ConstDecl` items before any function
     /// body is compiled. Key: const name. Value: the const's value
@@ -322,19 +323,19 @@ struct Codegen<'ctx> {
     /// expression at the use site, leaving constant folding to LLVM.
     /// Cycles are precluded upstream by the typechecker's const-evaluation
     /// pass (`check_const_decl`).
-    consts: HashMap<String, Expr>,
+    pub(crate) consts: HashMap<String, Expr>,
     /// Source filename threaded in from the CLI (`compile_to_object_with_options`
     /// / `compile_to_ir_with_options`). When `Some`, `emit_error_trace_push`
     /// emits a deduped global string and passes its `(ptr, len)` to the runtime
     /// so error-return traces print as `<file>:<line>:<col>`. `None` preserves
     /// the original `<line>:<col>` MVP output for callers that don't supply a
     /// filename (most tests, ad-hoc IR dumps).
-    source_filename: Option<String>,
+    pub(crate) source_filename: Option<String>,
     /// Memoized `(ptr, len)` for the global string materialized from
     /// `source_filename`. Populated lazily on first `?` site so we don't add
     /// an unused global to programs with no `?` propagation. Cleared on each
     /// `compile_program` entry alongside the other side-tables.
-    source_filename_global: Option<(PointerValue<'ctx>, u64)>,
+    pub(crate) source_filename_global: Option<(PointerValue<'ctx>, u64)>,
     /// Source text threaded in from the CLI (`compile_to_object_with_options`
     /// / `compile_to_ir_with_options` via `set_source_text`). When `Some`,
     /// `record_spawn_site` resolves each `par {}` block's byte offset to
@@ -343,13 +344,13 @@ struct Codegen<'ctx> {
     /// emits, just without source-position fidelity (most tests and ad-hoc
     /// IR dumps don't supply source text, and the `(line, col)` fields are
     /// strictly for the slice 5 / debugger surface).
-    source_text: Option<String>,
+    pub(crate) source_text: Option<String>,
     /// Symbols carrying `#[used]` collected during declaration. After the
     /// program is fully lowered, `emit_llvm_used` materializes them into the
     /// special `@llvm.used` appending-linkage global so the linker preserves
     /// each symbol even when nothing else references it. Order is preserved
     /// for stable IR output (helps snapshot tests and diffs).
-    used_symbols: Vec<FunctionValue<'ctx>>,
+    pub(crate) used_symbols: Vec<FunctionValue<'ctx>>,
     /// When compiling a par-branch function body, holds the LLVM pointer
     /// to the runtime's `AtomicBool` cancel flag (the second parameter
     /// passed by `karac_par_run`). `compile_call` reads this to emit a
@@ -360,46 +361,46 @@ struct Codegen<'ctx> {
     /// sends/receives) but the over-approximation is sound and avoids
     /// threading the `EffectCheckResult` through codegen for v1.
     /// `None` outside par branches.
-    branch_cancel_ptr: Option<PointerValue<'ctx>>,
+    pub(crate) branch_cancel_ptr: Option<PointerValue<'ctx>>,
     // ── RC-fallback bindings ──────────────────────────────────────
     /// Per-function RC-fallback binding names populated from `OwnershipCheckResult`.
     /// Function name → set of binding names that need heap-boxing + refcount.
-    rc_fallback_fns: HashMap<String, HashSet<String>>,
+    pub(crate) rc_fallback_fns: HashMap<String, HashSet<String>>,
     /// Per-function Arc-promoted binding names — the subset of `rc_fallback_fns`
     /// flagged by the ownership pass as crossing a `par {}` thread boundary.
     /// Inc/dec on these bindings emits atomic LLVM operations (`atomicrmw add` /
     /// `atomicrmw sub`, `SeqCst`); the rest stay on plain non-atomic load+arith+store.
     /// Allocation site is unchanged — the heap layout `{ refcount: i64, payload: T }`
     /// is identical for both flavors.
-    arc_fallback_fns: HashMap<String, HashSet<String>>,
+    pub(crate) arc_fallback_fns: HashMap<String, HashSet<String>>,
     /// Heap struct type for each active RC-fallback binding in the current function.
     /// Cleared at each `compile_function` call. Key: binding name.
-    rc_fallback_heap_types: HashMap<String, StructType<'ctx>>,
+    pub(crate) rc_fallback_heap_types: HashMap<String, StructType<'ctx>>,
     /// Per-function parallelization decisions populated from `ConcurrencyAnalysis`.
     /// Function name → `FunctionConcurrency` (parallel groups + total stmt count).
     /// Threaded in by `load_concurrency_analysis`; consumed in slice 2 by the
     /// auto-par lowering path that emits `karac_par_run` for inferred groups
     /// outside explicit `par {}` blocks. Empty when no analysis was supplied.
-    concurrency_decisions: HashMap<String, FunctionConcurrency>,
+    pub(crate) concurrency_decisions: HashMap<String, FunctionConcurrency>,
     /// Name of the function currently being compiled (for rc_fallback_fns lookup).
-    current_fn_name: String,
+    pub(crate) current_fn_name: String,
     // ── Par block runtime ─────────────────────────────────────────
     /// Monotonic counter used to generate unique par-branch function names.
     /// Also serves as the `SpawnSiteId` for each `par {}` block — the value
     /// at the time `emit_par_run` records a spawn site is the ID written
     /// into the `KARAC_SPAWN_SITES` metadata table (slice 3 of the
     /// Debugger Contract; see `SpawnSiteRecord`).
-    par_counter: u32,
+    pub(crate) par_counter: u32,
     /// Runtime struct `KaracBranch { ptr func, ptr ctx }` — shared across par blocks.
-    karac_branch_ty: StructType<'ctx>,
+    pub(crate) karac_branch_ty: StructType<'ctx>,
     /// Runtime entry point `void karac_par_run(const KaracBranch*, usize)`.
-    karac_par_run_fn: FunctionValue<'ctx>,
+    pub(crate) karac_par_run_fn: FunctionValue<'ctx>,
     // ── Debugger contract: SpawnSiteId metadata (slice 3) ─────────
     /// One entry per `par {}` block (explicit or inferred). Populated by
     /// `record_spawn_site`; emitted as the `KARAC_SPAWN_SITES` global by
     /// `emit_spawn_sites_metadata` at the end of compilation. The order
     /// matches `SpawnSiteId` order (entry 0 → ID 0, entry 1 → ID 1, …).
-    spawn_sites: Vec<SpawnSiteRecord>,
+    pub(crate) spawn_sites: Vec<SpawnSiteRecord>,
     /// Whether `KARAC_SPAWN_SITES` and friends emit populated. Driven by
     /// the `KARAC_RUNTIME_DEBUG_METADATA` env var read at `Codegen::new`
     /// time:
@@ -419,7 +420,7 @@ struct Codegen<'ctx> {
     /// `__par_branch_<id>_<i>` symbol names stay stable across the
     /// gate-on / gate-off boundary. See `phase-8-stdlib-floor.md`
     /// § Auto-Concurrency Codegen — Debugger Contract slice 3.
-    runtime_debug_metadata_enabled: bool,
+    pub(crate) runtime_debug_metadata_enabled: bool,
     /// Slice 6 (Parallax-lite workload) — when true,
     /// `compile_function_body` skips its parallel-group dispatch path
     /// entirely and falls through to plain sequential `compile_block`,
@@ -432,51 +433,51 @@ struct Codegen<'ctx> {
     /// v1, `KARAC_AUTO_PAR=0` is the only way to flip the gate. See
     /// `phase-8-stdlib-floor.md` § "Auto-Concurrency Codegen —
     /// Parallax-lite Workload".
-    auto_par_disabled: bool,
+    pub(crate) auto_par_disabled: bool,
     // ── Theme 6: `with_provider[R]` trait-method dispatch ──────────
     /// Resource name → stable u32 ID assigned at codegen init from the
     /// declaration order of `Item::EffectResource` items. The same
     /// integer flows through to runtime calls (`karac_provider_push`,
     /// `karac_provider_lookup`); the runtime is name-agnostic.
-    provider_resource_ids: HashMap<String, u32>,
+    pub(crate) provider_resource_ids: HashMap<String, u32>,
     /// Resource name → trait name for resources declared as
     /// `effect resource R: T`. Used to (1) drive vtable emission for
     /// the impls of `T` and (2) resolve method indices at `R.method(...)`
     /// call sites.
-    provider_resource_traits: HashMap<String, String>,
+    pub(crate) provider_resource_traits: HashMap<String, String>,
     /// Trait name → ordered method-name list (source-declaration order
     /// from the `trait T { ... }` block). Vtables for `impl T for U`
     /// store fn ptrs in this same order; method dispatch resolves the
     /// vtable index by `position()` against this list.
-    provider_trait_methods: HashMap<String, Vec<String>>,
+    pub(crate) provider_trait_methods: HashMap<String, Vec<String>>,
     /// (impl-target type name, trait name) → emitted vtable global.
     /// Populated after impl method declarations run in `compile_program`.
-    provider_vtables: HashMap<(String, String), GlobalValue<'ctx>>,
+    pub(crate) provider_vtables: HashMap<(String, String), GlobalValue<'ctx>>,
     /// Runtime extern: `karac_provider_push(frame_ptr, resource_id, data_ptr, vtable_ptr)`.
     /// Consumed by `with_provider[R]` lowering (sub-step 3).
-    karac_provider_push_fn: FunctionValue<'ctx>,
+    pub(crate) karac_provider_push_fn: FunctionValue<'ctx>,
     /// Runtime extern: `karac_provider_pop()`. Consumed by `with_provider[R]`
     /// lowering (sub-step 3) for the matching pop on body exit.
-    karac_provider_pop_fn: FunctionValue<'ctx>,
+    pub(crate) karac_provider_pop_fn: FunctionValue<'ctx>,
     /// Runtime extern: `karac_provider_lookup(resource_id) -> ProviderLookupResult`.
     /// Consumed by `R.method(...)` dispatch (sub-step 4) to find the
     /// active provider's data pointer and vtable.
-    karac_provider_lookup_fn: FunctionValue<'ctx>,
+    pub(crate) karac_provider_lookup_fn: FunctionValue<'ctx>,
     /// Runtime extern: `karac_provider_get_stack_head() -> *const ProviderFrame`.
     /// Consumed by par-block lowering (sub-step 5) to snapshot the
     /// calling thread's stack head into the par-block env-struct.
-    karac_provider_get_stack_head_fn: FunctionValue<'ctx>,
+    pub(crate) karac_provider_get_stack_head_fn: FunctionValue<'ctx>,
     /// Runtime extern: `karac_provider_set_stack_head(head)`. Consumed
     /// by par-branch fn prologues (sub-step 5) to seed each worker
     /// thread's TLS from the env-struct snapshot, so providers in
     /// scope at the par-block site stay visible inside spawned branches.
-    karac_provider_set_stack_head_fn: FunctionValue<'ctx>,
+    pub(crate) karac_provider_set_stack_head_fn: FunctionValue<'ctx>,
     /// LLVM struct type for `ProviderFrame { prev, resource_id, data, vtable }`
     /// — `#[repr(C)]` matches `runtime/src/lib.rs::ProviderFrame`. Consumed
     /// at `with_provider[R]` lowering sites for the alloca'd frame storage
     /// (sub-step 3); declared here so the type is established alongside
     /// the runtime extern declarations.
-    provider_frame_ty: StructType<'ctx>,
+    pub(crate) provider_frame_ty: StructType<'ctx>,
     /// LLVM struct type for `ProviderLookupResult { data, vtable }` —
     /// matches the runtime's `#[repr(C)]` shape. Used once at codegen
     /// init to type the `karac_provider_lookup` extern's return; after
@@ -486,14 +487,14 @@ struct Codegen<'ctx> {
     /// readers and as the canonical anchor if `ProviderLookupResult`'s
     /// shape ever changes.
     #[allow(dead_code)]
-    provider_lookup_result_ty: StructType<'ctx>,
+    pub(crate) provider_lookup_result_ty: StructType<'ctx>,
     // ── Map runtime ───────────────────────────────────────────────
     /// Per-variable Map key LLVM type (variable name → K LLVM type).
-    map_key_types: HashMap<String, BasicTypeEnum<'ctx>>,
+    pub(crate) map_key_types: HashMap<String, BasicTypeEnum<'ctx>>,
     /// Per-variable Map value LLVM type (variable name → V LLVM type).
-    map_val_types: HashMap<String, BasicTypeEnum<'ctx>>,
+    pub(crate) map_val_types: HashMap<String, BasicTypeEnum<'ctx>>,
     /// Per-variable Map key type name string (e.g. "i64", "String") for hash/eq fn selection.
-    map_key_type_names: HashMap<String, String>,
+    pub(crate) map_key_type_names: HashMap<String, String>,
     /// Per-variable element-`TypeExpr` side-table for collection variables —
     /// the *element* of a Vec/Slice/Array, or the *value* of a Map. Used by
     /// `compile_for_*_var` so for-loop bindings inherit the right side-table
@@ -501,27 +502,27 @@ struct Codegen<'ctx> {
     /// when the element is itself a Vec/String/Slice/Map. Without this,
     /// LLVM-type-only tracking can't distinguish `Vec[String]` from
     /// `Vec[Vec[T]]` (both store `vec_struct_type` as the element LLVM type).
-    var_elem_type_exprs: HashMap<String, TypeExpr>,
+    pub(crate) var_elem_type_exprs: HashMap<String, TypeExpr>,
     /// Per-Map-variable key-`TypeExpr` side-table (parallels
     /// `var_elem_type_exprs` for the key slot). Used by `compile_for_map_var`
     /// to register the per-iteration `k` binding when iterating with a tuple
     /// pattern `for (k, v) in m`.
-    map_key_type_exprs: HashMap<String, TypeExpr>,
+    pub(crate) map_key_type_exprs: HashMap<String, TypeExpr>,
     /// Per-variable Set element LLVM type (variable name → T LLVM type).
     /// Mirrors `map_key_types` — `Set[T]` lowers to `Map[T, ()]` at codegen,
     /// reusing the `karac_map_*` C runtime, but the surface type identity is
     /// kept distinct so codegen can pick the right method dispatch and the
     /// Display fn can pick the `Set{...}` brace style.
-    set_elem_types: HashMap<String, BasicTypeEnum<'ctx>>,
+    pub(crate) set_elem_types: HashMap<String, BasicTypeEnum<'ctx>>,
     /// Per-variable Set element type name string (e.g. `"i64"`, `"String"`)
     /// for hash/eq fn selection. Mirrors `map_key_type_names`.
-    set_elem_type_names: HashMap<String, String>,
+    pub(crate) set_elem_type_names: HashMap<String, String>,
     /// Per-variable Set element-`TypeExpr` side-table. Mirrors
     /// `map_key_type_exprs` and is consulted alongside it by Set-aware paths
     /// (`compile_for_set_var`, Set Display fn) so compound element types
     /// (`Set[(i64, String)]`, `Set[Vec[T]]`) compose through the
     /// TypeExpr-aware hash/eq/Display paths.
-    set_elem_type_exprs: HashMap<String, TypeExpr>,
+    pub(crate) set_elem_type_exprs: HashMap<String, TypeExpr>,
     /// Variables whose surface type is `String`. Disambiguates Strings from
     /// `Vec[u8]` at iteration time — both share the `{ptr, i64, i64}`
     /// physical layout and are both registered in `vec_elem_types` with
@@ -531,16 +532,16 @@ struct Codegen<'ctx> {
     /// `karac_string_decode_char` runtime helper; `for b in v` on a
     /// `Vec[u8]` iterates per byte. Populated alongside the existing
     /// `vec_elem_types` insertion at every String-registration site.
-    string_vars: HashSet<String>,
+    pub(crate) string_vars: HashSet<String>,
     /// HTTP handler ABI trampoline (2026-05-09): cache of per-handler-fn
     /// `extern "C"` shims. Key is the user handler's mangled fn name (e.g.
     /// `"handle"`); value is the synthesized shim function. Sharing the
     /// shim across multiple `Server.serve(handler)` calls in one program
     /// avoids redundant emission and keeps the IR stable. Pinned by
     /// `tests/codegen.rs::test_server_serve_handler_shim_caches`.
-    http_shim_cache: HashMap<String, FunctionValue<'ctx>>,
-    karac_map_new_fn: FunctionValue<'ctx>,
-    karac_map_free_fn: FunctionValue<'ctx>,
+    pub(crate) http_shim_cache: HashMap<String, FunctionValue<'ctx>>,
+    pub(crate) karac_map_new_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_free_fn: FunctionValue<'ctx>,
     /// `karac_map_free_with_drop_vec(map: ptr, drop_key: i32, drop_val: i32)`
     /// — `karac_map_free` variant that recursively drops per-entry
     /// Vec/String content before deallocating the bucket storage.
@@ -556,44 +557,44 @@ struct Codegen<'ctx> {
     /// `Map[String, Vec[U]]` / `Map[Vec[T], Vec[U]]` (both flags). The
     /// primitive-only `Map[i64, i64]` case stays on plain
     /// `karac_map_free` for zero overhead.
-    karac_map_free_with_drop_vec_fn: FunctionValue<'ctx>,
-    karac_map_insert_old_fn: FunctionValue<'ctx>,
-    karac_map_get_fn: FunctionValue<'ctx>,
-    karac_map_remove_old_fn: FunctionValue<'ctx>,
-    karac_map_contains_fn: FunctionValue<'ctx>,
-    karac_map_len_fn: FunctionValue<'ctx>,
-    karac_map_clear_fn: FunctionValue<'ctx>,
-    karac_map_iter_new_fn: FunctionValue<'ctx>,
-    karac_map_iter_next_fn: FunctionValue<'ctx>,
-    karac_map_iter_free_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_free_with_drop_vec_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_insert_old_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_get_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_remove_old_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_contains_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_len_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_clear_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_iter_new_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_iter_next_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_iter_free_fn: FunctionValue<'ctx>,
     /// `i64 karac_string_decode_char(*const u8 data, i64 len, i64 byte_offset, *mut u32 out_cp)`.
     /// Returns the byte offset after the decoded char and writes the
     /// codepoint through the out-param. Drives `for c in s` / `for c in
     /// s.chars()` lowering — see `compile_for_string_chars`.
-    karac_string_decode_char_fn: FunctionValue<'ctx>,
+    pub(crate) karac_string_decode_char_fn: FunctionValue<'ctx>,
     /// `karac_map_entry(map: ptr, key: ptr, out_slot_ptr: ptr) -> i1` —
     /// probe-and-insert-on-vacant. Used by entry chains whose terminal is
     /// `or_insert` / `or_insert_with` — codegen will write a default through
     /// the slot when occupied=false, so the runtime claims the bucket up
     /// front.
-    karac_map_entry_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_entry_fn: FunctionValue<'ctx>,
     /// `karac_map_lookup_slot(map: ptr, key: ptr, out_slot_ptr: ptr) -> i1`
     /// — read-only variant used by entry chains whose terminal is
     /// `and_modify`. The closure runs only when occupied=true; nothing is
     /// inserted on the Vacant path.
-    karac_map_lookup_slot_fn: FunctionValue<'ctx>,
+    pub(crate) karac_map_lookup_slot_fn: FunctionValue<'ctx>,
     /// `karac_string_clone(src: ptr, dst: ptr) -> void` — runtime helper
     /// for the codegen-emitted String case in `emit_clone_fn_for_type_expr`.
     /// Allocates a fresh buffer, copies len bytes, writes the new
     /// `{data, len, cap}` to `dst`. Static-literal sources (cap = 0) get
     /// a heap-owned copy so scope-exit cleanup fires; source untouched.
-    karac_string_clone_fn: FunctionValue<'ctx>,
+    pub(crate) karac_string_clone_fn: FunctionValue<'ctx>,
     /// Per-type clone function cache. Keyed on the canonical mangled type
     /// name (`display_mangle_te`). Each emitted fn has signature
     /// `void karac_clone_<typename>(*const T src, *mut T dst)` — caller
     /// provides both source and destination addresses, callee writes the
     /// cloned value into the destination slot. Mirror of `display_fn_cache`.
-    clone_fn_cache: HashMap<String, FunctionValue<'ctx>>,
+    pub(crate) clone_fn_cache: HashMap<String, FunctionValue<'ctx>>,
     /// Per-type Drop function cache. Keyed by the canonical type name
     /// (e.g. `"i64"`, `"String"`, `"Vec_i64"`, `"Map_String_i64"`). Each
     /// emitted fn has signature `void karac_drop_<typename>(*mut T)` and
@@ -610,7 +611,7 @@ struct Codegen<'ctx> {
     /// "Monomorphized collections" entry). The framework is foundation;
     /// it has no production caller until the consumer lands.
     #[allow(dead_code)]
-    drop_fn_cache: HashMap<String, FunctionValue<'ctx>>,
+    pub(crate) drop_fn_cache: HashMap<String, FunctionValue<'ctx>>,
     /// Per-(K, V) cache of monomorphized `Map[K, V]` method symbols.
     /// Keyed by the mangled `"{key_mangle}_{val_mangle}"` token (e.g.
     /// `"i64_i64"`) produced by `mono_map_cache_key`. Lazily populated
@@ -621,7 +622,7 @@ struct Codegen<'ctx> {
     /// the gating predicate `should_use_mono_map_for` returns `false`
     /// for every other K/V tuple, leaving them on the erased fallback
     /// per § 3.6.
-    map_mono_methods: HashMap<String, MapMonoMethods<'ctx>>,
+    pub(crate) map_mono_methods: HashMap<String, MapMonoMethods<'ctx>>,
     /// Per-type Display function cache. Keyed by the canonical type name
     /// (e.g. `"i64"`, `"String"`, `"Vec_i64"`, `"Map_String_i64"`). Each
     /// emitted fn has signature `void karac_display_<typename>(ptr)` and
@@ -635,17 +636,17 @@ struct Codegen<'ctx> {
     /// 3-7 which add the callers (Vec/Map/Set/Tuple Display fns + the
     /// `compile_print` integration). Remove the allow when subtask 7 lands.
     #[allow(dead_code)]
-    display_fn_cache: HashMap<String, FunctionValue<'ctx>>,
+    pub(crate) display_fn_cache: HashMap<String, FunctionValue<'ctx>>,
     // ── Error return trace runtime ────────────────────────────────
     /// `void karac_error_trace_push(ptr file, i64 file_len, i32 line, i32 col)`.
     /// Called by `compile_question` at each `?` failure block before
     /// `emit_scope_cleanup`. The runtime maintains a thread-local depth-64
     /// ring buffer; an atexit handler prints it to stderr at program exit.
-    karac_error_trace_push_fn: FunctionValue<'ctx>,
+    pub(crate) karac_error_trace_push_fn: FunctionValue<'ctx>,
     /// `void karac_error_trace_clear()`. Emitted at every `?` success site
     /// so a recovered earlier propagation doesn't leak frames into a later
     /// failure.
-    karac_error_trace_clear_fn: FunctionValue<'ctx>,
+    pub(crate) karac_error_trace_clear_fn: FunctionValue<'ctx>,
     /// Lazily-initialized `TargetData` consumed by the layout-introspection
     /// intrinsics (`align_of[T]()`, `offset_of[T](field)`). Constructed
     /// via `create_target_machine().get_target_data()` on first use; the
@@ -653,7 +654,7 @@ struct Codegen<'ctx> {
     /// host-target initialization pulls in `Target::initialize_native`,
     /// which we want to avoid in the (common) path where no layout
     /// intrinsic is invoked.
-    target_data: Option<TargetData>,
+    pub(crate) target_data: Option<TargetData>,
 }
 
 impl<'ctx> Codegen<'ctx> {

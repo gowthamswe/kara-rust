@@ -20,9 +20,9 @@ use inkwell::values::{FunctionValue, IntValue, PointerValue};
 // ── Variable slot: pointer + LLVM type for typed loads ─────────
 
 #[derive(Clone, Copy)]
-pub(super) struct VarSlot<'ctx> {
-    pub(super) ptr: PointerValue<'ctx>,
-    pub(super) ty: BasicTypeEnum<'ctx>,
+pub(crate) struct VarSlot<'ctx> {
+    pub(crate) ptr: PointerValue<'ctx>,
+    pub(crate) ty: BasicTypeEnum<'ctx>,
 }
 
 /// Resolved view of a slice-pattern scrutinee (`Array[T, N]`, `Vec[T]`,
@@ -30,11 +30,11 @@ pub(super) struct VarSlot<'ctx> {
 /// and `len` is the runtime element count as i64. `mutable` mirrors the
 /// source's mutability for `Slice` rest-binding header construction.
 #[derive(Clone, Copy)]
-pub(super) struct SliceSource<'ctx> {
-    pub(super) data_ptr: PointerValue<'ctx>,
-    pub(super) len: IntValue<'ctx>,
-    pub(super) elem_ty: BasicTypeEnum<'ctx>,
-    pub(super) mutable: bool,
+pub(crate) struct SliceSource<'ctx> {
+    pub(crate) data_ptr: PointerValue<'ctx>,
+    pub(crate) len: IntValue<'ctx>,
+    pub(crate) elem_ty: BasicTypeEnum<'ctx>,
+    pub(crate) mutable: bool,
 }
 
 // ── Shared type (RC) layout ────────────────────────────────────
@@ -43,14 +43,14 @@ pub(super) struct SliceSource<'ctx> {
 /// Heap layout for structs: `{ i64 refcount, field0, field1, … }`
 /// Heap layout for enums:   `{ i64 refcount, i64 tag, i64 word0, … }`
 #[derive(Clone)]
-pub(super) struct SharedTypeInfo<'ctx> {
+pub(crate) struct SharedTypeInfo<'ctx> {
     /// The LLVM struct type for the heap object (includes refcount header).
-    pub(super) heap_type: StructType<'ctx>,
+    pub(crate) heap_type: StructType<'ctx>,
     /// Field names in declaration order (structs only; empty for enums).
     #[allow(dead_code)]
-    pub(super) field_names: Vec<String>,
+    pub(crate) field_names: Vec<String>,
     /// true if this is a shared enum (vs shared struct).
-    pub(super) is_enum: bool,
+    pub(crate) is_enum: bool,
 }
 
 // ── Enum variant layout ─────────────────────────────────────────
@@ -65,7 +65,7 @@ pub(super) struct SharedTypeInfo<'ctx> {
 /// nested user-struct payloads — the last one is the v1 carve-out, see
 /// the slice's *Out of scope* paragraph and the optional test 7).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum EnumDropKind {
+pub(crate) enum EnumDropKind {
     /// No cleanup — primitive, slice (no ownership), RC-pointer (handled
     /// by the shared-type RC machinery), or v1-carved-out nested struct.
     None,
@@ -79,16 +79,16 @@ pub(super) enum EnumDropKind {
 /// Representation: `{ i64 tag, i64 word_0, ..., i64 word_N }`.
 /// All payload words are stored as i64 (signed-extended / reinterpreted).
 #[derive(Clone)]
-pub(super) struct EnumLayout<'ctx> {
+pub(crate) struct EnumLayout<'ctx> {
     /// The LLVM struct type for all instances of this enum.
-    pub(super) llvm_type: StructType<'ctx>,
+    pub(crate) llvm_type: StructType<'ctx>,
     /// variant name → discriminant tag (0, 1, 2, …)
-    pub(super) tags: HashMap<String, u64>,
+    pub(crate) tags: HashMap<String, u64>,
     /// variant name → number of source-position payload fields. Preserved
     /// verbatim from `VariantKind::Tuple(tys).len()` / `Struct(fields).len()`
     /// so existing pattern-binding code that counts source fields keeps
     /// working unchanged.
-    pub(super) field_counts: HashMap<String, usize>,
+    pub(crate) field_counts: HashMap<String, usize>,
     /// Compound-payload enum codegen (Phase 7.2 Slice CP) — per-variant
     /// per-field word range in the unified payload area. Each variant's
     /// vec entry has one `(start_word, num_words)` pair per source field
@@ -99,7 +99,7 @@ pub(super) struct EnumLayout<'ctx> {
     /// streams instead of single-i64-coerced collapse, and by
     /// destructure (`bind_pattern_values` `TupleVariant` arm) to read
     /// each field's word range and reconstruct the original aggregate.
-    pub(super) field_word_offsets: HashMap<String, Vec<(usize, usize)>>,
+    pub(crate) field_word_offsets: HashMap<String, Vec<(usize, usize)>>,
     /// Phase 7.2 Slice DP — drop-path classification per source field.
     /// Same shape as `field_word_offsets`: variant name → vec of
     /// per-field `EnumDropKind` (declaration order). Read by
@@ -107,48 +107,48 @@ pub(super) struct EnumLayout<'ctx> {
     /// require destructor invocations at scope exit. `None` for every
     /// field of a variant means the variant's cleanup BB short-circuits
     /// to `ret void` without emitting any work.
-    pub(super) field_drop_kinds: HashMap<String, Vec<EnumDropKind>>,
+    pub(crate) field_drop_kinds: HashMap<String, Vec<EnumDropKind>>,
     /// Whether this enum is a `shared enum` (RC heap-allocated). When
     /// true, the layout's value-type drop machinery is dormant — RC
     /// inc/dec via `track_rc_var` handles cleanup through refcount
     /// semantics. The DP slice's `track_enum_var` registration site
     /// guards on `!is_shared` per design lock DP3.
-    pub(super) is_shared: bool,
+    pub(crate) is_shared: bool,
 }
 
 // ── SoA layout metadata ─────────────────────────────────────────
 
 /// Metadata for a single group in a SoA layout.
 #[derive(Clone, Debug)]
-pub(super) struct SoaGroup {
+pub(crate) struct SoaGroup {
     #[allow(dead_code)]
-    pub(super) name: String,
+    pub(crate) name: String,
     #[allow(dead_code)]
-    pub(super) fields: Vec<String>,
+    pub(crate) fields: Vec<String>,
     /// Index of each field in the original struct's field list.
-    pub(super) field_indices: Vec<usize>,
+    pub(crate) field_indices: Vec<usize>,
     #[allow(dead_code)]
-    pub(super) elem_type: Option<StructType<'static>>,
+    pub(crate) elem_type: Option<StructType<'static>>,
     /// Optional `align(N)` — N is a power-of-two byte alignment for the group's backing array.
-    pub(super) align: Option<u32>,
+    pub(crate) align: Option<u32>,
     #[allow(dead_code)]
-    pub(super) is_cold: bool,
+    pub(crate) is_cold: bool,
 }
 
 /// Full SoA layout for a named collection.
 #[derive(Clone, Debug)]
-pub(super) struct SoaLayout {
+pub(crate) struct SoaLayout {
     #[allow(dead_code)]
-    pub(super) name: String,
+    pub(crate) name: String,
     /// Element struct name (e.g., "Entity").
-    pub(super) struct_name: String,
+    pub(crate) struct_name: String,
     /// Hot groups in declaration order (excludes the cold group).
-    pub(super) groups: Vec<SoaGroup>,
+    pub(crate) groups: Vec<SoaGroup>,
     /// Optional cold group (separate allocation, appended after all hot group pointers).
-    pub(super) cold_group: Option<SoaGroup>,
+    pub(crate) cold_group: Option<SoaGroup>,
     /// Number of hot groups (including implicit trailing group for unassigned fields).
     /// Does NOT include the cold group — the cold pointer is always last in the struct.
-    pub(super) num_groups: usize,
+    pub(crate) num_groups: usize,
 }
 
 // ── Scope cleanup action ────────────────────────────────────────
@@ -156,7 +156,7 @@ pub(super) struct SoaLayout {
 /// Tagged kind for per-scope destructor actions emitted at scope exit.
 /// The `scope_cleanup_actions` stack holds one `Vec` per scope frame;
 /// each frame accumulates these in push order and drains in reverse.
-pub(super) enum CleanupAction<'ctx> {
+pub(crate) enum CleanupAction<'ctx> {
     /// Decrement the refcount of a `shared struct` value.
     RcDec {
         /// Variable name — used to reload the current pointer value in case
@@ -273,17 +273,17 @@ pub(super) enum CleanupAction<'ctx> {
 /// store is effectively a bitcopy and the parent's subsequent
 /// `track_*` on the loaded value is the unique cleanup owner).
 #[derive(Clone)]
-pub(super) struct ReturnSlot<'ctx> {
+pub(crate) struct ReturnSlot<'ctx> {
     /// Source-level binding name produced inside the branch.
-    pub(super) binding_name: String,
+    pub(crate) binding_name: String,
     /// Position of the statement in the group's branch order — also the
     /// branch index passed to `emit_par_branch_fn`. Slot-writes inside
     /// the branch are gated on this index.
-    pub(super) branch_index: usize,
+    pub(crate) branch_index: usize,
     /// LLVM scalar/aggregate type for this slot's field. Matches what
     /// the branch's `compile_stmt` produces for the let-binding's value
     /// (derived from explicit annotation or call-target return type).
-    pub(super) llvm_ty: BasicTypeEnum<'ctx>,
+    pub(crate) llvm_ty: BasicTypeEnum<'ctx>,
 }
 
 /// Per-element predicate driving `emit_set_op_iter` (`Set.union` /
@@ -291,7 +291,7 @@ pub(super) struct ReturnSlot<'ctx> {
 /// element; the other two consult `karac_map_contains` against the named
 /// other-set handle and either insert on hit or on miss.
 #[derive(Clone, Copy)]
-pub(super) enum SetOpFilter<'ctx> {
+pub(crate) enum SetOpFilter<'ctx> {
     Always,
     ContainsIn(PointerValue<'ctx>),
     NotContainsIn(PointerValue<'ctx>),
@@ -311,24 +311,24 @@ pub(super) enum SetOpFilter<'ctx> {
 /// Reads at the four `compile_break` / `compile_continue` sites use
 /// `.last().cloned()` instead of `.copied()`.
 #[derive(Clone)]
-pub(super) struct LoopFrame<'ctx> {
+pub(crate) struct LoopFrame<'ctx> {
     /// Source-level label of this frame, or `None` for unlabeled loops.
     /// Set from the loop AST node's `label: Option<String>` field for
     /// loops, and from `ExprKind::LabeledBlock { label, .. }` for blocks.
-    pub(super) label: Option<String>,
+    pub(crate) label: Option<String>,
     /// Block to branch to on `continue`. For labeled blocks this is a
     /// freshly-created `lblock.continue.unreachable` BB whose body is a
     /// single `unreachable` instruction — the resolver rejects
     /// `continue label` referring to a labeled-block label, so this BB
     /// is never reached at runtime; the field stays uniform to avoid
     /// splitting `LoopFrame` into a `LoopOrBlockFrame` enum.
-    pub(super) continue_bb: BasicBlock<'ctx>,
+    pub(crate) continue_bb: BasicBlock<'ctx>,
     /// Block to branch to on `break` (loop / labeled-block exit).
-    pub(super) break_bb: BasicBlock<'ctx>,
+    pub(crate) break_bb: BasicBlock<'ctx>,
     /// Optional alloca for `break value`. For labeled blocks the slot is
     /// always `Some` and stores both the body's tail value (on normal
     /// fall-through) and any `break label expr` value (on early exit).
-    pub(super) result_slot: Option<PointerValue<'ctx>>,
+    pub(crate) result_slot: Option<PointerValue<'ctx>>,
 }
 
 /// One half of a Vec-index safety fact, asserted by a dominating
@@ -341,7 +341,7 @@ pub(super) struct LoopFrame<'ctx> {
 /// us drop one or both halves when the source-level guard already
 /// proves them.
 #[derive(Debug, Clone)]
-pub(super) enum AssertedIndexBound {
+pub(crate) enum AssertedIndexBound {
     /// `idx_var >= 0` is known true in the current scope. Elides the
     /// negative-idx half of the bounds check on `vec[idx_var]` regardless
     /// of which Vec is being indexed (the lower bound doesn't depend on
@@ -381,20 +381,20 @@ pub(super) enum AssertedIndexBound {
 /// - the still-future `std.panic` crash report
 ///   (`design.md § Crash Report Format`) reads them for the
 ///   `parallel_context` field.
-pub(super) struct SpawnSiteRecord {
+pub(crate) struct SpawnSiteRecord {
     /// Stable per-binary `SpawnSiteId`. Equal to the `par_counter` value
     /// at the time the record was minted; the same value is used to name
     /// the par-branch functions (`__par_branch_<id>_<i>`).
-    pub(super) id: u32,
+    pub(crate) id: u32,
     /// Source filename. Empty when `Codegen::source_filename` was not
     /// threaded in (most tests, ad-hoc IR dumps).
-    pub(super) file: String,
+    pub(crate) file: String,
     /// 1-indexed line of the par-block keyword (or first stmt of an
     /// inferred group), per `crate::byte_offset_to_line_col`.
-    pub(super) line: u32,
+    pub(crate) line: u32,
     /// 1-indexed column of the par-block keyword (or first stmt of an
     /// inferred group), per `crate::byte_offset_to_line_col`.
-    pub(super) col: u32,
+    pub(crate) col: u32,
     /// Static branch count (number of stmts in the block at codegen
     /// time). `None` would indicate "unknown"; v1's runtime spawns one
     /// OS thread per branch (`karac_par_run` in `runtime/src/lib.rs`),
@@ -407,7 +407,7 @@ pub(super) struct SpawnSiteRecord {
     /// field) and a separate dynamic "currently active workers"
     /// surface from the runtime. Defer the decision; the field name
     /// captures the static-source intent.
-    pub(super) worker_count: Option<u32>,
+    pub(crate) worker_count: Option<u32>,
 }
 
 /// Per-(K, V) cache of monomorphized `Map[K, V]` method symbols.
@@ -435,9 +435,9 @@ pub(super) struct SpawnSiteRecord {
 /// fully-inlined LLVM bodies (direct i64 hash + icmp eq, no extern
 /// call) and locks the bench gain.
 #[derive(Copy, Clone)]
-pub(super) struct MapMonoMethods<'ctx> {
+pub(crate) struct MapMonoMethods<'ctx> {
     /// `i64 karac_map_<keymangle>_<valmangle>_len(map: ptr)`.
-    pub(super) len_fn: FunctionValue<'ctx>,
+    pub(crate) len_fn: FunctionValue<'ctx>,
     /// `i1 karac_map_<keymangle>_<valmangle>_insert_old(map: ptr,
     /// key: K, val: V, out_old_val: ptr)`. Slice 1b.2a ships a
     /// slow-path-only body that delegates to the erased
@@ -445,12 +445,12 @@ pub(super) struct MapMonoMethods<'ctx> {
     /// slots; Slice 1b.2b adds the inline fast-path (load-factor
     /// check + inline hash + probe loop + inline eq) that unlocks
     /// the bench gain.
-    pub(super) insert_old_fn: FunctionValue<'ctx>,
+    pub(crate) insert_old_fn: FunctionValue<'ctx>,
     /// `i1 karac_map_<keymangle>_<valmangle>_get(map: ptr,
     /// key: K, out_val: ptr)`. Slice 1b.3 lands the inline-probe
     /// body — no load-factor branch (get never resizes), no
     /// tombstone-tracking PHI; just hash + probe + i64 eq + val
     /// load on match. Mirrors the `KaracMap::lookup` /
     /// `KaracMap::get` shape from `runtime/src/map.rs`.
-    pub(super) get_fn: FunctionValue<'ctx>,
+    pub(crate) get_fn: FunctionValue<'ctx>,
 }
