@@ -33,25 +33,25 @@ pub use value::{ErrorTraceFrame, RuntimeError, TestOutcome, Value};
 // ── Interpreter ─────────────────────────────────────────────────
 
 pub struct Interpreter<'a> {
-    program: &'a Program,
+    pub(crate) program: &'a Program,
     #[allow(dead_code)]
-    typecheck_result: &'a TypeCheckResult,
-    env: Env,
+    pub(crate) typecheck_result: &'a TypeCheckResult,
+    pub(crate) env: Env,
     /// Captured output for testing (when Some, print/println write here instead of stdout)
     pub captured_output: Option<Vec<String>>,
     /// Pending control flow signal (return/break/continue)
-    pending_cf: Option<ControlFlow>,
+    pub(crate) pending_cf: Option<ControlFlow>,
     /// Runtime effect tracking: records effects performed during execution
     pub tracked_effects: Vec<String>,
     /// Tracks variables that have been moved (ownership simulation)
     #[allow(dead_code)]
-    moved_vars: std::collections::HashSet<String>,
+    pub(crate) moved_vars: std::collections::HashSet<String>,
     /// Error return trace: ring buffer of (file, line, expr_text) for ? propagation
-    error_trace: Vec<ErrorTraceFrame>,
+    pub(crate) error_trace: Vec<ErrorTraceFrame>,
     /// Whether oldest entries were dropped from the trace ring buffer
-    error_trace_truncated: bool,
+    pub(crate) error_trace_truncated: bool,
     /// Source filename for error trace frames
-    source_filename: String,
+    pub(crate) source_filename: String,
     /// When true, par {} blocks execute sequentially (--sequential mode)
     pub sequential_mode: bool,
     /// User-triggered runtime errors collected during execution. Populated by
@@ -68,19 +68,19 @@ pub struct Interpreter<'a> {
     /// The base frame (index 0) holds defaults for ambient program-rooted
     /// resources (planted by a later CR); the tree-walk interpreter is
     /// single-threaded so all frames live on one stack.
-    provider_stack: Vec<HashMap<String, Arc<Value>>>,
+    pub(crate) provider_stack: Vec<HashMap<String, Arc<Value>>>,
     /// Names of `effect resource` declarations in the program, collected
     /// at [`register_items`] time. Used by [`eval_method_call`] to detect
     /// receivers of the form `UserDB.query(...)` — where `UserDB` is not
     /// a value binding — and dispatch via the provider stack instead of
     /// normal method lookup.
-    effect_resources: HashSet<String>,
+    pub(crate) effect_resources: HashSet<String>,
     /// Xorshift64 state backing the default `RandomSource` provider.
     /// Seeded once per [`Interpreter::new`] from the system clock's
     /// sub-second nanoseconds so repeated `cargo test` runs see fresh
     /// sequences. `with_provider[RandomSource](Fake…)` shadows this
     /// entirely; determinism-sensitive tests must opt in via a fake.
-    rand_state: u64,
+    pub(crate) rand_state: u64,
     /// Per-call frame of generic-param substitutions: name → concrete type
     /// name. Pushed at every generic call (using
     /// `TypeCheckResult.call_type_subs` keyed by call span); popped on
@@ -89,7 +89,7 @@ pub struct Interpreter<'a> {
     /// impl to dispatch to. Outer-frame entries are visible (transitive
     /// resolution: a callee's `T → "U"` where `U` is itself a generic param
     /// of the caller resolves via the next frame down).
-    type_subs_stack: Vec<HashMap<String, String>>,
+    pub(crate) type_subs_stack: Vec<HashMap<String, String>>,
     /// `par {}` shared cancellation flag. Set by `eval_par_block` on
     /// each branch interpreter; observed by `eval_block_inner` between
     /// top-level statements as a minimal effect-boundary check. When
@@ -97,7 +97,7 @@ pub struct Interpreter<'a> {
     /// which classifies as `ExitPath::Cancelled(sentinel)` so any
     /// `errdefer(e)` in the active scope binds `e` to the sentinel
     /// during the errdefer phase. None outside `par {}` branches.
-    cancel_flag: Option<Arc<AtomicBool>>,
+    pub(crate) cancel_flag: Option<Arc<AtomicBool>>,
     /// Records the order in which `CleanupAction::Drop` slots fire —
     /// both NLL early-drops (mid-block, after a binding's last use)
     /// and scope-exit drops drained from the unified cleanup stack.
@@ -113,12 +113,12 @@ pub struct Interpreter<'a> {
     /// (structured mode). Empty until [`set_source_text`] is called by
     /// the CLI; tests may leave it empty in which case `dbg()` falls
     /// back to a placeholder.
-    source_text: String,
+    pub(crate) source_text: String,
     /// Format mode for `dbg()` output. `Terminal` (default) prints a
     /// human-readable line; `Json` prints a single JSON object per
     /// call. Selected by the CLI based on `--output=…`. See design.md
     /// § dbg() — Output formats.
-    dbg_output_mode: DbgOutputMode,
+    pub(crate) dbg_output_mode: DbgOutputMode,
     /// Per-task identifier for `dbg()` tagging in `par {}` regions.
     /// `None` outside `par {}`; `Some(N)` inside a branch. Allocated
     /// from `task_id_counter` on branch entry; nested `par {}` inside
@@ -128,7 +128,7 @@ pub struct Interpreter<'a> {
     /// Shared monotonic counter for `par {}` task ids. Cloned across
     /// every branch interpreter so nested `par {}` regions allocate
     /// from the same sequence.
-    task_id_counter: Arc<AtomicU64>,
+    pub(crate) task_id_counter: Arc<AtomicU64>,
     /// Test-only capture buffer for `dbg()` output. When `Some`,
     /// `eval_builtin_dbg` pushes its formatted line here instead of
     /// writing to stderr. Tests inspect this to assert the exact

@@ -14,7 +14,7 @@ use super::helpers::value_compare;
 
 // ── Error Return Trace ─────────────────────────────────────────
 
-pub(super) const ERROR_TRACE_MAX_DEPTH: usize = 64;
+pub(crate) const ERROR_TRACE_MAX_DEPTH: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ErrorTraceFrame {
@@ -779,7 +779,7 @@ impl std::fmt::Display for Value {
 /// point. The `source_label` is best-effort context — derived from the
 /// active expression's place-expression root when available, else
 /// `"<value>"`.
-pub(super) fn try_write_or_panic<'a>(
+pub(crate) fn try_write_or_panic<'a>(
     storage: &'a Arc<RwLock<Vec<Value>>>,
     source_label: &str,
 ) -> std::sync::RwLockWriteGuard<'a, Vec<Value>> {
@@ -796,7 +796,7 @@ pub(super) fn try_write_or_panic<'a>(
 /// constants share `Value::Int(i64)`; both float widths share
 /// `Value::Float(f64)`. The codegen path uses the same `ConstValue`
 /// table but emits the correct LLVM constant width per variant.
-pub(super) fn primitive_const_to_value(cv: &crate::prelude::ConstValue) -> Value {
+pub(crate) fn primitive_const_to_value(cv: &crate::prelude::ConstValue) -> Value {
     use crate::prelude::ConstValue::*;
     match cv {
         I8(v) => Value::Int(*v as i64),
@@ -964,7 +964,7 @@ impl Value {
 /// for use in `Value::SharedStruct` PartialEq. Two weaks are equal iff
 /// they point at the same allocation (`Arc::ptr_eq` after upgrade) or
 /// both are dangling. A dangling weak is never equal to a live one.
-pub(super) fn weak_referent_eq(
+pub(crate) fn weak_referent_eq(
     a: &std::sync::Weak<SharedStructInner>,
     b: &std::sync::Weak<SharedStructInner>,
 ) -> bool {
@@ -981,7 +981,7 @@ pub(super) fn weak_referent_eq(
 /// bumps the strong RC), or `None` if every strong holder has been
 /// dropped. Used at every `weak`-field read site and any `.upgrade()`
 /// dispatch.
-pub(super) fn upgrade_weak_to_option(weak: &std::sync::Weak<SharedStructInner>) -> Value {
+pub(crate) fn upgrade_weak_to_option(weak: &std::sync::Weak<SharedStructInner>) -> Value {
     match weak.upgrade() {
         Some(arc) => Value::EnumVariant {
             enum_name: "Option".to_string(),

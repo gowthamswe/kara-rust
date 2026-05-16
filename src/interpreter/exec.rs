@@ -21,7 +21,7 @@ use super::value::{EnumData, Value};
 
 /// Signals for non-local control flow (return, break, continue, exit).
 #[derive(Debug)]
-pub(super) enum ControlFlow {
+pub(crate) enum ControlFlow {
     Return(Value),
     Break {
         label: Option<String>,
@@ -47,14 +47,14 @@ pub(super) enum ControlFlow {
     Cancelled,
 }
 
-pub(super) type EvalResult = Result<Value, ControlFlow>;
+pub(crate) type EvalResult = Result<Value, ControlFlow>;
 
 // ── Unified drop+defer cleanup stack ────────────────────────────
 
 /// One entry in a block's unified drop+defer cleanup stack. Per
 /// design.md § Drop ordering within a branch, destructors and
 /// `defer` blocks interleave in a single program-order LIFO stack.
-pub(super) enum CleanupAction {
+pub(crate) enum CleanupAction {
     /// A `defer { ... }` block.
     Defer(Block),
     /// A binding's destructor slot. The action is a no-op today — the
@@ -67,15 +67,15 @@ pub(super) enum CleanupAction {
 /// One entry in a block's `errdefer` stack (phase-1 cleanup, error
 /// paths only). Kept separate from the unified drop+defer stack
 /// because `errdefer` always fires before any destructor or `defer`.
-pub(super) struct ErrDeferEntry {
-    pub(super) binding: Option<String>,
-    pub(super) body: Block,
+pub(crate) struct ErrDeferEntry {
+    pub(crate) binding: Option<String>,
+    pub(crate) body: Block,
 }
 
 /// Classification of a block's exit path, used to drive `errdefer`
 /// behavior. Param-less `errdefer` fires on every error path;
 /// `errdefer(e)` only binds when a payload is available.
-pub(super) enum ExitPath {
+pub(crate) enum ExitPath {
     Normal,
     Err(Value),
     NoneProp,
@@ -87,7 +87,7 @@ pub(super) enum ExitPath {
 }
 
 impl ExitPath {
-    pub(super) fn classify(cf: &ControlFlow) -> ExitPath {
+    pub(crate) fn classify(cf: &ControlFlow) -> ExitPath {
         match cf {
             ControlFlow::Return(Value::EnumVariant { variant, data, .. }) if variant == "Err" => {
                 let payload = match data {
@@ -105,7 +105,7 @@ impl ExitPath {
         }
     }
 
-    pub(super) fn is_error(&self) -> bool {
+    pub(crate) fn is_error(&self) -> bool {
         !matches!(self, ExitPath::Normal)
     }
 }
@@ -136,7 +136,7 @@ impl std::fmt::Debug for ExitPath {
 /// Reference-semantics types (`SharedStruct`, `Sender`, `Receiver`,
 /// `SharedCell`, `Atomic`) preserve aliasing — those types are
 /// shared-by-design per Kāra's `shared struct` and channel rules.
-pub(super) fn deep_clone_value(v: &Value) -> Value {
+pub(crate) fn deep_clone_value(v: &Value) -> Value {
     match v {
         Value::Array(rc) => {
             let items: Vec<Value> = rc.read().unwrap().iter().map(deep_clone_value).collect();
@@ -208,7 +208,7 @@ type SlicePatternView = (Arc<RwLock<Vec<Value>>>, usize, usize, bool);
 /// rest binding's mutability mirrors the source. Returns `None` for
 /// any other Value variant (the typechecker rejects non-sequence
 /// scrutinees, so this is a defensive never-match fallback if reached).
-pub(super) fn slice_pattern_view(value: &Value) -> Option<SlicePatternView> {
+pub(crate) fn slice_pattern_view(value: &Value) -> Option<SlicePatternView> {
     match value {
         Value::Array(rc) => {
             let len = rc.read().unwrap().len();
@@ -228,7 +228,7 @@ pub(super) fn slice_pattern_view(value: &Value) -> Option<SlicePatternView> {
 /// Kāra `Option[T]` enum variant. Used by `pop_back` / `pop_front` —
 /// any method whose return type is `Option[T]` and whose Rust impl
 /// already produces an `Option<Value>`.
-pub(super) fn option_value_from(v: Option<Value>) -> Value {
+pub(crate) fn option_value_from(v: Option<Value>) -> Value {
     match v {
         Some(inner) => Value::EnumVariant {
             enum_name: "Option".to_string(),
@@ -248,7 +248,7 @@ pub(super) fn option_value_from(v: Option<Value>) -> Value {
 /// come from `E::cancelled()` where `E` is the function's `Err` type and
 /// `E: Cancellable`; until that trait + factory wiring lands in the
 /// typechecker, a placeholder unit-variant carries the right shape.
-pub(super) fn cancelled_sentinel() -> Value {
+pub(crate) fn cancelled_sentinel() -> Value {
     Value::EnumVariant {
         enum_name: "Cancelled".to_string(),
         variant: "Cancelled".to_string(),
@@ -273,7 +273,7 @@ pub(super) fn cancelled_sentinel() -> Value {
 /// The walker is intentionally conservative — it only fires NLL
 /// drops when it can prove the binding is dead. Cross-block
 /// liveness (CFG dataflow) is out of scope for this round.
-pub(super) fn compute_block_last_use(block: &Block) -> HashMap<String, usize> {
+pub(crate) fn compute_block_last_use(block: &Block) -> HashMap<String, usize> {
     // Collect every binding the block introduces.
     let mut owned: HashSet<String> = HashSet::new();
     for stmt in &block.stmts {
@@ -396,7 +396,7 @@ pub(super) fn compute_block_last_use(block: &Block) -> HashMap<String, usize> {
 /// Called after the statement evaluates successfully, so the drop
 /// slot lands at the program-order LIFO position the binding
 /// claims in the unified stack.
-pub(super) fn push_drops_for_stmt(stmt: &Stmt, cleanup: &mut Vec<CleanupAction>) {
+pub(crate) fn push_drops_for_stmt(stmt: &Stmt, cleanup: &mut Vec<CleanupAction>) {
     match &stmt.kind {
         StmtKind::Let { pattern, .. } | StmtKind::LetElse { pattern, .. } => {
             for name in pattern.binding_names() {
@@ -413,32 +413,32 @@ pub(super) fn push_drops_for_stmt(stmt: &Stmt, cleanup: &mut Vec<CleanupAction>)
 // ── Scoped Environment ──────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub(super) struct Env {
+pub(crate) struct Env {
     pub(crate) scopes: Vec<HashMap<String, Value>>,
 }
 
 impl Env {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Env {
             scopes: vec![HashMap::new()],
         }
     }
 
-    pub(super) fn push_scope(&mut self) {
+    pub(crate) fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
 
-    pub(super) fn pop_scope(&mut self) {
+    pub(crate) fn pop_scope(&mut self) {
         self.scopes.pop();
     }
 
-    pub(super) fn define(&mut self, name: String, val: Value) {
+    pub(crate) fn define(&mut self, name: String, val: Value) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name, val);
         }
     }
 
-    pub(super) fn set(&mut self, name: &str, val: Value) {
+    pub(crate) fn set(&mut self, name: &str, val: Value) {
         // Update in the nearest scope that has this name. If the existing
         // slot is a `SharedCell` (a `mut ref` closure capture aliased back
         // to the outer binding) the assignment writes through the cell so
@@ -459,7 +459,7 @@ impl Env {
 
     /// Read a binding by name. Auto-derefs `SharedCell` so callers always
     /// see the underlying value rather than the aliasing slot.
-    pub(super) fn get(&self, name: &str) -> Option<Value> {
+    pub(crate) fn get(&self, name: &str) -> Option<Value> {
         for scope in self.scopes.iter().rev() {
             if let Some(v) = scope.get(name) {
                 return Some(match v {
@@ -474,7 +474,7 @@ impl Env {
     /// Snapshot current env for closure capture. Preserves `SharedCell`
     /// slots verbatim so a captured `mut ref` alias keeps pointing at the
     /// shared cell when the closure dispatches.
-    pub(super) fn snapshot(&self) -> HashMap<String, Value> {
+    pub(crate) fn snapshot(&self) -> HashMap<String, Value> {
         let mut all = HashMap::new();
         for scope in &self.scopes {
             for (k, v) in scope {
@@ -490,7 +490,7 @@ impl Env {
     /// map. Used at construction of a `mut ref |...|` closure to convert
     /// each captured outer binding into an aliased cell so mutations made
     /// inside the closure body propagate back.
-    pub(super) fn wrap_capture(&mut self, name: &str) -> Option<Value> {
+    pub(crate) fn wrap_capture(&mut self, name: &str) -> Option<Value> {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(slot) = scope.get_mut(name) {
                 if !matches!(slot, Value::SharedCell(_)) {
@@ -514,13 +514,13 @@ impl Env {
 // shadowing: a name that appears in the body before a `let` of the same
 // name is captured; a name that appears only after the `let` is treated
 // as the inner shadow and not captured.
-pub(super) fn add_pattern_bindings(pat: &Pattern, out: &mut HashSet<String>) {
+pub(crate) fn add_pattern_bindings(pat: &Pattern, out: &mut HashSet<String>) {
     for n in pat.binding_names() {
         out.insert(n);
     }
 }
 
-pub(super) fn collect_free_idents_block(
+pub(crate) fn collect_free_idents_block(
     block: &Block,
     bound: &mut HashSet<String>,
     out: &mut Vec<String>,
@@ -573,7 +573,7 @@ pub(super) fn collect_free_idents_block(
     *bound = snapshot;
 }
 
-pub(super) fn collect_free_idents_expr(
+pub(crate) fn collect_free_idents_expr(
     expr: &Expr,
     bound: &mut HashSet<String>,
     out: &mut Vec<String>,
