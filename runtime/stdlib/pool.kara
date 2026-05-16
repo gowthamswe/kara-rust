@@ -52,6 +52,21 @@ struct Pool[T] { }
 // to the pool — see file-level comment for the v1 vs follow-up
 // behavior. Empty struct in v1 (the real impl threads a back-pointer
 // to the Pool and the slot index).
+//
+// **`#[must_use]` (slice 2 of the `#[must_use]` mandate).**
+// `PooledConnection[T]` is a guard-shaped handle: the drop-releases-
+// automatically contract (file-level comment, "drop releases
+// automatically") means discarding the handle hands the slot straight
+// back to the pool without ever using the connection — the user paid
+// for the acquire round-trip for nothing. Mirrors the guard / lock
+// category in the slice 2 spec (`MutexGuard`, `RwLockReadGuard`, …).
+// The attribute lands on the AST today and is inert until slice 4
+// wires the discard-site enforcement
+// (`docs/implementation_checklist/phase-5-diagnostics.md` § `#[must_use]`
+// mandate, slice 4). Once slice 4 ships, discarding a
+// `PooledConnection[T]` at statement position emits
+// `warning[must_use]` with the message below.
+#[must_use = "discarding the connection releases the slot back to the pool without using it — bind the handle to a variable so it lives across the work, or pass it to the consuming function"]
 struct PooledConnection[T] { }
 
 impl[T] Pool[T] {

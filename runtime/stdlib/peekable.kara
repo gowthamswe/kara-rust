@@ -5,5 +5,14 @@
 // plus an extra `peek()` method dispatched only when the receiver
 // carries this name. See `wip-list2.md` § Iterator trait — full
 // adaptor surface.
+//
+// **`#[must_use]` (slice 2 of the `#[must_use]` mandate).** Peekable is
+// an iterator-adapter return type — discarding it drops the adapter
+// chain without ever running it. The attribute lands on the AST today
+// and is inert until slice 4 wires the discard-site enforcement
+// (`docs/implementation_checklist/phase-5-diagnostics.md` § `#[must_use]`
+// mandate, slice 4). Once slice 4 ships, discarding a `Peekable[T]` at
+// statement position emits `warning[must_use]` with the message below.
 
+#[must_use = "discarding the iterator drops every adapter without running it — chain a terminal method or bind the result"]
 struct Peekable[T] { }
