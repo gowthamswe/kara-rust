@@ -233,41 +233,41 @@ pub struct EffectCheckResult {
 // ── Effect Checker ──────────────────────────────────────────────
 
 pub struct EffectChecker<'a> {
-    program: &'a Program,
+    pub(crate) program: &'a Program,
     /// Public-function effect declaration policy (see `PublicEffectsPolicy`).
-    public_effects_policy: PublicEffectsPolicy,
+    pub(crate) public_effects_policy: PublicEffectsPolicy,
     /// Expanded effect groups: group name → EffectSet.
-    expanded_groups: HashMap<String, EffectSet>,
+    pub(crate) expanded_groups: HashMap<String, EffectSet>,
     /// Active compile profile — determines which effects are forbidden at extern sites.
-    profile: CompileProfile,
+    pub(crate) profile: CompileProfile,
     /// Transparent effect verb names.
-    transparent_effects: HashSet<String>,
+    pub(crate) transparent_effects: HashSet<String>,
     /// Declared effects per function name.
-    declared_effects: HashMap<String, DeclaredEffects>,
+    pub(crate) declared_effects: HashMap<String, DeclaredEffects>,
     /// Inferred effects per function name.
-    inferred_effects: HashMap<String, EffectSet>,
+    pub(crate) inferred_effects: HashMap<String, EffectSet>,
     /// Whether each function is public.
-    function_visibility: HashMap<String, bool>,
+    pub(crate) function_visibility: HashMap<String, bool>,
     /// Function spans for error reporting.
-    function_spans: HashMap<String, Span>,
+    pub(crate) function_spans: HashMap<String, Span>,
     /// Functions and their AST bodies (for inference).
-    function_bodies: HashMap<String, Function>,
+    pub(crate) function_bodies: HashMap<String, Function>,
     /// Impl method bodies: "TypeName.method" → Function
-    method_bodies: HashMap<String, Function>,
+    pub(crate) method_bodies: HashMap<String, Function>,
     /// Functions that call polymorphic (`with _`) callees.
-    calls_polymorphic: HashSet<String>,
+    pub(crate) calls_polymorphic: HashSet<String>,
     /// Functions that explicitly declare `with _` (anonymous polymorphism)
     /// — distinct from `with E` (named) declarations. The viral rule fires
     /// only for `with _` callees: `with E` is resolved at the call site
     /// against concrete bindings, so it does not "leak" through callers
     /// that lack a `with _` of their own.
-    fn_uses_with_underscore: HashSet<String>,
+    pub(crate) fn_uses_with_underscore: HashSet<String>,
     /// Per-function generic-parameter bounds index: function key (e.g.
     /// `"sort"` or `"Wrapper.default"`) → param name → bounds. Populated
     /// once before inference; consulted by `extract_trait_assoc_fn_keys`
     /// to redirect `T.method()` and bare `method()` calls to the matching
     /// `Trait.method` ceiling key.
-    fn_bounds_index: HashMap<String, HashMap<String, Vec<TraitBound>>>,
+    pub(crate) fn_bounds_index: HashMap<String, HashMap<String, Vec<TraitBound>>>,
     /// Per-function effect-variable position index: function key → effect
     /// variable name → list of parameter indices whose `Fn(...) with E`
     /// type references that variable. Populated after `collect_function_info`;
@@ -277,7 +277,7 @@ pub struct EffectChecker<'a> {
     /// adds no constraint beyond the existing `with _` polymorphic behavior;
     /// a variable at 2+ positions requires every closure argument's effect
     /// set to agree, with a conflict diagnostic otherwise.
-    fn_effect_var_positions: HashMap<String, HashMap<String, Vec<usize>>>,
+    pub(crate) fn_effect_var_positions: HashMap<String, HashMap<String, Vec<usize>>>,
     /// Method-call → resolved `Type.method` key, populated by the typechecker
     /// (`TypeCheckResult.method_callee_types`). Used by `MethodCall` arms in
     /// `collect_calls_in_expr` (function-reference arg propagation), in
@@ -285,7 +285,7 @@ pub struct EffectChecker<'a> {
     /// `check_subtyping_in_expr_owned` (Fn-slot subtyping) to resolve the
     /// callee precisely instead of falling back to per-method-name heuristics.
     /// Empty when constructed via the unparameterised `new` family.
-    method_callee_types: HashMap<SpanKey, String>,
+    pub(crate) method_callee_types: HashMap<SpanKey, String>,
     /// Per-call-site type-parameter substitutions, populated by the
     /// typechecker (`TypeCheckResult.call_type_subs`). Maps a call-expression
     /// span to a `param_name → resolved_type_name` table — concrete entries
@@ -294,8 +294,8 @@ pub struct EffectChecker<'a> {
     /// diagnostics, so the user sees `Fn(i64) -> ()` instead of `Fn(T) -> ()`
     /// when a generic call's effect-subtyping check fails. Empty when
     /// constructed via the unparameterised `new` family.
-    call_type_subs: HashMap<SpanKey, HashMap<String, String>>,
-    errors: Vec<EffectError>,
+    pub(crate) call_type_subs: HashMap<SpanKey, HashMap<String, String>>,
+    pub(crate) errors: Vec<EffectError>,
 }
 
 impl<'a> EffectChecker<'a> {
