@@ -37,6 +37,7 @@ mod stdlib_io;
 mod stdlib_iter;
 mod stdlib_map;
 mod stdlib_methods;
+mod stdlib_seq;
 #[cfg(test)]
 mod tests;
 pub mod types;
