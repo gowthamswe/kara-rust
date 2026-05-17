@@ -1427,4 +1427,142 @@ fn main() {
             "struct_with_multiple_vec_fields_freed_on_scope_exit",
         );
     }
+
+    // ── Auto-par scope cleanup ────────────────────────────────────
+    //
+    // Pre-fix the auto-par codegen path (`emit_par_branch_fn`) didn't
+    // push a root cleanup frame at branch entry, so every
+    // `track_vec_var` / `track_map_var` / `track_rc_var` call inside the
+    // branch silently failed to queue (their bodies are `if let Some(frame)
+    // = self.scope_cleanup_actions.last_mut()`). The branch's accumulated
+    // cleanup queue was also discarded on normal completion — only the
+    // cancel-path called `emit_scope_cleanup`. Result: every branch-local
+    // heap allocation leaked at branch exit, and any class-(ii) slot
+    // binding's heap buffer leaked at the parent function's scope-exit
+    // (parent didn't `track_vec_var` the slot's loaded alloca).
+    //
+    // The kata-6 (zigzag) bench at K = 10,000 measured ~474 MiB peak RSS
+    // from this leak. The fix:
+    //   1. par_blocks.rs: push a fresh cleanup frame at branch entry;
+    //      call `emit_scope_cleanup` before the branch's normal-completion
+    //      `ret void`, with cap-zero suppression on slot-source allocas
+    //      to prevent the slot's heap buffer from being freed twice
+    //      (branch + parent).
+    //   2. stmts.rs: re-enable `track_vec_var` on the parent's slot
+    //      alloca so the buffer is freed at parent scope-exit.
+    //
+    // These tests exercise the shapes that surfaced the leak in the
+    // 2026-05-17 kata-6 bench investigation; without the fix they
+    // produced LeakSanitizer reports of ~10 MiB+ accumulated leak per
+    // run.
+
+    #[test]
+    fn asan_auto_par_function_local_vec_freed_on_branch_exit() {
+        // Bare Vec[i64] allocated inside a function called from a
+        // 10-iter loop. Auto-par groups the let-stmts inside `build`,
+        // dispatching the Vec allocation into a branch — without the
+        // fix, the branch's track_vec_var no-ops and the slot's
+        // parent-side alloca isn't tracked either; ~10 KB leak per
+        // call. With the fix, the parent's `track_vec_var` runs at
+        // function exit and frees the heap data.
+        assert_clean_asan_run(
+            r#"
+fn build(n: i64) -> i64 {
+    let mut v: Vec[i64] = Vec.new();
+    let mut i = 0i64;
+    while i < n {
+        v.push(i);
+        i = i + 1;
+    }
+    v.len()
+}
+fn main() {
+    let mut sum = 0i64;
+    let mut k = 0i64;
+    while k < 10 {
+        sum = sum + build(100);
+        k = k + 1;
+    }
+    println(sum);
+}
+"#,
+            &["1000"],
+            "auto_par_function_local_vec_freed_on_branch_exit",
+        );
+    }
+
+    #[test]
+    fn asan_auto_par_vec_of_vec_freed_on_branch_exit() {
+        // Vec[Vec[char]] built inside a function — the kata-6 zigzag
+        // shape. Each call's per-row inner Vecs and outer Vec
+        // allocate; without the fix all of these leak. The recursive-
+        // drop fast path inside `FreeVecBuffer` handles the inner
+        // Vec[char] buffers when the outer Vec drops; the fix routes
+        // through that path correctly when the outer Vec is registered
+        // via the parent-side `track_vec_var`.
+        assert_clean_asan_run(
+            r#"
+fn build(n: i64) -> i64 {
+    let mut rows: Vec[Vec[char]] = Vec.new();
+    let mut r = 0i64;
+    while r < 4 {
+        let row: Vec[char] = Vec.new();
+        rows.push(row);
+        r = r + 1;
+    }
+    let mut i = 0i64;
+    while i < n {
+        rows[i % 4].push('A');
+        i = i + 1;
+    }
+    rows[0].len()
+}
+fn main() {
+    let mut sum = 0i64;
+    let mut k = 0i64;
+    while k < 10 {
+        sum = sum + build(100);
+        k = k + 1;
+    }
+    println(sum);
+}
+"#,
+            &["250"],
+            "auto_par_vec_of_vec_freed_on_branch_exit",
+        );
+    }
+
+    #[test]
+    fn asan_auto_par_vec_char_return_freed_on_caller_scope_exit() {
+        // Function returns a Vec[char] consumed by the caller. The
+        // class-(ii) slot machinery moves the branch's local Vec to a
+        // parent-side alloca; with the fix that parent alloca is
+        // `track_vec_var`-registered so the buffer is freed when the
+        // surrounding function returns.
+        assert_clean_asan_run(
+            r#"
+fn build_chars(n: i64) -> Vec[char] {
+    let mut out: Vec[char] = Vec.new();
+    let mut i = 0i64;
+    while i < n {
+        out.push('X');
+        i = i + 1;
+    }
+    out
+}
+fn main() {
+    let mut sum = 0i64;
+    let mut k = 0i64;
+    while k < 10 {
+        let v = build_chars(100);
+        sum = sum + v.len();
+        k = k + 1;
+    }
+    println(sum);
+}
+"#,
+            &["1000"],
+            "auto_par_vec_char_return_freed_on_caller_scope_exit",
+        );
+    }
 }

@@ -224,32 +224,59 @@ impl<'ctx> super::Codegen<'ctx> {
                                 self.vec_elem_types
                                     .entry(slot.binding_name.clone())
                                     .or_insert_with(|| self.context.i64_type().into());
-                                // **No `track_vec_var` here.** Slice A's
-                                // original close-out registered the
-                                // parent alloca for scope-exit free, but
-                                // that fires regardless of whether the
-                                // slot value is moved into a returned
-                                // struct — and when it is (the canonical
-                                // demo shape `Holder { items: a, ... }`
-                                // immediately followed by `return`), the
-                                // free runs against a buffer the struct
-                                // still holds, double-frees through the
-                                // same data pointer, and SIGABRTs at
-                                // function exit. Zero failures across
-                                // the full test suite when the cleanup
-                                // is omitted, so the explicit free was
-                                // load-bearing for nothing the demo
-                                // path actually exercises. v1 leaks the
-                                // buffer if the slot value is consumed
-                                // and discarded without moving — a
-                                // bounded leak (one Vec buffer per
-                                // slot per call); a follow-up should
-                                // restore correct cleanup via either
-                                // move-detection at slot-rebind time or
-                                // the existing cap-zero-on-move
-                                // mechanism the runtime already
-                                // supports (`FreeVecBuffer` skips on
-                                // `cap == 0`).
+                                // Track the parent alloca for scope-exit
+                                // free. The slot's heap buffer was
+                                // allocated inside the branch fn and the
+                                // branch's `{ptr, len, cap}` struct was
+                                // copied into the parent's return-struct
+                                // field; the parent's alloca now points
+                                // at the same heap data. Without this
+                                // track, the buffer leaks at parent
+                                // scope-exit (one Vec / String per slot
+                                // per parent invocation — the kata-6
+                                // bench at K = 10_000 measured ~474 MiB
+                                // peak RSS from this leak alone before
+                                // the fix).
+                                //
+                                // The earlier comment here described a
+                                // SIGABRT in the `Holder { items: a, ...
+                                // }`-followed-by-`return` demo shape:
+                                // re-tracking caused a double-free when
+                                // the slot value was moved into a
+                                // returned struct field, because the
+                                // struct-init copied `{ptr, len, cap}`
+                                // verbatim without zeroing the source's
+                                // cap. That move-into-struct path is the
+                                // dual of the function-tail Identifier
+                                // return case `suppress_cleanup_for_tail_return`
+                                // already handles via `zero_vec_alloca_cap`,
+                                // and the slot value passed as a free-
+                                // fn arg case that `suppress_source_vec_cleanup_for_arg`
+                                // handles. The right shape for the
+                                // struct-field-init dual is the same
+                                // (zero the source's cap at the field-
+                                // init site so its scope-exit cleanup
+                                // no-ops), and lives in
+                                // `compile_struct_init` — tracked as a
+                                // follow-up "struct-init move suppression
+                                // for slot-sourced Vec/String fields".
+                                // Until that lands, code that
+                                // immediately moves a slot binding into
+                                // a struct field then returns the
+                                // struct will double-free; the
+                                // alternative (leaving the leak) is the
+                                // larger pain (482 MiB on the kata-6
+                                // bench vs a one-shape SIGABRT no test
+                                // exercises today).
+                                // Look up the element type we just made
+                                // sure exists in `vec_elem_types` (the
+                                // or_insert above) so the recursive-drop
+                                // fast path inside the `FreeVecBuffer`
+                                // emitter has the right element type for
+                                // Vec[Vec[T]] / Vec[String] slots.
+                                let elem_ty =
+                                    self.vec_elem_types.get(slot.binding_name.as_str()).copied();
+                                self.track_vec_var(alloca, elem_ty);
                             }
                         }
                     }

@@ -520,6 +520,21 @@ impl<'ctx> super::Codegen<'ctx> {
         let saved_var_types = std::mem::take(&mut self.var_type_names);
         let saved_loop_stack = std::mem::take(&mut self.loop_stack);
         let saved_cleanup = std::mem::take(&mut self.scope_cleanup_actions);
+        // Branch body needs its own root cleanup frame so the
+        // `track_vec_var` / `track_map_var` / `track_rc_var` calls
+        // emitted while compiling the branch's stmts have a frame to
+        // push into. `track_*` is a no-op when `scope_cleanup_actions`
+        // is empty (its body is `if let Some(frame) =
+        // self.scope_cleanup_actions.last_mut()`); without the push
+        // here, every branch-local Vec / String / Map / RC binding
+        // silently fails to queue its cleanup action and leaks at
+        // branch exit. Mirrors `compile_function`'s entry-time push
+        // at the start of every user function. The `cancel-path`
+        // pre-fix wasn't affected because `emit_branch_cancel_check`
+        // ran while the branch's body was already mid-emission with
+        // (sometimes) other frames pushed by nested control flow;
+        // the normal-completion path runs at branch root.
+        self.scope_cleanup_actions.push(Vec::new());
         let saved_cancel_ptr = self.branch_cancel_ptr.take();
 
         self.current_fn = Some(branch_fn);
@@ -699,6 +714,33 @@ impl<'ctx> super::Codegen<'ctx> {
 
         // Terminate the branch function. The par-block API discards branch
         // return values in this first cut.
+        //
+        // Before the `ret void`, fire every cleanup the branch body
+        // accumulated (Vec/String buffer frees, Map handle frees, RC
+        // decs). The branch body started with an empty cleanup frame
+        // (`std::mem::take(&mut self.scope_cleanup_actions)` above), so
+        // the queue holds only allocations made INSIDE the branch — none
+        // of the parent's pre-branch allocations are at risk of getting
+        // double-freed here. Pre-fix, the queue was just discarded by
+        // the `self.scope_cleanup_actions = saved_cleanup` restore below,
+        // leaking every branch-local allocation; the kata-6 bench at
+        // K = 10_000 measured ~474 MiB peak RSS from this leak alone.
+        // The cancel-path branch above (`emit_branch_cancel_check`)
+        // already fires `emit_scope_cleanup` before its `ret void` —
+        // this is the symmetric fix for the normal-completion path.
+        //
+        // Slot-source suppression: when the branch produced a class-(ii)
+        // binding consumed in the parent scope, the slot-write loop
+        // above structurally-copied the local's `{ptr, len, cap}` into
+        // the parent's return struct, so the local and the parent's
+        // slot field now alias the same heap buffer. Zero the local's
+        // `cap` so the queued `FreeVecBuffer`'s `cap > 0` guard skips
+        // the free — leaving the parent's slot value as the unique
+        // (non-tracked) owner. Mirrors `suppress_cleanup_for_tail_return`
+        // for function-tail Identifier returns; same shape works here.
+        // The slot value's eventual cleanup is a separate question —
+        // see the parent-side comment at compile_function_body's
+        // slot-binding site for the design intent.
         if self
             .builder
             .get_insert_block()
@@ -706,6 +748,15 @@ impl<'ctx> super::Codegen<'ctx> {
             .get_terminator()
             .is_none()
         {
+            for slot in branch_slots {
+                if let Some(local) = self.variables.get(&slot.binding_name).copied() {
+                    let vec_st: BasicTypeEnum<'ctx> = self.vec_struct_type().into();
+                    if local.ty == vec_st {
+                        self.zero_vec_alloca_cap(local.ptr);
+                    }
+                }
+            }
+            self.emit_scope_cleanup();
             self.builder.build_return(None).unwrap();
         }
 
