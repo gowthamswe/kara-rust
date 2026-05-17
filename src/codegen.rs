@@ -17,7 +17,8 @@ use inkwell::AddressSpace;
 
 use crate::ast::*;
 use crate::concurrency::{ConcurrencyAnalysis, FunctionConcurrency};
-use crate::ownership::OwnershipCheckResult;
+use crate::ownership::{CapturePath, OwnershipCheckResult, OwnershipMode};
+use crate::resolver::SpanKey;
 use crate::token::Span;
 
 mod assoc_call;
@@ -422,6 +423,18 @@ pub(super) struct Codegen<'ctx> {
     /// Heap struct type for each active RC-fallback binding in the current function.
     /// Cleared at each `compile_function` call. Key: binding name.
     pub(crate) rc_fallback_heap_types: HashMap<String, StructType<'ctx>>,
+    /// Per-closure capture path modes sourced from
+    /// `OwnershipCheckResult::closure_capture_path_modes` — line 353
+    /// phase-5 checklist disjoint-capture slice 4. When a closure
+    /// expression's `SpanKey` lives in this map, `compile_closure` lays
+    /// the env struct out with one slot per captured `CapturePath` (each
+    /// sized to the leaf type at the projection chain end) and stitches
+    /// the leaf values back into a fresh root alloca in the synthesized
+    /// closure body. Absent → fall back to the per-name
+    /// `collect_closure_free_vars` layout (preserves the `compile_to_ir`
+    /// path and any codegen-only tests that don't run the ownership
+    /// pass).
+    pub(crate) closure_capture_paths: HashMap<SpanKey, Vec<(CapturePath, OwnershipMode)>>,
     /// Per-function parallelization decisions populated from `ConcurrencyAnalysis`.
     /// Function name → `FunctionConcurrency` (parallel groups + total stmt count).
     /// Threaded in by `load_concurrency_analysis`; consumed in slice 2 by the
@@ -1197,6 +1210,7 @@ impl<'ctx> Codegen<'ctx> {
             rc_fallback_fns: HashMap::new(),
             arc_fallback_fns: HashMap::new(),
             rc_fallback_heap_types: HashMap::new(),
+            closure_capture_paths: HashMap::new(),
             concurrency_decisions: HashMap::new(),
             current_fn_name: String::new(),
             par_counter: 0,
@@ -1286,6 +1300,13 @@ impl<'ctx> Codegen<'ctx> {
         for (fn_name, arc_set) in &ow.arc_values {
             self.arc_fallback_fns
                 .insert(fn_name.clone(), arc_set.clone());
+        }
+        // Disjoint-capture slice 4: per-closure capture-path mode set
+        // (slice 2 output). Drives the per-path env-struct layout in
+        // `compile_closure` when the closure expression's `SpanKey` is
+        // present in this map; absent → per-name fallback.
+        for (k, v) in &ow.closure_capture_path_modes {
+            self.closure_capture_paths.insert(*k, v.clone());
         }
     }
 

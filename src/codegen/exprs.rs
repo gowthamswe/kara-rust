@@ -195,7 +195,9 @@ impl<'ctx> super::Codegen<'ctx> {
                 self.compile_break(label.as_deref(), value.as_deref())
             }
             ExprKind::Continue { label } => self.compile_continue(label.as_deref()),
-            ExprKind::Closure { params, body, .. } => self.compile_closure(params, body),
+            ExprKind::Closure { params, body, .. } => {
+                self.compile_closure(params, body, &expr.span)
+            }
             ExprKind::Return(val) => {
                 // Early-return cleanup parity with the function-end path
                 // at `compile_function`: walk the full `scope_cleanup_actions`

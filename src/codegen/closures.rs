@@ -10,6 +10,9 @@
 //! par-block capture sets.
 
 use crate::ast::*;
+use crate::ownership::CapturePath;
+use crate::resolver::SpanKey;
+use crate::token::Span;
 use std::collections::{HashMap, HashSet};
 
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, StructType};
@@ -17,6 +20,56 @@ use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum};
 use inkwell::AddressSpace;
 
 use super::state::VarSlot;
+
+/// Per-root unpack plan for the disjoint-capture slice-4 per-path env
+/// layout. Records how a captured root binding is rebuilt inside the
+/// synthesized closure body from one or more env-struct slots.
+///
+/// `whole_root_slot = Some(idx)` means the env's slot at `idx` holds the
+/// entire root value (matches today's per-name layout); the body unpack
+/// loads the slot and stores into a root-named alloca, and field accesses
+/// in the body walk it normally.
+///
+/// `whole_root_slot = None` means the root was captured *path-precisely*:
+/// `sub_slots` lists the env slots that hold leaf values at non-empty
+/// projection chains under this root. The body unpack allocates a fresh
+/// root-typed alloca (uninit'd in the unread fields — the ownership pass
+/// guarantees the body never reads them) and writes each sub-slot leaf
+/// into its GEP chain. The body's field accesses then walk the stitched
+/// root as if it were a whole-root capture.
+struct RootUnpackPlan<'ctx> {
+    /// LLVM type of the root in the outer scope (matches `VarSlot.ty`).
+    root_ty: BasicTypeEnum<'ctx>,
+    /// Source type-name of the root, if `var_type_names` has an entry.
+    /// Propagated into the closure body's `var_type_names` so method
+    /// dispatch on the captured root resolves through the user impl-block.
+    type_name: Option<String>,
+    /// `Some(env_slot_idx)` → whole-root capture; `None` → per-path.
+    whole_root_slot: Option<usize>,
+    /// Per-sub-path entries when `whole_root_slot` is None. Each tuple
+    /// is `(env_slot_idx, gep_chain, leaf_ty)` — load env[idx] of type
+    /// `leaf_ty`, then GEP into the root alloca via `gep_chain` and store.
+    sub_slots: Vec<(usize, Vec<u32>, BasicTypeEnum<'ctx>)>,
+}
+
+/// Full per-closure capture layout — slot list (env struct field order)
+/// plus the per-root unpack plans. Produced by
+/// `Codegen::build_capture_path_layout` when ownership data is available
+/// for the closure's `SpanKey` and every captured root resolves cleanly
+/// through `struct_field_names` / `struct_field_type_names`. `None` →
+/// fall back to the legacy `collect_closure_free_vars` per-name layout.
+struct CapturePathLayout<'ctx> {
+    /// Env-struct field types in slot order. Empty when no captures.
+    slot_tys: Vec<BasicTypeEnum<'ctx>>,
+    /// `slot_idx → (root_name, gep_chain)` — drives capture-site loads:
+    /// for slot i, load `outer.variables[root]` via the gep chain and
+    /// store into env field i. Empty `gep_chain` → store the whole-root
+    /// value.
+    slot_sources: Vec<(String, Vec<u32>)>,
+    /// Per-root unpack plans, in deterministic root-name order. Drives
+    /// the closure body's prelude.
+    root_plans: Vec<(String, RootUnpackPlan<'ctx>)>,
+}
 
 impl<'ctx> super::Codegen<'ctx> {
     // ── Closure compilation ────────────────────────────────────────
@@ -31,21 +84,52 @@ impl<'ctx> super::Codegen<'ctx> {
     ///
     /// Sets `pending_closure_fn_type` so the surrounding `let` binding can register the
     /// function type for later indirect calls.
+    ///
+    /// `closure_span` is the `ExprKind::Closure` expression's own span — used
+    /// as the lookup key into `Codegen::closure_capture_paths` (sourced from
+    /// `OwnershipCheckResult::closure_capture_path_modes`). When the ownership
+    /// pass supplied per-path mode data for this closure and every captured
+    /// root resolves cleanly through `struct_field_names`, the env struct is
+    /// laid out with one field per captured path (disjoint-capture slice 4);
+    /// otherwise the legacy per-captured-name layout from
+    /// `collect_closure_free_vars` is used.
     pub(super) fn compile_closure(
         &mut self,
         params: &[ClosureParam],
         body: &Expr,
+        closure_span: &Span,
     ) -> Result<BasicValueEnum<'ctx>, String> {
         let id = self.closure_counter;
         self.closure_counter += 1;
         let fn_name = format!("__closure_{}", id);
 
-        // 1. Collect free variables (names referenced in body, not in params, present in scope).
+        // 1. Collect free variables (names referenced in body, not in
+        //    params, present in scope). Always run the per-name walker —
+        //    it doubles as the fallback when no per-path layout is
+        //    available, and the per-path layout consults it indirectly
+        //    via `self.variables` for the root types.
         let free_vars = self.collect_closure_free_vars(params, body);
 
+        // 1b. Disjoint-capture slice 4: per-path env layout when the
+        //     ownership pass supplied modes for this closure and every
+        //     captured root resolves cleanly. Falls back to per-name
+        //     layout when the data is missing (e.g., `compile_to_ir`
+        //     called without ownership) or any captured root has a
+        //     projection step that can't be resolved (treated as a
+        //     whole-root capture for that root inside the path layout
+        //     builder).
+        let path_layout = self.build_capture_path_layout(closure_span, &free_vars);
+
         // 2. Build the env struct type: { T0_cap, T1_cap, ... }.
-        //    Use a dummy i8 when there are no captures so we always have a valid struct type.
-        let env_field_types: Vec<BasicTypeEnum<'ctx>> = if free_vars.is_empty() {
+        //    Use a dummy i8 when there are no captures so we always have
+        //    a valid struct type.
+        let env_field_types: Vec<BasicTypeEnum<'ctx>> = if let Some(layout) = path_layout.as_ref() {
+            if layout.slot_tys.is_empty() {
+                vec![self.context.i8_type().into()]
+            } else {
+                layout.slot_tys.clone()
+            }
+        } else if free_vars.is_empty() {
             vec![self.context.i8_type().into()]
         } else {
             free_vars.iter().map(|n| self.variables[n].ty).collect()
@@ -130,7 +214,61 @@ impl<'ctx> super::Codegen<'ctx> {
             .build_load::<BasicTypeEnum<'ctx>>(env_struct_ty.into(), env_ptr, "__env")
             .unwrap();
 
-        if !free_vars.is_empty() {
+        if let Some(layout) = path_layout.as_ref() {
+            // Per-path unpack: one env slot per captured CapturePath.
+            // For whole-root entries the slot holds the root value as-is;
+            // for path-precise entries we allocate a root-typed alloca
+            // and stitch each leaf into its GEP chain, then register the
+            // root alloca in `self.variables` so the body's `u.f` reads
+            // walk it normally.
+            let env_struct = env_val.into_struct_value();
+            for (root_name, plan) in &layout.root_plans {
+                if let Some(slot_idx) = plan.whole_root_slot {
+                    let field_val = self
+                        .builder
+                        .build_extract_value(env_struct, slot_idx as u32, root_name)
+                        .unwrap();
+                    let alloca = self.create_entry_alloca(closure_fn, root_name, plan.root_ty);
+                    self.builder.build_store(alloca, field_val).unwrap();
+                    self.variables.insert(
+                        root_name.clone(),
+                        VarSlot {
+                            ptr: alloca,
+                            ty: plan.root_ty,
+                        },
+                    );
+                } else {
+                    // Stitch: allocate the root, write each captured leaf
+                    // into its GEP chain. Other leaves stay undef — the
+                    // ownership pass guarantees the body never reads them.
+                    let alloca = self.create_entry_alloca(closure_fn, root_name, plan.root_ty);
+                    for (slot_idx, gep_chain, leaf_ty) in &plan.sub_slots {
+                        let leaf_val = self
+                            .builder
+                            .build_extract_value(
+                                env_struct,
+                                *slot_idx as u32,
+                                &format!("{}.cap", root_name),
+                            )
+                            .unwrap();
+                        let leaf_ptr = self.gep_root_chain(plan.root_ty, alloca, gep_chain);
+                        self.builder.build_store(leaf_ptr, leaf_val).unwrap();
+                        let _ = leaf_ty; // typed read at capture site; store inherits type from value.
+                    }
+                    self.variables.insert(
+                        root_name.clone(),
+                        VarSlot {
+                            ptr: alloca,
+                            ty: plan.root_ty,
+                        },
+                    );
+                }
+                if let Some(type_name) = &plan.type_name {
+                    self.var_type_names
+                        .insert(root_name.clone(), type_name.clone());
+                }
+            }
+        } else if !free_vars.is_empty() {
             for (i, var_name) in free_vars.iter().enumerate() {
                 let cap_ty = env_field_types[i];
                 let field_val = self
@@ -201,7 +339,38 @@ impl<'ctx> super::Codegen<'ctx> {
         // 9. In the outer context, allocate and populate the env struct.
         let outer_fn = self.current_fn.unwrap();
         let env_alloca = self.create_entry_alloca(outer_fn, "__closure_env", env_struct_ty.into());
-        if !free_vars.is_empty() {
+        if let Some(layout) = path_layout.as_ref() {
+            // Per-path capture: for each env slot, walk the source root's
+            // GEP chain and store the leaf value into the slot.
+            if !layout.slot_sources.is_empty() {
+                let mut env_agg = env_struct_ty.get_undef();
+                for (i, (root, gep_chain)) in layout.slot_sources.iter().enumerate() {
+                    let slot = self.variables[root];
+                    let val = if gep_chain.is_empty() {
+                        // Whole-root: load the root binding directly.
+                        self.builder.build_load(slot.ty, slot.ptr, root).unwrap()
+                    } else {
+                        // Path-precise: GEP into the root's alloca, load
+                        // the leaf. `slot.ptr` is the alloca holding the
+                        // root struct value (root captures gated to
+                        // non-RC, non-ref-param roots in
+                        // `build_capture_path_layout` so this is always
+                        // a direct struct alloca).
+                        let leaf_ptr = self.gep_root_chain(slot.ty, slot.ptr, gep_chain);
+                        let leaf_ty = self.leaf_type_for_chain(slot.ty, gep_chain);
+                        self.builder
+                            .build_load(leaf_ty, leaf_ptr, &format!("{}.cap.read", root))
+                            .unwrap()
+                    };
+                    env_agg = self
+                        .builder
+                        .build_insert_value(env_agg, val, i as u32, "__env_field")
+                        .unwrap()
+                        .into_struct_value();
+                }
+                self.builder.build_store(env_alloca, env_agg).unwrap();
+            }
+        } else if !free_vars.is_empty() {
             // Build the env struct by inserting each captured value.
             let mut env_agg = env_struct_ty.get_undef();
             for (i, var_name) in free_vars.iter().enumerate() {
@@ -422,6 +591,223 @@ impl<'ctx> super::Codegen<'ctx> {
             }
             _ => self.context.i64_type().into(),
         }
+    }
+
+    // ── Disjoint-capture slice 4 helpers ───────────────────────────
+
+    /// Build a per-path env layout for the closure at `closure_span`.
+    /// Returns `None` when the ownership pass did not supply path-mode
+    /// data for this closure (caller falls back to per-name layout).
+    /// Roots that aren't safe for path-precise stitching (RC-fallback
+    /// promoted, `ref`-param-shaped, or any projection step the resolver
+    /// can't walk through `struct_field_names`) are collapsed to a single
+    /// whole-root slot for that root — other roots in the same layout
+    /// still get path-precise slots.
+    fn build_capture_path_layout(
+        &self,
+        closure_span: &Span,
+        free_vars: &[String],
+    ) -> Option<CapturePathLayout<'ctx>> {
+        let key = SpanKey::from_span(closure_span);
+        let path_modes = self.closure_capture_paths.get(&key)?;
+
+        // Group paths by root, preserving the slice-2 list order so
+        // multiple paths under the same root keep deterministic ordering.
+        let mut roots_in_order: Vec<String> = Vec::new();
+        let mut by_root: HashMap<String, Vec<&CapturePath>> = HashMap::new();
+        for (path, _mode) in path_modes {
+            if !self.variables.contains_key(path.root.as_str()) {
+                // Path references a binding the codegen scope doesn't
+                // know about (e.g. captured by a nested closure but
+                // shadowed before reaching this point) — skip; the
+                // legacy per-name walker mirrors the same filter.
+                continue;
+            }
+            if !by_root.contains_key(&path.root) {
+                roots_in_order.push(path.root.clone());
+            }
+            by_root.entry(path.root.clone()).or_default().push(path);
+        }
+        // The slice-2 path set is keyed off the closure's free-variable
+        // scan, which records roots even when the body only reaches them
+        // through stopping constructs. Cross-check with `free_vars` so
+        // any root the per-name walker found but slice 2 missed (and
+        // vice-versa) doesn't silently drop from the env — fall back to
+        // per-name layout if the two sets disagree.
+        let path_root_set: HashSet<&String> = by_root.keys().collect();
+        let free_var_set: HashSet<&String> = free_vars.iter().collect();
+        if path_root_set != free_var_set {
+            return None;
+        }
+
+        let mut slot_tys: Vec<BasicTypeEnum<'ctx>> = Vec::new();
+        let mut slot_sources: Vec<(String, Vec<u32>)> = Vec::new();
+        let mut root_plans: Vec<(String, RootUnpackPlan<'ctx>)> = Vec::new();
+
+        for root in roots_in_order {
+            let slot = *self.variables.get(root.as_str())?;
+            let type_name = self.var_type_names.get(root.as_str()).cloned();
+            let paths = by_root.get(&root).unwrap();
+
+            // Conservative force-whole-root triggers: RC-fallback root
+            // (slot.ty is `ptr`, body field-access goes through the
+            // heap-deref path), ref-param root (alloca holds a pointer,
+            // not a struct value), or any path under this root has a
+            // projection chain that can't be resolved through
+            // `struct_field_names`.
+            let force_whole_root = self.is_rc_fallback_binding(&root)
+                || self.ref_params.contains_key(root.as_str())
+                || paths.iter().any(|p| {
+                    !p.projection.is_empty()
+                        && self
+                            .resolve_gep_chain(slot.ty, type_name.as_deref(), &p.projection)
+                            .is_none()
+                });
+
+            let any_whole = paths.iter().any(|p| p.projection.is_empty());
+
+            if force_whole_root || any_whole {
+                // One whole-root slot for this root. Drop sub-paths —
+                // the body walks the whole root and field reads work
+                // through normal compile_field_access dispatch.
+                let slot_idx = slot_tys.len();
+                slot_tys.push(slot.ty);
+                slot_sources.push((root.clone(), Vec::new()));
+                root_plans.push((
+                    root.clone(),
+                    RootUnpackPlan {
+                        root_ty: slot.ty,
+                        type_name,
+                        whole_root_slot: Some(slot_idx),
+                        sub_slots: Vec::new(),
+                    },
+                ));
+            } else {
+                // Per-path: one slot per non-empty projection. The slice-2
+                // set guarantees every path here has non-empty projection
+                // (`any_whole` is false in this branch).
+                let mut sub_slots: Vec<(usize, Vec<u32>, BasicTypeEnum<'ctx>)> = Vec::new();
+                for p in paths {
+                    let gep_chain = self
+                        .resolve_gep_chain(slot.ty, type_name.as_deref(), &p.projection)
+                        .unwrap();
+                    let leaf_ty = self.leaf_type_for_chain(slot.ty, &gep_chain);
+                    let slot_idx = slot_tys.len();
+                    slot_tys.push(leaf_ty);
+                    slot_sources.push((root.clone(), gep_chain.clone()));
+                    sub_slots.push((slot_idx, gep_chain, leaf_ty));
+                }
+                root_plans.push((
+                    root.clone(),
+                    RootUnpackPlan {
+                        root_ty: slot.ty,
+                        type_name,
+                        whole_root_slot: None,
+                        sub_slots,
+                    },
+                ));
+            }
+        }
+
+        Some(CapturePathLayout {
+            slot_tys,
+            slot_sources,
+            root_plans,
+        })
+    }
+
+    /// Walk a projection chain (root-to-leaf field names, possibly mixed
+    /// with numeric tuple indices) into a sequence of LLVM struct GEP
+    /// indices. Returns `None` if any step can't be resolved — the
+    /// caller treats that root as a whole-root capture. `type_name` is
+    /// the source-level type of the root, looked up in
+    /// `struct_field_names` to translate field-name → index.
+    fn resolve_gep_chain(
+        &self,
+        root_ty: BasicTypeEnum<'ctx>,
+        type_name: Option<&str>,
+        projection: &[String],
+    ) -> Option<Vec<u32>> {
+        let mut current_ty = root_ty;
+        let mut current_type_name: Option<String> = type_name.map(|s| s.to_string());
+        let mut chain: Vec<u32> = Vec::with_capacity(projection.len());
+        for step in projection {
+            let struct_ty = match current_ty {
+                BasicTypeEnum::StructType(st) => st,
+                _ => return None,
+            };
+            // Try struct-field-name → index lookup first.
+            let idx = if let Some(name) = current_type_name.as_deref() {
+                if let Some(names) = self.struct_field_names.get(name) {
+                    names.iter().position(|f| f == step).map(|p| p as u32)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            // Fall back to numeric tuple-index parse.
+            let idx = idx.or_else(|| step.parse::<u32>().ok())?;
+            // Advance the LLVM and source type-name pointers.
+            current_ty = struct_ty.get_field_type_at_index(idx)?;
+            current_type_name = current_type_name
+                .as_deref()
+                .and_then(|name| self.struct_field_type_names.get(name))
+                .and_then(|tys| tys.get(idx as usize).cloned())
+                .flatten();
+            chain.push(idx);
+        }
+        Some(chain)
+    }
+
+    /// Resolve the LLVM type at the end of a GEP chain rooted at
+    /// `root_ty`. Used by both the capture-site loader (to type the load
+    /// from the source root) and the unpack-site stitcher (to type the
+    /// store into the stitched root).
+    fn leaf_type_for_chain(
+        &self,
+        root_ty: BasicTypeEnum<'ctx>,
+        chain: &[u32],
+    ) -> BasicTypeEnum<'ctx> {
+        let mut current = root_ty;
+        for &idx in chain {
+            if let BasicTypeEnum::StructType(st) = current {
+                current = st.get_field_type_at_index(idx).unwrap();
+            } else {
+                // Builder guarantees the chain is resolvable; this branch
+                // is only reached if a non-struct sneaks in, which would
+                // be a bug — return the i64 fallback rather than panic.
+                return self.context.i64_type().into();
+            }
+        }
+        current
+    }
+
+    /// GEP into a struct alloca via a chain of field indices. Used by
+    /// both the capture site (to read a leaf from the outer-scope root)
+    /// and the unpack site (to write a leaf into the stitched-back
+    /// root). The chain is rooted at field index 0 conceptually — every
+    /// `struct_gep` step walks down one level from the current pointer.
+    fn gep_root_chain(
+        &self,
+        root_ty: BasicTypeEnum<'ctx>,
+        root_ptr: inkwell::values::PointerValue<'ctx>,
+        chain: &[u32],
+    ) -> inkwell::values::PointerValue<'ctx> {
+        let mut current_ptr = root_ptr;
+        let mut current_ty = root_ty;
+        for (i, &idx) in chain.iter().enumerate() {
+            let struct_ty = match current_ty {
+                BasicTypeEnum::StructType(st) => st,
+                _ => return current_ptr,
+            };
+            current_ptr = self
+                .builder
+                .build_struct_gep(struct_ty, current_ptr, idx, &format!("cap.gep.{}", i))
+                .unwrap();
+            current_ty = struct_ty.get_field_type_at_index(idx).unwrap();
+        }
+        current_ptr
     }
 
     /// Collect the names of variables captured by a closure (free variables from outer scope).

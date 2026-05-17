@@ -1468,6 +1468,243 @@ fn main() {
         }
     }
 
+    // ── Disjoint closure capture: per-path env layout (slice 4) ─
+
+    // The tests below exercise line 353 phase-5 checklist
+    // "Disjoint closure capture" slice 4: when the ownership pass
+    // supplies per-path capture modes, `compile_closure` lays the env
+    // struct out with one slot per captured `CapturePath` instead of one
+    // slot per captured root binding. `run_program_with_ownership` /
+    // `ir_for_with_ownership` are required — the plain `run_program` /
+    // `ir_for` helpers pass `None` for ownership and fall through to the
+    // per-name layout, which leaves slice-4 untested.
+
+    #[test]
+    fn test_e2e_disjoint_field_capture_returns_leaf_value() {
+        // Headline slice-4 case: closure captures a single field of a
+        // struct. The env's slot for `p.x` is sized to the leaf type
+        // (i64), not the whole struct, and the body stitches the leaf
+        // back into a fresh `p` alloca so the body's `p.x` read walks
+        // through the normal FieldAccess path.
+        let out = run_program_with_ownership(
+            r#"
+struct Point { x: i64, y: i64 }
+fn main() {
+    let p = Point { x: 7, y: 11 };
+    let read_x = || p.x;
+    println(read_x());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "7");
+        }
+    }
+
+    #[test]
+    fn test_e2e_disjoint_two_closures_over_sibling_fields() {
+        // Spec test from the line-353 entry: "two closures over different
+        // fields of the same struct compile and run". Each closure gets
+        // its own per-path env with one i64 leaf slot; the outer code
+        // calls both and sums the results.
+        let out = run_program_with_ownership(
+            r#"
+struct Point { x: i64, y: i64 }
+fn main() {
+    let p = Point { x: 7, y: 11 };
+    let read_x = || p.x;
+    let read_y = || p.y;
+    println(read_x() + read_y());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "18");
+        }
+    }
+
+    #[test]
+    fn test_e2e_disjoint_field_capture_with_outer_sibling_access() {
+        // Spec test: "outer-scope access to u.history after a closure
+        // captured u.name is permitted". The ownership pass (slice 3)
+        // accepts this; codegen (slice 4) emits a per-path env that
+        // captures just `p.x`, leaving `p.y` accessible in the outer
+        // scope. Verifies the full pipeline composes.
+        let out = run_program_with_ownership(
+            r#"
+struct Point { x: i64, y: i64 }
+fn main() {
+    let p = Point { x: 7, y: 11 };
+    let read_x = || p.x;
+    let saved_y = p.y;
+    println(read_x() + saved_y);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "18");
+        }
+    }
+
+    #[test]
+    fn test_e2e_disjoint_capture_two_fields_under_one_root() {
+        // A single closure that captures two disjoint sub-paths under
+        // the same root. Without slice 4 this collapsed into a whole-
+        // root capture; with slice 4 the env carries two i64 slots
+        // (one for `p.x`, one for `p.y`) and the body stitches both
+        // into a fresh `p` alloca.
+        let out = run_program_with_ownership(
+            r#"
+struct Point { x: i64, y: i64 }
+fn main() {
+    let p = Point { x: 7, y: 11 };
+    let sum = || p.x + p.y;
+    println(sum());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "18");
+        }
+    }
+
+    #[test]
+    fn test_e2e_disjoint_capture_nested_field_path() {
+        // Multi-segment projection (`o.a.v`). The path resolver walks
+        // both struct steps via `struct_field_names` lookups; the
+        // capture-site GEP chain has length 2; the body stitches the
+        // leaf back into the matching nested position of a fresh `o`
+        // alloca.
+        let out = run_program_with_ownership(
+            r#"
+struct Inner { v: i64 }
+struct Outer { a: Inner, b: Inner }
+fn main() {
+    let o = Outer { a: Inner { v: 3 }, b: Inner { v: 5 } };
+    let f = || o.a.v;
+    let g = || o.b.v;
+    println(f() + g());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "8");
+        }
+    }
+
+    #[test]
+    fn test_e2e_method_call_on_captured_root_uses_whole_root_layout() {
+        // Slice 1's path scanner commits a whole-root capture when it
+        // hits a stopping construct (method call on the captured
+        // binding). Slice 4 honours that — the env carries one slot of
+        // the full struct type, not per-path. End-to-end check: the
+        // method call inside the closure reads through the captured
+        // whole-root alloca and returns the right value.
+        let out = run_program_with_ownership(
+            r#"
+struct Point { x: i64, y: i64 }
+impl Point { fn doubled_x(self) -> i64 { self.x + self.x } }
+fn main() {
+    let p = Point { x: 7, y: 11 };
+    let f = || p.doubled_x();
+    println(f());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "14");
+        }
+    }
+
+    #[test]
+    fn test_ir_disjoint_field_capture_env_slot_is_leaf_type() {
+        // IR pin: the synthesized closure body's env-struct load has a
+        // single-i64 element type, not the `Point` struct type. This is
+        // the wire-format change slice 4 introduces — without it the
+        // env carries the whole root (3-i64 word for `{x, y, padding}`
+        // depending on alignment) which forces extra copies at both
+        // capture and unpack.
+        let ir = ir_for_with_ownership(
+            r#"
+struct Point { x: i64, y: i64 }
+fn main() {
+    let p = Point { x: 7, y: 11 };
+    let read_x = || p.x;
+    let _ = read_x();
+}
+"#,
+        );
+        // Env load inside the synthesized closure body is typed `{ i64 }`,
+        // not `{ i64, i64 }` (the whole-Point shape). The closure body
+        // also contains a `cap.gep` GEP for the stitching write into the
+        // fresh `p` alloca.
+        assert!(
+            ir.contains("load { i64 }"),
+            "expected env load typed `{{ i64 }}` (single leaf slot) in:\n{}",
+            ir
+        );
+        assert!(
+            ir.contains("cap.gep"),
+            "expected stitching GEP `cap.gep.<n>` in the closure body in:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_ir_method_call_on_captured_root_forces_whole_root_env() {
+        // Companion to the e2e test above: at the IR level, the env
+        // struct for a closure whose body method-calls a captured root
+        // carries the whole Point struct (not a per-path layout) — the
+        // slice-1 path scanner committed `(p, [])` because method calls
+        // are stopping constructs, and slice 4 honoured that.
+        let ir = ir_for_with_ownership(
+            r#"
+struct Point { x: i64, y: i64 }
+impl Point { fn doubled_x(self) -> i64 { self.x + self.x } }
+fn main() {
+    let p = Point { x: 7, y: 11 };
+    let f = || p.doubled_x();
+    let _ = f();
+}
+"#,
+        );
+        // Whole-root capture means the env's single slot is the full
+        // Point struct (two i64 words), so the body's env load is typed
+        // `{ { i64, i64 } }` — the outer braces are the env struct, the
+        // inner are the captured Point.
+        assert!(
+            ir.contains("load { { i64, i64 } }"),
+            "expected env load typed `{{ {{ i64, i64 }} }}` (whole-root Point) in:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_e2e_disjoint_capture_preserves_uncaptured_fields_after_call() {
+        // Stress test: the per-path env carries only `p.x`, leaves
+        // `p.y` unpopulated in the closure body's stitched alloca. The
+        // closure body only reads `p.x` (ownership-checked), so the
+        // undef `p.y` is never touched. After the call returns, the
+        // outer scope's `p.y` is still its original value. Pins that
+        // outer-scope state is not perturbed by the per-path stitching.
+        let out = run_program_with_ownership(
+            r#"
+struct Point { x: i64, y: i64 }
+fn main() {
+    let p = Point { x: 7, y: 11 };
+    let f = || p.x;
+    let after_call = f();
+    println(after_call);
+    println(p.y);
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["7", "11"]);
+        }
+    }
+
     // ── Shared struct (RC) tests ────────────────────────────────
 
     #[test]
