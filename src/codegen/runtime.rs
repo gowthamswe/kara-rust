@@ -222,6 +222,13 @@ impl<'ctx> super::Codegen<'ctx> {
     }
 
     /// Track a shared-type variable for scope-exit rc_dec.
+    ///
+    /// See `null_init_slot_in_entry_block` for the null-init step that
+    /// has to fire AFTER the slot exists in `self.variables` (which
+    /// happens at `bind_pattern` time, after this function returns in
+    /// the let-stmt flow). The caller in `compile_stmt` re-fetches the
+    /// slot after bind_pattern and calls `null_init_slot_in_entry_block`
+    /// directly.
     pub(super) fn track_rc_var(
         &mut self,
         name: &str,
@@ -235,6 +242,33 @@ impl<'ctx> super::Codegen<'ctx> {
                 heap_type,
             });
         }
+    }
+
+    /// Emit a `store null, slot` at the top of the current function's
+    /// entry block (after any allocas, before any body code). Used by
+    /// `track_rc_var` to ensure body-local shared-struct slots whose
+    /// let-binding may not execute carry a defined null sentinel by the
+    /// time scope cleanup runs.
+    pub(super) fn null_init_slot_in_entry_block(&self, slot: PointerValue<'ctx>) {
+        let Some(fn_val) = self.current_fn else {
+            return;
+        };
+        let Some(entry) = fn_val.get_first_basic_block() else {
+            return;
+        };
+        let b = self.context.create_builder();
+        // Position at end of entry block — after any allocas, but
+        // before any non-alloca instructions that compile_function
+        // emits (parameter copies, RC fallback boxing, etc.). Per LLVM
+        // SSA discipline allocas in the entry block precede other ops,
+        // so a store at end-of-entry-block runs before the body's
+        // first basic-block branch.
+        match entry.get_terminator() {
+            Some(term) => b.position_before(&term),
+            None => b.position_at_end(entry),
+        }
+        let null = self.context.ptr_type(AddressSpace::default()).const_null();
+        let _ = b.build_store(slot, null);
     }
 
     /// Track a Vec/String alloca for scope-exit buffer free. Pass the
@@ -578,7 +612,32 @@ impl<'ctx> super::Codegen<'ctx> {
                 } else {
                     *ptr
                 };
+                // Null-guard the dec: body-local shared-struct slots
+                // whose let-binding never executed (the enclosing loop
+                // body or conditional branch was skipped) carry a
+                // null sentinel — `track_rc_var` emits a `store null`
+                // at function entry. Without the guard, the dec
+                // dereferences null (or stale memory) and hangs in
+                // macOS malloc's bookkeeping pages. Skip when null;
+                // otherwise dispatch through `emit_refcount_dec` as
+                // before.
+                let null = ptr_ty.const_null();
+                let is_null = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, current_ptr, null, "rc_is_null")
+                    .unwrap();
+                let skip_bb = self.context.append_basic_block(fn_val, "rc_cleanup_skip");
+                let do_bb = self.context.append_basic_block(fn_val, "rc_cleanup_do");
+                let join_bb = self.context.append_basic_block(fn_val, "rc_cleanup_join");
+                self.builder
+                    .build_conditional_branch(is_null, skip_bb, do_bb)
+                    .unwrap();
+                self.builder.position_at_end(do_bb);
                 self.emit_refcount_dec(name, *heap_type, current_ptr);
+                self.builder.build_unconditional_branch(join_bb).unwrap();
+                self.builder.position_at_end(skip_bb);
+                self.builder.build_unconditional_branch(join_bb).unwrap();
+                self.builder.position_at_end(join_bb);
             }
             CleanupAction::FreeVecBuffer {
                 vec_alloca,

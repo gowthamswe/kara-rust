@@ -401,6 +401,9 @@ impl<'ctx> super::Codegen<'ctx> {
         let pushed_bounds = self.collect_asserted_bounds_from_guard(condition);
         let pushed_count = pushed_bounds.len();
         self.asserted_index_bounds.extend(pushed_bounds);
+        // Per-iteration scope frame, same shape as compile_for_range — see
+        // its comment for the leak rationale.
+        self.scope_cleanup_actions.push(Vec::new());
         self.compile_block(body)?;
         // Pop the bounds we pushed for this loop; restore the surrounding
         // scope's stack untouched. Nested loops therefore see only their
@@ -408,14 +411,17 @@ impl<'ctx> super::Codegen<'ctx> {
         for _ in 0..pushed_count {
             self.asserted_index_bounds.pop();
         }
-        if self
+        let body_has_terminator = self
             .builder
             .get_insert_block()
             .unwrap()
             .get_terminator()
-            .is_none()
-        {
+            .is_some();
+        if !body_has_terminator {
+            self.drain_top_frame_with_emit();
             self.builder.build_unconditional_branch(cond_bb).unwrap();
+        } else {
+            self.scope_cleanup_actions.pop();
         }
 
         self.loop_stack.pop();
@@ -445,15 +451,24 @@ impl<'ctx> super::Codegen<'ctx> {
 
         self.builder.build_unconditional_branch(loop_bb).unwrap();
         self.builder.position_at_end(loop_bb);
+        // Per-iteration scope frame, same shape as compile_for_range — see
+        // its comment for the leak rationale (body-local shared-struct
+        // lets re-bound on every iteration would otherwise climb refcount
+        // N×K and pin the chain). Drained just before the back-edge to
+        // `loop_bb`.
+        self.scope_cleanup_actions.push(Vec::new());
         self.compile_block(body)?;
-        if self
+        let body_has_terminator = self
             .builder
             .get_insert_block()
             .unwrap()
             .get_terminator()
-            .is_none()
-        {
+            .is_some();
+        if !body_has_terminator {
+            self.drain_top_frame_with_emit();
             self.builder.build_unconditional_branch(loop_bb).unwrap();
+        } else {
+            self.scope_cleanup_actions.pop();
         }
 
         self.loop_stack.pop();

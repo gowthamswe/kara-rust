@@ -538,18 +538,41 @@ impl<'ctx> super::Codegen<'ctx> {
             self.collect_asserted_bounds_from_for_range(pattern, start, end, inclusive);
         let pushed_for_count = pushed_for_bounds.len();
         self.asserted_index_bounds.extend(pushed_for_bounds);
+        // Per-iteration scope frame for body-local lets — the alloca lives
+        // for the whole function (entry-block one-shot), but a `let node
+        // = SharedT { … }` rebound on every iteration must drop the
+        // previous iteration's value before the next store, or the
+        // refcount climbs N×K and the chain leaks. Pushing a frame here
+        // and draining it just before the increment branch emits one
+        // rc_dec per body-local shared-struct let per iteration. Matches
+        // the match-arm push/drain pattern in `control_flow_match.rs`.
+        // Function-tail `emit_scope_cleanup` no longer walks these
+        // bindings (the frame is gone by the time control reaches the
+        // function tail), so the slot's null sentinel (emitted by
+        // `null_init_slot_in_entry_block` for nested-block shared-struct
+        // lets) only matters for the unreachable-body case, not the
+        // iterate-then-cleanup case.
+        self.scope_cleanup_actions.push(Vec::new());
         self.compile_block(body)?;
         for _ in 0..pushed_for_count {
             self.asserted_index_bounds.pop();
         }
-        if self
+        let body_has_terminator = self
             .builder
             .get_insert_block()
             .unwrap()
             .get_terminator()
-            .is_none()
-        {
+            .is_some();
+        if !body_has_terminator {
+            self.drain_top_frame_with_emit();
             self.builder.build_unconditional_branch(incr_bb).unwrap();
+        } else {
+            // Body ended with a terminator (break / continue / return) —
+            // the early-exit path's own cleanup walk already handled
+            // every frame in the stack including this one. Pop without
+            // emitting so the frame doesn't shadow the surrounding
+            // scope's bindings.
+            self.scope_cleanup_actions.pop();
         }
 
         // Increment by `step_val`

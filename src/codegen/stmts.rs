@@ -937,6 +937,44 @@ impl<'ctx> super::Codegen<'ctx> {
                 } else {
                     self.bind_pattern(pattern, val)?;
                 }
+                // For shared-struct lets that may not execute at runtime
+                // (nested inside a loop body or conditional branch),
+                // null-init the slot at function entry. The bind_pattern
+                // store above runs in the let-stmt's basic block; when
+                // that block is unreachable at runtime, the alloca
+                // stays at the entry-block null sentinel emitted here,
+                // and the cleanup walker's null-guard (in
+                // `emit_cleanup_action`'s `RcDec` arm) skips the dec.
+                // Mirrors the way Rust's MIR Drop-flag tracking encodes
+                // conditionally-live bindings.
+                //
+                // Skipped when the let is at function top-level (its
+                // bind_pattern store always runs, so the null sentinel
+                // would just be immediate dead-store). The
+                // `scope_cleanup_actions.len() > 1` check distinguishes
+                // nested-block lets (their cleanup frame is the
+                // function's, but they live inside a control-flow
+                // sub-block whose body store may not fire) from
+                // top-level lets that share the entry block. Actually,
+                // all lets currently land in the function-level frame
+                // (no per-block frames), so the heuristic uses the
+                // builder's current basic block: if it isn't the entry
+                // block, we're nested.
+                if shared_info.is_some() {
+                    if let PatternKind::Binding(var_name) = &pattern.kind {
+                        if let Some(slot) = self.variables.get(var_name.as_str()).copied() {
+                            let is_nested = self
+                                .current_fn
+                                .and_then(|f| f.get_first_basic_block())
+                                .zip(self.builder.get_insert_block())
+                                .map(|(entry, cur)| entry != cur)
+                                .unwrap_or(false);
+                            if is_nested {
+                                self.null_init_slot_in_entry_block(slot.ptr);
+                            }
+                        }
+                    }
+                }
                 // Track Vec variables for scope cleanup.
                 if let PatternKind::Binding(var_name) = &pattern.kind {
                     if let Some(&elem_ty) = self.vec_elem_types.get(var_name.as_str()) {
