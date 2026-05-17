@@ -9139,6 +9139,43 @@ When a panic unwinds through a parked task — a network-boundary task currently
 
 **Layer classification.** The four-rule semantics above are *Guaranteed* — a conforming compiler+runtime must execute the cleanup, surface the panic on the parent join, cancel siblings cooperatively, and release provider-rooted resources in the panic-during-suspend case. The specific stack-frame walking strategy the runtime uses to surface the panic on the parent join is *Implementation freedom*. The crash-report content for panic-during-suspend follows the [Crash Report Format](#4-crash-report-format) contract (which is *Reported behavior*).
 
+#### Debugger Contract Extension for Parked Tasks
+
+The four debugger-contract elements at [§ 3. Debugger Contract](#3-debugger-contract) — static spawn-site IDs, parent-frame reference, await-chain pointer, `std.runtime::list_tasks()` / `list_par_blocks()` — apply to network-event-loop-parked tasks identically to `par {}` / `spawn()` workers. This subsection makes the extension explicit: the existing contract surface is the language-level contract for parked tasks too, and the network-event-loop case extends the `WaitTarget` enum with typed variants for network I/O readiness.
+
+**Element 1 — Static spawn-site IDs.** Network-boundary functions inherit `SpawnSiteId`s from their nearest enclosing `par {}` block or `spawn()` site, exactly as workers do. A network-boundary function called inside a `par {}` branch carries the branch's `SpawnSiteId`; one called from the root task carries the root sentinel. The network event loop itself is not a spawn site — it is the runtime substrate that drives the state machine for an already-spawned task. No new IDs are introduced by parking.
+
+**Element 2 — Parent-frame reference.** Every parked task carries a parent-frame pointer per the existing contract. The pointer is set at the moment the network-boundary function is entered (before the first yield point) and persists across every yield-and-resume cycle inside the function — the runtime preserves the pointer in the state struct's metadata header alongside the `state` tag. The pointer survives unwind (panic, cancellation, normal return); during unwind, the parent-frame walk drives the panic-surfacing rule in [Panic During Suspend](#panic-during-suspend).
+
+**Element 3 — Await-chain pointer with typed `WaitTarget` variants.** A parked task's `WaitTarget` carries one of three typed variants, distinguishing what the task is blocked against:
+
+```kara
+pub enum WaitTarget {
+    NetworkIo { fd: RawFd, direction: IoDirection, timeout: Option[Duration] },
+    Timer { deadline: Instant },
+    Channel { receiver_id: ChannelId, side: ChannelSide },
+}
+
+pub enum IoDirection { Read, Write, Both }
+pub enum ChannelSide { Sender, Receiver }
+```
+
+`NetworkIo` is the v1 contribution from the network-event-loop story — every network-boundary task parked at a yield point carries this variant, populated with the file descriptor of the socket the task is parked against, the direction the task is waiting on (read-readable, write-ready, or both — depending on whether the yielded call was `sends(Network)`, `receives(Network)`, or both), and the timeout (if the call was made through a deadline-bearing wrapper). The `RawFd` exposure is intentional: a debugger plugin that wants to correlate the parked task with `lsof` / `netstat` output uses the fd as the join key.
+
+`Timer` and `Channel` cover the broader `suspends` surface (timer waits via the kernel timer wheel, channel-receive blocks) — included here for completeness; the network-event-loop story drives `NetworkIo`, the others are already covered by the broader runtime contract.
+
+**Element 4 — `std.runtime::list_tasks()` includes parked tasks.** The enumeration function returns parked tasks alongside thread-blocking and synchronously-running tasks. Each parked task entry carries: the `TaskId`, the source location of the yield-point call (`file:line` + callee name), the `WaitTarget` variant + payload, the source-level effect summary (the function's declared / inferred effect set), the `SpawnSiteId` inherited from the enclosing concurrency scope, and the parent-frame reference. The same data is available through the structured crash report (per [Crash Report Format](#4-crash-report-format)), so post-mortem analyzers see the parked-task tree at panic time without needing a live runtime attach.
+
+**Profile-gated metadata emission.** Per the existing contract, the four elements are emitted under `runtime_debug_metadata = true` (default `true` for `[profile.dev]`, default `false` for `[profile.release]`, programmer-overridable in `kara.toml`). The network-event-loop case follows the same gate: a release binary without metadata returns an empty list from `list_tasks()` (degrades gracefully — not an error), and a `WaitTarget` lookup returns `None`. The runtime cost of the metadata is the same shape as for `par {}` / `spawn()` workers — a small per-task header on the state struct, an entry in the global parked-task table maintained by the event loop, and an event-loop-side hook that updates `WaitTarget` on park / unpark transitions. Embedded and `isr` profiles default the gate off (per the existing rule — incompatible with `panics_off` / `default_no_alloc` semantics).
+
+**Stability.** The `WaitTarget.NetworkIo` payload (`fd`, `direction`, `timeout`) is part of the language-level contract and stable within a major version. New `WaitTarget` variants may be added (additive) over time as new wait-target classes emerge (e.g., GPU-fence wait targets for the future GPU backend); existing variants' payloads cannot change shape without an edition-gated migration. Tools keying on `WaitTarget` see the same variant names, field names, and types across compatible compiler versions.
+
+**v1 deliverables.** The runtime metadata emission for parked tasks, the typed `WaitTarget` enum with the three variants, the `list_tasks()` extension to include parked tasks, and the profile-gating wiring. **Out of scope for v1:** debugger plugins (gdb / lldb adapters that render the parked-task tree), DAP-server task views, profiler GUIs surfacing per-task park duration histograms. These are downstream consumers built on the contract; ecosystem and engineering bandwidth, not language design, gates them.
+
+**Sequencing.** This extension lands with the [Phase 6 runtime](implementation_checklist/phase-6-runtime.md) network-event-loop work — the contract must be in place *before* the event loop's runtime first emits parked-task metadata, or the surface gets locked in by accident.
+
+**Layer classification.** Per the existing § 3 Debugger Contract rule, the four elements form a *Reported behavior* surface — stable within a release, additive evolution across releases. The `NetworkIo` variant's specific shape (the `RawFd` / `IoDirection` / `Option[Duration]` payload triple) is itself *Reported*; tools must tolerate additive evolution.
+
 ### Explicit Concurrency: `par {}` and `spawn()`
 
 Auto-concurrency handles the common case — the compiler finds independent operations and parallelizes them. Two explicit constructs complement it for cases the compiler cannot handle alone:
