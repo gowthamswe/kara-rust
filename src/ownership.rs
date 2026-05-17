@@ -40,6 +40,30 @@ impl std::fmt::Display for OwnershipMode {
     }
 }
 
+/// A capture path recorded by the disjoint-closure-capture analyser
+/// (line 353 phase-5 checklist — disjoint capture slice 1). A path
+/// names a *place* inside an outer binding that the closure body
+/// references — the root identifier plus zero-or-more field-projection
+/// steps. Empty `projection` means "captured whole" (the closure body
+/// references the bare binding, or references the root through a
+/// stopping construct like an index, method call, or deref of a
+/// borrow). Non-empty `projection` lists the field chain root-to-leaf
+/// — `u.profile.name` → root `"u"`, projection `["profile", "name"]`.
+/// Tuple-index access (`t.0`) extends the path with the index's
+/// textual form (`"0"`) so the same path-set machinery covers both
+/// struct-field and tuple-position projections uniformly.
+///
+/// Slice 1 records the *set* of paths the body touches per closure;
+/// per-path mode inference (which path is `ref` vs `mut ref` vs `own`)
+/// is slice 2. Borrow-checker integration that lets outer-scope sibling
+/// paths remain accessible is slice 3. Stored on
+/// `OwnershipCheckResult::closure_capture_paths`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CapturePath {
+    pub root: String,
+    pub projection: Vec<String>,
+}
+
 /// A projection step from a root binding to a sub-place.
 /// `Field("inner")` for `c.inner`, `Index` for `arr[i]` or `tup.0`,
 /// `Range` for the half-open `v[a..b]` slice form (kept distinct from
@@ -305,6 +329,21 @@ pub struct OwnershipCheckResult {
     /// emission time gives stable output for tests / `karac
     /// explain`.
     pub closure_captures: HashMap<SpanKey, Vec<(String, OwnershipMode)>>,
+    /// Per-closure capture-path sets — line 353 phase-5 checklist
+    /// disjoint-capture slice 1. Keyed by the closure expression's
+    /// `SpanKey`. Each entry lists the distinct
+    /// `CapturePath { root, projection }` records the body's
+    /// place-expression scan produced, sorted lexicographically by
+    /// `(root, projection)`. Paths with empty projection mean
+    /// "captured whole" (bare-identifier reference, or root reached
+    /// through a stopping construct like index, method call, or
+    /// deref). Field chains accumulate as the projection vector.
+    /// Read-only surface for now: per-path mode inference (slice 2)
+    /// and borrow-checker integration that lets outer-scope sibling
+    /// paths remain accessible (slice 3) consume this map without
+    /// changing existing per-name semantics. Empty for any closure
+    /// whose body references no outer bindings.
+    pub closure_capture_paths: HashMap<SpanKey, Vec<CapturePath>>,
     /// Closure expression span → enclosing function key (round
     /// 12.25). Lets `karac query ownership <fn>` filter
     /// `closure_param_modes` / `closure_captures` to closures whose
@@ -408,6 +447,12 @@ pub struct OwnershipChecker<'a> {
     /// expression's `SpanKey`. Surfaced via
     /// `OwnershipCheckResult::closure_captures`.
     pub(crate) closure_captures: HashMap<SpanKey, Vec<(String, OwnershipMode)>>,
+    /// Per-closure capture-path sets — line 353 phase-5 checklist
+    /// disjoint-capture slice 1. Populated alongside `closure_captures`
+    /// in `check_expr_consuming`'s Closure arm by
+    /// `classify_capture_body_paths`. Surfaced via
+    /// `OwnershipCheckResult::closure_capture_paths`.
+    pub(crate) closure_capture_paths: HashMap<SpanKey, Vec<CapturePath>>,
     /// Closure span → enclosing function key (round 12.25). Built
     /// up at every `Closure` arm visit alongside the param/capture
     /// inference. Surfaced via `OwnershipCheckResult::closure_function`.
@@ -513,6 +558,7 @@ impl<'a> OwnershipChecker<'a> {
             param_modes: HashMap::new(),
             closure_param_modes: HashMap::new(),
             closure_captures: HashMap::new(),
+            closure_capture_paths: HashMap::new(),
             closure_function: HashMap::new(),
             closure_spans: HashMap::new(),
             errors: Vec::new(),
@@ -590,6 +636,7 @@ impl<'a> OwnershipChecker<'a> {
             param_modes: self.param_modes,
             closure_param_modes: self.closure_param_modes,
             closure_captures: self.closure_captures,
+            closure_capture_paths: self.closure_capture_paths,
             closure_function: self.closure_function,
             closure_spans: self.closure_spans,
             errors: self.errors,

@@ -2827,6 +2827,311 @@ fn bare_closure_consume_capture_with_outer_use_routes_through_rc_fallback() {
     );
 }
 
+// ── Disjoint closure capture — slice 1 (capture-path enumeration) ─
+//
+// Phase-5 § Disjoint closure capture (line 353) slice 1: the closure
+// analyser produces a `CapturePath { root, projection }` set per
+// closure expression in addition to the per-name capture-mode list.
+// Empty projection means "captured whole" (bare identifier or a
+// reference through a stopping construct — index, method call, or
+// deref). Non-empty projection lists the field-chain root-to-leaf.
+// Slice 1 surfaces only the set; mode inference is slice 2,
+// borrow-checker integration is slice 3.
+//
+// These tests pin the path-set shape produced for the closure-body
+// constructs the spec calls out in its test plan.
+
+/// Pull the capture-path list for the single closure in `result`.
+fn single_closure_capture_paths(result: &OwnershipCheckResult) -> &Vec<CapturePath> {
+    assert_eq!(
+        result.closure_capture_paths.len(),
+        1,
+        "expected exactly one closure in source; got {} entries",
+        result.closure_capture_paths.len()
+    );
+    result.closure_capture_paths.values().next().unwrap()
+}
+
+fn path(root: &str, projection: &[&str]) -> CapturePath {
+    CapturePath {
+        root: root.to_string(),
+        projection: projection.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[test]
+fn capture_path_bare_identifier_is_whole_root() {
+    // `|| take(cfg)` — the body references `cfg` as a bare identifier
+    // (call arg). Path-set is `{(cfg, [])}` — root captured whole.
+    let result = ownership_ok(
+        "struct Config { name: i64 }\n\
+         fn take(c: Config) { }\n\
+         fn main() {\n\
+             let cfg = Config { name: 1 };\n\
+             let _f = || take(cfg);\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("cfg", &[])],
+        "bare identifier should register whole-root path; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_single_field_chain_records_projection() {
+    // `|| cfg.value + 1` — body reads a single field projection. Path
+    // is `(cfg, ["value"])` — root + one-segment projection. The root
+    // is NOT additionally registered as a whole capture (the spec
+    // walker extends the path through field accesses; only stopping
+    // constructs commit the root as whole).
+    let result = ownership_ok(
+        "struct Config { value: i64 }\n\
+         fn main() {\n\
+             let cfg = Config { value: 1 };\n\
+             let _f = || cfg.value + 1;\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("cfg", &["value"])],
+        "field projection should record projection chain only; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_nested_field_chain_records_full_projection() {
+    // `|| u.profile.name` — body reads through two field segments.
+    // Path is `(u, ["profile", "name"])` — full root-to-leaf chain.
+    let result = ownership_ok(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 } };\n\
+             let _f = || u.profile.name + 1;\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("u", &["profile", "name"])],
+        "nested field chain should record full projection; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_disjoint_fields_under_same_root_record_distinct_paths() {
+    // `|| { u.name; u.age }` — two distinct field projections under
+    // one root. Path-set is `{(u, ["age"]), (u, ["name"])}` — both
+    // siblings recorded, sorted lexicographically. The root `u` is
+    // NOT registered as whole — neither projection hits a stopping
+    // construct, so the path walker extends through each access
+    // independently. Pins the foundation slice 2/3 will use to
+    // accept outer-scope sibling access of `u.history` after the
+    // closure captures only `u.name` and `u.age`.
+    let result = ownership_ok(
+        "struct User { name: i64, age: i64 }\n\
+         fn main() {\n\
+             let u = User { name: 1, age: 2 };\n\
+             let _f = || u.name + u.age;\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("u", &["age"]), path("u", &["name"])],
+        "disjoint sibling fields should record distinct paths; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_index_commits_root_whole() {
+    // `|| vec[0]` — index is a stopping construct per spec. The
+    // walker commits the root `vec` as captured whole regardless of
+    // what the indexed result is used for. Path-set is `{(vec, [])}`.
+    // Slice 3's borrow checker will use this to deny outer-scope
+    // sibling access when the closure captured the whole vec.
+    let result = ownership_ok(
+        "fn main() {\n\
+             let vec = [1, 2, 3];\n\
+             let _f = || vec[0] + 1;\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("vec", &[])],
+        "index expression should commit root whole; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_method_call_receiver_commits_root_whole() {
+    // `|| u.length()` — method call on a captured root is a stopping
+    // construct (the method may use any/all of the receiver's state
+    // through its `self` parameter; the analyser cannot tell which
+    // fields a method touches without inter-procedural inspection).
+    // Path-set is `{(u, [])}`.
+    let result = ownership_ok(
+        "struct User { name: i64 }\n\
+         impl User { fn length(ref self) -> i64 { 0 } }\n\
+         fn main() {\n\
+             let u = User { name: 1 };\n\
+             let _f = || u.length();\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("u", &[])],
+        "method call on captured root should commit root whole; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_index_into_field_chain_commits_root_whole() {
+    // `|| vec[0].field` — index appears inside the projection chain.
+    // The walker hits Index before completing the FieldAccess
+    // extraction; the root `vec` commits as captured whole. The
+    // outer `.field` access surrounding the index does not extend
+    // the path (its object is no longer a pure field chain).
+    let result = ownership_ok(
+        "struct Item { field: i64 }\n\
+         fn main() {\n\
+             let items = [Item { field: 1 }];\n\
+             let _f = || items[0].field + 1;\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("items", &[])],
+        "index inside field chain should commit root whole; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_method_call_on_field_chain_commits_root_whole() {
+    // `|| u.profile.method()` — the method-call receiver `u.profile`
+    // is a captured-rooted place; the receiver commits the root `u`
+    // as captured whole. The intermediate `profile` projection is
+    // NOT recorded as a separate path — it was an in-progress field
+    // chain when the stopping construct fired.
+    let result = ownership_ok(
+        "struct Profile { name: i64 }\n\
+         impl Profile { fn length(ref self) -> i64 { 0 } }\n\
+         struct User { profile: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 } };\n\
+             let _f = || u.profile.length();\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("u", &[])],
+        "method call on field chain should commit root whole; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_multiple_roots_each_recorded_independently() {
+    // Two distinct outer bindings, each touched through its own path
+    // shape (one via field, one via index). Output is sorted by root
+    // then projection.
+    let result = ownership_ok(
+        "struct Config { value: i64 }\n\
+         fn main() {\n\
+             let cfg = Config { value: 1 };\n\
+             let arr = [10, 20, 30];\n\
+             let _f = || cfg.value + arr[1];\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("arr", &[]), path("cfg", &["value"])],
+        "two roots should appear sorted with their respective shapes; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_excludes_shadowed_outer_name() {
+    // Outer `x` lexically shadowed by the closure's own parameter
+    // `x`. The closure body's `x.v` references the closure-local,
+    // not the outer binding. Path-set must be empty — the outer `x`
+    // is not captured.
+    let result = ownership_ok(
+        "struct Data { v: i64 }\n\
+         fn take(d: Data) { }\n\
+         fn outer(x: i64) -> i64 {\n\
+             let _f = |x: Data| take(x);\n\
+             x\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert!(
+        paths.is_empty(),
+        "shadowed outer name must not appear in path-set; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_unreferenced_outer_name_produces_no_path() {
+    // `unused_v` is in the outer scope but the closure body never
+    // touches it. Only `cfg.value` is captured, registering one
+    // path. Pins the parity with `closure_captures` exclusion of
+    // unreferenced outer bindings.
+    let result = ownership_ok(
+        "struct Config { value: i64 }\n\
+         fn main() {\n\
+             let cfg = Config { value: 1 };\n\
+             let unused_v = 42;\n\
+             let _f = || cfg.value + 1;\n\
+             let _u = unused_v;\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("cfg", &["value"])],
+        "unreferenced outer name should not appear in path-set; got {:?}",
+        paths
+    );
+}
+
+#[test]
+fn capture_path_tuple_index_extends_projection() {
+    // `|| t.0 + 1` — tuple-index access extends the path the same
+    // way struct-field access does, with the index segment
+    // stringified into the projection vector.
+    let result = ownership_ok(
+        "fn main() {\n\
+             let t = (10, 20);\n\
+             let _f = || t.0 + 1;\n\
+         }",
+    );
+    let paths = single_closure_capture_paths(&result);
+    assert_eq!(
+        paths.as_slice(),
+        &[path("t", &["0"])],
+        "tuple-index access should extend projection with stringified index; got {:?}",
+        paths
+    );
+}
+
 // ── Step 7 sentinels: ref-captured value escape (E0508) ─────────
 //
 // Round 12.35 — design.md § Closures Rule 2 sub-case (iv):

@@ -922,6 +922,23 @@ impl<'a> super::OwnershipChecker<'a> {
                 self.closure_captures
                     .insert(SpanKey::from_span(&expr.span), captures);
 
+                // Disjoint capture slice 1 (line 353 phase-5
+                // checklist) — record the set of distinct capture
+                // paths the body touches against each pre-live root.
+                // Shares `pre_live` with the per-name walker above and
+                // applies the closure-param shadow filter identically.
+                // Slice 2 will run mode inference per path; slice 3
+                // will pass this set to the borrow checker so outer-
+                // scope sibling-path access is permitted.
+                let path_pre_live: Vec<String> = pre_live
+                    .iter()
+                    .filter(|name| !closure_param_set.contains(*name))
+                    .cloned()
+                    .collect();
+                let capture_paths = self.classify_capture_body_paths(body, &path_pre_live);
+                self.closure_capture_paths
+                    .insert(SpanKey::from_span(&expr.span), capture_paths);
+
                 // K2 conflict-table row "mut ref + reads only" (Rule 2½):
                 // if the closure declared `mut ref` but the body never
                 // mutates a referenced capture, emit a Tier 2 perf note.
