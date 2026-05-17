@@ -846,7 +846,7 @@ impl<'a> super::TypeChecker<'a> {
     /// (function types, raw pointers, type variables) — the discharge
     /// engine guards `TypeVar` / `TypeParam` / `Error` upstream so those
     /// don't reach here in practice.
-    fn type_satisfies_bound(&self, ty: &Type, trait_name: &str) -> bool {
+    pub(super) fn type_satisfies_bound(&self, ty: &Type, trait_name: &str) -> bool {
         // Built-in coverage via the type_supports_* helpers — these
         // recognize primitives implicitly + named types via
         // `#[derive(Trait)]` registration.

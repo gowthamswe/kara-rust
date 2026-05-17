@@ -18,7 +18,7 @@ use super::const_eval::{
     apply_binary, apply_unary, const_value_type, infer_operand_target_ty, integer_to_const_value,
 };
 use super::inference::{find_unbound_const_param, find_unbound_type_param};
-use super::types::{IntSize, Type, UIntSize, VariantTypeInfo};
+use super::types::{type_display, IntSize, Type, UIntSize, VariantTypeInfo};
 use super::{ConstEvalError, LocalTypeScope, TypeErrorKind};
 
 impl<'a> super::TypeChecker<'a> {
@@ -887,6 +887,37 @@ impl<'a> super::TypeChecker<'a> {
             self.enclosing_bounds.insert(name, bounds);
         }
 
+        // GAT slice 7: cache the trait's AssocTypeDecl bounds keyed by
+        // assoc-type name so the binding loop can enforce them at impl
+        // site without re-walking program.items per binding. Empty when
+        // the impl is inherent (no trait) or the trait isn't found in
+        // the current program's items (e.g., baked stdlib traits, where
+        // the bound enforcement is a no-op — slice 7 v1 scope is the
+        // user-program surface where program.items carries the decl).
+        let trait_assoc_bounds: HashMap<String, Vec<TraitBound>> = imp
+            .trait_name
+            .as_ref()
+            .and_then(|tp| tp.segments.last())
+            .and_then(|tn| {
+                self.program.items.iter().find_map(|it| match it {
+                    Item::TraitDef(t) if t.name == *tn => Some(t),
+                    _ => None,
+                })
+            })
+            .map(|trait_def| {
+                trait_def
+                    .items
+                    .iter()
+                    .filter_map(|it| match it {
+                        TraitItem::AssocType(decl) => {
+                            Some((decl.name.clone(), decl.bounds.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         for item in &imp.items {
             match item {
                 ImplItem::Method(method) => self.check_function(method, Some(&self_type), &[]),
@@ -904,6 +935,41 @@ impl<'a> super::TypeChecker<'a> {
                     let mut combined_scope = gp.clone();
                     combined_scope.extend(gat_params.iter().cloned());
                     let bound_ty = self.lower_type_expr(&binding.ty, &combined_scope);
+
+                    // GAT slice 7: impl-site bound enforcement.
+                    // The trait's GAT declaration may carry bounds
+                    // (`type Mapped[U]: Trait`). At every impl site,
+                    // the binding's lowered RHS must satisfy each
+                    // declared bound. Per design.md the proof is
+                    // structural: the RHS is provable to satisfy
+                    // `Trait` for arbitrary GAT-param instantiation
+                    // when the RHS's head type carries a generic-on-
+                    // name impl of the bound trait (e.g.,
+                    // `Vec[U]: Clone` via `impl[T] Clone for Vec[T]`).
+                    // The TypeParam-RHS shape (`type Mapped = T`)
+                    // proves via the impl's own `enclosing_bounds`
+                    // on T.
+                    if let Some(bounds) = trait_assoc_bounds.get(&binding.name) {
+                        for bound in bounds {
+                            let bound_trait = bound.path.last().cloned().unwrap_or_default();
+                            if !self.gat_rhs_satisfies_bound(&bound_ty, &bound_trait) {
+                                self.type_error(
+                                    format!(
+                                        "error[E_GAT_BOUND_NOT_SATISFIED]: \
+                                         binding `type {} = {}` does not satisfy \
+                                         declared GAT bound `{}: {}`",
+                                        binding.name,
+                                        type_display(&bound_ty),
+                                        binding.name,
+                                        bound_trait,
+                                    ),
+                                    binding.span.clone(),
+                                    TypeErrorKind::TypeMismatch,
+                                );
+                            }
+                        }
+                    }
+
                     self.env.impl_assoc_types.insert(
                         (type_name.clone(), binding.name.clone()),
                         crate::typechecker::env::ImplAssocTypeEntry {

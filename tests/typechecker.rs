@@ -12505,3 +12505,203 @@ fn test_gat_slice6_generic_and_specialized_gat_impls_rejected() {
         errors.iter().map(|e| &e.message).collect::<Vec<_>>()
     );
 }
+
+// ── GAT slice 7 — impl-site bound enforcement ──────────────────────
+//
+// When a GAT declaration carries a bound (`type Mapped[U]: Trait`),
+// every impl's binding RHS must satisfy that bound. The proof is
+// structural:
+//   - TypeParam RHS proves via the impl's `enclosing_bounds`
+//     (e.g., `type Mapped = T` with impl `[T: Trait]`).
+//   - Concrete-head RHS routes through `type_satisfies_bound`,
+//     accepting generic-on-name impls (e.g., `Vec[U]: Clone` via
+//     the prelude `impl Clone for Vec[T]` registered with empty
+//     target_args).
+// Diagnostic: `E_GAT_BOUND_NOT_SATISFIED` at the binding span,
+// naming both the GAT and the unsatisfied bound trait.
+
+// User-defined `Show` trait is used as the bound throughout to keep
+// the surface in the impl-table-driven path (where slice 7's
+// `gat_rhs_satisfies_bound` actually does work). Built-in derive-only
+// traits like `Clone` are recognised by the parser but not registered
+// as impl-table entries — `type_satisfies_bound` returns false for
+// them on any nominal type today, so they aren't suitable for the
+// slice 7 enforcement surface.
+
+#[test]
+fn test_gat_slice7_concrete_rhs_satisfies_bound_accepted() {
+    // The GAT-bound trait `Show` is implemented for `Foo`. The
+    // binding `type Mapped[U] = Foo` uses a concrete type whose
+    // impl table carries `Show` directly — slice 7's
+    // `gat_rhs_satisfies_bound` routes through
+    // `type_satisfies_bound` → impl-table lookup → accepts.
+    typecheck_ok(
+        "trait Show { fn show(ref self) -> i64; }\n\
+         struct Foo {}\n\
+         impl Show for Foo { fn show(ref self) -> i64 { 1 } }\n\
+         trait Functor {\n\
+             type Mapped[U]: Show;\n\
+         }\n\
+         struct Doubler {}\n\
+         impl Functor for Doubler {\n\
+             type Mapped[U] = Foo;\n\
+         }",
+    );
+}
+
+#[test]
+fn test_gat_slice7_non_satisfying_rhs_rejected() {
+    // The GAT-bound trait `Show` is NOT implemented for `Bar`. The
+    // binding `type Mapped[U] = Bar` must be rejected with
+    // E_GAT_BOUND_NOT_SATISFIED.
+    let errors = typecheck_errors(
+        "trait Show { fn show(ref self) -> i64; }\n\
+         struct Foo {}\n\
+         struct Bar {}\n\
+         impl Show for Foo { fn show(ref self) -> i64 { 1 } }\n\
+         trait Functor {\n\
+             type Mapped[U]: Show;\n\
+         }\n\
+         struct Doubler {}\n\
+         impl Functor for Doubler {\n\
+             type Mapped[U] = Bar;\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_GAT_BOUND_NOT_SATISFIED")
+                && e.message.contains("Mapped")
+                && e.message.contains("Show")),
+        "expected E_GAT_BOUND_NOT_SATISFIED naming Mapped + Show, \
+         got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_gat_slice7_typeparam_rhs_satisfies_via_impl_bound_accepted() {
+    // `type Mapped = T` with impl `[T: Show]` — the binding RHS
+    // is a bare TypeParam `T`, and `T: Show` is in the impl's
+    // enclosing_bounds. The structural-proof rule discharges via
+    // the impl-param bound.
+    typecheck_ok(
+        "trait Show { fn show(ref self) -> i64; }\n\
+         trait Functor {\n\
+             type Mapped[U]: Show;\n\
+         }\n\
+         struct Wrapper[T] { x: T }\n\
+         impl[T: Show] Functor for Wrapper[T] {\n\
+             type Mapped[U] = T;\n\
+         }",
+    );
+}
+
+#[test]
+fn test_gat_slice7_typeparam_rhs_without_impl_bound_rejected() {
+    // `type Mapped = T` with impl `[T]` (no Show bound on T) — the
+    // binding RHS is a bare TypeParam with no way to prove Show.
+    // Slice 7 rejects.
+    let errors = typecheck_errors(
+        "trait Show { fn show(ref self) -> i64; }\n\
+         trait Functor {\n\
+             type Mapped[U]: Show;\n\
+         }\n\
+         struct Wrapper[T] { x: T }\n\
+         impl[T] Functor for Wrapper[T] {\n\
+             type Mapped[U] = T;\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_GAT_BOUND_NOT_SATISFIED")),
+        "expected E_GAT_BOUND_NOT_SATISFIED for unbound T, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_gat_slice7_unbounded_gat_accepts_any_rhs() {
+    // Regression: when the GAT has no bound (`type Mapped[U]`,
+    // no `: Trait`), slice 7 is a no-op and any RHS is accepted —
+    // even types with no Show impl.
+    typecheck_ok(
+        "trait Functor {\n\
+             type Mapped[U];\n\
+         }\n\
+         struct Bar {}\n\
+         struct Doubler {}\n\
+         impl Functor for Doubler {\n\
+             type Mapped[U] = Bar;\n\
+         }",
+    );
+}
+
+#[test]
+fn test_gat_slice7_non_gat_binding_with_bound_satisfied() {
+    // Bound enforcement applies to non-generic associated types
+    // too — `type Item: Trait` is just a degenerate GAT. The
+    // non-generic shape composes cleanly with the slice 7
+    // checker.
+    typecheck_ok(
+        "trait Show { fn show(ref self) -> i64; }\n\
+         struct Foo {}\n\
+         impl Show for Foo { fn show(ref self) -> i64 { 1 } }\n\
+         trait Container {\n\
+             type Item: Show;\n\
+         }\n\
+         struct C {}\n\
+         impl Container for C {\n\
+             type Item = Foo;\n\
+         }",
+    );
+}
+
+#[test]
+fn test_gat_slice7_non_gat_binding_with_bound_rejected() {
+    // Symmetric negative pin for the non-generic shape: `type Item =
+    // Bar` does not satisfy `Show`.
+    let errors = typecheck_errors(
+        "trait Show { fn show(ref self) -> i64; }\n\
+         struct Foo {}\n\
+         struct Bar {}\n\
+         impl Show for Foo { fn show(ref self) -> i64 { 1 } }\n\
+         trait Container {\n\
+             type Item: Show;\n\
+         }\n\
+         struct C {}\n\
+         impl Container for C {\n\
+             type Item = Bar;\n\
+         }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_GAT_BOUND_NOT_SATISFIED") && e.message.contains("Item")),
+        "expected E_GAT_BOUND_NOT_SATISFIED on Item, got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_gat_slice7_supertrait_satisfies_bound() {
+    // Structural-proof via supertrait closure: when the bound is
+    // `Show` and the RHS impls `ShowPlus` (which extends `Show`),
+    // `gat_rhs_satisfies_bound` should accept via the supertrait
+    // walk inside `type_satisfies_trait`.
+    typecheck_ok(
+        "trait Show { fn show(ref self) -> i64; }\n\
+         trait ShowPlus: Show { fn show_plus(ref self) -> i64; }\n\
+         struct Foo {}\n\
+         impl Show for Foo { fn show(ref self) -> i64 { 1 } }\n\
+         impl ShowPlus for Foo { fn show_plus(ref self) -> i64 { 2 } }\n\
+         trait Functor {\n\
+             type Mapped[U]: Show;\n\
+         }\n\
+         struct Doubler {}\n\
+         impl Functor for Doubler {\n\
+             type Mapped[U] = Foo;\n\
+         }",
+    );
+}

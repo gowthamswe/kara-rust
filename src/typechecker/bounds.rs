@@ -249,6 +249,51 @@ impl<'a> super::TypeChecker<'a> {
         }
     }
 
+    /// GAT slice 7 — structural proof that an impl's GAT binding RHS
+    /// satisfies a bound declared on the GAT (e.g., `type Mapped[U]: Clone`).
+    /// The check runs once at impl-site registration and must hold for
+    /// arbitrary instantiations of the GAT's own parameters.
+    ///
+    /// Three proof paths:
+    ///
+    /// 1. **`TypeParam(name)` RHS** — the binding is bare (`type Mapped = T`).
+    ///    Proof discharges via the impl's `enclosing_bounds[T]` carrying the
+    ///    bound trait (or one whose supertrait closure reaches it).
+    ///
+    /// 2. **Concrete-head RHS** (`Vec[U]`, `i64`, `Doubler`, etc.) — proof
+    ///    routes through `type_satisfies_bound`, which consults built-in
+    ///    `type_supports_*` for derive-recognised traits and the impl table
+    ///    (with `impl_args_match`'s "stored-empty matches any" rule) for
+    ///    everything else. A generic-on-name impl like
+    ///    `impl[T] Clone for Vec[T]` discharges `Vec[U]: Clone` for any U.
+    ///
+    /// 3. **Anything else** (function types, raw pointers, type variables)
+    ///    cannot satisfy a nominal trait bound today and conservatively
+    ///    returns `false` — the diagnostic at the call site surfaces the
+    ///    mismatch.
+    ///
+    /// Conservative-by-design: types we can't prove satisfy the bound get
+    /// rejected at impl-site. The user can address by providing an explicit
+    /// impl, an explicit bound on the impl param, or a different RHS choice.
+    pub(super) fn gat_rhs_satisfies_bound(&self, rhs: &Type, bound_trait: &str) -> bool {
+        if let Type::TypeParam(name) = rhs {
+            if let Some(bounds) = self.enclosing_bounds.get(name) {
+                return bounds.iter().any(|tb| {
+                    let trait_name = tb.path.last().cloned().unwrap_or_default();
+                    if trait_name == bound_trait {
+                        return true;
+                    }
+                    self.env
+                        .supertrait_closure_traits(&trait_name)
+                        .iter()
+                        .any(|st| st == bound_trait)
+                });
+            }
+            return false;
+        }
+        self.type_satisfies_bound(rhs, bound_trait)
+    }
+
     /// Verify `expr` is a valid constant for a default-parameter
     /// position. Tuple and array literals recurse element-wise; other
     /// shapes route through `eval_const_expr`. The composite recursion
