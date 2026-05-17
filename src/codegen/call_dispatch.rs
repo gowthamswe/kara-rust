@@ -15,6 +15,7 @@ use crate::ast::*;
 
 use inkwell::types::BasicType;
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum};
+use inkwell::AddressSpace;
 
 use super::helpers::{expr_as_type_expr_codegen, match_with_provider_call};
 
@@ -450,6 +451,7 @@ impl<'ctx> super::Codegen<'ctx> {
             None => return,
         };
         let vec_ty = self.vec_struct_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_t = self.context.i64_type();
         // Vec / String binding: zero the source's `cap` so the source's
         // `FreeVecBuffer` cleanup's `cap > 0` guard skips. The consumer
@@ -463,6 +465,43 @@ impl<'ctx> super::Codegen<'ctx> {
                 let _ = self.builder.build_store(cap_ptr, zero);
             }
             return;
+        }
+        // Shared-struct / shared-enum binding (RC-tier): the binding
+        // holds a `ptr` whose pointee is the heap object with the i64
+        // refcount header. The let-site `track_rc_var` queued a scope-
+        // exit `RcDec` that, when fired against a freshly-constructed
+        // local at RC=1, would drop the refcount to 0 and free the
+        // allocation before the consumer (caller via tail-return,
+        // `Map.insert`'s bucket, `Vec.push`'s buffer, etc.) can use it.
+        // The Vec/String arm above can no-op the cleanup via the
+        // `cap > 0` guard; the RC cleanup has no analogous guard (the
+        // pointer slot is always followed). Instead, mirror the
+        // `let b = a;` aliasing path at `stmts.rs:828`: emit an
+        // `rc_inc` here so the *consumer* holds an independent ref,
+        // and the source's queued `rc_dec` decrements the freshly-
+        // incremented count back to the construction-time value (net
+        // zero for the source's slot, +1 transferred to the consumer).
+        // Symmetric to how the Vec arm's `cap = 0` makes the source's
+        // free a no-op while the consumer assumes the buffer; here the
+        // source's dec is balanced by a new inc, with the same net
+        // effect of "consumer becomes the new owner of one ref".
+        //
+        // Without this: returning a `let n = SharedT { … }` from a
+        // helper, or pushing one into a Vec/Map/Set, frees the
+        // allocation at end-of-helper-scope before the caller / the
+        // collection can read it (silent garbage value or a hang in
+        // a follow-on RC inc loop, depending on what the freed memory
+        // gets reused as). Closes bug #7 (`Map[K, SharedStruct]`
+        // value insert + return) and the sibling cases
+        // (`Vec[SharedStruct]`, plain `fn f() -> SharedT { let n = …; n }`).
+        if let Some(type_name) = self.var_type_names.get(var_name).cloned() {
+            if let Some(info) = self.shared_types.get(type_name.as_str()).cloned() {
+                if let Ok(loaded) = self.builder.build_load(ptr_ty, slot.ptr, "move.rc.load") {
+                    let p = loaded.into_pointer_value();
+                    self.emit_refcount_inc(var_name, info.heap_type, p);
+                }
+                return;
+            }
         }
         // Struct binding (slice γ, 2026-05-14): when the source is a
         // tracked non-shared struct, walk its fields and zero each

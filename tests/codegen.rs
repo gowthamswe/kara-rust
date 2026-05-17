@@ -1674,6 +1674,187 @@ fn main() {
         }
     }
 
+    // ── Bug #7 regression: shared-struct move-out from a tracked local ──
+    //
+    // The let-site `track_rc_var` queues a scope-exit `RcDec` for the
+    // freshly-constructed shared local. When that local is then moved
+    // into a sink that takes ownership (function tail-return, `Map.insert`'s
+    // bucket, `Vec.push`'s buffer), the source's scope-exit dec used to
+    // fire against the construction-time RC=1 and free the allocation
+    // *before* the consumer could observe it.  Symptom: silent data
+    // corruption on the moved-out value (Repro A) or a hang in the
+    // follow-on caller-side `rc_inc` against use-after-free memory
+    // (Repro B). The fix balances the upcoming dec by emitting an
+    // `rc_inc` at each move-out site so the consumer holds an
+    // independent ref — symmetric to the Vec/String `cap=0` skip and
+    // to the existing `let b = a;` aliasing inc.
+
+    #[test]
+    fn test_e2e_bug7_shared_struct_return_from_helper() {
+        // The minimal repro: `let n = SharedT { … }; n` as the tail
+        // expression of a helper.  Before the fix this printed garbage
+        // (`4` or `0` depending on what the freed alloc got reused as);
+        // after the fix it prints the original 42.
+        let out = run_program(
+            r#"
+shared struct Node { val: i64 }
+fn helper() -> Node {
+    let n = Node { val: 42 };
+    n
+}
+fn main() {
+    let r = helper();
+    println(r.val);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "42");
+        }
+    }
+
+    #[test]
+    fn test_e2e_bug7_shared_struct_inserted_and_returned_mut_ref_map() {
+        // Repro A from the bug report — mut-ref-Map shape.  The helper
+        // inserts `n` into a caller-owned `Map[i64, SharedStruct]` then
+        // returns `n` itself.  Before the fix this printed `2` (silent
+        // data corruption); after the fix it prints 42.
+        let out = run_program(
+            r#"
+shared struct Node { val: i64 }
+fn helper(visited: mut ref Map[i64, Node]) -> Node {
+    let n = Node { val: 42 };
+    let _ = visited.insert(1_i64, n);
+    n
+}
+fn main() {
+    let mut m: Map[i64, Node] = Map.new();
+    let r = helper(mut m);
+    println(r.val);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "42");
+        }
+    }
+
+    #[test]
+    fn test_e2e_bug7_shared_struct_inserted_and_returned_owned_map() {
+        // Repro B from the bug report — helper-owned-Map shape.  The
+        // helper allocates its own `Map[i64, SharedStruct]`, inserts
+        // `n`, then returns `n`.  Before the fix this hung at high CPU
+        // (the freed `n` allocation gets reused as part of the map's
+        // bucket array, and the caller's `rc_inc` loops against that
+        // memory); after the fix it prints 42 promptly.
+        let out = run_program(
+            r#"
+shared struct Node { val: i64 }
+fn helper() -> Node {
+    let mut visited: Map[i64, Node] = Map.new();
+    let n = Node { val: 42 };
+    let _ = visited.insert(1_i64, n);
+    n
+}
+fn main() {
+    let r = helper();
+    println(r.val);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "42");
+        }
+    }
+
+    #[test]
+    fn test_e2e_bug7_vec_shared_struct_push_and_return() {
+        // Sibling case to Repro A/B: `Vec[SharedStruct]` rather than
+        // `Map[K, SharedStruct]`.  The Vec.push site already calls the
+        // shared cleanup-suppression helper, so the same fix carries
+        // through — return value reads 42, not garbage.
+        let out = run_program(
+            r#"
+shared struct Node { val: i64 }
+fn helper() -> Node {
+    let mut v: Vec[Node] = Vec.new();
+    let n = Node { val: 42 };
+    v.push(n);
+    n
+}
+fn main() {
+    let r = helper();
+    println(r.val);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "42");
+        }
+    }
+
+    #[test]
+    fn test_e2e_bug7_shared_struct_nested_map_in_vec_return() {
+        // Combined ownership path: the helper inserts the same `n` into
+        // BOTH a Map and a Vec before returning it.  Each move-out site
+        // emits an independent `rc_inc`, and the source's single
+        // scope-exit `rc_dec` keeps the refcount above zero across all
+        // three consumers (Map bucket, Vec buffer, caller's `r`).
+        let out = run_program(
+            r#"
+shared struct Node { val: i64 }
+fn helper() -> Node {
+    let mut m: Map[i64, Node] = Map.new();
+    let mut v: Vec[Node] = Vec.new();
+    let n = Node { val: 42 };
+    let _ = m.insert(1_i64, n);
+    v.push(n);
+    n
+}
+fn main() {
+    let r = helper();
+    println(r.val);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "42");
+        }
+    }
+
+    #[test]
+    fn test_ir_bug7_shared_struct_move_out_emits_rc_inc() {
+        // IR-level gate so a future regression that drops the inc-on-
+        // move-out is caught immediately, not just by the e2e tests.
+        // The helper body must contain at least two RC adjustments
+        // against `n` (the move-out `rc_inc` + the scope-exit `rc_dec`),
+        // both lowering to plain non-atomic `add/sub i64` on the
+        // refcount field at offset 0 of the heap struct.  Before the
+        // fix only the `rc_dec` was emitted, leaving the moved-out
+        // pointer at RC=0 (freed) at the `ret`.
+        let ir = ir_for(
+            r#"
+shared struct Node { val: i64 }
+fn helper() -> Node {
+    let n = Node { val: 42 };
+    n
+}
+"#,
+        );
+        let inc_count = ir.matches("add i64 %rc").count();
+        let dec_count = ir.matches("sub i64 %rc").count();
+        assert!(
+            inc_count >= 1,
+            "helper should emit rc_inc on move-out (found {} `add i64 %rc` ops)",
+            inc_count
+        );
+        assert!(
+            dec_count >= 1,
+            "helper should still emit rc_dec on scope exit (found {} `sub i64 %rc` ops)",
+            dec_count
+        );
+    }
+
     // ── Unit enum variant matching ──────────────────────────────
 
     #[test]
