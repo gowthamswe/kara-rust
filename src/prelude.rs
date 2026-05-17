@@ -766,6 +766,7 @@ fn stub_function(name: &str, span: &Span) -> Item {
         stdlib_origin: true,
         deprecation: None,
         is_track_caller: false,
+        lint_overrides: Vec::new(),
     })
 }
 

@@ -15,6 +15,7 @@ pub mod ffi_lint;
 pub mod formatter;
 pub mod interpreter;
 pub mod lexer;
+pub mod lints;
 pub mod logical_lint;
 pub mod lowering;
 pub mod manifest;

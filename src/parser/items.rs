@@ -240,6 +240,7 @@ impl super::Parser {
         // still see the captured attribute.
         let is_track_caller = self.scan_track_caller_attr(&attributes);
         let deprecation = self.scan_deprecated_attr(&attributes);
+        let lint_overrides = self.scan_lint_level_attrs(&attributes);
 
         Some(Function {
             span: self.span_from(&start),
@@ -261,6 +262,7 @@ impl super::Parser {
             stdlib_origin: false,
             deprecation,
             is_track_caller,
+            lint_overrides,
         })
     }
 
@@ -417,6 +419,129 @@ impl super::Parser {
             });
         }
         first
+    }
+
+    /// Scan `attributes` for the four lint-level attributes —
+    /// `#[allow(...)]`, `#[warn(...)]`, `#[deny(...)]`,
+    /// `#[expect(...)]` — and produce one `LintLevelOverride`
+    /// per (level, lint-name) pair. Per `design.md § Lint Level
+    /// Attributes`, each attribute accepts a comma-separated list
+    /// of lint identifiers (no values, no nested attributes).
+    ///
+    /// **Diagnostics emitted at this slice.**
+    /// - `E_DUPLICATE_LINT_LEVEL` — the same lint name appears
+    ///   more than once in the **same** attribute, e.g.
+    ///   `#[allow(deprecated, deprecated)]`. The first occurrence
+    ///   is recorded; the duplicates are dropped after the error
+    ///   fires. Per the spec, this is unconditionally an error
+    ///   (not a lint) — bad surface, no recovery semantics.
+    /// - `E_LINT_LEVEL_NON_IDENT_ARG` — an attribute argument is
+    ///   not a bare identifier (`#[allow("deprecated")]`,
+    ///   `#[allow(deprecated = "...")]`, `#[allow(1)]`). The
+    ///   spec requires bare identifiers; positional non-ident
+    ///   args and key=value shapes are malformed.
+    /// - `E_LINT_LEVEL_NO_ARGS` — the attribute has zero lint
+    ///   names (`#[allow()]` or `#[allow]`). Each lint-level
+    ///   attribute must name at least one lint to have any
+    ///   effect.
+    ///
+    /// **Deferred.** Unknown lint names (per `lints::lint_by_name`)
+    /// are *silently accepted* at this slice. Per the design.md
+    /// "Naming" rule, an unknown lint surfaces the
+    /// `unknown_lint` warning (suppressible) once the lint
+    /// emission infrastructure lands — silencing today is the
+    /// safe choice because `#[allow(removed_lint)]` from older
+    /// code must keep building. Cross-attribute duplicates
+    /// (`#[allow(deprecated)]` plus `#[allow(deprecated)]`) are
+    /// not deduplicated either — the scope cascade slice will
+    /// decide last-writer-wins semantics.
+    pub(crate) fn scan_lint_level_attrs(
+        &mut self,
+        attributes: &[Attribute],
+    ) -> Vec<crate::lints::LintLevelOverride> {
+        use crate::lints::{LintLevel, LintLevelOverride};
+        let mut overrides = Vec::new();
+        for attr in attributes {
+            let Some(level) = LintLevel::from_attr_name(&attr.name) else {
+                continue;
+            };
+            if attr.string_value.is_some() {
+                self.errors.push(super::ParseError {
+                    message: format!(
+                        "error[E_LINT_LEVEL_NON_IDENT_ARG]: \
+                         `#[{}]` does not accept a string value — \
+                         name the lint(s) inside parens, as in \
+                         `#[{}(lint_name)]`",
+                        attr.name, attr.name,
+                    ),
+                    span: attr.span.clone(),
+                });
+                continue;
+            }
+            if attr.args.is_empty() {
+                self.errors.push(super::ParseError {
+                    message: format!(
+                        "error[E_LINT_LEVEL_NO_ARGS]: \
+                         `#[{}]` requires at least one lint name — \
+                         write `#[{}(lint_name)]`",
+                        attr.name, attr.name,
+                    ),
+                    span: attr.span.clone(),
+                });
+                continue;
+            }
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for arg in &attr.args {
+                // Extract the lint name. The attribute parser
+                // produces three shapes for an arg:
+                //   - bare `IDENT` → name=None, value=Some(Identifier(N))
+                //   - `IDENT: expr` / `IDENT = expr` → name=Some(N),
+                //     value=Some(expr)
+                //   - bare expr (not Identifier) → name=None,
+                //     value=Some(other)
+                // The first is what `#[allow(deprecated)]` produces
+                // and the only legal shape here. The other two are
+                // both `E_LINT_LEVEL_NON_IDENT_ARG`.
+                let lint_name: Option<String> = match (&arg.name, &arg.value) {
+                    (None, Some(v)) => match &v.kind {
+                        crate::ast::ExprKind::Identifier(n) => Some(n.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(name) = lint_name else {
+                    self.errors.push(super::ParseError {
+                        message: format!(
+                            "error[E_LINT_LEVEL_NON_IDENT_ARG]: \
+                             `#[{}(...)]` accepts bare lint-name \
+                             identifiers only — drop the value \
+                             expression",
+                            attr.name,
+                        ),
+                        span: arg.span.clone(),
+                    });
+                    continue;
+                };
+                if !seen.insert(name.clone()) {
+                    self.errors.push(super::ParseError {
+                        message: format!(
+                            "error[E_DUPLICATE_LINT_LEVEL]: lint \
+                             name `{}` appears more than once in \
+                             `#[{}(...)]`",
+                            name, attr.name,
+                        ),
+                        span: arg.span.clone(),
+                    });
+                    continue;
+                }
+                overrides.push(LintLevelOverride {
+                    span: arg.span.clone(),
+                    level,
+                    lint: name.clone(),
+                });
+            }
+        }
+        overrides
     }
 
     pub(super) fn parse_fn_params(&mut self) -> Option<(Option<SelfParam>, Vec<Param>)> {

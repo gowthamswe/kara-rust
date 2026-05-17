@@ -137,6 +137,16 @@ pub struct Function {
     /// attribute takes none — and the resolver rejects placement on
     /// items that are not `fn` declarations.
     pub is_track_caller: bool,
+    /// Lint-level overrides declared at this function via
+    /// `#[allow(NAME)]` / `#[warn(NAME)]` / `#[deny(NAME)]` /
+    /// `#[expect(NAME)]`. Each attribute produces one entry per
+    /// lint name in its argument list. The scope cascade (outer
+    /// item / module / build-flag) lands in a follow-up slice;
+    /// at this slice the list is purely structural and informs
+    /// no behavior yet — exists so the data is available to the
+    /// emit-time consumer once it lands. See `design.md § Lint
+    /// Level Attributes`.
+    pub lint_overrides: Vec<crate::lints::LintLevelOverride>,
 }
 
 #[derive(Debug, Clone)]

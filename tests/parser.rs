@@ -2334,6 +2334,188 @@ fn enabling_change_attr_on_struct_variant() {
     assert!(matches!(e.variants[0].kind, VariantKind::Struct(_)));
 }
 
+// ── Lint level attributes slice 1+2+3 ─────────────────────────────
+//
+// Per design.md § Lint Level Attributes, four attributes override
+// a named lint's level: #[allow(NAME)], #[warn(NAME)], #[deny(NAME)],
+// #[expect(NAME)]. Each accepts a comma-separated list of lint
+// identifiers.
+//
+// This slice ships:
+//   - LintLevel enum + LintLevelOverride struct + LintRegistry
+//   - Parser captures lint_overrides on Function (representative
+//     item; broader attachment ships with slice 4 cascade).
+//   - 3 parse-time diagnostics: E_DUPLICATE_LINT_LEVEL,
+//     E_LINT_LEVEL_NON_IDENT_ARG, E_LINT_LEVEL_NO_ARGS
+//
+// Deferred (slice 4+): scope cascade, unknown_lint warning emit,
+// #[expect] semantics, lint-name carry into warning diagnostics.
+
+use karac::lints::LintLevel;
+
+#[test]
+fn lint_attrs_slice1_allow_single_lint_captures_override() {
+    let prog = parse_ok("#[allow(deprecated)]\nfn f() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert_eq!(f.lint_overrides.len(), 1);
+    assert_eq!(f.lint_overrides[0].level, LintLevel::Allow);
+    assert_eq!(f.lint_overrides[0].lint, "deprecated");
+}
+
+#[test]
+fn lint_attrs_slice1_all_four_attribute_names_recognized() {
+    let prog = parse_ok(
+        "#[allow(deprecated)]\n\
+         #[warn(rc_fallback)]\n\
+         #[deny(implicit_clone)]\n\
+         #[expect(unfulfilled_lint_expectation)]\n\
+         fn f() { }",
+    );
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert_eq!(f.lint_overrides.len(), 4);
+    assert_eq!(f.lint_overrides[0].level, LintLevel::Allow);
+    assert_eq!(f.lint_overrides[1].level, LintLevel::Warn);
+    assert_eq!(f.lint_overrides[2].level, LintLevel::Deny);
+    assert_eq!(f.lint_overrides[3].level, LintLevel::Expect);
+}
+
+#[test]
+fn lint_attrs_slice1_comma_separated_list_produces_multiple_overrides() {
+    let prog = parse_ok("#[allow(deprecated, rc_fallback, implicit_clone)]\nfn f() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert_eq!(f.lint_overrides.len(), 3);
+    let names: Vec<&str> = f.lint_overrides.iter().map(|o| o.lint.as_str()).collect();
+    assert_eq!(names, vec!["deprecated", "rc_fallback", "implicit_clone"]);
+    for o in &f.lint_overrides {
+        assert_eq!(o.level, LintLevel::Allow);
+    }
+}
+
+#[test]
+fn lint_attrs_slice1_function_without_attribute_has_empty_overrides() {
+    let prog = parse_ok("fn f() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert!(f.lint_overrides.is_empty());
+}
+
+#[test]
+fn lint_attrs_slice1_unknown_lint_silently_accepted() {
+    // Per design.md § Lint Level Attributes "Naming" rule, an
+    // unknown lint surfaces the `unknown_lint` warning once the
+    // lint emission infrastructure lands. Today the parser
+    // silently accepts unknown names so `#[allow(removed_lint)]`
+    // from older code continues to build.
+    let prog = parse_ok("#[allow(some_lint_that_does_not_exist)]\nfn f() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert_eq!(f.lint_overrides.len(), 1);
+    assert_eq!(f.lint_overrides[0].lint, "some_lint_that_does_not_exist");
+}
+
+#[test]
+fn lint_attrs_slice1_duplicate_lint_in_single_attribute_rejected() {
+    let (_prog, errors) = parse_with_errors("#[allow(deprecated, deprecated)]\nfn f() { }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_DUPLICATE_LINT_LEVEL")
+                && e.message.contains("deprecated")),
+        "Expected E_DUPLICATE_LINT_LEVEL naming `deprecated`; got: {errors:?}"
+    );
+}
+
+#[test]
+fn lint_attrs_slice1_duplicate_in_separate_attrs_currently_allowed() {
+    // Cross-attribute duplicates are accepted at this slice — the
+    // scope cascade (slice 4) will define last-writer-wins
+    // semantics, and de-duping here would preempt that decision.
+    let prog = parse_ok("#[allow(deprecated)]\n#[allow(deprecated)]\nfn f() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert_eq!(f.lint_overrides.len(), 2);
+}
+
+#[test]
+fn lint_attrs_slice1_empty_arg_list_rejected() {
+    let (_prog, errors) = parse_with_errors("#[allow()]\nfn f() { }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_LINT_LEVEL_NO_ARGS")),
+        "Expected E_LINT_LEVEL_NO_ARGS; got: {errors:?}"
+    );
+}
+
+#[test]
+fn lint_attrs_slice1_bare_form_with_no_args_rejected() {
+    // `#[allow]` with no parens — same diagnostic family as
+    // `#[allow()]`. Both produce zero lint names, both rejected.
+    let (_prog, errors) = parse_with_errors("#[allow]\nfn f() { }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_LINT_LEVEL_NO_ARGS")),
+        "Expected E_LINT_LEVEL_NO_ARGS for bare `#[allow]`; got: {errors:?}"
+    );
+}
+
+#[test]
+fn lint_attrs_slice1_string_value_rejected() {
+    let (_prog, errors) = parse_with_errors("#[allow = \"deprecated\"]\nfn f() { }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_LINT_LEVEL_NON_IDENT_ARG")),
+        "Expected E_LINT_LEVEL_NON_IDENT_ARG; got: {errors:?}"
+    );
+}
+
+#[test]
+fn lint_attrs_slice1_key_value_arg_rejected() {
+    let (_prog, errors) = parse_with_errors("#[allow(deprecated = \"oops\")]\nfn f() { }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_LINT_LEVEL_NON_IDENT_ARG")),
+        "Expected E_LINT_LEVEL_NON_IDENT_ARG for key=value arg; got: {errors:?}"
+    );
+}
+
+#[test]
+fn lint_attrs_slice1_spans_point_at_lint_name() {
+    // The override's span should locate the lint name (not the
+    // whole attribute), so the scope-cascade diagnostic (slice 4)
+    // can underline the precise authoring site.
+    let prog = parse_ok("#[allow(deprecated)]\nfn f() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    // We can't easily compare spans here without exposing more,
+    // but at minimum the override has *some* span associated.
+    assert!(f.lint_overrides[0].span.length > 0);
+}
+
+#[test]
+fn lint_attrs_slice1_attribute_coexists_with_other_attributes() {
+    let prog = parse_ok("#[allow(deprecated)]\n#[track_caller]\n#[deprecated]\nfn f() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert_eq!(f.lint_overrides.len(), 1);
+    assert!(f.is_track_caller);
+    assert!(f.deprecation.is_some());
+}
+
 #[test]
 fn test_const_generic_args() {
     let prog = parse_ok("fn dot(a: Array[f64, 3], b: Array[f64, 3]) -> f64 { 0.0 }");

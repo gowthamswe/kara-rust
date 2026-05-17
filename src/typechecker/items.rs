@@ -114,6 +114,7 @@ impl<'a> super::TypeChecker<'a> {
                         stdlib_origin: t.stdlib_origin,
                         deprecation: None,
                         is_track_caller: false,
+                        lint_overrides: Vec::new(),
                     };
                     self.check_function(&synthesized, Some(&self_type), &enclosing);
                 }

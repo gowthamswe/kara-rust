@@ -377,6 +377,7 @@ impl<'a> super::EffectChecker<'a> {
                                 stdlib_origin: t.stdlib_origin,
                                 deprecation: None,
                                 is_track_caller: false,
+                                lint_overrides: Vec::new(),
                             };
                             let by_var = scan(&stub);
                             if !by_var.is_empty() {

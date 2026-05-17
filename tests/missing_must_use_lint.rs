@@ -135,6 +135,7 @@ impl<'a> FnSpec<'a> {
             stdlib_origin: self.stdlib_origin,
             deprecation: None,
             is_track_caller: false,
+            lint_overrides: Vec::new(),
         }
     }
 }
