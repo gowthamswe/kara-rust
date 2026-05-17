@@ -30,6 +30,17 @@ impl<'a> super::OwnershipChecker<'a> {
     /// by Phase 2: bindings in `arc_values` get "shared (Arc) — promoted:
     /// value crosses a parallel region"; others get "shared (Rc) — value
     /// does not cross a parallel region".
+    ///
+    /// Slice-6 enrichment (line 353 phase-5 checklist disjoint-capture
+    /// slice 6): when the RC binding was captured *whole* by a closure
+    /// inside the same enclosing function, append the
+    /// `WholeRootCaptureReason` explanation to the note message and
+    /// replace the generic suggestion with a fix-it that names the
+    /// rewrite (hoist the field access outside the stopping
+    /// construct). Lets the user see *why* their natural sibling-path
+    /// access forced an RC promotion — without the explanation, the
+    /// N0503 note tells the user RC happened but not which construct
+    /// in the closure body forced the whole-root capture choice.
     pub(crate) fn emit_rc_fallback_notes(&mut self) {
         let mut notes = Vec::new();
         for (fn_key, rc_map) in &self.rc_values {
@@ -44,29 +55,107 @@ impl<'a> super::OwnershipChecker<'a> {
                 } else {
                     "shared (Rc) — value does not cross a parallel region"
                 };
+                let base_message = format!(
+                    "RC fallback inserted for '{}' ({}); {}; consume at line {}:{}, other use at line {}:{}",
+                    entry.binding,
+                    entry.trigger.label(),
+                    flavor,
+                    entry.consume_span.line,
+                    entry.consume_span.column,
+                    entry.other_use_span.line,
+                    entry.other_use_span.column,
+                );
+                let (message, suggestion) =
+                    match self.find_whole_root_closure_reason(fn_key, binding) {
+                        Some((closure_span, reason)) => {
+                            let reason_text = reason.describe(binding);
+                            let enriched = format!(
+                                "{} — closure at line {}:{} captured `{}` whole because {}",
+                                base_message,
+                                closure_span.line,
+                                closure_span.column,
+                                binding,
+                                reason_text,
+                            );
+                            (enriched, Some(Self::slice6_fix_it_suggestion(&reason)))
+                        }
+                        None => (
+                            base_message,
+                            Some(
+                                "restructure to a single ownership path, or accept the RC and silence with #[allow(rc_fallback)]"
+                                    .to_string(),
+                            ),
+                        ),
+                    };
                 notes.push(OwnershipError {
-                    message: format!(
-                        "RC fallback inserted for '{}' ({}); {}; consume at line {}:{}, other use at line {}:{}",
-                        entry.binding,
-                        entry.trigger.label(),
-                        flavor,
-                        entry.consume_span.line,
-                        entry.consume_span.column,
-                        entry.other_use_span.line,
-                        entry.other_use_span.column,
-                    ),
+                    message,
                     span: entry.other_use_span.clone(),
                     kind: OwnershipErrorKind::RcFallbackNote,
-                    suggestion: Some(
-                        "restructure to a single ownership path, or accept the RC and silence with #[allow(rc_fallback)]"
-                            .to_string(),
-                    ),
+                    suggestion,
                     replacement: None,
                     consume_span: Some(entry.consume_span.clone()),
                 });
             }
         }
         self.notes.extend(notes);
+    }
+
+    /// Find a closure inside function `fn_key` whose whole-root
+    /// capture reasons name `binding`. Returns the closure span and
+    /// its reason for that root — used by `emit_rc_fallback_notes`
+    /// to enrich the N0503 note with the slice-6 explanation. When
+    /// multiple closures in the same function whole-root capture the
+    /// same binding, the first encountered wins; the user typically
+    /// only needs one explanation to understand the pattern. Per
+    /// design.md § Rule 2¼ Interaction with Rule 2½, the closure's
+    /// capture reason is the spec-mandated "the body called method
+    /// `…` on `…`" explanation that completes the N0503 note's
+    /// `direct re-use after consume` framing.
+    fn find_whole_root_closure_reason(
+        &self,
+        fn_key: &str,
+        binding: &str,
+    ) -> Option<(super::Span, super::WholeRootCaptureReason)> {
+        for (closure_key, reasons) in &self.whole_root_capture_reasons {
+            if self.closure_function.get(closure_key).map(String::as_str) != Some(fn_key) {
+                continue;
+            }
+            if let Some(reason) = reasons.get(binding) {
+                if let Some(span) = self.closure_spans.get(closure_key) {
+                    return Some((span.clone(), reason.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Spec-mandated fix-it tail for slice 6: a one-liner steering
+    /// the user toward the rewrite that breaks the whole-root
+    /// capture. Method calls: hoist the field access outside the
+    /// call. Index / Deref: hoist the indexed / dereffed value into
+    /// a local. By-value pass: lift the projection out of the call
+    /// arg. BareIdentifier has no rewrite — the closure body
+    /// *intentionally* names the whole binding — so we fall back to
+    /// the generic "accept the RC" framing.
+    fn slice6_fix_it_suggestion(reason: &super::WholeRootCaptureReason) -> String {
+        match reason {
+            super::WholeRootCaptureReason::MethodCall { method_name, .. } => format!(
+                "hoist the call outside the closure (assign `{}`'s result to a local before the closure) so the closure body captures only the fields it actually reads",
+                method_name,
+            ),
+            super::WholeRootCaptureReason::Index { .. } => {
+                "hoist the indexed element into a local before the closure so the closure body captures only the element, not the whole collection".to_string()
+            }
+            super::WholeRootCaptureReason::Deref { .. } => {
+                "hoist the dereferenced value into a local before the closure so the closure body captures the pointee directly".to_string()
+            }
+            super::WholeRootCaptureReason::ByValuePass { .. } => {
+                "if only specific fields are needed, project them into locals before the closure and pass those locals instead of the whole binding".to_string()
+            }
+            super::WholeRootCaptureReason::BareIdentifier => {
+                "the closure body directly names the whole binding; accept the RC and silence with #[allow(rc_fallback)]".to_string()
+            }
+        }
     }
 
     // ── Phase 2: Rc → Arc Promotion ─────────────────────────────

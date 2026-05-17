@@ -64,6 +64,109 @@ pub struct CapturePath {
     pub projection: Vec<String>,
 }
 
+/// Why a closure body forced a particular root to be captured whole
+/// (empty-projection `CapturePath`) — line 353 phase-5 checklist
+/// disjoint-capture slice 6. Slice 1's path enumerator commits a root
+/// as captured-whole when it hits a stopping construct (method call on
+/// the root, index expression, deref of a captured borrow, by-value
+/// pass to a function call) *or* when the body references the bare
+/// identifier directly. The reason record names the construct so the
+/// RC-fallback note (`emit_rc_fallback_notes`) can explain *why* the
+/// natural sibling-path access pattern doesn't compose with the
+/// closure's capture choice — the spec sentence: *"call to method
+/// `User.foo` on `user` captures `user` whole — disjoint capture only
+/// sees through field projections"*.
+///
+/// Stored in `OwnershipCheckResult::whole_root_capture_reasons` and
+/// keyed by `(closure SpanKey, root name)`. When a body has multiple
+/// stopping constructs for the same root (e.g., both `u.show()` and
+/// `u[0]`), only the *first* construct encountered wins — the user
+/// only needs one explanation to understand the whole-root choice, and
+/// fixing it (e.g., hoisting one field access) typically reveals the
+/// remaining constructs in turn. `BareIdentifier` is the lowest-
+/// priority reason: it loses to any stopping construct seen later so
+/// the note steers the user toward the construct most likely to be
+/// rewritable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WholeRootCaptureReason {
+    /// `u.method(args)` — method-call receiver. The captured root is
+    /// the receiver (`u`), captured whole because disjoint capture
+    /// cannot see through the method body to know which fields it
+    /// reads. `method_name` is the bare method identifier; `call_span`
+    /// is the span of the full `MethodCall` expression.
+    MethodCall {
+        method_name: String,
+        call_span: Span,
+    },
+    /// `u[index]` — index expression on a captured root. Whole-root
+    /// because the index value isn't statically known (and even when
+    /// it is, the index projection has no field-name to subdivide on).
+    Index { call_span: Span },
+    /// `*u` — deref of a captured root that is a borrow. The deref
+    /// reaches the pointee whole; the projection stops at the deref.
+    Deref { call_span: Span },
+    /// `f(u)` — bare-identifier pass to a function call (callee
+    /// parameter takes the root by value). The pass collapses the
+    /// projection chain to the bare root.
+    ByValuePass { call_span: Span },
+    /// The body references the root as a bare identifier (e.g., `u` on
+    /// its own as the final expression of a block), without going
+    /// through any stopping construct. This is the natural whole-root
+    /// capture — not a "could be tighter" case. The note still mentions
+    /// it so the user knows the closure body did directly name the
+    /// whole binding.
+    BareIdentifier,
+}
+
+impl WholeRootCaptureReason {
+    /// Short prose snippet for the RC-fallback note tail. Used to
+    /// build the spec-mandated *"because the body called method `…`
+    /// on `…`"* explanation.
+    pub fn describe(&self, root: &str) -> String {
+        match self {
+            WholeRootCaptureReason::MethodCall { method_name, .. } => format!(
+                "the closure body called method `{}` on `{}` (disjoint capture only sees through field projections)",
+                method_name, root,
+            ),
+            WholeRootCaptureReason::Index { .. } => format!(
+                "the closure body indexed into `{}` (`{}[…]` captures `{}` whole — disjoint capture only sees through field projections)",
+                root, root, root,
+            ),
+            WholeRootCaptureReason::Deref { .. } => format!(
+                "the closure body dereferenced `{}` (`*{}` captures `{}` whole — disjoint capture only sees through field projections)",
+                root, root, root,
+            ),
+            WholeRootCaptureReason::ByValuePass { .. } => format!(
+                "the closure body passed `{}` by value to a function call (disjoint capture only sees through field projections)",
+                root,
+            ),
+            WholeRootCaptureReason::BareIdentifier => {
+                format!("the closure body referenced `{}` directly", root)
+            }
+        }
+    }
+
+    /// Span of the construct that triggered whole-root capture.
+    /// Returned `None` for `BareIdentifier` — the body's reference is
+    /// a leaf identifier with no enclosing construct span to label.
+    pub fn span(&self) -> Option<&Span> {
+        match self {
+            WholeRootCaptureReason::MethodCall { call_span, .. }
+            | WholeRootCaptureReason::Index { call_span }
+            | WholeRootCaptureReason::Deref { call_span }
+            | WholeRootCaptureReason::ByValuePass { call_span } => Some(call_span),
+            WholeRootCaptureReason::BareIdentifier => None,
+        }
+    }
+
+    /// Priority for the "first reason wins" merge rule: stopping
+    /// constructs outrank `BareIdentifier`, so the note steers toward
+    /// a rewritable construct when both apply to the same root.
+    pub(crate) fn is_bare_identifier(&self) -> bool {
+        matches!(self, WholeRootCaptureReason::BareIdentifier)
+    }
+}
+
 /// A projection step from a root binding to a sub-place.
 /// `Field("inner")` for `c.inner`, `Index` for `arr[i]` or `tup.0`,
 /// `Range` for the half-open `v[a..b]` slice form (kept distinct from
@@ -389,6 +492,23 @@ pub struct OwnershipCheckResult {
     /// environment layout (slice 4) consume this map without changing
     /// existing per-name semantics.
     pub closure_capture_path_modes: HashMap<SpanKey, Vec<(CapturePath, OwnershipMode)>>,
+    /// Per-closure whole-root capture *reasons* — line 353 phase-5
+    /// checklist disjoint-capture slice 6. Keyed by the closure
+    /// expression's `SpanKey`. The inner map is per captured root
+    /// (only roots with a `(root, [])` entry in `closure_capture_paths`
+    /// appear here) and records *why* the path enumeration committed
+    /// the root as captured-whole: a method call on the root, an
+    /// index expression, a deref of a captured borrow, a by-value
+    /// pass to a function call, or — when nothing else applies — a
+    /// bare-identifier reference. Consumed by `emit_rc_fallback_notes`
+    /// to enrich the N0503 note with the spec-mandated *"because the
+    /// closure body called method `…` on `…` — disjoint capture only
+    /// sees through field projections"* explanation. Empty for any
+    /// closure whose body does not commit any root to whole-root
+    /// capture. The first stopping construct encountered per root
+    /// wins; `BareIdentifier` loses to any stopping construct so the
+    /// note steers toward a rewritable cause.
+    pub whole_root_capture_reasons: HashMap<SpanKey, HashMap<String, WholeRootCaptureReason>>,
     /// Closure expression span → enclosing function key (round
     /// 12.25). Lets `karac query ownership <fn>` filter
     /// `closure_param_modes` / `closure_captures` to closures whose
@@ -505,6 +625,15 @@ pub struct OwnershipChecker<'a> {
     /// overlap detection (see `classify_capture_path_mutations`).
     /// Surfaced via `OwnershipCheckResult::closure_capture_path_modes`.
     pub(crate) closure_capture_path_modes: HashMap<SpanKey, Vec<(CapturePath, OwnershipMode)>>,
+    /// Per-closure whole-root capture reasons — line 353 phase-5
+    /// checklist disjoint-capture slice 6. Populated alongside
+    /// `closure_capture_paths` in `check_expr_consuming`'s Closure arm
+    /// by `classify_capture_body_paths`, which now tracks the AST
+    /// construct (method call / index / deref / by-value pass / bare
+    /// identifier) that committed each root to whole-root capture.
+    /// Surfaced via `OwnershipCheckResult::whole_root_capture_reasons`.
+    pub(crate) whole_root_capture_reasons:
+        HashMap<SpanKey, HashMap<String, WholeRootCaptureReason>>,
     /// Closure span → enclosing function key (round 12.25). Built
     /// up at every `Closure` arm visit alongside the param/capture
     /// inference. Surfaced via `OwnershipCheckResult::closure_function`.
@@ -625,6 +754,7 @@ impl<'a> OwnershipChecker<'a> {
             closure_captures: HashMap::new(),
             closure_capture_paths: HashMap::new(),
             closure_capture_path_modes: HashMap::new(),
+            whole_root_capture_reasons: HashMap::new(),
             closure_function: HashMap::new(),
             closure_spans: HashMap::new(),
             errors: Vec::new(),
@@ -705,6 +835,7 @@ impl<'a> OwnershipChecker<'a> {
             closure_captures: self.closure_captures,
             closure_capture_paths: self.closure_capture_paths,
             closure_capture_path_modes: self.closure_capture_path_modes,
+            whole_root_capture_reasons: self.whole_root_capture_reasons,
             closure_function: self.closure_function,
             closure_spans: self.closure_spans,
             errors: self.errors,

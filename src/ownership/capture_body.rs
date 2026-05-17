@@ -33,7 +33,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
 
-use super::{CaptureBodyUsage, CapturePath};
+use super::{CaptureBodyUsage, CapturePath, WholeRootCaptureReason};
 
 impl<'a> super::OwnershipChecker<'a> {
     /// Walk `body` once and classify each pre-live capture's usage as
@@ -308,17 +308,49 @@ impl<'a> super::OwnershipChecker<'a> {
 
     /// Walk `body` once and produce the set of distinct
     /// `CapturePath` records the body touches against any pre-live
-    /// name. Output is sorted lexicographically by `(root, projection)`
-    /// for deterministic test pins.
+    /// name *plus* the per-root reason map for any root committed to
+    /// whole-root capture (line 353 phase-5 checklist disjoint-capture
+    /// slice 6). Path output is sorted lexicographically by
+    /// `(root, projection)` for deterministic test pins; the reason
+    /// map carries the AST construct (method call / index / deref /
+    /// by-value pass / bare identifier) that first committed each
+    /// root as captured-whole, so the RC-fallback note can explain
+    /// the user's natural sibling-path pattern doesn't compose with
+    /// the closure's capture choice.
     pub(crate) fn classify_capture_body_paths(
         &self,
         body: &Expr,
         pre_live: &[String],
-    ) -> Vec<CapturePath> {
+    ) -> (Vec<CapturePath>, HashMap<String, WholeRootCaptureReason>) {
         let live: HashSet<&str> = pre_live.iter().map(String::as_str).collect();
         let mut paths: BTreeSet<CapturePath> = BTreeSet::new();
-        Self::walk_capture_paths_expr(body, &live, &mut paths);
-        paths.into_iter().collect()
+        let mut reasons: HashMap<String, WholeRootCaptureReason> = HashMap::new();
+        Self::walk_capture_paths_expr(body, &live, &mut paths, &mut reasons);
+        (paths.into_iter().collect(), reasons)
+    }
+
+    /// Record `reason` against `root` with the slice-6 "first stopping
+    /// construct wins; BareIdentifier loses to any stopping construct"
+    /// priority. Called at every whole-root capture insertion point so
+    /// the per-closure reason map carries the most-informative cause
+    /// available — a method call beats a later bare-ident reference
+    /// even when the walker visits the bare-ident leaf first.
+    fn record_whole_root_reason(
+        reasons: &mut HashMap<String, WholeRootCaptureReason>,
+        root: &str,
+        reason: WholeRootCaptureReason,
+    ) {
+        use std::collections::hash_map::Entry;
+        match reasons.entry(root.to_string()) {
+            Entry::Vacant(e) => {
+                e.insert(reason);
+            }
+            Entry::Occupied(mut e) => {
+                if e.get().is_bare_identifier() && !reason.is_bare_identifier() {
+                    e.insert(reason);
+                }
+            }
+        }
     }
 
     /// If `expr` is a chain of `FieldAccess` / `TupleIndex` rooted at
@@ -370,13 +402,26 @@ impl<'a> super::OwnershipChecker<'a> {
         expr: &Expr,
         pre_live: &HashSet<&str>,
         paths: &mut BTreeSet<CapturePath>,
+        reasons: &mut HashMap<String, WholeRootCaptureReason>,
     ) {
         // A pure place expression rooted at a pre-live name — register
         // the projection chain and stop. The chain has no sub-
         // expressions to recurse into beyond the (already-walked) root
-        // identifier.
+        // identifier. Whole-root (empty projection) registers a
+        // low-priority `BareIdentifier` reason; any stopping construct
+        // encountered elsewhere for the same root overrides via the
+        // `record_whole_root_reason` priority rule.
         if let Some(p) = Self::extract_pure_path(expr, pre_live) {
+            let root = p.root.clone();
+            let is_whole = p.projection.is_empty();
             paths.insert(p);
+            if is_whole {
+                Self::record_whole_root_reason(
+                    reasons,
+                    &root,
+                    WholeRootCaptureReason::BareIdentifier,
+                );
+            }
             return;
         }
 
@@ -389,7 +434,7 @@ impl<'a> super::OwnershipChecker<'a> {
             // `items[0].field` — the object is `items[0]`, which the
             // Index arm below will register as `(items, [])`).
             ExprKind::FieldAccess { object, .. } | ExprKind::TupleIndex { object, .. } => {
-                Self::walk_capture_paths_expr(object, pre_live, paths);
+                Self::walk_capture_paths_expr(object, pre_live, paths, reasons);
             }
             // Stopping construct: index. If the indexed expression is
             // rooted at a pre-live name, the root is captured whole;
@@ -398,29 +443,56 @@ impl<'a> super::OwnershipChecker<'a> {
             ExprKind::Index { object, index } => {
                 if let Some(root) = Self::place_root_for_capture(object, pre_live) {
                     paths.insert(CapturePath {
-                        root,
+                        root: root.clone(),
                         projection: Vec::new(),
                     });
+                    Self::record_whole_root_reason(
+                        reasons,
+                        &root,
+                        WholeRootCaptureReason::Index {
+                            call_span: expr.span.clone(),
+                        },
+                    );
                 } else {
-                    Self::walk_capture_paths_expr(object, pre_live, paths);
+                    Self::walk_capture_paths_expr(object, pre_live, paths, reasons);
                 }
-                Self::walk_capture_paths_expr(index, pre_live, paths);
+                Self::walk_capture_paths_expr(index, pre_live, paths, reasons);
             }
             // Stopping construct: method call. The receiver, if rooted
             // at a pre-live name, captures the root whole. Args are
             // walked normally — each may itself capture a different
-            // path under the same or a different root.
-            ExprKind::MethodCall { object, args, .. } => {
+            // path under the same or a different root. Bare-rooted
+            // args additionally register `ByValuePass` (Owned param
+            // semantics is the "by value" the spec's path-stopping
+            // rule names — see design.md § Rule 2¼ stopping
+            // constructs).
+            ExprKind::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } => {
                 if let Some(root) = Self::place_root_for_capture(object, pre_live) {
                     paths.insert(CapturePath {
-                        root,
+                        root: root.clone(),
                         projection: Vec::new(),
                     });
+                    Self::record_whole_root_reason(
+                        reasons,
+                        &root,
+                        WholeRootCaptureReason::MethodCall {
+                            method_name: method.clone(),
+                            call_span: expr.span.clone(),
+                        },
+                    );
                 } else {
-                    Self::walk_capture_paths_expr(object, pre_live, paths);
+                    Self::walk_capture_paths_expr(object, pre_live, paths, reasons);
                 }
                 for arg in args {
-                    Self::walk_capture_paths_expr(&arg.value, pre_live, paths);
+                    Self::register_bare_root_arg_as_byvalue(
+                        &arg.value, pre_live, paths, reasons, &expr.span,
+                    );
+                    Self::walk_capture_paths_expr(&arg.value, pre_live, paths, reasons);
                 }
             }
             // Stopping construct: deref. Per spec, "deref of a captured
@@ -434,15 +506,22 @@ impl<'a> super::OwnershipChecker<'a> {
             } => {
                 if let Some(root) = Self::place_root_for_capture(operand, pre_live) {
                     paths.insert(CapturePath {
-                        root,
+                        root: root.clone(),
                         projection: Vec::new(),
                     });
+                    Self::record_whole_root_reason(
+                        reasons,
+                        &root,
+                        WholeRootCaptureReason::Deref {
+                            call_span: expr.span.clone(),
+                        },
+                    );
                 } else {
-                    Self::walk_capture_paths_expr(operand, pre_live, paths);
+                    Self::walk_capture_paths_expr(operand, pre_live, paths, reasons);
                 }
             }
             ExprKind::Unary { operand, .. } => {
-                Self::walk_capture_paths_expr(operand, pre_live, paths);
+                Self::walk_capture_paths_expr(operand, pre_live, paths, reasons);
             }
             // Call: callee + args. Each arg expression is walked
             // normally; whether an arg is passed by value or by borrow
@@ -453,26 +532,31 @@ impl<'a> super::OwnershipChecker<'a> {
             // `cfg.value` arg registers `(cfg, [value])`. The
             // distinction between "passed-by-value collapses to whole"
             // and "passed-by-ref preserves projection" lands with the
-            // mode pass.
+            // mode pass. Slice 6 additionally registers a bare-rooted
+            // arg's whole-root reason as `ByValuePass` so the
+            // RC-fallback note can name the call as the cause.
             ExprKind::Call { callee, args } => {
-                Self::walk_capture_paths_expr(callee, pre_live, paths);
+                Self::walk_capture_paths_expr(callee, pre_live, paths, reasons);
                 for arg in args {
-                    Self::walk_capture_paths_expr(&arg.value, pre_live, paths);
+                    Self::register_bare_root_arg_as_byvalue(
+                        &arg.value, pre_live, paths, reasons, &expr.span,
+                    );
+                    Self::walk_capture_paths_expr(&arg.value, pre_live, paths, reasons);
                 }
             }
             ExprKind::Binary { left, right, .. } | ExprKind::NilCoalesce { left, right } => {
-                Self::walk_capture_paths_expr(left, pre_live, paths);
-                Self::walk_capture_paths_expr(right, pre_live, paths);
+                Self::walk_capture_paths_expr(left, pre_live, paths, reasons);
+                Self::walk_capture_paths_expr(right, pre_live, paths, reasons);
             }
             ExprKind::If {
                 condition,
                 then_block,
                 else_branch,
             } => {
-                Self::walk_capture_paths_expr(condition, pre_live, paths);
-                Self::walk_capture_paths_block(then_block, pre_live, paths);
+                Self::walk_capture_paths_expr(condition, pre_live, paths, reasons);
+                Self::walk_capture_paths_block(then_block, pre_live, paths, reasons);
                 if let Some(eb) = else_branch {
-                    Self::walk_capture_paths_expr(eb, pre_live, paths);
+                    Self::walk_capture_paths_expr(eb, pre_live, paths, reasons);
                 }
             }
             ExprKind::IfLet {
@@ -481,44 +565,44 @@ impl<'a> super::OwnershipChecker<'a> {
                 else_branch,
                 ..
             } => {
-                Self::walk_capture_paths_expr(value, pre_live, paths);
-                Self::walk_capture_paths_block(then_block, pre_live, paths);
+                Self::walk_capture_paths_expr(value, pre_live, paths, reasons);
+                Self::walk_capture_paths_block(then_block, pre_live, paths, reasons);
                 if let Some(eb) = else_branch {
-                    Self::walk_capture_paths_expr(eb, pre_live, paths);
+                    Self::walk_capture_paths_expr(eb, pre_live, paths, reasons);
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                Self::walk_capture_paths_expr(scrutinee, pre_live, paths);
+                Self::walk_capture_paths_expr(scrutinee, pre_live, paths, reasons);
                 for arm in arms {
                     if let Some(g) = &arm.guard {
-                        Self::walk_capture_paths_expr(g, pre_live, paths);
+                        Self::walk_capture_paths_expr(g, pre_live, paths, reasons);
                     }
-                    Self::walk_capture_paths_expr(&arm.body, pre_live, paths);
+                    Self::walk_capture_paths_expr(&arm.body, pre_live, paths, reasons);
                 }
             }
             ExprKind::While {
                 condition, body, ..
             } => {
-                Self::walk_capture_paths_expr(condition, pre_live, paths);
-                Self::walk_capture_paths_block(body, pre_live, paths);
+                Self::walk_capture_paths_expr(condition, pre_live, paths, reasons);
+                Self::walk_capture_paths_block(body, pre_live, paths, reasons);
             }
             ExprKind::WhileLet { value, body, .. } => {
-                Self::walk_capture_paths_expr(value, pre_live, paths);
-                Self::walk_capture_paths_block(body, pre_live, paths);
+                Self::walk_capture_paths_expr(value, pre_live, paths, reasons);
+                Self::walk_capture_paths_block(body, pre_live, paths, reasons);
             }
             ExprKind::For { iterable, body, .. } => {
-                Self::walk_capture_paths_expr(iterable, pre_live, paths);
-                Self::walk_capture_paths_block(body, pre_live, paths);
+                Self::walk_capture_paths_expr(iterable, pre_live, paths, reasons);
+                Self::walk_capture_paths_block(body, pre_live, paths, reasons);
             }
             ExprKind::Loop { body, .. } => {
-                Self::walk_capture_paths_block(body, pre_live, paths);
+                Self::walk_capture_paths_block(body, pre_live, paths, reasons);
             }
             ExprKind::Closure { body, .. } => {
                 // Recurse into nested closure bodies — captures of an
                 // outer-outer binding by an inner closure still appear
                 // as captures of this closure (it must capture the
                 // outer binding to make it available to the inner one).
-                Self::walk_capture_paths_expr(body, pre_live, paths);
+                Self::walk_capture_paths_expr(body, pre_live, paths, reasons);
             }
             ExprKind::Block(block)
             | ExprKind::Unsafe(block)
@@ -526,64 +610,64 @@ impl<'a> super::OwnershipChecker<'a> {
             | ExprKind::Seq(block)
             | ExprKind::Par(block)
             | ExprKind::Lock { body: block, .. } => {
-                Self::walk_capture_paths_block(block, pre_live, paths);
+                Self::walk_capture_paths_block(block, pre_live, paths, reasons);
             }
             ExprKind::Question(inner)
             | ExprKind::OptionalChain { object: inner, .. }
             | ExprKind::Cast { expr: inner, .. } => {
-                Self::walk_capture_paths_expr(inner, pre_live, paths);
+                Self::walk_capture_paths_expr(inner, pre_live, paths, reasons);
             }
             ExprKind::Tuple(exprs) | ExprKind::ArrayLiteral(exprs) => {
                 for e in exprs {
-                    Self::walk_capture_paths_expr(e, pre_live, paths);
+                    Self::walk_capture_paths_expr(e, pre_live, paths, reasons);
                 }
             }
             ExprKind::PrefixCollectionLiteral { items, .. } => {
                 for e in items {
-                    Self::walk_capture_paths_expr(e, pre_live, paths);
+                    Self::walk_capture_paths_expr(e, pre_live, paths, reasons);
                 }
             }
             ExprKind::RepeatLiteral { value, count, .. } => {
-                Self::walk_capture_paths_expr(value, pre_live, paths);
-                Self::walk_capture_paths_expr(count, pre_live, paths);
+                Self::walk_capture_paths_expr(value, pre_live, paths, reasons);
+                Self::walk_capture_paths_expr(count, pre_live, paths, reasons);
             }
             ExprKind::MapLiteral(entries) => {
                 for (k, v) in entries {
-                    Self::walk_capture_paths_expr(k, pre_live, paths);
-                    Self::walk_capture_paths_expr(v, pre_live, paths);
+                    Self::walk_capture_paths_expr(k, pre_live, paths, reasons);
+                    Self::walk_capture_paths_expr(v, pre_live, paths, reasons);
                 }
             }
             ExprKind::StructLiteral { fields, spread, .. } => {
                 for field in fields {
-                    Self::walk_capture_paths_expr(&field.value, pre_live, paths);
+                    Self::walk_capture_paths_expr(&field.value, pre_live, paths, reasons);
                 }
                 if let Some(s) = spread {
-                    Self::walk_capture_paths_expr(s, pre_live, paths);
+                    Self::walk_capture_paths_expr(s, pre_live, paths, reasons);
                 }
             }
             ExprKind::Pipe { left, right } => {
-                Self::walk_capture_paths_expr(left, pre_live, paths);
-                Self::walk_capture_paths_expr(right, pre_live, paths);
+                Self::walk_capture_paths_expr(left, pre_live, paths, reasons);
+                Self::walk_capture_paths_expr(right, pre_live, paths, reasons);
             }
             ExprKind::Range { start, end, .. } => {
                 if let Some(s) = start {
-                    Self::walk_capture_paths_expr(s, pre_live, paths);
+                    Self::walk_capture_paths_expr(s, pre_live, paths, reasons);
                 }
                 if let Some(e) = end {
-                    Self::walk_capture_paths_expr(e, pre_live, paths);
+                    Self::walk_capture_paths_expr(e, pre_live, paths, reasons);
                 }
             }
             ExprKind::Return(Some(inner))
             | ExprKind::Break {
                 value: Some(inner), ..
             } => {
-                Self::walk_capture_paths_expr(inner, pre_live, paths);
+                Self::walk_capture_paths_expr(inner, pre_live, paths, reasons);
             }
             ExprKind::Providers { bindings, body } => {
                 for b in bindings {
-                    Self::walk_capture_paths_expr(&b.value, pre_live, paths);
+                    Self::walk_capture_paths_expr(&b.value, pre_live, paths, reasons);
                 }
-                Self::walk_capture_paths_block(body, pre_live, paths);
+                Self::walk_capture_paths_block(body, pre_live, paths, reasons);
             }
             // Identifier handled by `extract_pure_path` above; any leaf
             // identifier whose name isn't in `pre_live` is not a
@@ -594,16 +678,56 @@ impl<'a> super::OwnershipChecker<'a> {
         }
     }
 
+    /// If `arg` is *syntactically* a bare identifier rooted at a
+    /// pre-live name (e.g., `f(cfg)`), register `(cfg, [])` with a
+    /// `ByValuePass { call_span }` reason. Slice 6 uses this to name
+    /// the call site as the cause when the RC-fallback note explains
+    /// why the closure committed `cfg` to whole-root capture. Only
+    /// the immediate-bare-identifier shape qualifies — `f(cfg.x)`
+    /// (field projection) records `(cfg, ["x"])` via the generic
+    /// walker and stays *not* whole-root; `f(1 + cfg)` (binary)
+    /// recurses through `Binary` and the bare `cfg` leaf registers
+    /// the lower-priority `BareIdentifier` reason because the bare
+    /// reference is to a computation argument, not a direct pass.
+    /// The `record_whole_root_reason` priority rule respects "first
+    /// stopping construct wins, BareIdentifier loses": calling this
+    /// before the generic walker recursion ensures `ByValuePass`
+    /// wins over the later BareIdentifier insertion from the recursion.
+    fn register_bare_root_arg_as_byvalue(
+        arg: &Expr,
+        pre_live: &HashSet<&str>,
+        paths: &mut BTreeSet<CapturePath>,
+        reasons: &mut HashMap<String, WholeRootCaptureReason>,
+        call_span: &crate::token::Span,
+    ) {
+        if let ExprKind::Identifier(n) = &arg.kind {
+            if pre_live.contains(n.as_str()) {
+                paths.insert(CapturePath {
+                    root: n.clone(),
+                    projection: Vec::new(),
+                });
+                Self::record_whole_root_reason(
+                    reasons,
+                    n,
+                    WholeRootCaptureReason::ByValuePass {
+                        call_span: call_span.clone(),
+                    },
+                );
+            }
+        }
+    }
+
     fn walk_capture_paths_block(
         block: &Block,
         pre_live: &HashSet<&str>,
         paths: &mut BTreeSet<CapturePath>,
+        reasons: &mut HashMap<String, WholeRootCaptureReason>,
     ) {
         for stmt in &block.stmts {
-            Self::walk_capture_paths_stmt(stmt, pre_live, paths);
+            Self::walk_capture_paths_stmt(stmt, pre_live, paths, reasons);
         }
         if let Some(expr) = &block.final_expr {
-            Self::walk_capture_paths_expr(expr, pre_live, paths);
+            Self::walk_capture_paths_expr(expr, pre_live, paths, reasons);
         }
     }
 
@@ -611,20 +735,21 @@ impl<'a> super::OwnershipChecker<'a> {
         stmt: &Stmt,
         pre_live: &HashSet<&str>,
         paths: &mut BTreeSet<CapturePath>,
+        reasons: &mut HashMap<String, WholeRootCaptureReason>,
     ) {
         match &stmt.kind {
             StmtKind::Let { value, .. } => {
-                Self::walk_capture_paths_expr(value, pre_live, paths);
+                Self::walk_capture_paths_expr(value, pre_live, paths, reasons);
             }
             StmtKind::LetUninit { .. } => {}
             StmtKind::LetElse {
                 value, else_block, ..
             } => {
-                Self::walk_capture_paths_expr(value, pre_live, paths);
-                Self::walk_capture_paths_block(else_block, pre_live, paths);
+                Self::walk_capture_paths_expr(value, pre_live, paths, reasons);
+                Self::walk_capture_paths_block(else_block, pre_live, paths, reasons);
             }
             StmtKind::Defer { body } | StmtKind::ErrDefer { body, .. } => {
-                Self::walk_capture_paths_block(body, pre_live, paths);
+                Self::walk_capture_paths_block(body, pre_live, paths, reasons);
             }
             // Assignment target: walked normally. A bare-identifier
             // target (`cfg = ...`) registers `(cfg, [])`; a field-chain
@@ -633,14 +758,14 @@ impl<'a> super::OwnershipChecker<'a> {
             // walker's job (slice 2 will fold that into per-path mode
             // inference).
             StmtKind::Assign { target, value } => {
-                Self::walk_capture_paths_expr(target, pre_live, paths);
-                Self::walk_capture_paths_expr(value, pre_live, paths);
+                Self::walk_capture_paths_expr(target, pre_live, paths, reasons);
+                Self::walk_capture_paths_expr(value, pre_live, paths, reasons);
             }
             StmtKind::CompoundAssign { target, value, .. } => {
-                Self::walk_capture_paths_expr(target, pre_live, paths);
-                Self::walk_capture_paths_expr(value, pre_live, paths);
+                Self::walk_capture_paths_expr(target, pre_live, paths, reasons);
+                Self::walk_capture_paths_expr(value, pre_live, paths, reasons);
             }
-            StmtKind::Expr(e) => Self::walk_capture_paths_expr(e, pre_live, paths),
+            StmtKind::Expr(e) => Self::walk_capture_paths_expr(e, pre_live, paths, reasons),
         }
     }
 

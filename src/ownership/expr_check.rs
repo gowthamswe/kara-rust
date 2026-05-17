@@ -1009,7 +1009,8 @@ impl<'a> super::OwnershipChecker<'a> {
                     .filter(|name| !closure_param_set.contains(*name))
                     .cloned()
                     .collect();
-                let capture_paths = self.classify_capture_body_paths(body, &path_pre_live);
+                let (capture_paths, whole_root_reasons) =
+                    self.classify_capture_body_paths(body, &path_pre_live);
 
                 // Disjoint capture slice 2 — per-path mode inference.
                 // Run the use-predicate scan from Rule 2 against each
@@ -1041,6 +1042,10 @@ impl<'a> super::OwnershipChecker<'a> {
                 }
                 self.closure_capture_paths
                     .insert(SpanKey::from_span(&expr.span), capture_paths);
+                if !whole_root_reasons.is_empty() {
+                    self.whole_root_capture_reasons
+                        .insert(SpanKey::from_span(&expr.span), whole_root_reasons);
+                }
 
                 // Disjoint capture slice 5 — Rule 2½ prefix interaction.
                 // When the closure carries an explicit `own` / `ref` /

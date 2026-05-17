@@ -1,5 +1,7 @@
 // tests/ownership.rs
 
+use std::collections::HashMap;
+
 use karac::ownership::*;
 use karac::resolver::SpanKey;
 use karac::{ownershipcheck, parse, resolve, typecheck};
@@ -4086,6 +4088,354 @@ fn slice3_borrow_drains_at_scope_holding_closure_value() {
              }\n\
              let _x = u.profile;\n\
          }",
+    );
+}
+
+// ── Disjoint closure capture — slice 6 (whole-root capture reason + N0503 enrichment) ─
+//
+// Line 353 phase-5 checklist — disjoint-capture slice 6. Slice 1's
+// path walker now records *why* it committed a root to whole-root
+// capture: a method call on the root, an index expression, a deref of
+// a captured borrow, a by-value pass to a function call, or — when
+// nothing else applies — a bare-identifier reference. The reason map
+// is surfaced via `OwnershipCheckResult::whole_root_capture_reasons`
+// and consumed by `emit_rc_fallback_notes` to enrich the N0503 perf
+// note with the spec-mandated *"because the closure body called
+// method `…` on `…` — disjoint capture only sees through field
+// projections"* explanation plus a fix-it that names the rewrite
+// (hoist the field access outside the stopping construct).
+
+fn slice6_reasons_for(result: &OwnershipCheckResult) -> &HashMap<String, WholeRootCaptureReason> {
+    assert_eq!(
+        result.whole_root_capture_reasons.len(),
+        1,
+        "expected exactly one closure with whole-root reasons; got {} entries",
+        result.whole_root_capture_reasons.len()
+    );
+    result.whole_root_capture_reasons.values().next().unwrap()
+}
+
+#[test]
+fn slice6_method_call_records_method_call_reason() {
+    // `|| u.show()` — method-call receiver is the slice-1 stopping
+    // construct that commits `u` to whole-root capture. The reason
+    // names the method (`show`) so the diagnostic can attribute the
+    // whole-root choice to the specific call site.
+    let result = ownership_ok(
+        "struct User { name: i64 }\n\
+         impl User { fn show(ref self) { } }\n\
+         fn main() {\n\
+             let u = User { name: 1 };\n\
+             let _f = || u.show();\n\
+         }",
+    );
+    let reasons = slice6_reasons_for(&result);
+    let r = reasons
+        .get("u")
+        .expect("expected whole-root reason for `u`");
+    match r {
+        WholeRootCaptureReason::MethodCall { method_name, .. } => {
+            assert_eq!(method_name, "show");
+        }
+        _ => panic!("expected MethodCall reason, got {:?}", r),
+    }
+}
+
+#[test]
+fn slice6_index_records_index_reason() {
+    // `|| v[0]` — index expression is a stopping construct; reason
+    // is `Index` with the call span.
+    let result = ownership_ok(
+        "fn main() {\n\
+             let v = Vec[1, 2, 3];\n\
+             let _f = || v[0] + 1;\n\
+         }",
+    );
+    let reasons = slice6_reasons_for(&result);
+    let r = reasons
+        .get("v")
+        .expect("expected whole-root reason for `v`");
+    assert!(
+        matches!(r, WholeRootCaptureReason::Index { .. }),
+        "expected Index reason, got {:?}",
+        r
+    );
+}
+
+#[test]
+fn slice6_by_value_pass_records_byvaluepass_reason() {
+    // `|| take(cfg)` — bare `cfg` passed to a function call. The
+    // slice-1 walker special-cases the immediate bare-identifier-as-
+    // call-arg shape to register `ByValuePass` rather than the
+    // lower-priority `BareIdentifier`. Pins that the call-site
+    // attribution is preserved across the recursion (the generic
+    // walker's later `BareIdentifier` insertion does not overwrite).
+    let result = ownership_ok(
+        "struct Config { name: i64 }\n\
+         fn take(c: Config) { }\n\
+         fn main() {\n\
+             let cfg = Config { name: 1 };\n\
+             let _f = || take(cfg);\n\
+         }",
+    );
+    let reasons = slice6_reasons_for(&result);
+    let r = reasons
+        .get("cfg")
+        .expect("expected whole-root reason for `cfg`");
+    assert!(
+        matches!(r, WholeRootCaptureReason::ByValuePass { .. }),
+        "expected ByValuePass reason, got {:?}",
+        r
+    );
+}
+
+#[test]
+fn slice6_bare_identifier_records_bareidentifier_reason() {
+    // `|| cfg` — bare-identifier final-expression reference, no
+    // enclosing stopping construct. The reason is `BareIdentifier`
+    // (lowest priority). Pin that bare references with no
+    // surrounding construct still produce a reason entry so the
+    // RC-fallback note's enrichment lookup never returns None for a
+    // captured-whole root.
+    let result = ownership_ok(
+        "struct Config { name: i64 }\n\
+         fn take(c: Config) { }\n\
+         fn main() {\n\
+             let cfg = Config { name: 1 };\n\
+             let _f = || { let c = cfg; take(c); };\n\
+         }",
+    );
+    let reasons = slice6_reasons_for(&result);
+    let r = reasons
+        .get("cfg")
+        .expect("expected whole-root reason for `cfg`");
+    assert!(
+        matches!(r, WholeRootCaptureReason::BareIdentifier),
+        "expected BareIdentifier reason, got {:?}",
+        r
+    );
+}
+
+#[test]
+fn slice6_method_call_beats_bare_identifier_priority() {
+    // Body has a stopping construct (`u.show()`) AND a bare-identifier
+    // reference (`u` as a let value). The priority rule pins
+    // `MethodCall` as the winning reason because stopping constructs
+    // outrank `BareIdentifier`. Pins the "first stopping construct
+    // wins; bare loses" merge rule (`record_whole_root_reason`).
+    let result = ownership_ok(
+        "struct User { name: i64 }\n\
+         impl User { fn show(ref self) { } }\n\
+         fn take(u: User) { }\n\
+         fn main() {\n\
+             let u = User { name: 1 };\n\
+             let _f = || { u.show(); let c = u; take(c); };\n\
+         }",
+    );
+    let reasons = slice6_reasons_for(&result);
+    let r = reasons
+        .get("u")
+        .expect("expected whole-root reason for `u`");
+    assert!(
+        matches!(r, WholeRootCaptureReason::MethodCall { method_name, .. } if method_name == "show"),
+        "stopping construct must beat BareIdentifier; got {:?}",
+        r
+    );
+}
+
+#[test]
+fn slice6_first_stopping_construct_wins_over_later_one() {
+    // Body has two stopping constructs (`u.show()` first, `v[0]` and
+    // method on u, etc.). For the same root, first-wins. Construct:
+    // closure does `u.show(); u[0]` — both stopping constructs on
+    // `u`. The walker sees the MethodCall first (top-down traversal
+    // through a Block), so `MethodCall` wins over `Index`.
+    let result = ownership_ok(
+        "struct U { name: i64 }\n\
+         impl U { fn show(ref self) { } }\n\
+         impl U { fn at(ref self, i: i64) -> i64 { 0 } }\n\
+         fn main() {\n\
+             let u = U { name: 1 };\n\
+             let _f = || { u.show(); u.at(0) };\n\
+         }",
+    );
+    let reasons = slice6_reasons_for(&result);
+    let r = reasons
+        .get("u")
+        .expect("expected whole-root reason for `u`");
+    match r {
+        WholeRootCaptureReason::MethodCall { method_name, .. } => {
+            assert_eq!(method_name, "show", "first method call wins");
+        }
+        _ => panic!(
+            "expected MethodCall(show) — first stopping construct wins; got {:?}",
+            r
+        ),
+    }
+}
+
+#[test]
+fn slice6_path_precise_capture_records_no_reason() {
+    // Closure captures `u.profile.name` (precise sub-path). Slice 1
+    // does not commit any root to whole-root capture, so the reasons
+    // map for this closure is absent (no entry for the closure span).
+    // Pin that we only populate reasons when whole-root capture
+    // actually fired.
+    let result = ownership_ok(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 } };\n\
+             let _f = || u.profile.name + 1;\n\
+         }",
+    );
+    assert!(
+        result.whole_root_capture_reasons.is_empty(),
+        "no whole-root reasons should be recorded for path-precise capture; got: {:?}",
+        result.whole_root_capture_reasons
+    );
+}
+
+#[test]
+fn slice6_n0503_note_includes_method_call_reason() {
+    // **The slice-6 headline test.** When the closure body forces
+    // whole-root capture via a method call AND the outer scope
+    // consumes a sibling sub-place (non-Copy) so the RC fallback
+    // fires, the N0503 note must include the spec-mandated
+    // explanation: "closure at line N captured `u` whole because the
+    // closure body called method `show` on `u` (disjoint capture only
+    // sees through field projections)".
+    let src = "struct Inner { v: i64 }\n\
+               struct User { name: i64, history: Inner }\n\
+               impl User { fn show(ref self) { } }\n\
+               fn take(x: Inner) { }\n\
+               fn main() {\n\
+                   let u = User { name: 1, history: Inner { v: 3 } };\n\
+                   let _f = || u.show();\n\
+                   take(u.history);\n\
+               }";
+    let parsed = parse(src);
+    let resolved = resolve(&parsed.program);
+    let typed = typecheck(&parsed.program, &resolved);
+    let result = ownershipcheck(&parsed.program, &typed);
+    let note = result
+        .notes
+        .iter()
+        .find(|n| n.kind == OwnershipErrorKind::RcFallbackNote)
+        .expect("expected N0503 RC fallback note");
+    assert!(
+        note.message.contains("captured `u` whole"),
+        "note should attribute the whole-root capture; got: {}",
+        note.message
+    );
+    assert!(
+        note.message.contains("method `show`"),
+        "note should name the method that caused the whole-root capture; got: {}",
+        note.message
+    );
+    assert!(
+        note.message
+            .contains("disjoint capture only sees through field projections"),
+        "note should include the spec-mandated framing; got: {}",
+        note.message
+    );
+}
+
+#[test]
+fn slice6_n0503_note_includes_method_call_fix_it_suggestion() {
+    // Companion to the headline test: the suggestion field must carry
+    // the slice-6 fix-it for `MethodCall` reasons — name the method
+    // and propose hoisting its result out of the closure.
+    let src = "struct Inner { v: i64 }\n\
+               struct User { name: i64, history: Inner }\n\
+               impl User { fn show(ref self) { } }\n\
+               fn take(x: Inner) { }\n\
+               fn main() {\n\
+                   let u = User { name: 1, history: Inner { v: 3 } };\n\
+                   let _f = || u.show();\n\
+                   take(u.history);\n\
+               }";
+    let parsed = parse(src);
+    let resolved = resolve(&parsed.program);
+    let typed = typecheck(&parsed.program, &resolved);
+    let result = ownershipcheck(&parsed.program, &typed);
+    let note = result
+        .notes
+        .iter()
+        .find(|n| n.kind == OwnershipErrorKind::RcFallbackNote)
+        .expect("expected N0503 RC fallback note");
+    let s = note
+        .suggestion
+        .as_ref()
+        .expect("expected a fix-it suggestion");
+    assert!(
+        s.contains("hoist") && s.contains("show"),
+        "fix-it should propose hoisting `show`'s call out of the closure; got: {}",
+        s
+    );
+}
+
+#[test]
+fn slice6_n0503_note_falls_back_to_generic_for_non_closure_rc() {
+    // Negative pin: when the RC promotion is not closure-capture-
+    // driven (e.g., a plain direct-reuse-after-consume between two
+    // free-standing statements), the slice-6 enrichment lookup must
+    // return None and the note falls back to the legacy generic
+    // suggestion. Catches accidental over-eager enrichment.
+    let src = "struct Owned { x: i64 }\n\
+               fn take(o: Owned) { }\n\
+               fn read(ref o: Owned) -> i64 { o.x }\n\
+               fn main() {\n\
+                   let o = Owned { x: 1 };\n\
+                   let _v = read(o);\n\
+                   take(o);\n\
+               }";
+    let parsed = parse(src);
+    let resolved = resolve(&parsed.program);
+    let typed = typecheck(&parsed.program, &resolved);
+    let result = ownershipcheck(&parsed.program, &typed);
+    let note = result
+        .notes
+        .iter()
+        .find(|n| n.kind == OwnershipErrorKind::RcFallbackNote);
+    if let Some(note) = note {
+        assert!(
+            !note.message.contains("closure at line"),
+            "non-closure RC promotion must not carry slice-6 closure-attribution; got: {}",
+            note.message
+        );
+        let s = note
+            .suggestion
+            .as_ref()
+            .expect("expected fallback suggestion");
+        assert!(
+            s.contains("restructure to a single ownership path"),
+            "non-closure RC promotion must keep the generic suggestion; got: {}",
+            s
+        );
+    }
+}
+
+#[test]
+fn slice6_describe_helper_renders_method_call_reason() {
+    // Direct API pin for `WholeRootCaptureReason::describe`. Tests
+    // the formatting helper without going through the full ownership
+    // pipeline — regression guard for the spec-mandated message
+    // shape if the helper is ever moved or rewritten.
+    let r = WholeRootCaptureReason::MethodCall {
+        method_name: "show".to_string(),
+        call_span: karac::token::Span::default(),
+    };
+    let s = r.describe("u");
+    assert!(
+        s.contains("`show`") && s.contains("`u`"),
+        "describe should name both method and receiver; got: {}",
+        s
+    );
+    assert!(
+        s.contains("disjoint capture only sees through field projections"),
+        "describe should include the spec framing; got: {}",
+        s
     );
 }
 
