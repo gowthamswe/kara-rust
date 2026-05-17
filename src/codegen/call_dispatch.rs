@@ -15,7 +15,7 @@ use crate::ast::*;
 
 use inkwell::types::BasicType;
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum};
-use inkwell::AddressSpace;
+use inkwell::{AddressSpace, IntPredicate};
 
 use super::helpers::{expr_as_type_expr_codegen, match_with_provider_call};
 
@@ -236,6 +236,38 @@ impl<'ctx> super::Codegen<'ctx> {
                 }
             }
             let val = self.compile_expr(&a.value)?;
+            // `Option[shared T]` ref-share at the call site: when
+            // the arg is a tracked Identifier binding whose static
+            // type is Option[shared T], emit a discriminant- and
+            // null-guarded `rc_inc` on the inner pointer so the
+            // callee receives an independent +1 ref. The caller's
+            // slot is NOT mutated — its queued `RcDecOption` still
+            // fires at scope-exit and balances the original +1.
+            // The callee's `track_rc_option_var` (queued in
+            // `compile_function` for Option[shared T] params)
+            // owns the dec of the newly-incremented ref at
+            // function exit.
+            //
+            // Mirrors the plain shared-T arm of
+            // `suppress_source_vec_cleanup_for_arg`: caller-side
+            // `emit_refcount_inc` so the consumer holds its own
+            // ref while the source's dec stays in place. The
+            // earlier (0866037) design here zeroed the caller's
+            // slot to "move" ownership; that broke any call site
+            // that passed the same Option[shared T] binding more
+            // than once (e.g., `for i in 0..k { f(l1, l2); }` —
+            // the first call would clear l1/l2 to None, every
+            // subsequent call would receive None). The kata bench
+            // surfaced this as `add_two_numbers(l1, l2)` returning
+            // None on iterations 2..K.
+            //
+            // No-op for non-Identifier args (call-result
+            // `make_chain(10)`, struct literals, fresh `Some(...)`)
+            // — those carry their own +1 from the producer; the
+            // callee's `track_rc_option_var` balances them. Also
+            // no-op for non-shared Option[T] params (no entry in
+            // `var_option_shared_heap`).
+            self.share_option_shared_ref_for_arg(&a.value);
             compiled_args.push(BasicMetadataValueEnum::from(val));
         }
 
@@ -651,6 +683,124 @@ impl<'ctx> super::Codegen<'ctx> {
                 }
             }
         }
+    }
+
+    /// Ref-share at the call site for `Option[shared T]` Identifier
+    /// args. Mirrors the shared-T branch of
+    /// `suppress_source_vec_cleanup_for_arg` for the Option-wrapped
+    /// shape: when an Identifier-typed argument's static type is
+    /// `Option[shared T]`, emit a discriminant- and null-guarded
+    /// `rc_inc` on the inner heap pointer so the consumer (callee
+    /// param) holds an independent +1 ref. The caller's slot is
+    /// NOT mutated — its queued `RcDecOption` still fires at
+    /// scope-exit and balances the construction-time +1; the
+    /// callee's `track_rc_option_var` cleanup (queued in
+    /// `compile_function` for Option[shared T] params) balances
+    /// the new +1 emitted here.
+    ///
+    /// IR shape (same as the Assign-arm's "inc new inner" branch
+    /// in `compile_stmt`): load the slot's tag → branch on `Some`
+    /// → load `w0` → `int_to_ptr` → null-guard → `emit_refcount_inc`.
+    /// On `None` or null inner, all branches skip and no inc fires.
+    ///
+    /// Companion to `track_rc_option_var` on the callee side, which
+    /// fires for `Option[shared T]` parameters in `compile_function`.
+    /// The Caller's slot is preserved as-is so a call site that
+    /// passes the same binding many times (e.g., `for i in 0..k {
+    /// f(l1, l2); }`) sees the live chain on every call.
+    ///
+    /// No-op for non-Identifier args (call-result `make_chain(10)`,
+    /// struct literals, fresh `Some(...)`), for non-shared
+    /// Option[T] params, and for ref-bound aliasing — those carry
+    /// their own ownership semantics (a Call's return value carries
+    /// the callee's +1 directly into the caller's param slot;
+    /// `track_rc_option_var` on the callee param owns the dec).
+    /// Resolution uses `var_option_shared_heap` (populated by
+    /// `track_rc_option_var` at the let-stmt and param-binding
+    /// sites) as the single source of truth for "is this binding
+    /// an Option[shared T]".
+    pub(super) fn share_option_shared_ref_for_arg(&self, arg_expr: &Expr) {
+        let var_name = match &arg_expr.kind {
+            ExprKind::Identifier(n) => n.as_str(),
+            _ => return,
+        };
+        let heap_type = match self.var_option_shared_heap.get(var_name).copied() {
+            Some(t) => t,
+            None => return,
+        };
+        let slot = match self.variables.get(var_name) {
+            Some(s) => *s,
+            None => return,
+        };
+        let Some(fn_val) = self.current_fn else {
+            return;
+        };
+        let option_ty = self.enum_layouts["Option"].llvm_type;
+        let i64_t = self.context.i64_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let some_tag = self
+            .enum_layouts
+            .get("Option")
+            .and_then(|l| l.tags.get("Some").copied())
+            .unwrap_or(1);
+        let some_tag_const = i64_t.const_int(some_tag, false);
+        // Load tag, branch on Some.
+        let Ok(tag_ptr) = self
+            .builder
+            .build_struct_gep(option_ty, slot.ptr, 0, "opt.arg.tag.p")
+        else {
+            return;
+        };
+        let Ok(tag) = self.builder.build_load(i64_t, tag_ptr, "opt.arg.tag") else {
+            return;
+        };
+        let Ok(is_some) = self.builder.build_int_compare(
+            IntPredicate::EQ,
+            tag.into_int_value(),
+            some_tag_const,
+            "opt.arg.is_some",
+        ) else {
+            return;
+        };
+        let do_bb = self.context.append_basic_block(fn_val, "opt.arg.inc.do");
+        let skip_bb = self.context.append_basic_block(fn_val, "opt.arg.inc.skip");
+        let _ = self
+            .builder
+            .build_conditional_branch(is_some, do_bb, skip_bb);
+        self.builder.position_at_end(do_bb);
+        // Recover inner ptr from w0.
+        let Ok(w0_ptr) = self
+            .builder
+            .build_struct_gep(option_ty, slot.ptr, 1, "opt.arg.w0.p")
+        else {
+            self.builder.position_at_end(skip_bb);
+            return;
+        };
+        let Ok(w0) = self.builder.build_load(i64_t, w0_ptr, "opt.arg.w0") else {
+            self.builder.position_at_end(skip_bb);
+            return;
+        };
+        let Ok(inner) = self
+            .builder
+            .build_int_to_ptr(w0.into_int_value(), ptr_ty, "opt.arg.inner")
+        else {
+            self.builder.position_at_end(skip_bb);
+            return;
+        };
+        let Ok(is_null) = self.builder.build_is_null(inner, "opt.arg.is_null") else {
+            self.builder.position_at_end(skip_bb);
+            return;
+        };
+        let real_do_bb = self
+            .context
+            .append_basic_block(fn_val, "opt.arg.inc.real_do");
+        let _ = self
+            .builder
+            .build_conditional_branch(is_null, skip_bb, real_do_bb);
+        self.builder.position_at_end(real_do_bb);
+        self.emit_refcount_inc(var_name, heap_type, inner);
+        let _ = self.builder.build_unconditional_branch(skip_bb);
+        self.builder.position_at_end(skip_bb);
     }
 
     /// Compound-payload enum codegen (CP4 helper) — decompose an

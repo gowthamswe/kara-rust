@@ -219,6 +219,32 @@ impl<'ctx> super::Codegen<'ctx> {
                         }
                     }
                 }
+                // `Option[shared T]` parameter registration. The
+                // param receives the caller's +1 ref by transfer:
+                //   - Identifier-arg caller binding (`shadow(chain)`)
+                //     has its RcDecOption cleanup defused at the
+                //     call site by
+                //     `suppress_source_option_shared_cleanup_for_arg`
+                //     (in `call_dispatch.rs`); the chain's +1 moves
+                //     into the callee's param slot.
+                //   - Call-result direct arg (`shadow(make_chain(10))`)
+                //     carries the callee's +1 in the return value's
+                //     SSA — no caller-side binding exists, no
+                //     suppression needed.
+                // Either way, the callee owns one ref on entry; no
+                // entry-side `emit_refcount_inc` is needed. The
+                // `track_rc_option_var` call queues an `RcDecOption`
+                // cleanup so the param's inner ref drops at function
+                // exit, and populates `var_option_shared_heap` so the
+                // Assign-arm in `compile_stmt` dispatches its dec/inc
+                // dance for param-shadowing (`opt = Some(...)` /
+                // `opt = other_opt`) — the leak shape the 79a7db8
+                // follow-up notes called out. No-op for Option[T]
+                // where T isn't a shared struct.
+                if let Some((_, info)) = self.option_inner_shared_type_for_type_expr(&param.ty) {
+                    let option_ty = self.enum_layouts["Option"].llvm_type;
+                    self.track_rc_option_var(&param_name, alloca, option_ty, info.heap_type);
+                }
                 // RC-fallback boxing for non-shared, non-Vec parameters flagged by the
                 // ownership checker. The param value is boxed in {i64 rc, T} on the heap
                 // so multiple "consumers" each get a copy of T and the heap object is freed
