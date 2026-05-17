@@ -7956,3 +7956,71 @@ fn test_slice_pattern_multiple_rest_rejected() {
         errors.iter().map(|e| &e.message).collect::<Vec<_>>()
     );
 }
+
+// ── GAT slice 9 — negative-space coverage (parser pins) ────────────
+//
+// Two pins documenting v1 parser-level rejections that belong to the
+// GAT negative-space surface: higher-ranked-trait-bound `for<X>`
+// syntax is not in v1, and effect-polymorphic GAT params
+// (`type Mapped[U, with E]`) are rejected at parse time per slice 1.
+// The latter is a re-verification — slice 1 already pins the
+// diagnostic, slice 9 re-asserts it from the negative-space framing
+// so a regression in the parser's effect-param rejection trips both
+// the slice 1 and slice 9 surfaces.
+
+#[test]
+fn gat_slice9_b_higher_ranked_for_in_where_clause_rejected() {
+    // `for<X> F.Mapped[X]: Send` would let an author quantify a where
+    // clause over an unknown-at-callsite `X`. Kāra v1 has no
+    // higher-ranked-trait-bound surface — `for` is a loop keyword,
+    // not a binder — so the parser fails on the `for` token in
+    // where-clause position. Slice 9 pins this rejection so a future
+    // parser change that adds a binder-position `for` (e.g., for
+    // existentials) cannot silently accept this surface and quietly
+    // ship HRTBs.
+    let (_prog, errors) = parse_with_errors(
+        r#"
+        trait Functor { type Mapped[U]; }
+        fn f[F: Functor]() where for<X> F.Mapped[X]: Send {}
+    "#,
+    );
+    assert!(
+        !errors.is_empty(),
+        "Expected parse error for `for<X>` in where-clause position; \
+         parser accepted the higher-ranked syntax"
+    );
+}
+
+#[test]
+fn gat_slice9_c_effect_param_on_gat_decl_still_rejected() {
+    // Re-verification of slice 1's `E_GAT_EFFECT_PARAM` diagnostic
+    // surface. Slice 1 already pins this in
+    // `gat_slice1_trait_assoc_type_rejects_effect_param`; the slice 9
+    // pin is intentionally redundant so a regression that loosens the
+    // parser's effect-param rejection trips a slice-9-framed failure
+    // (signalling that the v1 negative-space contract was broken),
+    // alongside the slice 1 failure (signalling that the
+    // slice-1-as-shipped behaviour regressed). The two framings name
+    // the same wound from two angles.
+    let (_prog, errors) = parse_with_errors(
+        r#"
+        trait Functor {
+            type Mapped[U, with E];
+        }
+    "#,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_GAT_EFFECT_PARAM") && e.message.contains("with E")),
+        "Expected E_GAT_EFFECT_PARAM diagnostic mentioning `with E`; \
+         got: {errors:?}"
+    );
+    // The steering-suggestion surface is also load-bearing: the user
+    // needs to know v1's prescribed shape (the carrying-method form).
+    assert!(
+        errors.iter().any(|e| e.message.contains("carrying method")),
+        "Expected diagnostic to suggest the carrying-method form; \
+         got: {errors:?}"
+    );
+}

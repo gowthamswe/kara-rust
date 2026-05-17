@@ -13320,3 +13320,49 @@ fn test_gat_slice8c_slices_4_through_8b_still_pass_regression() {
          fn main() -> i64 { use_it(V {}) }",
     );
 }
+
+// ── GAT slice 9 — negative-space coverage ──────────────────────────
+//
+// Three pins documenting what v1 GATs intentionally do NOT support.
+// Slice 9 ships no production code; the diagnostics it asserts on
+// were planted by slices 1 (effect-param rejection) and 6 (coherence).
+// The slice 9 framing makes the negative-space intent explicit so a
+// future reader knows these rejections are load-bearing, not
+// accidental gaps.
+
+#[test]
+fn test_gat_slice9_a_coherence_rejects_duplicate_impls_with_distinct_gat_bindings() {
+    // Slice 9 explicit-GAT-framing of slice 6's coherence pin. The
+    // existence of GAT bindings on an impl does NOT relax the "one
+    // impl per trait per type" rule — even when the two impls bind
+    // `Mapped[U]` to genuinely different RHS shapes, coherence still
+    // rejects the second registration via the existing
+    // `ConflictingImpl` diagnostic. The GAT bindings are part of the
+    // impl block; they contribute no coherence rule of their own.
+    //
+    // Slice 6 already pins this surface via three tests under
+    // `test_gat_slice6_*`; slice 9's contribution is the explicit
+    // framing in the test name and preamble so the negative-space
+    // intent is searchable.
+    let errors = typecheck_errors(
+        "trait Functor {\n\
+             type Mapped[U];\n\
+         }\n\
+         struct Wrapper[T] { x: T }\n\
+         impl Functor for Wrapper[i32] {\n\
+             type Mapped[U] = Vec[U];\n\
+         }\n\
+         impl Functor for Wrapper[i32] {\n\
+             type Mapped[U] = Set[U];\n\
+         }\n\
+         fn main() {}",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::ConflictingImpl),
+        "expected ConflictingImpl for duplicate impls with distinct GAT \
+         bindings; got: {:?}",
+        errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
