@@ -498,6 +498,17 @@ pub enum ResolveErrorKind {
     /// design.md § Error Handling > "Stdlib panic-emitters report the
     /// caller's source location". `E0240`.
     TrackCallerInvalidTarget,
+    /// `#[deprecated]` placed on an `impl` block. The spec rejects
+    /// this with `E_DEPRECATED_ON_IMPL` — impl-level deprecation
+    /// would be ambiguous (which methods?); the user should
+    /// deprecate the underlying methods individually. See design.md §
+    /// `#[deprecated]` for Item Deprecation. `E0241`.
+    DeprecatedOnImpl,
+    /// `#[deprecated]` placed on a struct *field*. The spec defers
+    /// field-level deprecation to post-v1 — use-site detection for
+    /// field reads/writes is non-trivial and is bundled with the
+    /// post-v1 lint expansion. `E_DEPRECATED_ON_FIELD`. `E0242`.
+    DeprecatedOnField,
     /// `continue label` where `label` refers to a labeled block (rather
     /// than a loop). `continue` is only valid for loop labels — reject
     /// the use site with `error[E_CONTINUE_LABEL_BLOCK]`. The diagnostic

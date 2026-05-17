@@ -112,6 +112,7 @@ impl<'a> super::TypeChecker<'a> {
                         where_clause: method.where_clause.clone(),
                         body: body.clone(),
                         stdlib_origin: t.stdlib_origin,
+                        deprecation: None,
                         is_track_caller: false,
                     };
                     self.check_function(&synthesized, Some(&self_type), &enclosing);

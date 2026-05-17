@@ -375,6 +375,7 @@ impl<'a> super::EffectChecker<'a> {
                                     span: m.span.clone(),
                                 }),
                                 stdlib_origin: t.stdlib_origin,
+                                deprecation: None,
                                 is_track_caller: false,
                             };
                             let by_var = scan(&stub);

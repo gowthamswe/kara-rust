@@ -239,6 +239,7 @@ impl super::Parser {
         // split, so downstream tools that re-parse without a resolver
         // still see the captured attribute.
         let is_track_caller = self.scan_track_caller_attr(&attributes);
+        let deprecation = self.scan_deprecated_attr(&attributes);
 
         Some(Function {
             span: self.span_from(&start),
@@ -258,6 +259,7 @@ impl super::Parser {
             where_clause,
             body,
             stdlib_origin: false,
+            deprecation,
             is_track_caller,
         })
     }
@@ -290,6 +292,131 @@ impl super::Parser {
             }
         }
         present
+    }
+
+    /// Scan `attributes` for `#[deprecated]` and produce the
+    /// `Deprecation` payload (slice 1/2 of design.md §
+    /// `#[deprecated]` for Item Deprecation). Recognises three
+    /// forms:
+    /// - bare `#[deprecated]` → `Deprecation { since: None, note: None }`
+    /// - shorthand `#[deprecated = "note"]` → `note` populated
+    /// - long form `#[deprecated(since: "...", note: "...")]` —
+    ///   both fields optional, accepted as `name = value` AND
+    ///   `name: value` (the attribute-arg parser already accepts
+    ///   both shapes; downstream stays uniform via `AttrArg.name`).
+    ///
+    /// Unknown keys (`#[deprecated(authored_by: "...")]`) emit
+    /// `E_DEPRECATED_UNKNOWN_FIELD` enumerating the accepted set
+    /// (`since`, `note`). Non-string values (`#[deprecated(since: 1)]`)
+    /// emit `E_DEPRECATED_FIELD_NOT_STRING` naming the offending key.
+    /// Positional args (`#[deprecated("oops")]`) emit
+    /// `E_DEPRECATED_POSITIONAL_ARG` — the long form requires named
+    /// fields, the only legal unnamed form is the shorthand
+    /// `= "string"`.
+    ///
+    /// Multiple `#[deprecated]` attributes on the same item: only the
+    /// first one wins; subsequent ones produce
+    /// `E_DEPRECATED_DUPLICATE`. Same idempotency rule as Rust.
+    pub(crate) fn scan_deprecated_attr(&mut self, attributes: &[Attribute]) -> Option<Deprecation> {
+        let mut first: Option<Deprecation> = None;
+        for attr in attributes {
+            if attr.name != "deprecated" {
+                continue;
+            }
+            if first.is_some() {
+                self.errors.push(super::ParseError {
+                    message: "error[E_DEPRECATED_DUPLICATE]: \
+                              multiple `#[deprecated]` attributes on the \
+                              same item; keep one and remove the rest"
+                        .to_string(),
+                    span: attr.span.clone(),
+                });
+                continue;
+            }
+            // Shorthand: `#[deprecated = "note"]`
+            if let Some(s) = &attr.string_value {
+                if !attr.args.is_empty() {
+                    // Shouldn't happen — the attribute parser uses
+                    // string_value XOR args, but pin the assumption.
+                    self.errors.push(super::ParseError {
+                        message: "error[E_DEPRECATED_DUPLICATE]: \
+                                  `#[deprecated = \"...\"]` cannot also \
+                                  carry parenthesised arguments"
+                            .to_string(),
+                        span: attr.span.clone(),
+                    });
+                    continue;
+                }
+                first = Some(Deprecation {
+                    span: attr.span.clone(),
+                    since: None,
+                    note: Some(s.clone()),
+                });
+                continue;
+            }
+            // Bare or long form: `#[deprecated]` / `#[deprecated(...)]`
+            let mut since: Option<String> = None;
+            let mut note: Option<String> = None;
+            for arg in &attr.args {
+                let Some(name) = &arg.name else {
+                    self.errors.push(super::ParseError {
+                        message: "error[E_DEPRECATED_POSITIONAL_ARG]: \
+                                  `#[deprecated(...)]` requires named \
+                                  arguments — use `since: \"...\"` and/or \
+                                  `note: \"...\"`, or the shorthand \
+                                  `#[deprecated = \"note\"]`"
+                            .to_string(),
+                        span: arg.span.clone(),
+                    });
+                    continue;
+                };
+                let field_slot = match name.as_str() {
+                    "since" => &mut since,
+                    "note" => &mut note,
+                    other => {
+                        self.errors.push(super::ParseError {
+                            message: format!(
+                                "error[E_DEPRECATED_UNKNOWN_FIELD]: \
+                                 `#[deprecated]` does not accept field \
+                                 `{other}`; the accepted fields are \
+                                 `since` and `note`",
+                            ),
+                            span: arg.span.clone(),
+                        });
+                        continue;
+                    }
+                };
+                let Some(value_expr) = &arg.value else {
+                    self.errors.push(super::ParseError {
+                        message: format!(
+                            "error[E_DEPRECATED_FIELD_NOT_STRING]: \
+                             `#[deprecated]` field `{name}` requires a \
+                             string-literal value",
+                        ),
+                        span: arg.span.clone(),
+                    });
+                    continue;
+                };
+                let ExprKind::StringLit(s) = &value_expr.kind else {
+                    self.errors.push(super::ParseError {
+                        message: format!(
+                            "error[E_DEPRECATED_FIELD_NOT_STRING]: \
+                             `#[deprecated]` field `{name}` requires a \
+                             string-literal value",
+                        ),
+                        span: arg.span.clone(),
+                    });
+                    continue;
+                };
+                *field_slot = Some(s.clone());
+            }
+            first = Some(Deprecation {
+                span: attr.span.clone(),
+                since,
+                note,
+            });
+        }
+        first
     }
 
     pub(super) fn parse_fn_params(&mut self) -> Option<(Option<SelfParam>, Vec<Param>)> {
@@ -604,6 +731,7 @@ impl super::Parser {
         // — mirrors the `#[compiler_builtin]` split between parser-
         // captures-flag and resolver-validates-placement.
         let is_non_exhaustive = attributes.iter().any(|a| a.name == "non_exhaustive");
+        let deprecation = self.scan_deprecated_attr(&attributes);
 
         Some(StructDef {
             span: self.span_from(&start),
@@ -619,6 +747,7 @@ impl super::Parser {
             fields,
             invariants,
             stdlib_origin: false,
+            deprecation,
             is_non_exhaustive,
         })
     }
@@ -686,6 +815,7 @@ impl super::Parser {
         self.expect(&Token::RightBrace)?;
 
         let is_non_exhaustive = attributes.iter().any(|a| a.name == "non_exhaustive");
+        let deprecation = self.scan_deprecated_attr(&attributes);
 
         Some(EnumDef {
             span: self.span_from(&start),
@@ -699,6 +829,7 @@ impl super::Parser {
             where_clause,
             variants,
             stdlib_origin: false,
+            deprecation,
             is_non_exhaustive,
         })
     }
@@ -1111,6 +1242,7 @@ impl super::Parser {
         };
         self.expect(&Token::Semicolon)?;
         let doc_comment = self.take_pending_doc();
+        let deprecation = self.scan_deprecated_attr(&attributes);
         Some(DistinctTypeDef {
             span: self.span_from(&start),
             attributes,
@@ -1121,6 +1253,7 @@ impl super::Parser {
             generic_params,
             base_type,
             refinement,
+            deprecation,
         })
     }
 }

@@ -133,6 +133,7 @@ impl<'a> FnSpec<'a> {
             where_clause: None,
             body: empty_block(),
             stdlib_origin: self.stdlib_origin,
+            deprecation: None,
             is_track_caller: false,
         }
     }

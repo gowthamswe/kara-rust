@@ -87,6 +87,7 @@ impl super::Parser {
             false
         };
 
+        let deprecation = self.scan_deprecated_attr(&attributes);
         Some(MarkerTraitDef {
             span: self.span_from(&start),
             attributes,
@@ -98,6 +99,7 @@ impl super::Parser {
             supertraits,
             where_clause,
             body_brace,
+            deprecation,
         })
     }
 
@@ -207,6 +209,7 @@ impl super::Parser {
         }
         self.expect(&Token::RightBrace)?;
 
+        let deprecation = self.scan_deprecated_attr(&attributes);
         Some(TraitDef {
             span: self.span_from(start),
             attributes,
@@ -220,6 +223,7 @@ impl super::Parser {
             where_clause,
             items,
             stdlib_origin: false,
+            deprecation,
         })
     }
 
@@ -276,6 +280,7 @@ impl super::Parser {
         let where_clause = self.parse_optional_where_clause();
         self.expect(&Token::Semicolon)?;
 
+        let deprecation = self.scan_deprecated_attr(&attributes);
         Some(TraitAliasDef {
             span: self.span_from(start),
             attributes,
@@ -286,6 +291,7 @@ impl super::Parser {
             generic_params,
             bounds,
             where_clause,
+            deprecation,
         })
     }
 

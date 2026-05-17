@@ -301,6 +301,55 @@ impl<'a> super::Resolver<'a> {
         }
     }
 
+    /// Reject `#[deprecated]` placed on an `impl` block per design.md
+    /// § `#[deprecated]` for Item Deprecation > "Where it cannot
+    /// appear" — impl-level deprecation would be ambiguous (which
+    /// methods does it cover?); the user should deprecate the
+    /// individual methods instead.
+    fn reject_deprecated_on_impl(&mut self, attrs: &[Attribute]) {
+        for attr in attrs {
+            if attr.name == "deprecated" {
+                self.errors.push(ResolveError {
+                    message: "error[E_DEPRECATED_ON_IMPL]: \
+                              `#[deprecated]` is not valid on an `impl` \
+                              block — deprecate the underlying methods \
+                              individually instead. See design.md § \
+                              `#[deprecated]` for Item Deprecation."
+                        .to_string(),
+                    span: attr.span.clone(),
+                    kind: ResolveErrorKind::DeprecatedOnImpl,
+                    suggestion: None,
+                    replacement: None,
+                });
+            }
+        }
+    }
+
+    /// Reject `#[deprecated]` placed on a struct field. Field-level
+    /// deprecation is post-v1 — use-site detection for field
+    /// reads/writes is non-trivial and is bundled with the post-v1
+    /// lint expansion. Per design.md § `#[deprecated]` for Item
+    /// Deprecation > "Where it cannot appear".
+    fn reject_deprecated_on_field(&mut self, attrs: &[Attribute]) {
+        for attr in attrs {
+            if attr.name == "deprecated" {
+                self.errors.push(ResolveError {
+                    message: "error[E_DEPRECATED_ON_FIELD]: \
+                              `#[deprecated]` on individual struct fields \
+                              is post-v1; only item-level deprecation is \
+                              supported. Use-site detection for field \
+                              reads/writes is bundled with the post-v1 \
+                              lint expansion."
+                        .to_string(),
+                    span: attr.span.clone(),
+                    kind: ResolveErrorKind::DeprecatedOnField,
+                    suggestion: None,
+                    replacement: None,
+                });
+            }
+        }
+    }
+
     /// Reject `#[track_caller]` placed on an item kind that is not a
     /// `fn` declaration. Per design.md § Error Handling > "Stdlib
     /// panic-emitters report the caller's source location", the
@@ -434,6 +483,7 @@ impl<'a> super::Resolver<'a> {
         for field in &s.fields {
             self.reject_non_exhaustive_attr(&field.attributes, "struct field");
             self.reject_track_caller_attr(&field.attributes, "struct field");
+            self.reject_deprecated_on_field(&field.attributes);
         }
         let field_names: Vec<String> = s.fields.iter().map(|f| f.name.clone()).collect();
         if let Err(e) = self.table.define(
@@ -559,6 +609,7 @@ impl<'a> super::Resolver<'a> {
         self.check_compiler_builtin_attr(&imp.attributes, false);
         self.reject_non_exhaustive_attr(&imp.attributes, "impl block");
         self.reject_track_caller_attr(&imp.attributes, "impl block");
+        self.reject_deprecated_on_impl(&imp.attributes);
         // Methods are registered in type_methods, not global scope.
         // We need the type name from the target_type.
         let type_name = self.type_expr_name(&imp.target_type);

@@ -2349,6 +2349,89 @@ fn track_caller_slice1_rejection_uses_dedicated_error_kind() {
     );
 }
 
+// ── #[deprecated] placement validation (E0241 / E0242) ────────────
+// Per design.md § `#[deprecated]` for Item Deprecation > "Where it
+// cannot appear", impl blocks (`E_DEPRECATED_ON_IMPL`) and struct
+// fields (`E_DEPRECATED_ON_FIELD`) are explicit rejection sites.
+// Every other attribute-bearing item kind accepts the attribute —
+// the parser captures the payload, the resolver doesn't fire.
+
+#[test]
+fn deprecated_slice3_accepted_on_function() {
+    let parsed = parse("#[deprecated]\nfn old() { }");
+    assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+    let errs = resolve(&parsed.program).errors;
+    assert!(
+        errs.iter().all(|e| !matches!(
+            e.kind,
+            ResolveErrorKind::DeprecatedOnImpl | ResolveErrorKind::DeprecatedOnField
+        )),
+        "fn should accept #[deprecated] without diagnostic; got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn deprecated_slice3_rejected_on_impl_block() {
+    let errs = resolve_errors(
+        "pub struct Foo { x: i64, }\n#[deprecated]\nimpl Foo { fn x(ref self) -> i64 { 0 } }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == ResolveErrorKind::DeprecatedOnImpl),
+        "Expected DeprecatedOnImpl kind; got: {:?}",
+        errs.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    assert!(
+        errs.iter().any(|e| {
+            e.kind == ResolveErrorKind::DeprecatedOnImpl
+                && e.message.contains("E_DEPRECATED_ON_IMPL")
+        }),
+        "Expected E_DEPRECATED_ON_IMPL symbolic code in message; got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn deprecated_slice3_rejected_on_struct_field() {
+    let errs = resolve_errors("pub struct Foo { #[deprecated] x: i64, }");
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == ResolveErrorKind::DeprecatedOnField),
+        "Expected DeprecatedOnField kind; got: {:?}",
+        errs.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    assert!(
+        errs.iter().any(|e| {
+            e.kind == ResolveErrorKind::DeprecatedOnField
+                && e.message.contains("E_DEPRECATED_ON_FIELD")
+        }),
+        "Expected E_DEPRECATED_ON_FIELD symbolic code; got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn deprecated_slice3_accepted_on_struct_enum_trait() {
+    // All three are legal placements. No rejection of any kind from
+    // the deprecated-validation paths.
+    let parsed = parse(
+        "#[deprecated]\npub struct OldShape { x: i64, }\n\
+         #[deprecated]\npub enum OldErr { Bad, }\n\
+         #[deprecated]\npub trait OldFmt { fn fmt(ref self); }",
+    );
+    assert!(parsed.errors.is_empty(), "parse: {:?}", parsed.errors);
+    let errs = resolve(&parsed.program).errors;
+    assert!(
+        errs.iter().all(|e| !matches!(
+            e.kind,
+            ResolveErrorKind::DeprecatedOnImpl | ResolveErrorKind::DeprecatedOnField
+        )),
+        "Legal placements should not produce DeprecatedOnImpl/Field; got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
 // ── Slice / array patterns (phase 5.2 sub-item 1) ─────────────────────────
 
 #[test]

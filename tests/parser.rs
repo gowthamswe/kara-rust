@@ -1903,6 +1903,267 @@ fn track_caller_slice1_set_on_non_fn_item_parser_does_not_reject() {
     assert_eq!(s.attributes[0].name, "track_caller");
 }
 
+// ── #[deprecated] slices 1+2 — parser + AST payload ───────────────
+//
+// Three forms per design.md § `#[deprecated]` for Item Deprecation:
+//   - bare `#[deprecated]`
+//   - shorthand `#[deprecated = "note"]`
+//   - long form `#[deprecated(since: "...", note: "...")]`
+//
+// All seven attribute-bearing target kinds capture the payload:
+// Function, StructDef, EnumDef, TraitDef, TraitAliasDef,
+// MarkerTraitDef, DistinctTypeDef. Variant / TraitMethod /
+// TypeAliasDef / ConstDecl don't carry attributes today —
+// extending those is a separate enabling change.
+//
+// Diagnostics:
+//   - E_DEPRECATED_UNKNOWN_FIELD (rejects keys other than since/note)
+//   - E_DEPRECATED_FIELD_NOT_STRING (non-string value)
+//   - E_DEPRECATED_POSITIONAL_ARG (positional arg in long form)
+//   - E_DEPRECATED_DUPLICATE (multiple #[deprecated] on one item)
+
+#[test]
+fn deprecated_slice1_bare_form_on_function() {
+    let prog = parse_ok("#[deprecated]\nfn old_api() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    let d = f
+        .deprecation
+        .as_ref()
+        .expect("expected Deprecation payload");
+    assert!(d.since.is_none());
+    assert!(d.note.is_none());
+}
+
+#[test]
+fn deprecated_slice1_shorthand_populates_note() {
+    let prog = parse_ok("#[deprecated = \"use `read_to_string` instead\"]\nfn old_api() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    let d = f
+        .deprecation
+        .as_ref()
+        .expect("expected Deprecation payload");
+    assert!(d.since.is_none());
+    assert_eq!(d.note.as_deref(), Some("use `read_to_string` instead"));
+}
+
+#[test]
+fn deprecated_slice1_long_form_with_since_only() {
+    let prog = parse_ok("#[deprecated(since: \"1.2.0\")]\nfn old_api() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    let d = f
+        .deprecation
+        .as_ref()
+        .expect("expected Deprecation payload");
+    assert_eq!(d.since.as_deref(), Some("1.2.0"));
+    assert!(d.note.is_none());
+}
+
+#[test]
+fn deprecated_slice1_long_form_with_note_only() {
+    let prog = parse_ok("#[deprecated(note: \"use foo\")]\nfn old_api() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    let d = f
+        .deprecation
+        .as_ref()
+        .expect("expected Deprecation payload");
+    assert!(d.since.is_none());
+    assert_eq!(d.note.as_deref(), Some("use foo"));
+}
+
+#[test]
+fn deprecated_slice1_long_form_with_both_fields() {
+    let prog = parse_ok(
+        "#[deprecated(since: \"1.2.0\", note: \"use `Channel.unbounded()` instead\")]\n\
+         fn make_channel() { }",
+    );
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    let d = f
+        .deprecation
+        .as_ref()
+        .expect("expected Deprecation payload");
+    assert_eq!(d.since.as_deref(), Some("1.2.0"));
+    assert_eq!(d.note.as_deref(), Some("use `Channel.unbounded()` instead"),);
+}
+
+#[test]
+fn deprecated_slice1_long_form_with_equals_separator() {
+    // The spec example uses `name: value` but the attribute parser
+    // also accepts `name = value`. Both shapes must populate the
+    // same fields.
+    let prog = parse_ok("#[deprecated(since = \"1.2.0\", note = \"use foo\")]\nfn old() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    let d = f
+        .deprecation
+        .as_ref()
+        .expect("expected Deprecation payload");
+    assert_eq!(d.since.as_deref(), Some("1.2.0"));
+    assert_eq!(d.note.as_deref(), Some("use foo"));
+}
+
+#[test]
+fn deprecated_slice1_struct_captures_payload() {
+    let prog = parse_ok("#[deprecated]\npub struct OldShape { x: i64, }");
+    let Item::StructDef(s) = &prog.items[0] else {
+        panic!("Expected StructDef");
+    };
+    assert!(s.deprecation.is_some());
+}
+
+#[test]
+fn deprecated_slice1_enum_captures_payload() {
+    let prog = parse_ok("#[deprecated = \"use NewError\"]\npub enum OldError { Bad, }");
+    let Item::EnumDef(e) = &prog.items[0] else {
+        panic!("Expected EnumDef");
+    };
+    let d = e
+        .deprecation
+        .as_ref()
+        .expect("expected Deprecation payload");
+    assert_eq!(d.note.as_deref(), Some("use NewError"));
+}
+
+#[test]
+fn deprecated_slice1_trait_captures_payload() {
+    let prog = parse_ok("#[deprecated]\npub trait OldFormat { fn write(ref self); }");
+    let Item::TraitDef(t) = &prog.items[0] else {
+        panic!("Expected TraitDef");
+    };
+    assert!(t.deprecation.is_some());
+}
+
+#[test]
+fn deprecated_slice1_marker_trait_captures_payload() {
+    let prog = parse_ok("#[deprecated]\npub marker trait OldMarker;");
+    let Item::MarkerTrait(m) = &prog.items[0] else {
+        panic!("Expected MarkerTrait");
+    };
+    assert!(m.deprecation.is_some());
+}
+
+#[test]
+fn deprecated_slice1_trait_alias_captures_payload() {
+    let prog = parse_ok("#[deprecated]\npub trait OldEq = Eq;");
+    let Item::TraitAlias(t) = &prog.items[0] else {
+        panic!("Expected TraitAlias");
+    };
+    assert!(t.deprecation.is_some());
+}
+
+#[test]
+fn deprecated_slice1_distinct_type_captures_payload() {
+    let prog = parse_ok("#[deprecated]\npub distinct type OldId = i64;");
+    let Item::DistinctType(d) = &prog.items[0] else {
+        panic!("Expected DistinctType");
+    };
+    assert!(d.deprecation.is_some());
+}
+
+#[test]
+fn deprecated_slice1_without_attribute_leaves_field_none() {
+    let prog = parse_ok("fn fresh_api() { }\nstruct Fresh { x: i64, }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert!(f.deprecation.is_none());
+    let Item::StructDef(s) = &prog.items[1] else {
+        panic!("Expected StructDef");
+    };
+    assert!(s.deprecation.is_none());
+}
+
+#[test]
+fn deprecated_slice1_rejects_unknown_field() {
+    let (_prog, errors) = parse_with_errors("#[deprecated(authored_by: \"alice\")]\nfn old() { }");
+    assert!(
+        errors.iter().any(|e| {
+            e.message.contains("E_DEPRECATED_UNKNOWN_FIELD")
+                && e.message.contains("authored_by")
+                && e.message.contains("since")
+                && e.message.contains("note")
+        }),
+        "Expected E_DEPRECATED_UNKNOWN_FIELD naming the offending field and accepted set; got: {errors:?}"
+    );
+}
+
+#[test]
+fn deprecated_slice1_rejects_non_string_value() {
+    let (_prog, errors) = parse_with_errors("#[deprecated(since: 1)]\nfn old() { }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_DEPRECATED_FIELD_NOT_STRING")
+                && e.message.contains("since")),
+        "Expected E_DEPRECATED_FIELD_NOT_STRING naming the offending field; got: {errors:?}"
+    );
+}
+
+#[test]
+fn deprecated_slice1_rejects_positional_arg() {
+    // Long form requires named args — bare strings inside parens
+    // are a malformed long form (the shorthand uses `= "..."`).
+    let (_prog, errors) = parse_with_errors("#[deprecated(\"oops\")]\nfn old() { }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_DEPRECATED_POSITIONAL_ARG")),
+        "Expected E_DEPRECATED_POSITIONAL_ARG; got: {errors:?}"
+    );
+}
+
+#[test]
+fn deprecated_slice1_rejects_duplicate_attribute() {
+    let (_prog, errors) =
+        parse_with_errors("#[deprecated]\n#[deprecated = \"second\"]\nfn old() { }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("E_DEPRECATED_DUPLICATE")),
+        "Expected E_DEPRECATED_DUPLICATE; got: {errors:?}"
+    );
+}
+
+#[test]
+fn deprecated_slice1_first_attribute_wins_when_duplicate() {
+    // After the duplicate diagnostic fires, the first attribute's
+    // payload survives — that's the spec's idempotency rule.
+    let (prog, _errors) =
+        parse_with_errors("#[deprecated = \"first\"]\n#[deprecated = \"second\"]\nfn old() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    let d = f
+        .deprecation
+        .as_ref()
+        .expect("expected Deprecation payload");
+    assert_eq!(d.note.as_deref(), Some("first"));
+}
+
+#[test]
+fn deprecated_slice1_set_on_impl_block_parser_does_not_reject() {
+    // Parser captures attributes uniformly; resolver rejects
+    // placement on impl blocks (covered in tests/resolver.rs).
+    let prog = parse_ok(
+        "pub struct Foo { x: i64, }\n#[deprecated]\nimpl Foo { fn x(ref self) -> i64 { 0 } }",
+    );
+    let Item::ImplBlock(imp) = &prog.items[1] else {
+        panic!("Expected ImplBlock");
+    };
+    assert_eq!(imp.attributes.len(), 1);
+    assert_eq!(imp.attributes[0].name, "deprecated");
+}
+
 #[test]
 fn test_const_generic_args() {
     let prog = parse_ok("fn dot(a: Array[f64, 3], b: Array[f64, 3]) -> f64 { 0.0 }");

@@ -946,6 +946,7 @@ impl<'a> EffectChecker<'a> {
                             where_clause: m.where_clause.clone(),
                             body,
                             stdlib_origin: t.stdlib_origin,
+                            deprecation: None,
                             is_track_caller: false,
                         };
                         self.method_bodies.insert(key, stub);

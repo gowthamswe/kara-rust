@@ -12,6 +12,31 @@ use super::{
     Visibility, WhereClause,
 };
 
+// ── Item deprecation payload ─────────────────────────────────────
+
+/// `#[deprecated]` payload captured at parse time and attached as
+/// `Option<Deprecation>` to every AST item kind that the spec lists
+/// as a valid target (function, struct, enum, trait, trait alias,
+/// marker trait, distinct type — for the slice-1 surface; enum
+/// variants, trait methods, type aliases, and module-level consts
+/// land alongside attribute-support extensions to those AST nodes).
+/// `since` and `note` are both optional — bare `#[deprecated]`
+/// produces `Deprecation { since: None, note: None, span }`.
+///
+/// See design.md § `#[deprecated]` for Item Deprecation.
+#[derive(Debug, Clone)]
+pub struct Deprecation {
+    pub span: Span,
+    /// `since: "1.2.0"` — free-form version string surfaced verbatim
+    /// in the use-site diagnostic. Advisory; the parser does NOT
+    /// validate against `kara.toml`'s `[package].version` field.
+    pub since: Option<String>,
+    /// `note: "use `read_to_string` instead"` — migration message
+    /// surfaced as the use-site warning's note. Also populated by
+    /// the shorthand form `#[deprecated = "..."]`.
+    pub note: Option<String>,
+}
+
 // ── Top-level Items ──────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -95,6 +120,12 @@ pub struct Function {
     /// `is_stdlib_source` flag is unset (e.g. when the bake AST is
     /// spliced into a user-mode program tree).
     pub stdlib_origin: bool,
+    /// `#[deprecated]` payload captured at parse time. `None` when the
+    /// attribute is absent. Use-site diagnostic emission (slice 4)
+    /// reads this through the resolver's symbol table; until then the
+    /// field is structurally populated but no warning is emitted.
+    /// See design.md § `#[deprecated]` for Item Deprecation.
+    pub deprecation: Option<Deprecation>,
     /// `#[track_caller]` declared on this function — at call sites, the
     /// codegen pass injects a hidden caller-location argument carrying
     /// the call site's `(file, line, col)` so the panic runtime
@@ -184,6 +215,9 @@ pub struct StructDef {
     pub invariants: Vec<Expr>,
     /// See [`Function::stdlib_origin`]. CR-202 slice 3b.
     pub stdlib_origin: bool,
+    /// `#[deprecated]` payload — see [`Deprecation`] and design.md §
+    /// `#[deprecated]` for Item Deprecation.
+    pub deprecation: Option<Deprecation>,
     /// `#[non_exhaustive]` declared on this struct — the type may grow
     /// new public fields in future versions, and cross-package
     /// consumers must use `..` in exhaustive struct patterns and a
@@ -225,6 +259,8 @@ pub struct EnumDef {
     pub variants: Vec<Variant>,
     /// See [`Function::stdlib_origin`]. CR-202 slice 3b.
     pub stdlib_origin: bool,
+    /// `#[deprecated]` payload — see [`Deprecation`].
+    pub deprecation: Option<Deprecation>,
     /// `#[non_exhaustive]` declared on this enum — the type may grow
     /// new variants in future versions, and cross-package consumers'
     /// `match` expressions must include a wildcard arm regardless of
@@ -272,6 +308,8 @@ pub struct TraitDef {
     pub items: Vec<TraitItem>,
     /// See [`Function::stdlib_origin`]. CR-202 slice 3b.
     pub stdlib_origin: bool,
+    /// `#[deprecated]` payload — see [`Deprecation`].
+    pub deprecation: Option<Deprecation>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +333,8 @@ pub struct TraitAliasDef {
     pub generic_params: Option<GenericParams>,
     pub bounds: Vec<TraitBound>,
     pub where_clause: Option<WhereClause>,
+    /// `#[deprecated]` payload — see [`Deprecation`].
+    pub deprecation: Option<Deprecation>,
 }
 
 /// `marker trait NAME[GENERICS] [: SUPERTRAITS] [where ...] (";" | "{" "}")`
@@ -319,6 +359,8 @@ pub struct MarkerTraitDef {
     /// they wrote the canonical `marker trait Foo;`. Drives
     /// formatter round-trip; the resolver treats both forms identically.
     pub body_brace: bool,
+    /// `#[deprecated]` payload — see [`Deprecation`].
+    pub deprecation: Option<Deprecation>,
 }
 
 #[derive(Debug, Clone)]
@@ -672,4 +714,6 @@ pub struct DistinctTypeDef {
     pub generic_params: Option<GenericParams>,
     pub base_type: TypeExpr,
     pub refinement: Option<Expr>,
+    /// `#[deprecated]` payload — see [`Deprecation`].
+    pub deprecation: Option<Deprecation>,
 }
