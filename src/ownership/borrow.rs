@@ -27,8 +27,8 @@ use crate::token::Span;
 
 use super::{
     borrow_kind_display, slice_conflict_message, stdlib_method_self_borrow_kind, ActiveBorrow,
-    BorrowConflict, BorrowKind, OwnershipError, OwnershipErrorKind, OwnershipMode, PlaceExpr,
-    Projection, SliceConflictShape,
+    ActiveClosureCapture, BorrowConflict, BorrowKind, CapturePath, OwnershipError,
+    OwnershipErrorKind, OwnershipMode, PlaceExpr, Projection, SliceConflictShape,
 };
 
 impl<'a> super::OwnershipChecker<'a> {
@@ -334,6 +334,14 @@ impl<'a> super::OwnershipChecker<'a> {
         }
         // Drop empty entries so the map stays clean.
         self.active_borrows.retain(|_, v| !v.is_empty());
+        // Disjoint capture slice 3 — drain closure-capture borrows
+        // whose recording scope is exiting at this depth. The closure
+        // borrow's lifetime tracks the scope that holds the closure
+        // value, mirroring the slice-borrow scope model.
+        self.closure_capture_borrows.retain(|_, captures| {
+            captures.retain(|c| c.scope_depth < exit_depth);
+            !captures.is_empty()
+        });
         for (place, span, secondary) in to_emit {
             self.errors.push(OwnershipError {
                 message: format!(
@@ -480,5 +488,136 @@ impl<'a> super::OwnershipChecker<'a> {
             None => return false,
         };
         matches!(self.method_self_modes.get(key), Some(SelfParam::MutRef))
+    }
+
+    /// Disjoint capture slice 3 — record a closure-induced borrow for
+    /// each `Ref` / `MutRef` capture path the slice-2 inference produced.
+    /// `Own` paths are skipped (those route through the consume machinery,
+    /// not borrow tracking). **Whole-root paths (empty projection) are
+    /// also skipped**: those are the existing RC-trigger-2 surface (a
+    /// bare-identifier or stopping-construct capture composed with an
+    /// outer use routes through `RcTrigger::ClosureCaptureWithOuterUse`
+    /// for RC promotion, not borrow-style rejection — see design.md
+    /// § Closures Rule 2 sub-case (ii)). Slice 3's rejection rule only
+    /// applies to *path-precise* captures (non-empty projection), which
+    /// is the value-add over per-name capture: a closure body that
+    /// projects through a specific field commits the borrow checker to
+    /// that path and disjoint sibling-path access remains accessible
+    /// while overlapping ancestor / equal-path access is restricted.
+    /// Each borrow is scope-stamped with the current scope depth so the
+    /// drain at block-exit retires it when the holding scope ends.
+    pub(crate) fn push_closure_capture_borrows(
+        &mut self,
+        closure_span: &Span,
+        path_modes: &[(CapturePath, OwnershipMode)],
+    ) {
+        for (path, mode) in path_modes {
+            if matches!(mode, OwnershipMode::Own) {
+                continue;
+            }
+            if path.projection.is_empty() {
+                continue;
+            }
+            self.closure_capture_borrows
+                .entry(path.root.clone())
+                .or_default()
+                .push(ActiveClosureCapture {
+                    path: path.clone(),
+                    mode: mode.clone(),
+                    closure_span: closure_span.clone(),
+                    scope_depth: self.current_scope_depth,
+                });
+        }
+    }
+
+    /// Disjoint capture slice 3 — translate a place expression's
+    /// projection chain into the `Vec<String>` shape `CapturePath` uses.
+    /// Returns `None` if any segment is `Index` / `Range` (a stopping
+    /// construct in slice 1's path enumeration), so the conflict
+    /// checker can fall back to whole-root overlap rather than try to
+    /// reason about index-dependent disjointness.
+    fn place_projection_as_field_chain(place: &PlaceExpr) -> Option<Vec<String>> {
+        let mut out = Vec::with_capacity(place.projections.len());
+        for p in &place.projections {
+            match p {
+                Projection::Field(name) => out.push(name.clone()),
+                Projection::Index | Projection::Range => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Disjoint capture slice 3 — check whether a consume of `place`
+    /// (root + projection chain) conflicts with any live closure-
+    /// capture borrow under the same root. Overlap is bidirectional
+    /// projection-prefix (matches slice-2's mutation-walker overlap
+    /// rule): the consume conflicts iff the shorter of the two
+    /// projections is a prefix of the longer. Disjoint sibling paths
+    /// (first differing segment exists within both) skip cleanly.
+    /// An `Index`-bearing consume falls back to whole-root overlap (the
+    /// consume's projection is unrecoverable as a field chain), which
+    /// conflicts with every captured path under that root.
+    pub(crate) fn check_consume_vs_closure_captures(
+        &mut self,
+        place: &PlaceExpr,
+        consume_span: &Span,
+    ) {
+        let consume_chain = Self::place_projection_as_field_chain(place);
+        let Some(captures) = self.closure_capture_borrows.get(&place.root) else {
+            return;
+        };
+        if captures.is_empty() {
+            return;
+        }
+        let captures = captures.clone();
+        for cap in &captures {
+            let overlaps = match &consume_chain {
+                None => true,
+                Some(chain) => {
+                    let shorter = cap.path.projection.len().min(chain.len());
+                    cap.path.projection[..shorter] == chain[..shorter]
+                }
+            };
+            if !overlaps {
+                continue;
+            }
+            let consume_place_str = if place.projections.is_empty() {
+                format!("`{}`", place.root)
+            } else {
+                let chain = consume_chain
+                    .as_ref()
+                    .map(|c| c.join("."))
+                    .unwrap_or_else(|| "<projection>".to_string());
+                format!("`{}.{}`", place.root, chain)
+            };
+            let captured_place_str = if cap.path.projection.is_empty() {
+                format!("`{}`", cap.path.root)
+            } else {
+                format!("`{}.{}`", cap.path.root, cap.path.projection.join("."))
+            };
+            let mode_str = match cap.mode {
+                OwnershipMode::Ref => "ref",
+                OwnershipMode::MutRef => "mut ref",
+                OwnershipMode::Own => "own",
+            };
+            self.errors.push(OwnershipError {
+                message: format!(
+                    "cannot consume {} while closure at line {}:{} captures {} by `{}` (borrow still live)",
+                    consume_place_str,
+                    cap.closure_span.line,
+                    cap.closure_span.column,
+                    captured_place_str,
+                    mode_str,
+                ),
+                span: consume_span.clone(),
+                kind: OwnershipErrorKind::ClosureCaptureBorrowConflict,
+                suggestion: Some(
+                    "drop the closure (or restructure so its captures end before the consume) before moving the source"
+                        .to_string(),
+                ),
+                replacement: None,
+                consume_span: Some(cap.closure_span.clone()),
+            });
+        }
     }
 }

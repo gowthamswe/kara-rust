@@ -3515,6 +3515,316 @@ fn capture_path_mode_modes_keyed_by_closure_expression_span() {
     );
 }
 
+// ── Disjoint closure capture — slice 3 (borrow-checker integration) ─
+
+// Line 353 phase-5 checklist — disjoint-capture slice 3. Pushes a
+// closure-induced borrow per `Ref` / `MutRef` capture path the slice-2
+// inference produced (whole-root and `Own` paths are skipped — those
+// remain the existing RC-trigger-2 surface). Path-aware conflict check
+// at consume sites uses bidirectional projection-prefix overlap so
+// disjoint sibling-path access remains permitted while overlapping
+// ancestor / equal-path access fires `ClosureCaptureBorrowConflict`.
+
+#[test]
+fn slice3_closure_ref_capture_permits_outer_sibling_field_consume() {
+    // The slice-3 headline permissive case. Closure ref-captures
+    // `(u, ["profile"])`; outer scope consumes a disjoint sibling
+    // field `u.history`. The path-aware conflict check matches
+    // `["profile"]` against `["history"]` — first segment differs,
+    // so no overlap and no error. Without slice 3's path precision
+    // the borrow would be root-keyed and the consume would falsely
+    // reject.
+    ownership_ok(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile, history: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 }, history: Profile { name: 2 } };\n\
+             let _f = || u.profile.name + 1;\n\
+             let _h = u.history;\n\
+         }",
+    );
+}
+
+#[test]
+fn slice3_closure_ref_capture_rejects_outer_whole_root_consume() {
+    // The slice-3 headline rejection case (spec test
+    // "outer-scope move of `u` while `u.name` is ref-captured is
+    // rejected"). Closure ref-captures `(u, ["profile"])`; outer
+    // scope consumes `u` whole. Bidirectional prefix overlap fires
+    // (shorter is the empty consume chain — trivial prefix of the
+    // captured `["profile"]`) → `ClosureCaptureBorrowConflict`.
+    let errs = ownership_errors(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile, history: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 }, history: Profile { name: 2 } };\n\
+             let _f = || u.profile.name + 1;\n\
+             let _v = u;\n\
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == OwnershipErrorKind::ClosureCaptureBorrowConflict),
+        "expected ClosureCaptureBorrowConflict, got {:?}",
+        errs
+    );
+}
+
+#[test]
+fn slice3_closure_mut_ref_capture_rejects_outer_whole_root_consume() {
+    // Mut-ref leg of the rejection rule. Closure mut-ref-captures
+    // `(u, ["profile"])` via a sub-field assignment; outer consume of
+    // `u` whole overlaps. The diagnostic must fire regardless of
+    // capture mode — mut-ref and ref both produce live borrows at
+    // the same scope.
+    let errs = ownership_errors(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile, history: Profile }\n\
+         fn main() {\n\
+             let mut u = User { profile: Profile { name: 1 }, history: Profile { name: 2 } };\n\
+             let _f = || { u.profile.name = 9; };\n\
+             let _v = u;\n\
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == OwnershipErrorKind::ClosureCaptureBorrowConflict),
+        "expected ClosureCaptureBorrowConflict, got {:?}",
+        errs
+    );
+}
+
+#[test]
+fn slice3_closure_ref_capture_rejects_equal_path_outer_consume() {
+    // Same-path overlap — consume of `u.profile` (non-Copy struct
+    // field) while the closure ref-captures the same `(u, ["profile"])`
+    // path via the deeper chain `u.profile.name`. `["profile"]` is a
+    // prefix of `["profile", "name"]` → overlap → conflict.
+    let errs = ownership_errors(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile, history: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 }, history: Profile { name: 2 } };\n\
+             let _f = || u.profile.name + 1;\n\
+             let _p = u.profile;\n\
+         }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.kind == OwnershipErrorKind::ClosureCaptureBorrowConflict),
+        "expected ClosureCaptureBorrowConflict, got {:?}",
+        errs
+    );
+}
+
+#[test]
+fn slice3_closure_ref_capture_permits_disjoint_nested_field_consume() {
+    // Disjoint nested-projection sibling — captured
+    // `(u, ["profile", "name"])` vs consumed `(u, ["history"])`. First
+    // segment differs (`profile` vs `history`) → no overlap → no error.
+    // Pins that the per-segment compare walks all the way through, not
+    // just the first segment of the captured side.
+    ownership_ok(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile, history: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 }, history: Profile { name: 2 } };\n\
+             let _f = || u.profile.name + 1;\n\
+             let _h = u.history;\n\
+         }",
+    );
+}
+
+#[test]
+fn slice3_two_closures_over_disjoint_fields_compile_cleanly() {
+    // Spec test "two closures over different fields of the same struct
+    // compile and run." Two closures, each holds a precise per-path
+    // borrow on a disjoint sibling. Neither closure's borrow overlaps
+    // the other, and no outer-scope consume happens, so both coexist
+    // without conflict. The slice-3 push-per-path is what lets the
+    // borrow tracker see them as independent rather than colliding
+    // on the shared root.
+    ownership_ok(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile, history: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 }, history: Profile { name: 2 } };\n\
+             let _f = || u.profile.name + 1;\n\
+             let _g = || u.history.name + 2;\n\
+         }",
+    );
+}
+
+#[test]
+fn slice3_closure_borrow_drains_at_block_exit() {
+    // Scope-stamp drain — the closure-capture borrow is scoped to
+    // the block that holds the closure value. After that block exits,
+    // the borrow drains and the outer `let _v = u` proceeds without
+    // a conflict. Pins the drain wired into `drain_borrows_at_depth`.
+    ownership_ok(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile, history: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 }, history: Profile { name: 2 } };\n\
+             {\n\
+                 let _f = || u.profile.name + 1;\n\
+             }\n\
+             let _v = u;\n\
+         }",
+    );
+}
+
+#[test]
+fn slice3_whole_root_capture_does_not_push_borrow_routes_through_rc_fallback() {
+    // Narrowing pin — when the captured path is whole-root (empty
+    // projection, typical when the body calls a method on the captured
+    // root which is a slice-1 stopping construct), slice 3 does NOT
+    // push a borrow. The outer-consume + closure-body-use pair routes
+    // through the existing RC fallback (RcTrigger::DirectReuseAfterConsume
+    // for a body-read + outer-consume composition) rather than firing
+    // a borrow-style rejection. Pins that slice 3 is purely additive
+    // on path-precise captures and does not regress the existing
+    // RC-trigger-2 surface.
+    let src = "struct Config { name: i64 }\n\
+               impl Config {\n\
+                   fn id(ref self) -> i64 { self.name }\n\
+               }\n\
+               fn log(c: Config) { }\n\
+               fn make_handler(cfg: Config) {\n\
+                   let h = || cfg.id();\n\
+                   log(cfg);\n\
+               }";
+    let parsed = parse(src);
+    let resolved = resolve(&parsed.program);
+    let typed = typecheck(&parsed.program, &resolved);
+    let result = ownershipcheck(&parsed.program, &typed);
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| e.kind == OwnershipErrorKind::ClosureCaptureBorrowConflict),
+        "slice 3 must not fire for whole-root captures: {:?}",
+        result.errors
+    );
+    let rc = result
+        .rc_values
+        .get("make_handler")
+        .and_then(|m| m.get("cfg"))
+        .expect("cfg should be RC-promoted via trigger composition");
+    assert_eq!(rc.trigger, RcTrigger::DirectReuseAfterConsume);
+}
+
+#[test]
+fn slice3_own_capture_does_not_push_borrow_routes_through_rc_fallback() {
+    // `Own` paths route through the consume machinery (`Moved` state
+    // + RC fallback for outer use), not borrow tracking. Slice 3's
+    // `push_closure_capture_borrows` explicitly skips `Own` entries.
+    // Outer use of the consumed binding triggers
+    // `ClosureCaptureWithOuterUse` RC promotion — no slice-3 error.
+    let src = "struct Owned { x: i64 }\n\
+               fn take(o: Owned) { }\n\
+               fn main() {\n\
+                   let o = Owned { x: 1 };\n\
+                   let _f = || take(o);\n\
+                   let _u = o;\n\
+               }";
+    let parsed = parse(src);
+    let resolved = resolve(&parsed.program);
+    let typed = typecheck(&parsed.program, &resolved);
+    let result = ownershipcheck(&parsed.program, &typed);
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| e.kind == OwnershipErrorKind::ClosureCaptureBorrowConflict),
+        "slice 3 must not fire for Own captures: {:?}",
+        result.errors
+    );
+    let rc = result
+        .rc_values
+        .get("main")
+        .and_then(|m| m.get("o"))
+        .expect("o should be RC-promoted via closure-capture-with-outer-use");
+    assert_eq!(rc.trigger, RcTrigger::ClosureCaptureWithOuterUse);
+}
+
+#[test]
+fn slice3_copy_field_outer_consume_does_not_fire_conflict_when_path_overlaps() {
+    // Copy guard — the consume-side path lookup at the top of
+    // `check_expr_consuming` suppresses the closure-capture conflict
+    // when the consumed expression's type is Copy. The closure ref-
+    // captures `(o, ["x"])` and outer `let _u = o.x` reads the same
+    // path, but `o.x: i64` is Copy and the consume is silently a
+    // copy at the binding level — no borrow disturbed.
+    ownership_ok(
+        "struct Owned { x: i64 }\n\
+         fn main() {\n\
+             let o = Owned { x: 1 };\n\
+             let _f = || o.x + 1;\n\
+             let _u = o.x;\n\
+         }",
+    );
+}
+
+#[test]
+fn slice3_diagnostic_carries_closure_span_as_secondary() {
+    // Diagnostic shape pin — `ClosureCaptureBorrowConflict` puts the
+    // closure-creation span in `consume_span` (the secondary label
+    // slot the borrow family uses for "the other site"), and the
+    // primary `span` is the consume site. The message names the
+    // closure's line:column and the capture mode (`ref` here).
+    let errs = ownership_errors(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile, history: Profile }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 }, history: Profile { name: 2 } };\n\
+             let _f = || u.profile.name + 1;\n\
+             let _v = u;\n\
+         }",
+    );
+    let err = errs
+        .iter()
+        .find(|e| e.kind == OwnershipErrorKind::ClosureCaptureBorrowConflict)
+        .expect("expected ClosureCaptureBorrowConflict");
+    assert!(
+        err.consume_span.is_some(),
+        "secondary span (closure site) should be populated"
+    );
+    assert!(
+        err.message.contains("by `ref`"),
+        "diagnostic should name the captured mode; got {:?}",
+        err.message
+    );
+    assert!(
+        err.message.contains("closure at line"),
+        "diagnostic should name the closure site; got {:?}",
+        err.message
+    );
+}
+
+#[test]
+fn slice3_borrow_drains_at_scope_holding_closure_value() {
+    // Drain happens when the SCOPE holding the closure-value exits,
+    // not when the closure is later consumed. Two scopes inside main:
+    // inner block creates and lets the closure go out of scope; outer
+    // block then consumes the previously-captured root. Without the
+    // drain hook the borrow would persist into the outer scope and
+    // false-fire.
+    ownership_ok(
+        "struct Profile { name: i64 }\n\
+         struct User { profile: Profile, history: Profile }\n\
+         fn use_int(n: i64) { }\n\
+         fn main() {\n\
+             let u = User { profile: Profile { name: 1 }, history: Profile { name: 2 } };\n\
+             {\n\
+                 let _f = || u.profile.name + 1;\n\
+                 use_int(0);\n\
+             }\n\
+             let _x = u.profile;\n\
+         }",
+    );
+}
+
 // ── Step 7 sentinels: ref-captured value escape (E0508) ─────────
 //
 // Round 12.35 — design.md § Closures Rule 2 sub-case (iv):

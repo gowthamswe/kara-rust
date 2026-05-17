@@ -874,6 +874,9 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 crate::ownership::OwnershipErrorKind::CrossBorrowConflict => {
                     "E_CROSS_BORROW_CONFLICT"
                 }
+                crate::ownership::OwnershipErrorKind::ClosureCaptureBorrowConflict => {
+                    "E_CLOSURE_CAPTURE_BORROW_CONFLICT"
+                }
             };
             let replacement_json = err.replacement.as_ref().map(|r| {
                 format!(

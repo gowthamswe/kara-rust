@@ -122,6 +122,27 @@ pub struct ActiveBorrow {
     pub scope_depth: usize,
 }
 
+/// A live closure-induced borrow against a captured *path* — disjoint
+/// capture slice 3 (line 353 phase-5 checklist). Pushed at closure-
+/// expression sites for every `(CapturePath, OwnershipMode)` entry in
+/// the slice-2 path-mode set with mode `Ref` or `MutRef` (`Own` paths
+/// are consumes routed through the legacy `Moved` state machine, not
+/// borrows). Drained at the same scope-exit drain that handles
+/// `ActiveBorrow`. The conflict matrix is path-aware: a later consume
+/// or mutation of the captured root only conflicts when the access
+/// path bidirectionally prefix-overlaps a captured path (`captured.
+/// projection` is a prefix of `access.projection` OR vice versa), so
+/// two captures of disjoint fields under the same root coexist with
+/// outer-scope access of a third sibling field without false
+/// rejection.
+#[derive(Debug, Clone)]
+pub struct ActiveClosureCapture {
+    pub path: CapturePath,
+    pub mode: OwnershipMode,
+    pub closure_span: Span,
+    pub scope_depth: usize,
+}
+
 /// Shape of a slice-vs-slice / slice-vs-source-state-change conflict.
 /// Used to route the rendered diagnostic message variant for
 /// `error[E_SLICE_BORROW_CONFLICT]`. Cross-borrow conflicts (slice +
@@ -288,6 +309,15 @@ pub enum OwnershipErrorKind {
     /// `let s = v.as_slice_mut();` outstanding). Phase-5 § Slice borrow
     /// conflict detection sub-step (g).
     CrossBorrowConflict,
+    /// Disjoint capture slice 3 — an outer-scope consume of a binding
+    /// (whole-root or partial via field-projection) conflicts with a
+    /// still-live closure-capture borrow whose captured path overlaps
+    /// the consume's place expression (bidirectional projection
+    /// prefix). Disjoint sibling-path access does NOT fire this — the
+    /// borrow stays scoped to the captured path. The diagnostic names
+    /// the consume site, the closure creation site, and the captured
+    /// path's borrow mode (`ref` / `mut ref`).
+    ClosureCaptureBorrowConflict,
 }
 
 impl std::fmt::Display for OwnershipError {
@@ -554,6 +584,19 @@ pub struct OwnershipChecker<'a> {
     /// scans this list at every push to find slice-vs-slice and
     /// slice-vs-ref overlaps against the same root.
     pub(crate) active_borrows: HashMap<String, Vec<ActiveBorrow>>,
+    /// Disjoint capture slice 3 — active closure-capture borrows per
+    /// captured root binding name. Pushed at the `ExprKind::Closure`
+    /// arm in `expr_check.rs` for each `Ref` / `MutRef` entry of the
+    /// closure's `closure_capture_path_modes` (Own entries route
+    /// through the consume machinery, not borrow tracking). Drained
+    /// at block-exit alongside `active_borrows` when an entry's
+    /// `scope_depth` strictly exceeds the exiting depth. Path-aware
+    /// conflict checks at consume sites (`check_expr_consuming`'s root
+    /// dispatch + `consume_named_binding`) compare the consume's place-
+    /// expression projection against each entry's `path.projection`
+    /// using bidirectional prefix overlap so disjoint sibling-path
+    /// access remains permitted.
+    pub(crate) closure_capture_borrows: HashMap<String, Vec<ActiveClosureCapture>>,
     /// Slice 2 — current block scope depth, incremented on `check_block`
     /// entry and decremented on exit. Used to stamp `ActiveBorrow` and
     /// to drive the drain-on-exit cleanup. Top-level fn body sits at
@@ -599,6 +642,7 @@ impl<'a> OwnershipChecker<'a> {
             slice_borrow_sources: HashMap::new(),
             slice_binding_sources: HashMap::new(),
             active_borrows: HashMap::new(),
+            closure_capture_borrows: HashMap::new(),
             current_scope_depth: 0,
             binding_scope_depth: HashMap::new(),
             slice_binding_scope_depth: HashMap::new(),

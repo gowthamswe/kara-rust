@@ -60,6 +60,15 @@ impl<'a> super::OwnershipChecker<'a> {
         if self.handle_moved_use(name, use_span, states) {
             return;
         }
+        // Slice 3 — a `bare self`-consuming method call on a chain like
+        // `u.profile.method()` lands here once the receiver root has
+        // been identified. Treat as a whole-root consume of the named
+        // binding so any overlapping closure-capture borrow fires.
+        let place = super::PlaceExpr {
+            root: name.to_string(),
+            projections: Vec::new(),
+        };
+        self.check_consume_vs_closure_captures(&place, use_span);
         let is_copy = if let Some(t) = param_types.get(name) {
             self.is_copy_type(t)
         } else if let Some(t) = self.binding_types.get(name) {
@@ -182,7 +191,64 @@ impl<'a> super::OwnershipChecker<'a> {
 
     /// Check an expression in a "consuming" context (e.g., passed to a function,
     /// returned, assigned to a variable). Non-Copy values are moved.
+    /// Disjoint capture slice 3 — this is the *external* entry point and
+    /// fires `check_consume_vs_closure_captures` against the full place-
+    /// expression chain (computed via `place_expr_root`). The inner walker
+    /// `check_expr_consuming_inner` is used by the FieldAccess/TupleIndex
+    /// arm's recursion into its `object` so the closure-capture conflict
+    /// is checked exactly once per chain (at the chain root, where the
+    /// projection is precise). Without that one-fire discipline a chain
+    /// like `let _x = u.history` would recurse through Identifier(`u`)
+    /// with an empty-projection consume — bidirectional prefix overlap
+    /// against any captured `u`-rooted path — false-firing even for
+    /// disjoint sibling-path closures.
     pub(crate) fn check_expr_consuming(
+        &mut self,
+        expr: &Expr,
+        states: &mut HashMap<String, ValueState>,
+        param_types: &HashMap<String, Type>,
+        param_usage: &mut HashMap<String, ParamUsage>,
+    ) {
+        // Slice 3 — fire the closure-capture conflict check only when
+        // the expression would actually move (non-Copy). Copy reads
+        // (`let _u = o.x` where `o.x: i64`) don't disturb a live ref
+        // capture; the per-variant arms route them through the reading
+        // path anyway. Without this gate the conflict check false-fires
+        // on every Copy field/leaf consume.
+        if let Some(place) = self.place_expr_root(expr) {
+            if !self.consume_expr_is_copy(expr, param_types) {
+                self.check_consume_vs_closure_captures(&place, &expr.span);
+            }
+        }
+        self.check_expr_consuming_inner(expr, states, param_types, param_usage);
+    }
+
+    /// Slice 3 helper — whether the expression's type is Copy at this
+    /// consume site. Mirrors the per-variant Copy gate the Identifier
+    /// and FieldAccess/TupleIndex arms use (param_types → binding_types
+    /// → typechecker `expr_types`, in that order), centralised here so
+    /// the conflict check can suppress itself on Copy reads.
+    fn consume_expr_is_copy(&self, expr: &Expr, param_types: &HashMap<String, Type>) -> bool {
+        if let ExprKind::Identifier(name) = &expr.kind {
+            if let Some(t) = param_types.get(name) {
+                return self.is_copy_type(t);
+            }
+            if let Some(t) = self.binding_types.get(name) {
+                return self.is_copy_type(t);
+            }
+        }
+        self.typecheck_result
+            .expr_types
+            .get(&SpanKey::from_span(&expr.span))
+            .map(|t| self.is_copy_type(t))
+            .unwrap_or(false)
+    }
+
+    /// Inner consume walker — invoked by the public `check_expr_consuming`
+    /// after the slice-3 closure-capture conflict check, and re-entered
+    /// by the FieldAccess/TupleIndex partial-move recursion (which skips
+    /// the conflict check; see `check_expr_consuming`'s doc comment).
+    pub(crate) fn check_expr_consuming_inner(
         &mut self,
         expr: &Expr,
         states: &mut HashMap<String, ValueState>,
@@ -295,7 +361,14 @@ impl<'a> super::OwnershipChecker<'a> {
                 if field_is_copy {
                     self.check_expr_reading(expr, states, param_types, param_usage);
                 } else {
-                    self.check_expr_consuming(object, states, param_types, param_usage);
+                    // Slice 3 — recurse via the *inner* walker so the
+                    // closure-capture conflict check (already fired at
+                    // the chain root by `check_expr_consuming`) is not
+                    // re-fired at the shorter chain prefix. Re-firing
+                    // would false-positive at the eventual Identifier
+                    // leaf (empty projection trivially overlaps every
+                    // captured path under the same root).
+                    self.check_expr_consuming_inner(object, states, param_types, param_usage);
                 }
             }
             // For compound expressions, delegate to reading (they don't consume at top level)
@@ -968,6 +1041,17 @@ impl<'a> super::OwnershipChecker<'a> {
                 }
                 self.closure_capture_paths
                     .insert(SpanKey::from_span(&expr.span), capture_paths);
+
+                // Disjoint capture slice 3 — register a closure-induced
+                // borrow per `Ref` / `MutRef` capture path so a later
+                // consume of an overlapping place under the same root
+                // fires `ClosureCaptureBorrowConflict`. `Own` paths are
+                // skipped (the consume machinery already routes them
+                // via the `Moved` state). The borrow is scope-stamped
+                // with the current scope depth so the standard borrow
+                // drain at block exit retires it when the holding
+                // scope ends — matches the slice-borrow scope model.
+                self.push_closure_capture_borrows(&expr.span, &path_modes);
                 self.closure_capture_path_modes
                     .insert(SpanKey::from_span(&expr.span), path_modes);
 
