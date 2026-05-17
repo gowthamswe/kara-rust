@@ -397,6 +397,18 @@ impl<'ctx> super::Codegen<'ctx> {
                     // the free). When per-field K/V type info is wired
                     // through (slice δ), tighten the flags to the
                     // minimum needed.
+                    //
+                    // Shared-half rc_dec walks (item 4, 2026-05-16):
+                    // when the field's K or V is a shared struct /
+                    // shared enum, emit the per-bucket walk BEFORE
+                    // the runtime free releases the bucket storage —
+                    // mirrors the `CleanupAction::FreeMapHandle`
+                    // ordering. Without this, a `struct Owner { m:
+                    // Map[i64, Node] }` (with `Node` shared) drops
+                    // the Map's bucket storage without ever dec'ing
+                    // the shared values, leaking one ref per live
+                    // entry. The runtime helper is type-erased and
+                    // can't see the shared layout itself.
                     let field_ptr = self
                         .builder
                         .build_struct_gep(
@@ -411,6 +423,41 @@ impl<'ctx> super::Codegen<'ctx> {
                         .build_load(ptr_ty, field_ptr, &format!("drop.field{field_idx}.handle"))
                         .unwrap()
                         .into_pointer_value();
+                    if let Some(field_te) = self
+                        .struct_field_type_exprs
+                        .get(struct_name)
+                        .and_then(|v| v.get(field_idx))
+                        .cloned()
+                    {
+                        // The walks build their own basic blocks via
+                        // `self.current_fn.unwrap()`, which at this
+                        // point still points at the outer function
+                        // that triggered drop synthesis (e.g.,
+                        // `main`). Swap to `drop_fn` so the blocks
+                        // attach to the synthesized drop body, then
+                        // restore. Save / restore matches the
+                        // surrounding `saved_bb` discipline so the
+                        // outer caller's builder position is
+                        // untouched.
+                        let saved_fn = self.current_fn;
+                        self.current_fn = Some(drop_fn);
+                        if let Some((k_te, v_te)) = super::helpers::map_kv_type_exprs(&field_te) {
+                            if let Some(heap_ty) = self.shared_heap_type_for_type_expr(&v_te) {
+                                self.emit_map_shared_half_rc_dec_walk(handle, heap_ty, true);
+                            }
+                            if let Some(heap_ty) = self.shared_heap_type_for_type_expr(&k_te) {
+                                self.emit_map_shared_half_rc_dec_walk(handle, heap_ty, false);
+                            }
+                        } else if let Some(elem_te) = super::helpers::set_inner_type_expr(&field_te)
+                        {
+                            // `Set[T]` lowers to `Map[T, ()]`; the
+                            // element occupies the key half.
+                            if let Some(heap_ty) = self.shared_heap_type_for_type_expr(&elem_te) {
+                                self.emit_map_shared_half_rc_dec_walk(handle, heap_ty, false);
+                            }
+                        }
+                        self.current_fn = saved_fn;
+                    }
                     let one = i32_t.const_int(1, false);
                     self.builder
                         .build_call(

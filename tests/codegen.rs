@@ -2674,6 +2674,77 @@ fn main() {
         }
     }
 
+    #[test]
+    fn test_ir_struct_field_map_shared_value_drop_walk() {
+        // `struct Owner { m: Map[i64, Node] }` where `Node` is a
+        // shared struct. The synthesized `__karac_drop_struct_Owner`
+        // walks the `m` field and routes to `karac_map_free_with_drop_vec`
+        // — but without the value-side shared rc_dec walk emitted
+        // beforehand, every live `Node` in the bucket array strands
+        // its refcount when the owner drops. Item 4 fix: the struct-
+        // drop synthesis now mirrors the `CleanupAction::FreeMapHandle`
+        // ordering and emits `emit_map_shared_half_rc_dec_walk`
+        // against the field's K/V halves before the runtime free.
+        //
+        // IR gate: the synthesized struct-drop fn contains the
+        // canonical `cleanup.map.shared.val.ptr` label that marks
+        // the val-side walk.
+        let ir = ir_for(
+            r#"
+shared struct Node { val: i64 }
+struct Owner { m: Map[i64, Node] }
+fn main() {
+    let o = Owner { m: Map.new() };
+}
+"#,
+        );
+        assert!(
+            ir.contains("__karac_drop_struct_Owner"),
+            "expected synthesized struct-drop fn `__karac_drop_struct_Owner` \
+             in IR; not found in:\n{}",
+            ir
+        );
+        assert!(
+            ir.contains("cleanup.map.shared.val.ptr"),
+            "expected val-side walk label `cleanup.map.shared.val.ptr` \
+             inside the struct-drop fn (gates the new shared-V walk \
+             emitted before `karac_map_free_with_drop_vec`); not \
+             found in:\n{}",
+            ir
+        );
+    }
+
+    #[test]
+    fn test_e2e_struct_owning_map_shared_drops_cleanly() {
+        // E2E: an `Owner` struct owns a `Map[i64, Node]` where
+        // `Node` is a shared struct. Constructing the field with
+        // `Map.new()` inline (no source local to double-track)
+        // and letting scope-exit run the synthesized struct drop
+        // is the contained surface for item 4 — the local-then-
+        // place pattern would trip a pre-existing Map-handle
+        // move-suppression gap (struct-field construction
+        // suppresses Vec/String/struct source cleanups but not
+        // Map handles; double-free on the local's FreeMapHandle
+        // + the struct's drop). The IR test above pins the
+        // structural assertion (walk emitted in the drop fn);
+        // this test exercises it at runtime on the empty-Map
+        // path so a future regression that breaks the drop fn's
+        // IR shape surfaces as a crash here.
+        let out = run_program(
+            r#"
+shared struct Node { val: i64 }
+struct Owner { m: Map[i64, Node] }
+fn main() {
+    let _o = Owner { m: Map.new() };
+    println(42);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "42");
+        }
+    }
+
     // ── Unit enum variant matching ──────────────────────────────
 
     #[test]

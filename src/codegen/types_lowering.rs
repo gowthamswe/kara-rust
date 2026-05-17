@@ -19,6 +19,8 @@
 //! and the shared-type accessors (`is_shared_type`, `shared_heap_type`,
 //! `shared_type_for_expr`).
 
+use std::collections::HashMap;
+
 use crate::ast::*;
 use crate::token::{FloatSuffix, IntSuffix};
 
@@ -874,11 +876,29 @@ impl<'ctx> super::Codegen<'ctx> {
             .map_key_type_exprs
             .get(var_name)
             .or_else(|| self.set_elem_type_exprs.get(var_name))?;
-        let head = match &k_te.kind {
+        Self::shared_heap_type_for_type_expr_with(&self.shared_types, k_te)
+    }
+
+    /// Resolve the heap layout for an arbitrary `TypeExpr` whose head
+    /// is a shared struct / shared enum. Returns `None` when the head
+    /// isn't a `Path` (tuple, ref, fn type, …) or when the head name
+    /// isn't a known shared type. Used by struct-field drop synthesis
+    /// to inspect a `Map[K, sharedV]` / `Set[sharedT]` field's K / V
+    /// halves without needing a per-binding side-table — the field
+    /// type carries the K/V `TypeExpr`s directly.
+    pub(super) fn shared_heap_type_for_type_expr(&self, te: &TypeExpr) -> Option<StructType<'ctx>> {
+        Self::shared_heap_type_for_type_expr_with(&self.shared_types, te)
+    }
+
+    fn shared_heap_type_for_type_expr_with(
+        shared_types: &HashMap<String, SharedTypeInfo<'ctx>>,
+        te: &TypeExpr,
+    ) -> Option<StructType<'ctx>> {
+        let head = match &te.kind {
             TypeKind::Path(p) => p.segments.first()?.as_str(),
             _ => return None,
         };
-        let info = self.shared_types.get(head)?;
+        let info = shared_types.get(head)?;
         Some(info.heap_type)
     }
 }
