@@ -977,6 +977,7 @@ mod gat_slice4_assoc_projection_args_tests {
             param: param.to_string(),
             assoc: assoc.to_string(),
             args,
+            receiver_args: vec![],
         }
     }
 
@@ -1140,5 +1141,323 @@ mod gat_slice4_assoc_projection_args_tests {
         let rhs = Type::Int(IntSize::I64);
         assert!(types_compatible(&lhs, &rhs));
         assert!(types_compatible(&rhs, &lhs));
+    }
+}
+
+#[cfg(test)]
+mod gat_slice5_assoc_projection_resolution_tests {
+    //! GAT slice 5 — `resolve_assoc_projections` substitutes both the
+    //! impl block's generic params (from the struct's `generic_params`
+    //! zipped with the projection's `receiver_args`) and the GAT's own
+    //! params (from the impl-assoc-type entry's `gat_params` zipped
+    //! with the projection's `args`) in a single pass against the
+    //! stored template. These tests pin the two-sided substitution end
+    //! to end via a minimal typechecker harness, plus the env-side
+    //! storage shape that slice 5 introduces.
+    use super::super::env::ImplAssocTypeEntry;
+    use super::super::inference::substitute_type_params;
+    use super::super::*;
+
+    fn typecheck_src(src: &str) -> TypeCheckResult {
+        let parsed = crate::parse(src);
+        let resolved = crate::resolve(&parsed.program);
+        crate::typecheck(&parsed.program, &resolved)
+    }
+
+    fn build_typechecker(src: &str) -> TypeChecker<'static> {
+        // Mirrors the leaked-borrow helper used elsewhere in this
+        // file. Static lifetimes are fine for the test-process scope.
+        // build_type_env populates the structs / impls / impl_assoc_types
+        // tables we need; check_items walks bodies and is required to
+        // process impl blocks' assoc-type bindings (the items.rs
+        // handler at the binding registration site).
+        let parsed: &'static _ = Box::leak(Box::new(crate::parse(src)));
+        let resolved: &'static _ = Box::leak(Box::new(crate::resolve(&parsed.program)));
+        let mut tc = TypeChecker::new(&parsed.program, resolved);
+        tc.build_type_env();
+        tc.check_items();
+        tc
+    }
+
+    fn proj(param: &str, assoc: &str, args: Vec<Type>, receiver_args: Vec<Type>) -> Type {
+        Type::AssocProjection {
+            param: param.to_string(),
+            assoc: assoc.to_string(),
+            args,
+            receiver_args,
+        }
+    }
+
+    // ── ImplAssocTypeEntry storage round-trip ──
+
+    #[test]
+    fn impl_assoc_types_entry_records_gat_params_for_generic_binding() {
+        // `type Mapped[U] = Wrapper[U]` inside an impl block must
+        // register the entry's `gat_params` with `["U"]` so the
+        // resolver knows which template TypeParams the projection's
+        // `args` substitute. Mirror impl param `T` is in scope too;
+        // the GAT-side list is just `[U]`.
+        let tc = build_typechecker(
+            "trait Functor {\n\
+                 type Mapped[U];\n\
+             }\n\
+             struct Wrapper[T] { x: T }\n\
+             impl[T] Functor for Wrapper[T] {\n\
+                 type Mapped[U] = Wrapper[U];\n\
+             }",
+        );
+        let entry = tc
+            .env
+            .impl_assoc_types
+            .get(&("Wrapper".to_string(), "Mapped".to_string()))
+            .expect("Wrapper.Mapped entry must be registered");
+        assert_eq!(entry.gat_params, vec!["U".to_string()]);
+        // Template RHS must reference `U` as a TypeParam (not as a
+        // free Named) — that's the slice 5 binding-RHS lowering fix.
+        match &entry.ty {
+            Type::Named { name, args } if name == "Wrapper" => {
+                assert_eq!(args.len(), 1);
+                assert!(
+                    matches!(&args[0], Type::TypeParam(n) if n == "U"),
+                    "expected Wrapper[TypeParam(U)] template, got Wrapper[{}]",
+                    type_display(&args[0])
+                );
+            }
+            other => panic!("expected Wrapper[U] template, got {}", type_display(other)),
+        }
+    }
+
+    #[test]
+    fn impl_assoc_types_entry_has_empty_gat_params_for_non_generic_binding() {
+        // `type Output = i64;` (no `[..]`) → `gat_params: []`. Pins
+        // that the slice 5 wrapper doesn't accidentally populate
+        // GAT params for the non-generic shape.
+        let tc = build_typechecker(
+            "trait Mapper {\n\
+                 type Output;\n\
+             }\n\
+             struct Doubler {}\n\
+             impl Mapper for Doubler {\n\
+                 type Output = i64;\n\
+             }",
+        );
+        let entry = tc
+            .env
+            .impl_assoc_types
+            .get(&("Doubler".to_string(), "Output".to_string()))
+            .expect("Doubler.Output entry must be registered");
+        assert!(entry.gat_params.is_empty());
+        assert_eq!(entry.ty, Type::Int(IntSize::I64));
+    }
+
+    // ── resolve_assoc_projections substitution ──
+
+    #[test]
+    fn resolve_substitutes_gat_param_from_projection_args() {
+        // Headline case: `Doubler.Mapped[i64]` where the impl entry
+        // template is `Wrapper[U]` with gat_params=["U"]. Slice 5
+        // builds `U → i64` and substitutes → `Wrapper[i64]`.
+        let tc = build_typechecker(
+            "trait Functor {\n\
+                 type Mapped[U];\n\
+             }\n\
+             struct Doubler {}\n\
+             struct Wrapper[T] { x: T }\n\
+             impl Functor for Doubler {\n\
+                 type Mapped[U] = Wrapper[U];\n\
+             }",
+        );
+        let p = proj("Doubler", "Mapped", vec![Type::Int(IntSize::I64)], vec![]);
+        let resolved = tc.resolve_assoc_projections(&p);
+        let expected = Type::Named {
+            name: "Wrapper".to_string(),
+            args: vec![Type::Int(IntSize::I64)],
+        };
+        assert_eq!(
+            resolved,
+            expected,
+            "expected Wrapper[i64], got {}",
+            type_display(&resolved)
+        );
+    }
+
+    #[test]
+    fn resolve_substitutes_both_impl_and_gat_params() {
+        // Two-sided case: `Wrapper.Mapped[i64]` with
+        // receiver_args=[String] (i.e., the receiver was solved to
+        // `Wrapper[String]`). The impl template is `Pair[T, U]` with
+        // impl param T and GAT param U. Slice 5 builds
+        // `T → String, U → i64` and yields `Pair[String, i64]`.
+        let tc = build_typechecker(
+            "trait Functor {\n\
+                 type Mapped[U];\n\
+             }\n\
+             struct Wrapper[T] { x: T }\n\
+             struct Pair[A, B] { a: A, b: B }\n\
+             impl[T] Functor for Wrapper[T] {\n\
+                 type Mapped[U] = Pair[T, U];\n\
+             }",
+        );
+        let p = proj(
+            "Wrapper",
+            "Mapped",
+            vec![Type::Int(IntSize::I64)],
+            vec![Type::Str],
+        );
+        let resolved = tc.resolve_assoc_projections(&p);
+        let expected = Type::Named {
+            name: "Pair".to_string(),
+            args: vec![Type::Str, Type::Int(IntSize::I64)],
+        };
+        assert_eq!(
+            resolved,
+            expected,
+            "expected Pair[String, i64], got {}",
+            type_display(&resolved)
+        );
+    }
+
+    #[test]
+    fn resolve_non_generic_path_still_works() {
+        // Regression pin: `Doubler.Output` with no args/receiver_args
+        // must still resolve to the non-generic binding (the pre-
+        // slice-5 behaviour the existing
+        // `test_assoc_type_resolved_through_impl` integration test
+        // already exercises end-to-end; this is the unit-test pin).
+        let tc = build_typechecker(
+            "trait Mapper {\n\
+                 type Output;\n\
+             }\n\
+             struct Doubler {}\n\
+             impl Mapper for Doubler {\n\
+                 type Output = i64;\n\
+             }",
+        );
+        let p = proj("Doubler", "Output", vec![], vec![]);
+        let resolved = tc.resolve_assoc_projections(&p);
+        assert_eq!(resolved, Type::Int(IntSize::I64));
+    }
+
+    #[test]
+    fn resolve_falls_through_when_no_entry_found() {
+        // Negative pin: when the lookup misses, the projection is
+        // reconstructed (not collapsed) so the caller can decide
+        // whether to error or wait. Mirrors the pre-slice-5
+        // fallback behaviour.
+        let tc = build_typechecker("trait T { type A; }");
+        let p = proj("NoSuchType", "Foo", vec![], vec![]);
+        let resolved = tc.resolve_assoc_projections(&p);
+        assert!(matches!(resolved, Type::AssocProjection { .. }));
+    }
+
+    // ── direct unit pin on the substitution mechanism ──
+
+    #[test]
+    fn substitute_type_params_with_two_sided_subs_resolves_template() {
+        // Unit-test the substitution mechanism without the resolver:
+        // a `Pair[T, U]` template with `T → String, U → i64` becomes
+        // `Pair[String, i64]`. This is the kernel of the two-sided
+        // resolution; slice 5's resolver wraps it with the entry
+        // lookup and zip-based map construction.
+        let template = Type::Named {
+            name: "Pair".to_string(),
+            args: vec![
+                Type::TypeParam("T".to_string()),
+                Type::TypeParam("U".to_string()),
+            ],
+        };
+        let mut subs: std::collections::HashMap<String, SubstValue> =
+            std::collections::HashMap::new();
+        subs.insert("T".to_string(), SubstValue::Type(Type::Str));
+        subs.insert("U".to_string(), SubstValue::Type(Type::Int(IntSize::I64)));
+        let result = substitute_type_params(&template, &subs);
+        assert_eq!(
+            result,
+            Type::Named {
+                name: "Pair".to_string(),
+                args: vec![Type::Str, Type::Int(IntSize::I64)],
+            }
+        );
+    }
+
+    // ── ImplAssocTypeEntry independent storage shape ──
+
+    #[test]
+    fn impl_assoc_type_entry_construct_and_field_access() {
+        // Defensive pin against future refactors: the entry struct
+        // is a public storage type; reordering / renaming fields
+        // would break the resolver. Construct one by hand and read
+        // both fields back.
+        let entry = ImplAssocTypeEntry {
+            ty: Type::Int(IntSize::I64),
+            gat_params: vec!["U".to_string()],
+        };
+        assert_eq!(entry.ty, Type::Int(IntSize::I64));
+        assert_eq!(entry.gat_params, vec!["U".to_string()]);
+    }
+
+    // ── type_display with receiver_args ──
+
+    #[test]
+    fn type_display_with_receiver_args_renders_angle_brackets() {
+        // Slice 5 changes `type_display` for AssocProjection to
+        // render `param<receiver_args>.assoc[args]` when
+        // receiver_args is non-empty. Pin the formatting choice so
+        // diagnostic snapshots are stable.
+        let bare = proj("F", "Item", vec![], vec![]);
+        assert_eq!(type_display(&bare), "F.Item");
+
+        let recv_only = proj("Wrapper", "Item", vec![], vec![Type::Str]);
+        assert_eq!(type_display(&recv_only), "Wrapper<String>.Item");
+
+        let gat_only = proj("F", "Mapped", vec![Type::Int(IntSize::I64)], vec![]);
+        assert_eq!(type_display(&gat_only), "F.Mapped[i64]");
+
+        let both = proj(
+            "Wrapper",
+            "Mapped",
+            vec![Type::Int(IntSize::I64)],
+            vec![Type::Str],
+        );
+        assert_eq!(type_display(&both), "Wrapper<String>.Mapped[i64]");
+    }
+
+    // ── End-to-end: typechecking a program with GAT resolution ──
+
+    #[test]
+    fn typecheck_program_with_gat_impl_resolves_caller_return() {
+        // End-to-end smoke: a concrete impl of a trait with a GAT
+        // binding, plus a function `caller` whose body calls a
+        // trait method returning `Self.Mapped[i64]`. After slice 5
+        // resolution, the call's return type is `Vec[i64]`, which
+        // must satisfy the caller's declared return type
+        // `Vec[i64]`. Pre-slice-5 this worked too (via the
+        // permissive projection arm in `types_compatible`); the
+        // pin here is that slice 5 doesn't regress the path. Uses
+        // `Vec[i64]` for the body return so existing collection
+        // inference handles the construction without surfacing
+        // struct-literal inference quirks unrelated to slice 5.
+        let result = typecheck_src(
+            "trait Functor {\n\
+                 type Mapped[U];\n\
+                 fn map_to_i64(ref self) -> Self.Mapped[i64];\n\
+             }\n\
+             struct Doubler {}\n\
+             impl Functor for Doubler {\n\
+                 type Mapped[U] = Vec[U];\n\
+                 fn map_to_i64(ref self) -> Vec[i64] {\n\
+                     let v: Vec[i64] = Vec.new();\n\
+                     v\n\
+                 }\n\
+             }\n\
+             fn caller(d: ref Doubler) -> Vec[i64] {\n\
+                 d.map_to_i64()\n\
+             }",
+        );
+        assert!(
+            result.errors.is_empty(),
+            "expected clean typecheck, got: {:?}",
+            result.errors
+        );
     }
 }

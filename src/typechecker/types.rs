@@ -96,20 +96,26 @@ pub enum Type {
     TypeVar(TypeVarId),
 
     /// `T.Item` — an associated type projection. `param` is the generic type
-    /// parameter name (e.g. `"I"`); `assoc` is the associated type name
-    /// (e.g. `"Item"`). `args` carries the projection's own type arguments
-    /// for a generic associated type (GAT) like `F.Mapped[i64]` (slice 4 of
-    /// the GAT epic) — empty for the non-generic form `F.Item`. Resolved to
-    /// a concrete type when the parameter is instantiated via
-    /// `resolve_assoc_projections`; the `args` are walked through the
-    /// substitution / free-var helpers below so a projection like
-    /// `F.Mapped[T]` inside a function signature still sees its `T` get
-    /// fresh-var'd at call-site instantiation. The substitution from
-    /// `args` into the GAT binding's RHS is slice 5's job.
+    /// parameter name (e.g. `"I"`); after `substitute_type_params` has run
+    /// it carries the resolved receiver's bare type name (e.g. `"Wrapper"`
+    /// for a `Wrapper[String]` receiver). `assoc` is the associated type
+    /// name (e.g. `"Item"`). `args` carries the projection's own type
+    /// arguments for a generic associated type (GAT) like `F.Mapped[i64]`
+    /// (slice 4 of the GAT epic) — empty for the non-generic form `F.Item`.
+    /// `receiver_args` carries the resolved receiver's own type arguments
+    /// (e.g. `[String]` for `Wrapper[String]`) once `substitute_type_params`
+    /// has solved the receiver — empty pre-substitution and for receivers
+    /// that aren't generic (slice 5 addition). The split between `param`
+    /// (base name) and `receiver_args` (the receiver's args) is what lets
+    /// `resolve_assoc_projections` look up the impl entry by bare name AND
+    /// substitute the impl-block's generic params, while the projection's
+    /// own `args` substitute the GAT params. Slice 5 wires the two-sided
+    /// substitution.
     AssocProjection {
         param: String,
         assoc: String,
         args: Vec<Type>,
+        receiver_args: Vec<Type>,
     },
 
     Error,
@@ -516,12 +522,23 @@ pub fn type_display(ty: &Type) -> String {
         }
         Type::TypeParam(name) => name.clone(),
         Type::TypeVar(id) => format!("?T{}", id.0),
-        Type::AssocProjection { param, assoc, args } => {
+        Type::AssocProjection {
+            param,
+            assoc,
+            args,
+            receiver_args,
+        } => {
+            let recv_str = if receiver_args.is_empty() {
+                param.clone()
+            } else {
+                let inner: Vec<String> = receiver_args.iter().map(type_display).collect();
+                format!("{}<{}>", param, inner.join(", "))
+            };
             if args.is_empty() {
-                format!("{}.{}", param, assoc)
+                format!("{}.{}", recv_str, assoc)
             } else {
                 let inner: Vec<String> = args.iter().map(type_display).collect();
-                format!("{}.{}[{}]", param, assoc, inner.join(", "))
+                format!("{}.{}[{}]", recv_str, assoc, inner.join(", "))
             }
         }
         Type::Error => "<error>".to_string(),

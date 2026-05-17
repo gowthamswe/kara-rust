@@ -242,10 +242,16 @@ impl<'a> super::TypeChecker<'a> {
                 let assoc = path.segments[1].clone();
                 let args =
                     self.lower_generic_args_named(&path.generic_args, generic_scope, Some(&assoc));
+                // GAT slice 5: `receiver_args` is empty at lowering time —
+                // the source-level `F.Mapped[i64]` shape has the receiver
+                // as a bare type param. `substitute_type_params` populates
+                // `receiver_args` once `F` is solved to a concrete generic
+                // receiver like `Wrapper[String]`.
                 return Type::AssocProjection {
                     param: path.segments[0].clone(),
                     assoc,
                     args,
+                    receiver_args: vec![],
                 };
             }
             // Multi-segment module path — use last segment as type name
@@ -468,36 +474,79 @@ impl<'a> super::TypeChecker<'a> {
         map
     }
 
-    /// Walk `ty` and resolve any `AssocProjection { param, assoc, args }` nodes
-    /// whose `param` (after substitution it holds the concrete type name as a
-    /// string) has an entry in `impl_assoc_types`. This is called after
-    /// `substitute_type_params` so that `T.Item` first gets its `T` replaced
-    /// by the concrete type name (stored in `param`), then gets resolved to
-    /// the actual associated type. The projection's own `args` (the `i64` in
-    /// `F.Mapped[i64]`) are walked recursively so any nested projections /
-    /// type params inside the GAT instantiation get resolved too; the actual
-    /// substitution from `args` into the GAT binding's RHS is slice 5's job
-    /// (today's `impl_assoc_types` keys are non-generic-aware, so a generic
-    /// projection still falls through to the no-resolution branch and
-    /// preserves its `args` for the consumer).
+    /// Walk `ty` and resolve any `AssocProjection { param, assoc, args,
+    /// receiver_args }` nodes whose `param` (after substitution it holds
+    /// the concrete receiver's bare type name) has an entry in
+    /// `impl_assoc_types`. This is called after `substitute_type_params`
+    /// so that `T.Item` first gets its `T` replaced by the concrete
+    /// receiver (base name in `param`, args in `receiver_args`), then
+    /// gets resolved to the actual associated type.
+    ///
+    /// GAT slice 5 — two-sided substitution: when the lookup hits, the
+    /// resolver builds a substitution map from BOTH
+    /// (a) the struct's `generic_params` zipped with the projection's
+    ///     `receiver_args` — substituting impl-side TypeParams in the
+    ///     template (e.g., the `T` in `Pair[T, U]` for an impl
+    ///     `impl[T] Functor for Wrapper[T] { type Mapped[U] = Pair[T, U] }`),
+    /// AND
+    /// (b) the entry's `gat_params` zipped with the projection's own `args` —
+    ///     substituting GAT-side TypeParams (the `U` in the same example).
+    /// The substitution runs once on the template, yielding the concrete
+    /// resolved type. If no entry is found, the projection is reconstructed
+    /// with the args/receiver_args recursively resolved so the consumer
+    /// sees a well-formed projection node.
     pub(super) fn resolve_assoc_projections(&self, ty: &Type) -> Type {
         match ty {
-            Type::AssocProjection { param, assoc, args } => {
+            Type::AssocProjection {
+                param,
+                assoc,
+                args,
+                receiver_args,
+            } => {
                 let resolved_args: Vec<Type> = args
                     .iter()
                     .map(|a| self.resolve_assoc_projections(a))
                     .collect();
-                if let Some(resolved) = self
+                let resolved_recv_args: Vec<Type> = receiver_args
+                    .iter()
+                    .map(|a| self.resolve_assoc_projections(a))
+                    .collect();
+                if let Some(entry) = self
                     .env
                     .impl_assoc_types
                     .get(&(param.clone(), assoc.clone()))
                 {
-                    resolved.clone()
+                    // Build the two-sided substitution map. Impl-side
+                    // params come from the struct's `generic_params`
+                    // paired with the projection's `receiver_args` —
+                    // mirroring the `element_type_of` substitution
+                    // pattern. GAT-side params come from the entry's
+                    // own `gat_params` list paired with the
+                    // projection's `args`. If the lengths don't match
+                    // (arity mismatch — should be caught upstream as
+                    // an error), zip truncates silently and the rest
+                    // of the template is left with unsolved TypeParams,
+                    // which downstream typechecking will surface.
+                    let mut subs: HashMap<String, SubstValue> = HashMap::new();
+                    if let Some(info) = self.env.structs.get(param) {
+                        for (p, a) in info.generic_params.iter().zip(resolved_recv_args.iter()) {
+                            subs.insert(p.clone(), SubstValue::Type(a.clone()));
+                        }
+                    }
+                    for (p, a) in entry.gat_params.iter().zip(resolved_args.iter()) {
+                        subs.insert(p.clone(), SubstValue::Type(a.clone()));
+                    }
+                    let substituted = substitute_type_params(&entry.ty, &subs);
+                    // Recursively resolve in case the substituted type
+                    // contains further projections (e.g., when the
+                    // template's RHS itself references an assoc type).
+                    self.resolve_assoc_projections(&substituted)
                 } else {
                     Type::AssocProjection {
                         param: param.clone(),
                         assoc: assoc.clone(),
                         args: resolved_args,
+                        receiver_args: resolved_recv_args,
                     }
                 }
             }
@@ -566,7 +615,7 @@ impl<'a> super::TypeChecker<'a> {
             Type::Array { element, .. } | Type::Slice { element, .. } => *element.clone(),
             Type::Named { name, args } => {
                 // Look up the "Item" associated type for this collection.
-                let Some(item_ty) = self
+                let Some(entry) = self
                     .env
                     .impl_assoc_types
                     .get(&(name.clone(), "Item".to_string()))
@@ -586,7 +635,7 @@ impl<'a> super::TypeChecker<'a> {
                     .zip(args.iter())
                     .map(|(p, a)| (p.clone(), SubstValue::Type(a.clone())))
                     .collect();
-                substitute_type_params(item_ty, &subs)
+                substitute_type_params(&entry.ty, &subs)
             }
             _ => ty.clone(),
         }

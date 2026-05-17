@@ -102,6 +102,20 @@ pub struct TraitInfo {
     pub supertraits: Vec<String>,
 }
 
+/// Storage entry for an impl block's associated-type binding.
+/// `ty` is the binding's right-hand side, lowered as a template where the
+/// substitutable TypeParams are (a) the impl block's own generic params
+/// (e.g., `T` in `impl[T] Functor for Wrapper[T]`) and (b) the GAT's own
+/// generic params (e.g., `U` in `type Mapped[U] = Pair[T, U]`).
+/// `gat_params` lists the GAT-side names so the resolver can build a
+/// substitution from the projection's own args. Empty for non-generic
+/// bindings (`type Item = i64`). GAT slice 5.
+#[derive(Debug, Clone)]
+pub struct ImplAssocTypeEntry {
+    pub ty: Type,
+    pub gat_params: Vec<String>,
+}
+
 pub struct TypeEnv {
     pub structs: HashMap<String, StructInfo>,
     pub enums: HashMap<String, EnumInfo>,
@@ -136,11 +150,20 @@ pub struct TypeEnv {
     /// are not indexed here.
     pub impls_by_trait: HashMap<String, Vec<usize>>,
     /// Associated type bindings from impl blocks. Key is `(concrete_type_name,
-    /// assoc_type_name)`; value is the concrete type. E.g. `impl Iterator for
-    /// Vec[i32]` with `type Item = i32` inserts `("Vec", "Item") → i32`.
-    /// Used by `resolve_assoc_projections` to substitute `T.Item` after `T`
-    /// is solved to a concrete named type.
-    pub impl_assoc_types: HashMap<(String, String), Type>,
+    /// assoc_type_name)`; value is an entry carrying the template type plus
+    /// the GAT parameter names (empty for non-generic bindings). E.g.
+    /// `impl Iterator for Vec[i32]` with `type Item = i32` inserts
+    /// `("Vec", "Item") → ImplAssocTypeEntry { ty: i32, gat_params: [] }`;
+    /// `impl[T] Functor for Wrapper[T] { type Mapped[U] = Pair[T, U]; }`
+    /// inserts `("Wrapper", "Mapped") → ImplAssocTypeEntry { ty: Pair[T, U],
+    /// gat_params: ["U"] }`, with both `T` (impl-side) and `U` (GAT-side)
+    /// lowered as `Type::TypeParam`. Used by `resolve_assoc_projections` to
+    /// substitute `T.Assoc[X1, X2, ...]` after `T` is solved to a concrete
+    /// named type — both impl-side params (via the struct's `generic_params`
+    /// zipped with the projection's `receiver_args`) and GAT-side params (via
+    /// the entry's `gat_params` zipped with the projection's own `args`) are
+    /// substituted in one pass. GAT slice 5.
+    pub impl_assoc_types: HashMap<(String, String), ImplAssocTypeEntry>,
     /// Names of functions declared with `#[compiler_builtin]` in stdlib
     /// source (CR-202 slice 2). The signature still lives in `functions`
     /// — the entry here marks the function as having its body replaced by

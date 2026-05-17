@@ -12302,3 +12302,90 @@ fn test_gat_slice4_non_generic_projection_unchanged() {
          }",
     );
 }
+
+// ── GAT slice 5 — two-sided substitution at projection resolution ────
+//
+// Slice 5 makes the typechecker's GAT-projection resolution path
+// actually substitute the impl's binding template at call sites. The
+// impl entry stores the template + the GAT param names; the resolver
+// builds a substitution from both impl-side params (via the struct's
+// generic_params zipped with the projection's receiver_args) and
+// GAT-side params (via the entry's gat_params zipped with the
+// projection's own args), then applies the substitution in one pass.
+// The unit tests in src/typechecker/tests.rs pin the internals; these
+// integration tests pin that the slice 5 plumbing flows through to
+// end-to-end typechecker behaviour without regressing the existing
+// permissive-projection paths.
+
+#[test]
+fn test_gat_slice5_concrete_impl_with_gat_binding_typechecks() {
+    // The headline GAT shape with a concrete impl: `Doubler` binds
+    // `Mapped[U]` to `Vec[U]`. A function calling `d.map_to_i64()`
+    // observes the return type post-substitution as `Vec[i64]`. The
+    // body of `caller` declares its return type as `Vec[i64]` and
+    // the call expression must satisfy it.
+    typecheck_ok(
+        "trait Functor {\n\
+             type Mapped[U];\n\
+             fn map_to_i64(ref self) -> Self.Mapped[i64];\n\
+         }\n\
+         struct Doubler {}\n\
+         impl Functor for Doubler {\n\
+             type Mapped[U] = Vec[U];\n\
+             fn map_to_i64(ref self) -> Vec[i64] {\n\
+                 let v: Vec[i64] = Vec.new();\n\
+                 v\n\
+             }\n\
+         }\n\
+         fn caller(d: ref Doubler) -> Vec[i64] {\n\
+             d.map_to_i64()\n\
+         }",
+    );
+}
+
+#[test]
+fn test_gat_slice5_generic_impl_with_gat_binding_signature_typechecks() {
+    // Generic-impl shape signature surface: `impl[T] Functor for
+    // Wrapper[T]` with `type Mapped[U] = Pair[T, U]`. Slice 5
+    // registers the binding template with both `T` (impl-side) and
+    // `U` (GAT-side) lowered as TypeParam, and the resolver builds
+    // both substitutions at projection-resolution time. The body
+    // of `map_pair` is intentionally skipped here (just the trait
+    // method signature) — the unit-test
+    // `resolve_substitutes_both_impl_and_gat_params` pins the
+    // substitution mechanism end-to-end against the env entry. The
+    // integration test surface focuses on the lowering accepting
+    // the impl + GAT binding without rejecting the template.
+    typecheck_ok(
+        "trait Functor {\n\
+             type Mapped[U];\n\
+         }\n\
+         struct Wrapper[T] { x: T }\n\
+         struct Pair[A, B] { a: A, b: B }\n\
+         impl[T] Functor for Wrapper[T] {\n\
+             type Mapped[U] = Pair[T, U];\n\
+         }",
+    );
+}
+
+#[test]
+fn test_gat_slice5_non_gat_binding_still_resolves() {
+    // Regression: the slice 5 entry wrapper carries empty
+    // gat_params for non-generic bindings; resolution falls back
+    // to the pre-slice-5 behaviour (substitute impl params only).
+    // The existing `test_assoc_type_resolved_through_impl` test
+    // covers this end-to-end; this is the explicit slice-5-named
+    // pin so the entry wrapper change is unambiguously regression-
+    // tested in the slice 5 group.
+    typecheck_ok(
+        "trait Mapper {\n\
+             type Output;\n\
+             fn map(ref self) -> Self.Output;\n\
+         }\n\
+         struct Doubler {}\n\
+         impl Mapper for Doubler {\n\
+             type Output = i64;\n\
+             fn map(ref self) -> i64 { 42_i64 }\n\
+         }",
+    );
+}

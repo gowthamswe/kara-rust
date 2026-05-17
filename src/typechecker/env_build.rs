@@ -13,7 +13,7 @@
 use crate::ast::*;
 use std::collections::{HashMap, HashSet};
 
-use super::env::{EnumInfo, FunctionSig, ImplInfo, StructInfo, TraitInfo};
+use super::env::{EnumInfo, FunctionSig, ImplAssocTypeEntry, ImplInfo, StructInfo, TraitInfo};
 use super::types::{
     type_display, type_is_fully_concrete, FloatSize, IntSize, Type, UIntSize, VariantTypeInfo,
 };
@@ -359,22 +359,33 @@ impl<'a> super::TypeChecker<'a> {
                     is_shared: false,
                     must_use_message,
                 });
-            self.env
-                .impl_assoc_types
-                .insert((name.to_string(), "Item".to_string()), t());
+            self.env.impl_assoc_types.insert(
+                (name.to_string(), "Item".to_string()),
+                ImplAssocTypeEntry {
+                    ty: t(),
+                    gat_params: vec![],
+                },
+            );
         }
 
         // Iterator-element-type (`Item`) mappings for baked collection
         // types. The structs themselves are baked; the assoc-type
         // mapping has no syntactic representation in baked source.
         for name in &["Vec", "VecDeque", "SortedSet", "Set", "Peekable", "Slice"] {
-            self.env
-                .impl_assoc_types
-                .insert((name.to_string(), "Item".to_string()), t());
+            self.env.impl_assoc_types.insert(
+                (name.to_string(), "Item".to_string()),
+                ImplAssocTypeEntry {
+                    ty: t(),
+                    gat_params: vec![],
+                },
+            );
         }
         self.env.impl_assoc_types.insert(
             ("Map".to_string(), "Item".to_string()),
-            Type::Tuple(vec![k(), v()]),
+            ImplAssocTypeEntry {
+                ty: Type::Tuple(vec![k(), v()]),
+                gat_params: vec![],
+            },
         );
 
         // Range family — typechecker-internal types constructed from
@@ -398,9 +409,13 @@ impl<'a> super::TypeChecker<'a> {
                     is_shared: false,
                     must_use_message: None,
                 });
-            self.env
-                .impl_assoc_types
-                .insert((name.to_string(), "Item".to_string()), t());
+            self.env.impl_assoc_types.insert(
+                (name.to_string(), "Item".to_string()),
+                ImplAssocTypeEntry {
+                    ty: t(),
+                    gat_params: vec![],
+                },
+            );
         }
 
         // ── Standard I/O function signatures ───────────────────────────────────

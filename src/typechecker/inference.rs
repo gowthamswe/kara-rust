@@ -97,23 +97,53 @@ pub(super) fn substitute_type_params(ty: &Type, subs: &HashMap<String, SubstValu
         // caller can post-resolve via `resolve_assoc_projections`. The
         // projection's own `args` (the `i64` in `F.Mapped[i64]` — GAT
         // slice 4) are walked too so a `F.Mapped[T]` with `T` solved
-        // becomes `F.Mapped[<concrete>]` before resolution.
-        Type::AssocProjection { param, assoc, args } => {
+        // becomes `F.Mapped[<concrete>]` before resolution. The
+        // `receiver_args` field (slice 5) is also walked recursively
+        // so an already-resolved generic receiver like
+        // `Wrapper<T>.Mapped[U]` propagates further substitutions
+        // into `T`.
+        Type::AssocProjection {
+            param,
+            assoc,
+            args,
+            receiver_args,
+        } => {
             let new_args: Vec<Type> = args
                 .iter()
                 .map(|a| substitute_type_params(a, subs))
                 .collect();
+            let walked_receiver_args: Vec<Type> = receiver_args
+                .iter()
+                .map(|a| substitute_type_params(a, subs))
+                .collect();
             if let Some(concrete) = subs.get(param).and_then(SubstValue::as_type) {
+                // GAT slice 5: when the receiver resolves to a generic
+                // concrete type (`Type::Named`/`Shared`/`Rc`/`Arc`),
+                // capture the base name in `param` and the receiver's
+                // args in `receiver_args` so the lookup at
+                // `resolve_assoc_projections` can key by bare name and
+                // build an impl-side substitution. The pre-slice-5 path
+                // used `type_display(concrete)` directly, which produced
+                // `"Wrapper<String>"` and failed the bare-name lookup.
+                let (param_name, captured_recv_args) = match concrete {
+                    Type::Named { name, args } => (name.clone(), args.clone()),
+                    Type::Shared(name) => (name.clone(), vec![]),
+                    Type::Rc(inner) => ("Rc".to_string(), vec![(**inner).clone()]),
+                    Type::Arc(inner) => ("Arc".to_string(), vec![(**inner).clone()]),
+                    other => (type_display(other), vec![]),
+                };
                 Type::AssocProjection {
-                    param: type_display(concrete),
+                    param: param_name,
                     assoc: assoc.clone(),
                     args: new_args,
+                    receiver_args: captured_recv_args,
                 }
             } else {
                 Type::AssocProjection {
                     param: param.clone(),
                     assoc: assoc.clone(),
                     args: new_args,
+                    receiver_args: walked_receiver_args,
                 }
             }
         }
@@ -194,8 +224,19 @@ pub(super) fn instantiate_signature_with_fresh_vars(
             // GAT slice 4: the projection's own `args` (the `T` in
             // `F.Mapped[T]`) IS an introduction site — walk it so the
             // outer signature gets fresh vars for nested params.
-            Type::AssocProjection { args, .. } => {
+            // GAT slice 5: `receiver_args` is empty at signature-source
+            // lowering time (the parser produces a bare-receiver path),
+            // but walking it preserves correctness if a synthesised
+            // signature ever carries pre-resolved receiver args.
+            Type::AssocProjection {
+                args,
+                receiver_args,
+                ..
+            } => {
                 for a in args {
+                    collect(a, names, seen, const_names, const_seen);
+                }
+                for a in receiver_args {
                     collect(a, names, seen, const_names, const_seen);
                 }
             }
@@ -304,11 +345,24 @@ pub(super) fn instantiate_signature_with_fresh_vars(
             // pre-resolution and stays as a String here; the call-site
             // solver re-maps it once `F` itself is bound (the
             // `substitute_type_params` arm in this same file handles
-            // that direction post-call-site solve).
-            Type::AssocProjection { param, assoc, args } => Type::AssocProjection {
+            // that direction post-call-site solve). GAT slice 5:
+            // `receiver_args` is empty for parsed signatures; walking
+            // it here keeps the structure stable for any synthesised
+            // projection that already carries pre-resolved receiver
+            // args.
+            Type::AssocProjection {
+                param,
+                assoc,
+                args,
+                receiver_args,
+            } => Type::AssocProjection {
                 param: param.clone(),
                 assoc: assoc.clone(),
                 args: args
+                    .iter()
+                    .map(|a| substitute(a, name_to_id, name_to_const_id))
+                    .collect(),
+                receiver_args: receiver_args
                     .iter()
                     .map(|a| substitute(a, name_to_id, name_to_const_id))
                     .collect(),
@@ -837,15 +891,29 @@ pub(super) fn find_unbound_type_param<'a>(
             .iter()
             .find_map(|p| find_unbound_type_param(p, in_scope))
             .or_else(|| find_unbound_type_param(return_type, in_scope)),
-        Type::AssocProjection { param, args, .. } => {
+        Type::AssocProjection {
+            param,
+            args,
+            receiver_args,
+            ..
+        } => {
             if !in_scope.contains(param.as_str()) {
                 return Some(param.as_str());
             }
             // GAT slice 4: walk the projection's own type-args
             // (`F.Mapped[T]` → `T` may be unbound) so the call-site
             // generic-instantiation check sees nested params.
+            // GAT slice 5: also walk receiver_args for the
+            // post-substitution shape where the projection carries
+            // the receiver's args (e.g., `Wrapper<T>.Mapped[i64]`
+            // post-`substitute_type_params`).
             args.iter()
                 .find_map(|a| find_unbound_type_param(a, in_scope))
+                .or_else(|| {
+                    receiver_args
+                        .iter()
+                        .find_map(|a| find_unbound_type_param(a, in_scope))
+                })
         }
         _ => None,
     }

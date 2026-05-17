@@ -891,10 +891,26 @@ impl<'a> super::TypeChecker<'a> {
             match item {
                 ImplItem::Method(method) => self.check_function(method, Some(&self_type), &[]),
                 ImplItem::AssocType(binding) => {
-                    let bound_ty = self.lower_type_expr(&binding.ty, &gp);
-                    self.env
-                        .impl_assoc_types
-                        .insert((type_name.clone(), binding.name.clone()), bound_ty);
+                    // GAT slice 5: extend the generic scope with the GAT's
+                    // own params so the binding RHS like `Wrapper[U]` lowers
+                    // `U` as `Type::TypeParam("U")` instead of falling
+                    // through as `Named { name: "U", args: [] }`. The
+                    // template now references both impl-side params
+                    // (from `gp`) and GAT-side params (from
+                    // `binding.generic_params`) uniformly; the resolver
+                    // distinguishes the two via the `gat_params` list
+                    // stored alongside the template.
+                    let gat_params = Self::generic_param_names(&binding.generic_params);
+                    let mut combined_scope = gp.clone();
+                    combined_scope.extend(gat_params.iter().cloned());
+                    let bound_ty = self.lower_type_expr(&binding.ty, &combined_scope);
+                    self.env.impl_assoc_types.insert(
+                        (type_name.clone(), binding.name.clone()),
+                        crate::typechecker::env::ImplAssocTypeEntry {
+                            ty: bound_ty,
+                            gat_params,
+                        },
+                    );
                 }
             }
         }
