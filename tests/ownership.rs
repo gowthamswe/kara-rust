@@ -2640,6 +2640,193 @@ fn nested_closures_each_get_their_own_mode_entry() {
     }
 }
 
+// ── Bare-form per-capture inference pins (Rule 2½ default) ──────
+//
+// design.md § Closures, Rule 2½: "A bare closure `|x| body` runs
+// Rule 2's first-use scan to infer each capture's mode (read → `ref`,
+// mutate → `mut ref`, consume → `own`)." `capture_consumed_in_body_is_own`
+// and `capture_read_only_is_ref` above pin the Own / Ref legs;
+// the MutRef leg is pinned here. Plus negative-space coverage for the
+// `own` prefix (the only one without a K2 conflict row to fire on a
+// stronger-than-declared body usage — declared `own` is the strongest
+// mode in the `ref < mut ref < own` ordering).
+
+#[test]
+fn capture_mutated_in_body_is_mut_ref() {
+    // Bare body assigns through a captured root → `body_usage.mutated`
+    // is set on `o`; classification picks `MutRef`. The MutRef leg of
+    // the Rule 2 inference table — completes the {Ref, MutRef, Own}
+    // trio.
+    let result = ownership_ok(
+        "struct Owned { x: i64 }\n\
+         fn main() {\n\
+             let mut o = Owned { x: 1 };\n\
+             let _f = || { o.x = 2; };\n\
+         }",
+    );
+    let caps = single_closure_captures(&result);
+    assert_eq!(
+        caps.as_slice(),
+        &[("o".to_string(), OwnershipMode::MutRef)],
+        "field-assign mutation of captured root should classify capture as MutRef; got {:?}",
+        caps
+    );
+}
+
+#[test]
+fn capture_mode_own_prefix_accepts_consume_body() {
+    // Explicit `own ||` + body consumes capture → declared mode and
+    // usage agree (K2 row "own + consumes"). Mirrors
+    // `test_capture_mode_bare_consume_unchanged` but with the explicit
+    // prefix pinned.
+    ownership_ok(
+        "struct Owned { x: i64 }\n\
+         fn main() {\n\
+             let o = Owned { x: 1 };\n\
+             let f = own || { let _ = o; };\n\
+             f();\n\
+         }",
+    );
+}
+
+#[test]
+fn capture_mode_own_prefix_accepts_read_only_body() {
+    // K2 row "own + reads only": OK — the "capture for ownership
+    // extension" idiom (closure holds the value by value; body chose
+    // not to consume it). No UnusedMutCaptureNote — that note is
+    // specific to the `mut ref` declared / read-only used gap.
+    let result = ownership_ok(
+        "struct Owned { x: i64 }\n\
+         fn main() {\n\
+             let o = Owned { x: 1 };\n\
+             let f = own || o.x + 1;\n\
+             let _ = f();\n\
+         }",
+    );
+    assert!(
+        result
+            .notes
+            .iter()
+            .all(|n| n.kind != OwnershipErrorKind::UnusedMutCaptureNote),
+        "no UnusedMutCaptureNote should fire for `own` + read-only; got: {:?}",
+        result.notes
+    );
+}
+
+#[test]
+fn capture_mode_ref_consume_diagnostic_includes_spec_fix_wording() {
+    // Pin the K2 conflict diagnostic's spec-mandated fix wording from
+    // design.md § Closures Rule 2½ conflict table for `ref` + consume:
+    //   "drop the `ref` prefix (use `own` or bare) or remove the consume"
+    // The existing `test_capture_mode_ref_consume_is_error` checks the
+    // error kind + key terms; this test pins the full guidance string
+    // so a future diagnostic rewrite cannot silently drop the redirect
+    // shape.
+    let errors = ownership_errors(
+        "struct Owned { x: i64 }\n\
+         fn main() {\n\
+             let o = Owned { x: 1 };\n\
+             let f = ref || { let _ = o; };\n\
+             let _ = f;\n\
+         }",
+    );
+    let cmv = errors
+        .iter()
+        .find(|e| e.kind == OwnershipErrorKind::CaptureModeViolation)
+        .expect("expected at least one CaptureModeViolation");
+    let fix = cmv.suggestion.as_deref().unwrap_or("");
+    assert!(
+        fix.contains("drop the `ref` prefix")
+            && fix.contains("`own` or bare")
+            && fix.contains("remove the consume"),
+        "ref K2 fix wording missing required phrases; got suggestion: {fix:?}"
+    );
+}
+
+#[test]
+fn capture_mode_mut_ref_consume_diagnostic_includes_spec_fix_wording() {
+    // Symmetric pin for the `mut ref` + consume row:
+    //   "drop the `mut ref` prefix and use `own`"
+    let errors = ownership_errors(
+        "struct Owned { x: i64 }\n\
+         fn main() {\n\
+             let o = Owned { x: 1 };\n\
+             let f = mut ref || { let _ = o; };\n\
+             let _ = f;\n\
+         }",
+    );
+    let cmv = errors
+        .iter()
+        .find(|e| e.kind == OwnershipErrorKind::CaptureModeViolation)
+        .expect("expected at least one CaptureModeViolation");
+    let fix = cmv.suggestion.as_deref().unwrap_or("");
+    assert!(
+        fix.contains("drop the `mut ref` prefix") && fix.contains("use `own`"),
+        "mut ref K2 fix wording missing required phrases; got suggestion: {fix:?}"
+    );
+}
+
+#[test]
+fn bare_closure_read_capture_leaves_outer_binding_usable() {
+    // Bare-form inference picks `Ref` for `o` (body only reads). The
+    // outer scope can continue to read `o` after the closure's last
+    // use — pins that outer-scope availability tracks the inferred
+    // per-capture mode, not a blanket "closure consumes everything"
+    // approximation.
+    ownership_ok(
+        "struct Owned { x: i64 }\n\
+         fn main() {\n\
+             let o = Owned { x: 1 };\n\
+             let _f = || o.x + 1;\n\
+             let _u = o.x;\n\
+         }",
+    );
+}
+
+#[test]
+fn bare_closure_consume_capture_with_outer_use_routes_through_rc_fallback() {
+    // Bare-form inference picks `Own` for `o` (body consumes via a
+    // value-taking call). The post-closure `let _u = o;` is an outer
+    // use of the consumed capture — by design (Rule 2 sub-case (ii) +
+    // Part 4 RC trigger 2), this does NOT fire UseAfterMove; the RC
+    // dataflow pass tentatively marks `o` as `Rc` instead. Pins the
+    // routing: outer-use-after-Own-capture is NOT a hard error, it is
+    // an opt-in to RC fallback. Symmetric to the read-only test above
+    // (Ref capture leaves outer-scope use trivially valid; Own
+    // capture leaves it valid via RC promotion).
+    let result = ownership_ok(
+        "struct Owned { x: i64 }\n\
+         fn take(o: Owned) { }\n\
+         fn main() {\n\
+             let o = Owned { x: 1 };\n\
+             let _f = || take(o);\n\
+             let _u = o;\n\
+         }",
+    );
+    let main_rcs = result
+        .rc_values
+        .get("main")
+        .expect("expected rc_values entry for `main`");
+    let o_entry = main_rcs
+        .get("o")
+        .expect("expected `o` to be RC-promoted via closure-capture-with-outer-use trigger");
+    assert!(
+        matches!(o_entry.trigger, RcTrigger::ClosureCaptureWithOuterUse),
+        "expected RC trigger ClosureCaptureWithOuterUse on `o`; got {:?}",
+        o_entry.trigger
+    );
+    // Capture mode for `o` is `Own` (body consumes via the value-take
+    // call). Pin alongside the RC trigger so the two halves of the
+    // routing story are asserted together.
+    let caps = single_closure_captures(&result);
+    assert_eq!(
+        caps.as_slice(),
+        &[("o".to_string(), OwnershipMode::Own)],
+        "consume in body → Own capture; got {:?}",
+        caps
+    );
+}
+
 // ── Step 7 sentinels: ref-captured value escape (E0508) ─────────
 //
 // Round 12.35 — design.md § Closures Rule 2 sub-case (iv):

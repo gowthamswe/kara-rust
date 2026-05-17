@@ -156,9 +156,15 @@ pub enum ExprKind {
     },
     Closure {
         params: Vec<ClosureParam>,
-        /// Explicit per-closure borrow-mode override (Rule 2½).
-        /// `None` = bare `|...|` (captures by ownership; default).
-        /// `Some(Ref)` / `Some(MutRef)` = explicit prefix (`ref |...|` / `mut ref |...|`).
+        /// Explicit per-closure capture-mode prefix (design.md § Closures,
+        /// Rule 2½). `None` = bare `|...|` — each capture's mode is
+        /// inferred from the body's first classifying use per Rule 2
+        /// (read → `Ref`, mutate → `MutRef`, consume → `Own`).
+        /// `Some(Own | Ref | MutRef)` = explicit prefix pinning every
+        /// captured path to the declared mode; the ownership checker
+        /// fires K2 violations when body usage exceeds the declared
+        /// mode (consume under `ref` / `mut ref`) and a perf note when
+        /// `mut ref` is declared but the body only reads.
         capture_mode: Option<CaptureMode>,
         /// Span of the explicit prefix tokens (`mut ref` / `ref` / `own` /
         /// `move`) when present. `None` for bare `|...|` closures. Lets
