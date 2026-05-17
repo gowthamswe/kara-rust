@@ -9043,6 +9043,78 @@ The state struct lives on the heap, allocated through the same `allocates(Heap)`
 
 **Layer classification.** The state struct's exact field layout, the encoding of the state tag, whether the poll function is inlined or kept as a separate symbol, and the specific IR shape used by codegen are *Implementation freedom* — the compiler may change them between releases without notice. What is *Guaranteed*: (a) network-boundary functions yield cooperatively at network-effect call boundaries; (b) yield-and-resume preserves source-level binding values; (c) cancellation is observed at every yield point and triggers reverse-construction-order drop of captured locals; (d) the user-visible call/return semantics match a function that did not yield. The state-struct field naming surfaced through `karac explain` and DWARF is *Reported behavior* — stable within a release, may evolve across releases with the same discipline as other `karac explain` output.
 
+#### RAII Across Yield Points
+
+A network-boundary function (per [State-Machine Transform — Network-Boundary Functions](#state-machine-transform--network-boundary-functions)) cannot hold a non-cancel-safe resource across a suspension point. This is a **hard compile error** under v1 — promoted from the warning-level rule earlier specs floated. The alternative — a runtime resource leak when the task is cancelled while parked — would be silent, untraceable, and would corrode the cancellation story.
+
+**The rule.** For every yield point in a network-boundary function `f`, the typechecker computes the set of bindings live across that yield point. If any binding's type does not satisfy `CancelSafe`, the function fails to typecheck with `error[E_RAII_ACROSS_YIELD]`. The check fires at every yield point independently — a single non-cancel-safe binding live across any yield point rejects the whole function.
+
+**The `CancelSafe` marker trait.** `CancelSafe` is a user-extensible marker trait (per [Marker Traits](#marker-traits)) — stdlib types ship with compiler-emitted `impl CancelSafe`, and user code may add its own `impl CancelSafe for T { }` for types whose destructor leaves the world in a sound state when invoked under cancellation.
+
+```kara
+pub marker trait CancelSafe;
+```
+
+**The semantic contract.** A type `T : CancelSafe` declares: *"If a task holding a value of type `T` is cancelled mid-flight, dropping the value as part of the unwind leaves every resource the value owns in a sound state — no partial writes, no half-committed transactions, no locks held longer than the type's documented scope, no buffered data lost without a documented contract."* The contract is a **safety claim**, not a UB guarantee — incorrectly marking a type `CancelSafe` produces resource leaks or surprising recovery behavior, not undefined behavior. The compiler trusts the impl; the author is responsible for the claim being sound.
+
+**Stdlib `CancelSafe` impls.** The following types ship with `impl CancelSafe` in stdlib:
+
+| Type | Why cancel-safe |
+|---|---|
+| Every primitive type (`i*`, `u*`, `f*`, `bool`, `char`) | No resources held; drop is a no-op. |
+| `String`, `StringSlice`, `Vec[T]`, `Map[K, V]`, etc. — when `T` / `K` / `V` are `CancelSafe` | Drop releases the backing allocation; no observable state escapes. |
+| `Box[T]`, `Arc[T]`, `Rc[T]` — when `T : CancelSafe` | Drop decrements / frees as appropriate; no partial state. |
+| `Mutex[T].Guard`, `RwLock[T].ReadGuard`, `RwLock[T].WriteGuard` | Drop releases the lock; the lock's documented scope is held until drop, no surprise. |
+| `TcpConnection`, `TlsStream`, `HttpConnection` | Drop closes the connection cleanly; partial reads / writes appear to the peer as a connection reset — documented behavior for the network types. |
+| `par struct` / `par enum` values — when every field is `CancelSafe` | Per-field cancel-safe transitively. |
+
+**Stdlib types that are NOT `CancelSafe` by default.** The following carry no stdlib `impl CancelSafe`, so holding them across a yield point in a network-boundary function is rejected:
+
+| Type | Why not cancel-safe |
+|---|---|
+| `File` before fsync | Drop closes the descriptor, but writes may sit in the page cache and not yet be durable. Cancellation could lose data the program "wrote" but did not flush. The user is responsible for issuing the documented sync call (`sync_data()` / `sync_all()`) before any yield point if durability is required. |
+| `BufReader[R]` while buffer non-empty | Drop discards buffered bytes; partial-read data lost without notice. User must explicitly `discard()` (which clears the buffer and is documented to leave the reader cancel-safe) before yielding. |
+| `BufWriter[W]` while buffer non-empty | Drop discards buffered writes; data the program "wrote" silently disappears. User must `flush()` before yielding. |
+| Database transaction handles (`TransactionGuard`, `Statement` mid-execute) | Drop without commit rolls the transaction back — usually desired — but partial writes visible to other transactions through `READ UNCOMMITTED` are leaked. The driver author audits cancel semantics on a per-handle-shape basis; until the audit lands, no `impl CancelSafe`. |
+| Critical-section guards (`InterruptDisabled`, `SignalMask.Guard`) | Drop re-enables interrupts / restores signals, but the time between disable and yield is undefined under cancellation, possibly violating real-time constraints. Embedded profiles do not implement `CancelSafe` on these types. |
+| Raw pointers `*const T` / `*mut T` | Drop is a no-op; the pointer outlives any structured reasoning about its referent's lifetime. Cancel-safety is a manual reasoning task — implementing `CancelSafe` on a raw pointer is rejected by stdlib lint convention. |
+| `shared struct` / `shared enum` with `Rc`-rooted reachability | RC drops during unwind cross unsynchronised state; `shared struct` reaches its cross-task-unsafe set under cancellation. Replace with `par struct` (which is `CancelSafe` per its definition contract). |
+
+**Diagnostic shape.** When the rule rejects a function:
+
+```
+error[E_RAII_ACROSS_YIELD]: holding 'guard' (type 'std.io.BufWriter[File]') across a suspension point is not cancel-safe
+  --> src/handler.kara:42:9
+   |
+40 |     let mut guard = BufWriter::new(file);
+   |         --------- live across the next yield point
+41 |     guard.write_all(payload)?;
+42 |     server.respond(response)?;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^ yield point here (sends(Network))
+   |
+note: 'BufWriter[File]' is not 'CancelSafe' while its internal buffer holds unwritten bytes
+   = note: if this task is cancelled while parked at the yield point, the buffered writes will be lost — the program "wrote" data that never reached disk
+help: flush the buffer before the yield point
+   |
+42 +     guard.flush()?;
+   |
+help: alternatively, mark the type 'CancelSafe' if your cancellation semantics tolerate buffer-loss
+   |
+20 + impl CancelSafe for BufWriter[File] { }
+   |
+   = note: marking a type 'CancelSafe' is a safety claim; see design.md § RAII Across Yield Points
+```
+
+The two fix-its appear in preferred order: (1) tighten the scope by releasing or committing the resource before the yield, (2) mark the type `CancelSafe` if the author has audited cancel semantics. The diagnostic includes the source span where the resource was constructed (the binding's introduction site) and the yield point's call-site span (so the user sees both ends of the live range).
+
+**Check site — typechecker, not codegen.** The check runs in the typechecker, *after* effect inference (so the function's network-boundary status is known) and *before* state-machine transform (so the transform never has to lower a function the check would reject). The live-range analysis reuses the existing live-range pass that ownership / NLL already runs; the addition is the per-yield-point set construction plus the `CancelSafe`-bound check on every binding in that set. No new analysis substrate is required.
+
+**Interaction with `unsafe`.** `unsafe { ... }` blocks do not exempt their contents from the rule — a non-cancel-safe binding live across a yield point inside an `unsafe` block still fails to typecheck. The `unsafe` keyword in Kāra grants the ability to invoke unsafe operations; it does not grant the ability to bypass the cancellation contract. Code that genuinely needs to hold a non-cancel-safe resource across a yield is either restructured (release-before-yield) or the type author audits cancel semantics and adds `impl CancelSafe`.
+
+**Orphan rule.** Standard marker-trait orphan rules apply (per [Marker Traits](#marker-traits)): a user-package author may add `impl CancelSafe for T { }` for their own types, but cannot add an impl when both `CancelSafe` and `T` are foreign. Stdlib evolution may add new `impl CancelSafe` impls over time; doing so is non-breaking (impl addition is additive). Removing an existing `impl CancelSafe` is a breaking change and is rolled into edition migrations.
+
+**Layer classification.** The rule "network-boundary function cannot hold a non-cancel-safe binding across a yield point" is *Guaranteed semantics* — a conforming compiler must enforce it. The specific stdlib set carrying `impl CancelSafe` is *Reported behavior* — the set is documented here as of v1, may grow across compiler releases (always additively per the SemVer rule for impls), and tools that inspect the set must tolerate version skew. Diagnostic wording is *Reported behavior* per the general carve-out.
+
 ### Explicit Concurrency: `par {}` and `spawn()`
 
 Auto-concurrency handles the common case — the compiler finds independent operations and parallelizes them. Two explicit constructs complement it for cases the compiler cannot handle alone:
