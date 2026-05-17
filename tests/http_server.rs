@@ -35,8 +35,21 @@ mod http_server_tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::Once;
+    use std::sync::{Mutex, Once};
     use std::time::{Duration, Instant};
+
+    // Test isolation: every test in this module calls
+    // `std::env::set_var("KARAC_RUNTIME", ...)` before linking the
+    // generated binary, and env-var mutation is not thread-safe
+    // (`std::env::set_var` is `unsafe` on edition 2024+ for exactly
+    // this reason — concurrent set/read interleavings produce
+    // intermittent link failures and `await_bound_port` timeouts
+    // when several tests run on cargo's default test thread pool).
+    // A shared `Mutex<()>` serializes the four tests within this
+    // test binary; lock is acquired at the top of each test and
+    // released on drop. Same precedent as
+    // `tests/codegen.rs::SPAWN_SITE_ENV_LOCK`.
+    static HTTP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -192,6 +205,7 @@ mod http_server_tests {
     /// for human readers.
     #[test]
     fn test_http_server_serves_hardcoded_handler() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Build the runtime statically; soft-skip if it can't be
         // built (e.g. no internet for crate downloads on a sandboxed
         // host — same skip pattern as `tests/par_codegen.rs`).
@@ -352,6 +366,7 @@ mod http_server_tests {
     /// this test is the end-to-end runtime exercise.
     #[test]
     fn test_server_serve_handler_smoke() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let Some(rt) = runtime_path() else {
             eprintln!(
                 "skip: libkarac_runtime.a not built \
@@ -522,6 +537,7 @@ mod http_server_tests {
     /// (`path()` method dispatch) end-to-end.
     #[test]
     fn test_server_serve_handler_reads_path() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let src = r#"
             struct Response { status: i64, body: String }
 
@@ -550,6 +566,7 @@ mod http_server_tests {
     /// shape is the only verb covered.)
     #[test]
     fn test_server_serve_handler_reads_method() {
+        let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let src = r#"
             struct Response { status: i64, body: String }
 
