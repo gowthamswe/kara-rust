@@ -7,6 +7,7 @@
 
 use crate::ast::*;
 
+use inkwell::module::Linkage;
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum};
 use inkwell::values::FunctionValue;
 use inkwell::AddressSpace;
@@ -114,7 +115,23 @@ impl<'ctx> super::Codegen<'ctx> {
             }
         }
 
-        let fn_val = self.module.add_function(&func.name, fn_type, None);
+        // Internal linkage for non-`pub`, non-FFI-marked functions lets LLVM's
+        // inliner treat them as private to the translation unit — it can elide
+        // the standalone symbol after inlining all callers, and the inliner's
+        // cost model is more aggressive with internal callees. `pub` items keep
+        // external linkage so future multi-crate compilation can resolve them,
+        // and `#[no_mangle]` / `#[used]` keep external so the symbol survives
+        // for FFI consumers / link-section anchors. `main` is handled above.
+        let linkage = if func.is_pub
+            || func.attributes.iter().any(|a| {
+                let n = a.name.as_str();
+                n == "no_mangle" || n == "used"
+            }) {
+            Some(Linkage::External)
+        } else {
+            Some(Linkage::Internal)
+        };
+        let fn_val = self.module.add_function(&func.name, fn_type, linkage);
         self.apply_linker_attrs(fn_val, &func.attributes);
         Ok(fn_val)
     }

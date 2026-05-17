@@ -10755,8 +10755,11 @@ fn main() {
                with_provider[Metric](p, || { 7 })\n\
              }",
         );
+        // Non-`pub` fns now emit with internal linkage so LLVM's inliner can
+        // elide their standalone symbol after inlining all callers; accept
+        // either form here so the test is robust against linkage tweaks.
         assert!(
-            ir.contains("define i64 @run"),
+            ir.contains("define i64 @run") || ir.contains("define internal i64 @run"),
             "expected `run` returns i64; IR: {}",
             ir
         );
