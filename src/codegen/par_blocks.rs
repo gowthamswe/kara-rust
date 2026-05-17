@@ -23,23 +23,165 @@ impl<'ctx> super::Codegen<'ctx> {
     /// fn, building a `KaracBranch[]` array, and handing it to
     /// `karac_par_run`. Each branch fn is given a fresh stack ctx that
     /// captures any outer bindings it reads (and writes them back through
-    /// caller-allocated return slots when applicable). The par block
-    /// itself evaluates to `unit` (i64 0); return-value propagation is
-    /// the slot mechanism.
+    /// caller-allocated return slots when applicable).
+    ///
+    /// **Block-result semantics (design.md § Explicit Concurrency).**
+    /// `par {}` is a block expression: its value is the value of the
+    /// last expression, exactly like any other block. The canonical
+    /// shape from `docs/syntax.md § 5.9 Parallel Blocks` and
+    /// `docs/design.md § Explicit Concurrency` is:
+    ///
+    /// ```kara
+    /// let (a, b) = par {
+    ///     let p = fetch_profile(uid)
+    ///     let o = fetch_orders(uid)
+    ///     (p, o)
+    /// }
+    /// ```
+    ///
+    /// Each top-level statement is a concurrent branch; the final
+    /// expression `(p, o)` is the join expression that combines the
+    /// per-branch results. For the join expression to see `p` / `o`
+    /// the branches' let-introduced bindings must escape to the
+    /// surrounding scope across the join barrier.
+    ///
+    /// **Bug #6 fix (2026-05-16).** Pre-fix this passed an empty slot
+    /// list, so let-bindings inside the par-block branches stayed
+    /// branch-local and the final expression's read of them errored
+    /// with "Undefined variable 'p'" at codegen. Fix: walk
+    /// `block.final_expr` for references to let-introduced names in
+    /// the branches, materialize a `ReturnSlot` per matching binding
+    /// (sibling to the auto-par dispatch site's
+    /// `compute_return_slots_checked`), thread them through
+    /// `emit_par_run`, and bind each returned slot value as a fresh
+    /// parent-scope local before compiling the join expression.
+    ///
+    /// Bindings whose let-RHS has an un-inferrable LLVM type
+    /// (closures, monomorphized bodies not yet declared) are dropped
+    /// from the slot list — the branch still runs concurrently but
+    /// the binding stays branch-local, and any join-expression read
+    /// of that name surfaces an "Undefined variable" diagnostic.
+    /// Matches the auto-par site's conservative fallback.
+    ///
+    /// When `block.final_expr` is `None` or references no
+    /// branch-defined names, the slot list is empty and the IR is
+    /// byte-identical to slice 2's pre-fix shape — only the
+    /// final-expression compile-and-return is added.
     #[allow(clippy::result_large_err)]
     pub(super) fn compile_par_block(
         &mut self,
         block: &Block,
     ) -> Result<BasicValueEnum<'ctx>, String> {
-        // Slice A: explicit `par {}` blocks pass an empty slot list — the
-        // par-block-as-expression doesn't have outer let-bindings to feed,
-        // so the slot mechanism is dormant on this path. The auto-par
-        // dispatch site in `compile_function_body` is the only call site
-        // that supplies a non-empty slot list today. Lifting this for
-        // `let x = par { ... }` is a v1.x extension noted in the slice-A
-        // out-of-scope list.
-        self.emit_par_run(&block.stmts, &block.span, &[])?;
-        Ok(self.context.i64_type().const_int(0, false).into())
+        use std::collections::{HashMap, HashSet};
+
+        // Step 1 — Identify branch-local let-introduced bindings and the
+        // branch index that defines each. Branches are top-level
+        // statements in source order; statement index = branch index for
+        // the explicit-par path (no sorting like the auto-par dispatch
+        // site does — the branches ARE the statements in order).
+        let mut defined: HashMap<String, (usize, &Stmt)> = HashMap::new();
+        for (branch_idx, stmt) in block.stmts.iter().enumerate() {
+            match &stmt.kind {
+                StmtKind::Let { pattern, .. } | StmtKind::LetElse { pattern, .. } => {
+                    if let PatternKind::Binding(name) = &pattern.kind {
+                        defined.insert(name.clone(), (branch_idx, stmt));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Step 2 — Collect names referenced by the join expression
+        // (block.final_expr). Names defined inside the join expression
+        // itself (let-introduced via nested blocks) are subtracted from
+        // the read set. Only names actually consumed by the join become
+        // slots; names only used inside their own branch remain
+        // branch-local with no slot.
+        let mut refs: HashSet<String> = HashSet::new();
+        let mut defs: HashSet<String> = HashSet::new();
+        if let Some(e) = &block.final_expr {
+            self.refs_in_expr(e, &mut refs, &mut defs);
+        }
+
+        // Step 3 — For each defined name read by the join, infer the
+        // LLVM type from the let-statement's RHS and build a
+        // ReturnSlot. Sort by binding name for deterministic slot
+        // layout (matches the auto-par dispatch's slot ordering).
+        let mut names_with_branch: Vec<(usize, String, &Stmt)> = defined
+            .into_iter()
+            .filter(|(name, _)| refs.contains(name))
+            .map(|(name, (branch_idx, stmt))| (branch_idx, name, stmt))
+            .collect();
+        names_with_branch.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut return_slots: Vec<super::state::ReturnSlot<'ctx>> = Vec::new();
+        for (branch_idx, name, stmt) in names_with_branch {
+            if let Some(llvm_ty) = self.infer_let_binding_llvm_type(stmt) {
+                return_slots.push(super::state::ReturnSlot {
+                    binding_name: name,
+                    branch_index: branch_idx,
+                    llvm_ty,
+                });
+            }
+            // Un-inferrable RHS: conservatively drop. Sibling to the
+            // auto-par site's behavior. Reads in the join expression
+            // will fall through to the standard "Undefined variable"
+            // diagnostic.
+        }
+
+        // Step 4 — Run the branches. `emit_par_run` allocates a
+        // parent-side return struct (one field per slot), passes its
+        // pointer through the per-branch env struct, and each branch
+        // fn writes its slot's value before returning. The barrier
+        // inside `karac_par_run` guarantees all writes are visible by
+        // the time the runtime call returns.
+        let slot_values = self.emit_par_run(&block.stmts, &block.span, &return_slots)?;
+
+        // Step 5 — Bind each loaded slot value as a fresh local in the
+        // surrounding scope. Mirrors the auto-par dispatch site's
+        // bind-back step (`compile_function_body` ~line 189) so the
+        // join expression's identifier reads resolve through
+        // `self.variables` just like any other in-scope local.
+        if let Some(parent_fn) = self.current_fn {
+            let vec_st: BasicTypeEnum<'ctx> = self.vec_struct_type().into();
+            for slot in &return_slots {
+                if let Some(loaded) = slot_values.get(&slot.binding_name) {
+                    let alloca =
+                        self.create_entry_alloca(parent_fn, &slot.binding_name, slot.llvm_ty);
+                    self.builder.build_store(alloca, *loaded).unwrap();
+                    self.variables.insert(
+                        slot.binding_name.clone(),
+                        super::state::VarSlot {
+                            ptr: alloca,
+                            ty: slot.llvm_ty,
+                        },
+                    );
+                    // Vec/String slot: register a placeholder element
+                    // type so subsequent `.len()` / `.is_empty()` etc.
+                    // dispatch through `compile_vec_method`. The
+                    // `or_insert` guard preserves any pre-existing
+                    // annotation registered before the par-block fired
+                    // (mirrors the auto-par dispatch path).
+                    if slot.llvm_ty == vec_st {
+                        self.vec_elem_types
+                            .entry(slot.binding_name.clone())
+                            .or_insert_with(|| self.context.i64_type().into());
+                    }
+                }
+            }
+        }
+
+        // Step 6 — Compile the join expression. The block-result
+        // semantics dictate the par-block's value is the join's value.
+        // When there is no final expression, the par-block evaluates
+        // to unit (i64 0) — preserves the pre-fix behavior for
+        // statement-form par-blocks (`par { side_effect_a();
+        // side_effect_b(); }`).
+        if let Some(expr) = &block.final_expr {
+            self.compile_expr(expr)
+        } else {
+            Ok(self.context.i64_type().const_int(0, false).into())
+        }
     }
 
     /// Lower a list of statements to a `karac_par_run` runtime dispatch.

@@ -502,6 +502,107 @@ fn main() {
         }
     }
 
+    /// Bug #6 regression: explicit `par {}` blocks support the
+    /// canonical "branches define let-bindings; join expression
+    /// combines them" shape from `docs/syntax.md § 5.9` and
+    /// `docs/design.md § Explicit Concurrency`:
+    ///
+    /// ```kara
+    /// let (x, y) = par {
+    ///     let p = double(a)
+    ///     let o = double(b)
+    ///     (p, o)
+    /// }
+    /// ```
+    ///
+    /// Pre-fix `compile_par_block` passed an empty slot list to
+    /// `emit_par_run`, so the branches' let-bindings stayed
+    /// branch-local — the final-expression `(p, o)` then read names
+    /// not visible in the parent scope and errored with "Undefined
+    /// variable 'p'". Fix walks the final expression for references
+    /// to branch-defined names, materializes a `ReturnSlot` per
+    /// match (parallel to the auto-par dispatch site's
+    /// `compute_return_slots_checked`), threads them through, and
+    /// binds each loaded value as a parent-scope local before
+    /// compiling the join expression.
+    #[test]
+    fn test_e2e_par_block_join_expression_reads_branch_bindings() {
+        let out = run_program(
+            r#"
+fn double(x: i64) -> i64 { x * 2 }
+fn main() {
+    let a: i64 = 10;
+    let b: i64 = 20;
+    let (x, y) = par {
+        let x = double(a);
+        let y = double(b);
+        (x, y)
+    };
+    println(x + y);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(
+                out, "60\n",
+                "par-block join expression must see let-introduced bindings from the \
+                 branches — the canonical doc example must compile and print 60"
+            );
+        }
+    }
+
+    /// Bug #6 follow-up: richer `par {}` block with four branches
+    /// each binding a value, summed at the join. Stress-tests slot
+    /// layout determinism, branch-to-parent type propagation for
+    /// multiple slots, and that the join expression's binary-op
+    /// chain reads each slot correctly.
+    #[test]
+    fn test_e2e_par_block_join_sums_four_branch_results() {
+        let out = run_program(
+            r#"
+fn compute_a(n: i64) -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        sum = sum + i;
+        i = i + 1;
+    }
+    sum
+}
+fn compute_b(n: i64) -> i64 {
+    let mut prod: i64 = 1;
+    let mut i: i64 = 1;
+    while i <= n {
+        prod = prod + i * i;
+        i = i + 1;
+    }
+    prod
+}
+fn main() {
+    let n: i64 = 10;
+    let m: i64 = 5;
+    let total = par {
+        let a = compute_a(n);
+        let b = compute_b(n);
+        let c = compute_a(m);
+        let d = compute_b(m);
+        a + b + c + d
+    };
+    println(total);
+}
+"#,
+        );
+        if let Some(out) = out {
+            // compute_a(10)=45, compute_b(10)=386, compute_a(5)=10,
+            // compute_b(5)=56 → 45+386+10+56 = 497
+            assert_eq!(
+                out, "497\n",
+                "par-block join must sum four branch results deterministically; \
+                 each branch binding must propagate through its own slot"
+            );
+        }
+    }
+
     // ── Auto-parallelization of non-par regions ──
 
     /// Compile-time helper for slice 2's auto-par tests: runs the full
