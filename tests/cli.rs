@@ -2944,3 +2944,234 @@ fn test_subcommand_help_vendor() {
     assert!(stdout.contains("karac vendor"));
     assert!(stdout.contains("--offline"));
 }
+
+// ── karac explain --concept=<name> ──────────────────────────────
+
+#[test]
+fn test_main_help_lists_explain_command() {
+    let out = karac_bin().arg("help").output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("explain --concept=NAME"),
+        "top-level help should advertise the explain subcommand"
+    );
+    assert!(
+        stdout.contains("closures"),
+        "top-level help should list the supported explain concepts"
+    );
+}
+
+#[test]
+fn test_subcommand_help_explain() {
+    for flag in ["--help", "-h"] {
+        let out = karac_bin().args(["explain", flag]).output().unwrap();
+        assert!(out.status.success(), "`karac explain {flag}` should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("karac explain"));
+        assert!(stdout.contains("--concept=NAME"));
+        assert!(stdout.contains("closures"));
+        assert!(
+            stdout.contains("karac query ownership"),
+            "scoped help should point at the per-function inspection surface"
+        );
+    }
+}
+
+#[test]
+fn test_explain_concept_closures_renders_page() {
+    let out = karac_bin()
+        .args(["explain", "--concept=closures"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "explain --concept=closures should exit 0; stderr was: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Section headers from the page.
+    assert!(stdout.contains("Closures: parameter modes, capture, and escape"));
+    assert!(stdout.contains("Rule 2 first-use inference"));
+    assert!(stdout.contains("Explicit prefixes: own | ref | mut ref"));
+    assert!(stdout.contains("K2 conflict table"));
+}
+
+#[test]
+fn test_explain_concept_closures_pins_first_use_classification() {
+    // The Rule 2 mapping (read → ref, mutate → mut ref, consume → own)
+    // is the load-bearing concept the page exists to teach. Pin all
+    // three rows so a future copyedit cannot silently drop one.
+    let out = karac_bin()
+        .args(["explain", "--concept=closures"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("first use is a read"));
+    assert!(stdout.contains("first use is a mutate"));
+    assert!(stdout.contains("first use is a consume"));
+    assert!(stdout.contains("`ref < mut ref < own`"));
+}
+
+#[test]
+fn test_explain_concept_closures_pins_k2_ref_consume_redirect() {
+    // Pin the *exact* diagnostic redirect wording the ownership checker
+    // emits for the `ref` + consume K2 violation (see slice 1 of
+    // phase-5-diagnostics.md § Closure default capture mode, and
+    // src/ownership/expr_check.rs line ~1004). If the diagnostic gets
+    // rephrased, this page must move with it or the user reading the
+    // page after hitting the error will not see matching guidance.
+    let out = karac_bin()
+        .args(["explain", "--concept=closures"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("drop the `ref` prefix (use `own` or bare) or remove the consume"),
+        "page must pin the exact `ref` + consume K2 redirect string the ownership checker emits"
+    );
+}
+
+#[test]
+fn test_explain_concept_closures_pins_k2_mut_ref_consume_redirect() {
+    // Symmetric pin for the `mut ref` + consume K2 violation
+    // (src/ownership/expr_check.rs line ~1007).
+    let out = karac_bin()
+        .args(["explain", "--concept=closures"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("drop the `mut ref` prefix and use `own`"),
+        "page must pin the exact `mut ref` + consume K2 redirect string"
+    );
+}
+
+#[test]
+fn test_explain_concept_closures_pins_unused_mut_capture_note() {
+    // The `mut ref` declared / read-only used perf note is the one
+    // non-error K2 row that fires a diagnostic — pin its code name
+    // so the page tracks the checker.
+    let out = karac_bin()
+        .args(["explain", "--concept=closures"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("perf[unused-mut-capture]"));
+}
+
+#[test]
+fn test_explain_concept_closures_cross_references_disjoint_capture() {
+    // Slice 2 spec requirement (b): cross-reference the disjoint
+    // capture (Rule 2¼) extension so a reader knows the per-name
+    // granularity is temporary and where the per-path future lives.
+    let out = karac_bin()
+        .args(["explain", "--concept=closures"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Rule 2¼"));
+    assert!(stdout.contains("Disjoint closure capture"));
+}
+
+#[test]
+fn test_explain_concept_closures_links_to_query_ownership() {
+    // Slice 2 spec requirement (c): link to `karac query ownership`
+    // as the per-function inspection surface. The page's final
+    // section is the user's entry point for inspecting inferred
+    // modes against a real source file.
+    let out = karac_bin()
+        .args(["explain", "--concept=closures"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("karac query ownership <file>.<function>"));
+    assert!(stdout.contains("Inspecting inferred capture modes"));
+}
+
+#[test]
+fn test_explain_concept_closures_describes_outer_scope_rc_routing() {
+    // Slice 1 of phase-5-diagnostics.md § Closure default capture mode
+    // documents the outer-scope routing case: a bare body that consumes
+    // a captured root does NOT produce a use-after-move on a post-closure
+    // outer-scope use — the binding promotes via RC fallback trigger 2
+    // (RcTrigger::ClosureCaptureWithOuterUse). This is the most
+    // common surprise the page exists to demystify.
+    let out = karac_bin()
+        .args(["explain", "--concept=closures"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("RcTrigger::ClosureCaptureWithOuterUse"));
+    assert!(stdout.contains("Outer-scope routing"));
+}
+
+#[test]
+fn test_explain_requires_concept_flag() {
+    let out = karac_bin().arg("explain").output().unwrap();
+    assert!(
+        !out.status.success(),
+        "bare `karac explain` should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--concept"));
+    assert!(stderr.contains("closures"));
+}
+
+#[test]
+fn test_explain_rejects_unknown_concept_with_supported_set() {
+    let out = karac_bin()
+        .args(["explain", "--concept=galaxy_brain"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown concept 'galaxy_brain'"),
+        "stderr should name the rejected concept; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("Supported:") && stderr.contains("closures"),
+        "stderr should list the supported concept set; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_explain_rejects_empty_concept_value() {
+    let out = karac_bin()
+        .args(["explain", "--concept="])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--concept requires a name"));
+}
+
+#[test]
+fn test_explain_rejects_duplicate_concept_flags() {
+    let out = karac_bin()
+        .args(["explain", "--concept=closures", "--concept=closures"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--concept may only be specified once"));
+}
+
+#[test]
+fn test_explain_rejects_positional_argument() {
+    let out = karac_bin().args(["explain", "closures"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--concept=NAME"));
+}
+
+#[test]
+fn test_explain_rejects_unknown_flag() {
+    let out = karac_bin()
+        .args(["explain", "--concept=closures", "--banana"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown flag '--banana'"));
+}

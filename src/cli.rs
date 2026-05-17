@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::process;
 
 mod args;
+mod explain;
 mod help;
 
 pub use args::parse_args;
@@ -182,6 +183,14 @@ pub enum Command {
     /// wiring lands in a follow-up; this arm currently emits a
     /// "not yet wired" diagnostic.
     Vendor,
+    /// Concept-level explainer surface. `karac explain --concept=closures`
+    /// renders a per-concept page covering the relevant analysis rules,
+    /// diagnostic shapes, and inspection commands. The concept name is
+    /// validated against the registered set at render time so a typo
+    /// produces a focused diagnostic listing the supported set.
+    Explain {
+        concept: String,
+    },
     Help,
     Version,
 }
@@ -246,6 +255,7 @@ pub fn execute(cmd: Command) {
         Command::Clean { global } => cmd_clean(global),
         Command::Install { spec } => cmd_install(&spec),
         Command::Vendor => cmd_vendor(),
+        Command::Explain { concept } => explain::render(&concept),
     }
 }
 

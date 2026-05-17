@@ -66,6 +66,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "clean" => parse_clean_command(args),
         "install" => parse_install_command(args),
         "vendor" => parse_vendor_command(args),
+        "explain" => parse_explain_command(args),
         // Bare file path: treat as `karac run <file>`
         other if other.ends_with(".kara") => {
             let p = parse_file_args(args, 1);
@@ -482,6 +483,41 @@ fn parse_fix_command(args: &[String]) -> Command {
         process::exit(1);
     };
     Command::Fix { file, dry_run }
+}
+
+/// Parser for `karac explain --concept=<name>`. The concept is required;
+/// missing or unrecognized flag forms abort with a usage diagnostic that
+/// names the canonical form. The concept *name* itself is validated at
+/// render time so the supported-set message lives in one place
+/// (`src/cli/explain.rs`).
+fn parse_explain_command(args: &[String]) -> Command {
+    let mut concept: Option<String> = None;
+    for arg in args.iter().skip(2) {
+        if let Some(rest) = arg.strip_prefix("--concept=") {
+            if rest.is_empty() {
+                eprintln!("error: --concept requires a name (e.g. --concept=closures)");
+                process::exit(1);
+            }
+            if concept.is_some() {
+                eprintln!("error: --concept may only be specified once");
+                process::exit(1);
+            }
+            concept = Some(rest.to_string());
+        } else if arg.starts_with('-') {
+            eprintln!("error: unknown flag '{arg}' for `karac explain`");
+            process::exit(1);
+        } else {
+            eprintln!(
+                "error: unexpected argument '{arg}' (use --concept=NAME to select a concept)"
+            );
+            process::exit(1);
+        }
+    }
+    let Some(concept) = concept else {
+        eprintln!("error: `karac explain` requires --concept=NAME (e.g. --concept=closures)");
+        process::exit(1);
+    };
+    Command::Explain { concept }
 }
 
 fn parse_query_command(args: &[String]) -> Command {

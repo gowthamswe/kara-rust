@@ -42,6 +42,11 @@ COMMANDS:
                         cost-summary   - static counts of compiler-emitted
                                          silent runtime costs (RC ops,
                                          Arc-provider wraps, borrow flags)
+    explain --concept=NAME
+                      Print a concept-level explainer page. Available
+                      concepts:
+                        closures       - capture-mode inference + the
+                                         own / ref / mut ref prefixes
     fmt <file>        Format a .kara file
     fix <file>        Apply machine-applicable suggestions (e.g. resolver
                       `did you mean` corrections) to a .kara file. Use
@@ -326,6 +331,33 @@ v1 status: the subcommand parses cleanly; the resolver + build + install
 machinery lands alongside the dependency-resolution slice. Until then,
 this command exits non-zero with a diagnostic that names the spec back.
 See `docs/implementation_checklist/phase-5-diagnostics.md`."
+        }
+        "explain" => {
+            "\
+karac explain - Print a concept-level explainer page
+
+USAGE:
+    karac explain --concept=NAME
+
+CONCEPTS:
+    closures           Closure capture-mode inference (Rule 2),
+                       the explicit own / ref / mut ref prefixes
+                       (Rule 2½), the K2 conflict table with the
+                       exact diagnostic-redirect wording the
+                       ownership checker emits, outer-scope routing
+                       for own-captured roots, and the
+                       `karac query ownership <fn>` inspection
+                       surface for per-function inferred capture
+                       modes.
+
+OPTIONS:
+    -h, --help         Print this message
+
+SEE ALSO:
+    karac query ownership <file>.<function>
+                       Per-function JSON of inferred parameter modes
+                       and per-closure capture modes against a real
+                       source file."
         }
         "vendor" => {
             "\
