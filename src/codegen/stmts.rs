@@ -526,6 +526,19 @@ impl<'ctx> super::Codegen<'ctx> {
     }
 
     pub(super) fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
+        // Detect `let _ = m.insert(k, v)` / bare `m.insert(k, v);` where V
+        // is a shared struct/enum. The flag is consumed by the `insert`
+        // arm of `compile_map_method` to emit a follow-up rc_dec on the
+        // displaced value — without it, every overwrite on a `Map[K,
+        // sharedV]` leaks one ref (the `Some(old)` payload that the
+        // discard never holds). Set unconditionally to false here so a
+        // prior statement's stale flag never bleeds into this one.
+        self.pending_map_insert_old_dec = false;
+        if let Some((receiver_name, method)) = Self::stmt_discards_method_call(stmt) {
+            if method == "insert" && self.map_val_shared_heap_type_for(receiver_name).is_some() {
+                self.pending_map_insert_old_dec = true;
+            }
+        }
         match &stmt.kind {
             StmtKind::Let {
                 pattern, value, ty, ..
@@ -1198,6 +1211,36 @@ impl<'ctx> super::Codegen<'ctx> {
             }
             _ => Ok(()),
         }
+    }
+}
+
+impl<'ctx> super::Codegen<'ctx> {
+    /// Detect statements that discard the result of a direct method call:
+    /// `let _ = obj.method(...)` (Wildcard let-binding) or a bare
+    /// `obj.method(...);` expression statement. Returns the receiver
+    /// identifier name and the method name when matched, so the caller
+    /// can gate further work on the specific receiver type. Returns
+    /// `None` for any other shape — nested calls, non-Identifier
+    /// receivers, non-Wildcard let patterns, etc. Used by the
+    /// `Map.insert` shared-value overwrite-leak fix; safe to extend
+    /// to other discard-leak shapes by checking the returned method
+    /// name at the call site.
+    pub(super) fn stmt_discards_method_call(stmt: &Stmt) -> Option<(&str, &str)> {
+        let expr: &Expr = match &stmt.kind {
+            StmtKind::Let { pattern, value, .. }
+                if matches!(&pattern.kind, PatternKind::Wildcard) =>
+            {
+                value
+            }
+            StmtKind::Expr(e) => e,
+            _ => return None,
+        };
+        if let ExprKind::MethodCall { object, method, .. } = &expr.kind {
+            if let ExprKind::Identifier(name) = &object.kind {
+                return Some((name.as_str(), method.as_str()));
+            }
+        }
+        None
     }
 }
 

@@ -2540,6 +2540,74 @@ fn main() {
         }
     }
 
+    #[test]
+    fn test_ir_map_insert_overwrite_shared_discard_rc_dec() {
+        // When `let _ = m.insert(k, v)` overwrites an existing key with
+        // a shared-V map, the displaced bucket value's +1 transfers to
+        // the synthesized `Some(old)` payload that the discard drops
+        // on the floor. Without the fix the prior pointer's refcount
+        // stays >0 forever — leaks one ref per overwrite.
+        //
+        // The fix emits an extra `sub i64 %rc` inside `map.ins.some`
+        // when V is shared and the result is discarded. This test
+        // gates the IR-level rc_dec presence by counting the `sub i64
+        // %rc` ops emitted for the program — a Map.new + first
+        // insert (no displacement) + second insert on same key
+        // (displaces, fires the dec) + scope-exit Map drop walk
+        // (dec on the still-live value).
+        let ir = ir_for(
+            r#"
+shared struct S { val: i64 }
+fn main() {
+    let mut m: Map[i64, S] = Map.new();
+    let _ = m.insert(1, S { val: 10 });
+    let _ = m.insert(1, S { val: 20 });
+}
+"#,
+        );
+        // Expected `sub i64 %rc` ops in the module:
+        //   - 1 dec inside `map.ins.some` from the second insert
+        //     (the overwrite-leak fix)
+        //   - 1 dec from the scope-exit Map-drop walk on the still-
+        //     live final value
+        // = 2 total. Without the fix, only the scope-exit dec fires,
+        // leaving 1.
+        let dec_count = ir.matches("sub i64 %rc").count();
+        assert!(
+            dec_count >= 2,
+            "expected at least 2 `sub i64 %rc` ops (overwrite dec + \
+             scope-exit dec); found {} in:\n{}",
+            dec_count,
+            ir
+        );
+    }
+
+    #[test]
+    fn test_e2e_map_insert_overwrite_shared_no_leak() {
+        // E2E: overwrite a shared-value Map entry repeatedly, then
+        // drop the map. Without the fix, every overwrite leaks one
+        // ref; the program's stdout was always correct (the freed
+        // pointer's bytes still hold valid data), so this test
+        // primarily pins program correctness — paired with the
+        // IR-level gate above which catches a regression that
+        // removes the dec.
+        let out = run_program(
+            r#"
+shared struct S { val: i64 }
+fn main() {
+    let mut m: Map[i64, S] = Map.new();
+    let _ = m.insert(1, S { val: 10 });
+    let _ = m.insert(1, S { val: 20 });
+    let _ = m.insert(1, S { val: 30 });
+    println(m.len());
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "1");
+        }
+    }
+
     // ── Unit enum variant matching ──────────────────────────────
 
     #[test]

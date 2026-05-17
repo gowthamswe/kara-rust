@@ -782,6 +782,32 @@ impl<'ctx> super::Codegen<'ctx> {
                     .builder
                     .build_load(val_ty, old_slot, "map.ins.old")
                     .unwrap();
+                // Shared-V overwrite-leak fix: when the caller discards
+                // the `Option[V]` result (`let _ = m.insert(...)` or a
+                // bare `m.insert(...)` statement) AND V is a shared
+                // struct / enum, the displaced bucket value's +1 is
+                // transferred to the synthesized `Some(old)` payload
+                // that no one will hold — so dec it here before the
+                // payload is materialized. The flag is set by
+                // `compile_stmt`'s discard detection and cleared
+                // unconditionally at the next statement; only consume
+                // (read + clear) here so a no-op for the discard path
+                // doesn't poison the bound-result path. When V isn't
+                // shared, `map_val_shared_heap_type_for` returns None
+                // and we skip — Vec/String/primitive V's don't have a
+                // refcount to dec.
+                if self.pending_map_insert_old_dec {
+                    self.pending_map_insert_old_dec = false;
+                    if let Some(heap_type) = self.map_val_shared_heap_type_for(var_name) {
+                        if old_val.is_pointer_value() {
+                            self.emit_refcount_dec(
+                                var_name,
+                                heap_type,
+                                old_val.into_pointer_value(),
+                            );
+                        }
+                    }
+                }
                 // Multi-word payload via `coerce_to_payload_words` — see
                 // `Vec.first`/`Vec.last` arm for the rationale.
                 let some_payload_words = self.coerce_to_payload_words(old_val, 3)?;

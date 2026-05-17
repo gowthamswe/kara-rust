@@ -221,6 +221,19 @@ pub(super) struct Codegen<'ctx> {
     /// `|a, b|` closures so tuple receivers don't collapse to bare `i64`.
     /// Taken once and cleared on entry to `compile_closure`.
     pub(crate) pending_closure_param_hints: Option<Vec<BasicTypeEnum<'ctx>>>,
+    /// Staging slot — set by `compile_stmt`'s Let / Expr arms when the
+    /// surrounding statement discards the `Option[V]` result of a
+    /// `Map.insert(k, v)` call (i.e. `let _ = m.insert(...)` or a bare
+    /// `m.insert(...)` statement). `compile_map_method`'s `insert` arm
+    /// reads + clears this flag to decide whether to emit a follow-up
+    /// `rc_dec` on the displaced shared value (the `Some(old)` payload
+    /// that no one will hold the +1 of). Without the dec the prior
+    /// bucket value's refcount stays >0 on every overwrite and the
+    /// shared object leaks. When the result *is* bound (`let prev =
+    /// m.insert(...)`), the caller's scope-exit cleanup on `prev`
+    /// handles the +1; the discard path is the only one that needs
+    /// the receive-site dec.
+    pub(crate) pending_map_insert_old_dec: bool,
     // ── Shared types (RC) ─────────────────────────────────────────
     /// Shared type metadata (struct/enum name → heap layout info).
     pub(crate) shared_types: HashMap<String, SharedTypeInfo<'ctx>>,
@@ -1176,6 +1189,7 @@ impl<'ctx> Codegen<'ctx> {
             closure_fn_types: HashMap::new(),
             pending_closure_fn_type: None,
             pending_closure_param_hints: None,
+            pending_map_insert_old_dec: false,
             shared_types: HashMap::new(),
             malloc_fn,
             free_fn,
