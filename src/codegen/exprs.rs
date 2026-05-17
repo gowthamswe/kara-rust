@@ -21,6 +21,16 @@ impl<'ctx> super::Codegen<'ctx> {
         match &expr.kind {
             ExprKind::Integer(n, sfx) => Ok(self.const_int_for_suffix(*n, *sfx).into()),
             ExprKind::Float(f, sfx) => Ok(self.const_float_for_suffix(*f, *sfx).into()),
+            // char lowers to an i32 holding the Unicode scalar value. The
+            // earlier fallthrough emitted `i64 0` for every char literal,
+            // breaking `let c: char = 'A'; println(f"{c}")` (printed `0`)
+            // and any downstream arithmetic / comparison against the
+            // literal value. Width parity with `s.chars()`'s decoded
+            // i32 (`compile_for_string_chars_inner`) so a CharLit and a
+            // chars-iter binding share a codegen type for the print and
+            // f-string char-arm pickup. `*c as u64` widens the surrogate-
+            // free `char` to fit the const_int sign-agnostic constructor.
+            ExprKind::CharLit(c) => Ok(self.context.i32_type().const_int(*c as u64, false).into()),
             ExprKind::Bool(b) => Ok(self
                 .context
                 .bool_type()
@@ -97,8 +107,19 @@ impl<'ctx> super::Codegen<'ctx> {
                             }
                         }
                         ParsedInterpolationPart::Expr(e) => {
+                            // Char arm — render as glyph (the codepoint
+                            // value would otherwise hit the generic
+                            // `%lld` integer path inside
+                            // `compile_fstr_part_to_cstr`, since `char`
+                            // lowers to `i32`). Detection mirrors
+                            // `compile_print`'s char arm.
+                            let is_char = self.expr_is_char(e);
                             let val = self.compile_expr(e)?;
-                            let (src_ptr, src_len) = self.compile_fstr_part_to_cstr(val);
+                            let (src_ptr, src_len) = if is_char {
+                                self.emit_codepoint_to_utf8(val.into_int_value())
+                            } else {
+                                self.compile_fstr_part_to_cstr(val)
+                            };
                             self.emit_string_append_raw(acc, src_ptr, src_len);
                         }
                     }

@@ -764,7 +764,51 @@ impl<'ctx> super::Codegen<'ctx> {
         match &expr.kind {
             ExprKind::Identifier(n) => self.var_type_names.get(n.as_str()).cloned(),
             ExprKind::StructLiteral { path, .. } => path.last().cloned(),
+            // `let x = vec_of_chars[i]` — recover the element type's name
+            // from `var_elem_type_exprs` so downstream consumers (notably
+            // `expr_is_char` for the print/f-string glyph rendering)
+            // pick up `x: char`. Generalises to any single-path element
+            // type, e.g. `let p = points[0]` → "Point" — same shape the
+            // shared-struct field-access machinery already relies on.
+            ExprKind::Index { object, .. } => {
+                if let ExprKind::Identifier(n) = &object.kind {
+                    if let Some(te) = self.var_elem_type_exprs.get(n.as_str()) {
+                        if let TypeKind::Path(p) = &te.kind {
+                            return p.segments.last().cloned();
+                        }
+                    }
+                }
+                None
+            }
             _ => None,
+        }
+    }
+
+    /// True when `expr` has source-level type `char` per the codegen-side
+    /// type tracking. Drives the print and f-string char-arms: a true
+    /// result routes the value through `emit_codepoint_to_utf8` so the
+    /// glyph is rendered rather than the integer codepoint.
+    pub(super) fn expr_is_char(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::CharLit(_) => true,
+            ExprKind::Identifier(n) => self
+                .var_type_names
+                .get(n.as_str())
+                .map(|s| s == "char")
+                .unwrap_or(false),
+            // `vec_of_chars[i]` / `array_of_chars[i]` — check the
+            // collection's element TypeExpr is a bare `char` path.
+            ExprKind::Index { object, .. } => {
+                if let ExprKind::Identifier(n) = &object.kind {
+                    if let Some(te) = self.var_elem_type_exprs.get(n.as_str()) {
+                        if let TypeKind::Path(p) = &te.kind {
+                            return p.segments.last().map(|s| s == "char").unwrap_or(false);
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
         }
     }
 

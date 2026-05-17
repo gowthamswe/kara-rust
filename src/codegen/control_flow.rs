@@ -191,6 +191,41 @@ impl<'ctx> super::Codegen<'ctx> {
             }
         }
 
+        // Char arm — render as the UTF-8 glyph rather than the integer
+        // codepoint. Must precede the generic int path because `char`
+        // lowers to `i32` and would otherwise hit the `%lld` branch.
+        // The detection covers literals (`println('A')`), char-typed
+        // identifiers (`for c in s.chars() { println(c); }`,
+        // `let c: char = 'A'; println(c);`), and Vec/Array indexed
+        // reads (`println(chars[i])`).
+        if self.expr_is_char(&args[0].value) {
+            let val = self.compile_expr(&args[0].value)?;
+            let (buf_ptr, byte_len) = self.emit_codepoint_to_utf8(val.into_int_value());
+            // printf reads the precision argument as `int`, so truncate
+            // the i64 length to i32 — codepoints are at most 4 bytes,
+            // well within i32.
+            let len_i32 = self
+                .builder
+                .build_int_truncate(byte_len, self.context.i32_type(), "u8.len.i32")
+                .unwrap();
+            let fmt = self
+                .builder
+                .build_global_string_ptr(&format!("%.*s{nl}"), "fc")
+                .unwrap();
+            self.builder
+                .build_call(
+                    self.printf_fn,
+                    &[
+                        BasicMetadataValueEnum::from(fmt.as_pointer_value()),
+                        BasicMetadataValueEnum::from(len_i32),
+                        BasicMetadataValueEnum::from(buf_ptr),
+                    ],
+                    "printf",
+                )
+                .unwrap();
+            return Ok(zero.into());
+        }
+
         let val = self.compile_expr(&args[0].value)?;
 
         if val.is_int_value() {

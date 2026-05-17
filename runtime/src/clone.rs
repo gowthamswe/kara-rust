@@ -199,3 +199,57 @@ pub unsafe extern "C" fn karac_string_decode_char(
     *out_codepoint = cp;
     (start + width) as i64
 }
+
+/// Encode a Unicode scalar value as 1–4 UTF-8 bytes written through `out`.
+/// Returns the number of bytes written. Peer to `karac_string_decode_char`
+/// — used by codegen's `compile_print` / f-string `char`-arm to render a
+/// codepoint as the glyph rather than the integer codepoint. Codepoints
+/// outside the Unicode scalar range (≥ 0x110000) and the surrogate range
+/// (0xD800..=0xDFFF) are normalized to U+FFFD (`EF BF BD`, 3 bytes).
+///
+/// # Safety
+///
+/// * `out` must point to a writable buffer of at least 4 bytes. The
+///   compiler emits a 4-byte stack alloca per call site (see
+///   `emit_codepoint_to_utf8`), so this precondition is satisfied at
+///   every generated call site.
+#[no_mangle]
+pub unsafe extern "C" fn karac_string_encode_char(cp: u32, out: *mut u8) -> i64 {
+    if cp < 0x80 {
+        *out = cp as u8;
+        1
+    } else if cp < 0x800 {
+        *out = 0xC0 | ((cp >> 6) as u8);
+        *out.add(1) = 0x80 | ((cp & 0x3F) as u8);
+        2
+    } else if cp < 0x10000 {
+        // Surrogates (0xD800..=0xDFFF) aren't valid scalar values; emit
+        // U+FFFD instead of round-tripping the surrogate as 3 bytes (which
+        // would produce malformed UTF-8 the next reader would reject).
+        // Well-formed Kāra `char` values can't hold a surrogate — the
+        // decoder normalizes them on the way in — but a downstream
+        // arithmetic op could land here on a synthetic codepoint.
+        if (0xD800..=0xDFFF).contains(&cp) {
+            *out = 0xEF;
+            *out.add(1) = 0xBF;
+            *out.add(2) = 0xBD;
+            return 3;
+        }
+        *out = 0xE0 | ((cp >> 12) as u8);
+        *out.add(1) = 0x80 | (((cp >> 6) & 0x3F) as u8);
+        *out.add(2) = 0x80 | ((cp & 0x3F) as u8);
+        3
+    } else if cp < 0x110000 {
+        *out = 0xF0 | ((cp >> 18) as u8);
+        *out.add(1) = 0x80 | (((cp >> 12) & 0x3F) as u8);
+        *out.add(2) = 0x80 | (((cp >> 6) & 0x3F) as u8);
+        *out.add(3) = 0x80 | ((cp & 0x3F) as u8);
+        4
+    } else {
+        // Out-of-range codepoint → U+FFFD (3 bytes).
+        *out = 0xEF;
+        *out.add(1) = 0xBF;
+        *out.add(2) = 0xBD;
+        3
+    }
+}

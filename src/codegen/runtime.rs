@@ -1684,4 +1684,37 @@ impl<'ctx> super::Codegen<'ctx> {
             }
         }
     }
+
+    /// Encode an i32 codepoint as 1–4 UTF-8 bytes in a 4-byte stack alloca;
+    /// return `(buf_ptr, byte_len_i64)`. Used by the print and f-string
+    /// char-arms to render a `char` as the glyph rather than the integer
+    /// codepoint. Delegates the encoding logic to the runtime helper
+    /// `karac_string_encode_char` to keep the lowered IR small (one call
+    /// per print, vs. the ~30-instruction inline branch ladder).
+    pub(super) fn emit_codepoint_to_utf8(
+        &self,
+        cp: inkwell::values::IntValue<'ctx>,
+    ) -> (PointerValue<'ctx>, inkwell::values::IntValue<'ctx>) {
+        let fn_val = self.current_fn.unwrap();
+        let i8_t = self.context.i8_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+
+        let buf = self.create_entry_alloca(fn_val, "u8.buf", i8_t.array_type(4).into());
+        let buf_ptr = self
+            .builder
+            .build_pointer_cast(buf, ptr_ty, "u8.buf.ptr")
+            .unwrap();
+        let len = self
+            .builder
+            .build_call(
+                self.karac_string_encode_char_fn,
+                &[cp.into(), buf_ptr.into()],
+                "u8.enc",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        (buf_ptr, len)
+    }
 }

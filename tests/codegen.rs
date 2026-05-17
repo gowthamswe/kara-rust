@@ -4461,6 +4461,130 @@ fn main() {
         }
     }
 
+    // ── char print / f-string char-arm ────────────────────────────
+    //
+    // Pre-fix state: `ExprKind::CharLit` fell through `compile_expr`'s
+    // tail arm and emitted `i64 0`, so `let c: char = 'A'` bound `c`
+    // to zero. And both `println(c)` and `println(f"{c}")` rendered
+    // the i32 codepoint via `%lld` rather than encoding it as a UTF-8
+    // glyph. The fix lands an explicit `CharLit → i32` arm and a
+    // char-aware branch in `compile_print` / the f-string Expr part
+    // that routes through `karac_string_encode_char` and prints
+    // `%.*s` of the UTF-8 bytes.
+
+    #[test]
+    fn test_e2e_println_char_literal_ascii() {
+        let out = run_program(
+            r#"
+fn main() {
+    let c: char = 'A';
+    println(c);
+    println(f"{c}");
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(
+                lines,
+                vec!["A", "A"],
+                "println(char) and f\"{{char}}\" must both render the glyph"
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_println_char_literal_multibyte() {
+        // 3-byte UTF-8 (CJK ideograph) exercises the wider arms of
+        // `karac_string_encode_char`. Pre-fix this printed `0`.
+        let out = run_program(
+            r#"
+fn main() {
+    let c: char = '日';
+    println(c);
+    println(f"a={c}b");
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["日", "a=日b"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_println_char_chars_iter() {
+        // `for c in s.chars()` binds c: char via decode_char's i32 out
+        // param. The for-loop must tag the binding as `char` in
+        // `var_type_names` so the print/f-string char arms pick it up.
+        let out = run_program(
+            r#"
+fn main() {
+    let s = "ABC";
+    for c in s.chars() {
+        println(c);
+        println(f"-{c}-");
+    }
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(
+                lines,
+                vec!["A", "-A-", "B", "-B-", "C", "-C-"],
+                "chars() iterator binding must render as glyph"
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_println_char_vec_index() {
+        // `vec_of_chars[i]` (Index over Vec[char]) flows through
+        // `expr_is_char`'s Index arm, which inspects
+        // `var_elem_type_exprs[name]`. The `let c = chars[i]` binding
+        // also gets `var_type_names[c] = "char"` via the extended
+        // `type_name_of` so the subsequent `println(c)` works too.
+        let out = run_program(
+            r#"
+fn main() {
+    let mut chars: Vec[char] = Vec.new();
+    chars.push('X');
+    chars.push('Y');
+    println(chars[0]);
+    println(f"{chars[1]}");
+    let c = chars[0];
+    println(c);
+    println(f"{c}");
+}
+"#,
+        );
+        if let Some(out) = out {
+            let lines: Vec<&str> = out.trim().lines().collect();
+            assert_eq!(lines, vec!["X", "Y", "X", "X"]);
+        }
+    }
+
+    #[test]
+    fn test_e2e_char_literal_value_round_trip() {
+        // Regression guard for the pre-fix `CharLit → 0` gap: the
+        // codepoint cast to i64 must be the actual value (65 for 'A'),
+        // not zero. Uses an explicit cast so we're checking the value
+        // rather than the print path.
+        let out = run_program(
+            r#"
+fn main() {
+    let c: char = 'A';
+    let n: i64 = c as i64;
+    println(n);
+}
+"#,
+        );
+        if let Some(out) = out {
+            assert_eq!(out.trim(), "65");
+        }
+    }
+
     // ── ref parameter semantics ───────────────────────────────────
 
     #[test]

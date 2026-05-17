@@ -703,6 +703,12 @@ pub(super) struct Codegen<'ctx> {
     /// codepoint through the out-param. Drives `for c in s` / `for c in
     /// s.chars()` lowering — see `compile_for_string_chars`.
     pub(crate) karac_string_decode_char_fn: FunctionValue<'ctx>,
+    /// `i64 karac_string_encode_char(u32 cp, *mut u8 out)`. Writes 1–4
+    /// UTF-8 bytes for the codepoint through `out`, returns the byte
+    /// count. Peer of `karac_string_decode_char_fn`; used by the print
+    /// and f-string char arms to render the glyph rather than the
+    /// integer codepoint. See `emit_codepoint_to_utf8`.
+    pub(crate) karac_string_encode_char_fn: FunctionValue<'ctx>,
     /// `karac_map_entry(map: ptr, key: ptr, out_slot_ptr: ptr) -> i1` —
     /// probe-and-insert-on-vacant. Used by entry chains whose terminal is
     /// `or_insert` / `or_insert_with` — codegen will write a default through
@@ -1174,6 +1180,18 @@ impl<'ctx> Codegen<'ctx> {
             Some(Linkage::External),
         );
 
+        // karac_string_encode_char(cp: u32, out: ptr) -> i64
+        // Encodes a Unicode scalar value as 1–4 UTF-8 bytes through `out`,
+        // returns the byte count. Drives the `println(c)` / `f"{c}"` glyph
+        // rendering — see `emit_codepoint_to_utf8`.
+        let u32_md: BasicMetadataTypeEnum = context.i32_type().into();
+        let string_encode_char_ty = context.i64_type().fn_type(&[u32_md, ptr_md], false);
+        let karac_string_encode_char_fn = module.add_function(
+            "karac_string_encode_char",
+            string_encode_char_ty,
+            Some(Linkage::External),
+        );
+
         // karac_map_entry(map: ptr, key: ptr, out_slot_ptr: ptr) -> i1
         let map_entry_ty = context
             .bool_type()
@@ -1330,6 +1348,7 @@ impl<'ctx> Codegen<'ctx> {
             karac_map_iter_next_fn,
             karac_map_iter_free_fn,
             karac_string_decode_char_fn,
+            karac_string_encode_char_fn,
             karac_map_entry_fn,
             karac_map_lookup_slot_fn,
             karac_string_clone_fn,

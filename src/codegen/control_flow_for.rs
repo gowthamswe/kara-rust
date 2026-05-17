@@ -943,6 +943,18 @@ impl<'ctx> super::Codegen<'ctx> {
             .build_load(i32_t, out_codepoint, "for.s.cp.load")
             .unwrap();
         self.bind_pattern(pattern, cp_val)?;
+        // Tag the loop binding's source type as `char` so the print and
+        // f-string arms render the value as a glyph rather than the
+        // integer codepoint. `bind_pattern` doesn't populate
+        // `var_type_names` by itself (it only owns the LLVM-side slot
+        // registration), and the typechecker doesn't write a binding
+        // entry for the loop variable through the codegen-visible
+        // `pattern_binding_types` table either, so the tag has to come
+        // from the call site that knows the source-level type.
+        if let PatternKind::Binding(bind_name) = &pattern.kind {
+            self.var_type_names
+                .insert(bind_name.clone(), "char".to_string());
+        }
         self.compile_block(body)?;
         if self
             .builder
