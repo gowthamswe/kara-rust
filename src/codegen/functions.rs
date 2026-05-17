@@ -123,6 +123,15 @@ impl<'ctx> super::Codegen<'ctx> {
         self.rc_fallback_heap_types.clear();
         self.scope_cleanup_actions.clear();
         self.scope_cleanup_actions.push(Vec::new());
+        // Clear cross-function staging slot. `last_fstr_acc` holds an
+        // alloca-valued LLVM pointer scoped to a specific function body;
+        // a stale value from a prior function's compilation must not
+        // leak into the next. The intra-function take points (Let /
+        // Assign / function-tail return for `InterpolatedStringLit`
+        // shapes) usually clear it, but a function whose final f-string
+        // sits behind a non-tail position (e.g. `let _ = f"…";`) can
+        // leave the slot populated.
+        self.last_fstr_acc = None;
 
         let entry = self.context.append_basic_block(fn_val, "entry");
         self.builder.position_at_end(entry);
@@ -287,6 +296,28 @@ impl<'ctx> super::Codegen<'ctx> {
             // they don't need this — the move-aware suppression only
             // matters when scope cleanup is about to run.
             self.suppress_cleanup_for_tail_return(&func.body);
+            // Sibling to `suppress_cleanup_for_tail_return` for the
+            // InterpolatedStringLit-tail case: when the function's final
+            // expression is `f"…"`, the loaded {data, len, cap} is the
+            // return value — but the f-string accumulator's queued
+            // `FreeVecBuffer` would free `data` here, between the return-
+            // value load and the `ret` instruction. The caller would
+            // receive a struct with a dangling data pointer. Zero the
+            // acc's `cap` so its cleanup no-ops; the caller's binding
+            // becomes the unique owner (or, for a discarded call result,
+            // the caller's expression-statement cleanup takes over).
+            // Identifier-tail returns are handled by the existing
+            // `suppress_cleanup_for_tail_return` above; the two paths
+            // cover the two move-aware tail shapes that produce a String
+            // value.
+            if matches!(
+                func.body.final_expr.as_deref().map(|e| &e.kind),
+                Some(ExprKind::InterpolatedStringLit(_))
+            ) {
+                if let Some(acc) = self.last_fstr_acc.take() {
+                    self.zero_vec_alloca_cap(acc);
+                }
+            }
             self.emit_scope_cleanup();
             if func.name == "main" {
                 let zero = self.context.i32_type().const_int(0, false);

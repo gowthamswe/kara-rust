@@ -234,6 +234,17 @@ pub(super) struct Codegen<'ctx> {
     /// handles the +1; the discard path is the only one that needs
     /// the receive-site dec.
     pub(crate) pending_map_insert_old_dec: bool,
+    /// Staging slot — set by `compile_expr`'s `InterpolatedStringLit` arm
+    /// to the f-string's accumulator alloca. The Let / Assign handlers
+    /// consume it when the RHS is an f-string AND the LHS is a tracked
+    /// Vec/String slot, zeroing the acc's `cap` so its scope-exit
+    /// `FreeVecBuffer` cleanup no-ops — the buffer is now owned by the
+    /// LHS slot (whose own queued cleanup will free it once). Without
+    /// this transfer both cleanups fire on the same heap pointer and
+    /// macOS malloc's double-free path hangs in `malloc_printf`.
+    /// Symmetric to `suppress_source_vec_cleanup_for_arg`'s
+    /// cap-zeroing for Identifier RHS aliasing.
+    pub(crate) last_fstr_acc: Option<PointerValue<'ctx>>,
     // ── Shared types (RC) ─────────────────────────────────────────
     /// Shared type metadata (struct/enum name → heap layout info).
     pub(crate) shared_types: HashMap<String, SharedTypeInfo<'ctx>>,
@@ -1190,6 +1201,7 @@ impl<'ctx> Codegen<'ctx> {
             pending_closure_fn_type: None,
             pending_closure_param_hints: None,
             pending_map_insert_old_dec: false,
+            last_fstr_acc: None,
             shared_types: HashMap::new(),
             malloc_fn,
             free_fn,

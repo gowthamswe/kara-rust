@@ -801,7 +801,18 @@ impl<'ctx> super::Codegen<'ctx> {
                 // fresh-ref source. Plain `Call` / `MethodCall` /
                 // `StructLiteral` match the base case directly.
                 let is_fresh_construction = rhs_yields_fresh_ref(value);
+                let rhs_is_fstring = matches!(&value.kind, ExprKind::InterpolatedStringLit(_));
                 let val = self.compile_expr(value)?;
+                // Sibling to the Assign arm's f-string staged-acc capture.
+                // The slot is consumed below at the tracked-Vec/String let-
+                // binding site (it transfers ownership of the buffer to
+                // the new binding's slot). Always take so a stale slot
+                // can't leak into an unrelated downstream Let/Assign.
+                let staged_fstr_acc = if rhs_is_fstring {
+                    self.last_fstr_acc.take()
+                } else {
+                    None
+                };
                 // Track variable → type name for field resolution.
                 let mut shared_info: Option<(String, SharedTypeInfo<'ctx>)> = None;
                 if let Some(ref type_name) = type_hint {
@@ -943,6 +954,14 @@ impl<'ctx> super::Codegen<'ctx> {
                         // No-op for non-Identifier RHS (fresh-value
                         // constructors / call results / literals).
                         self.suppress_source_vec_cleanup_for_arg(value);
+                        // Sibling case for `let t: String = f"…";` — the
+                        // f-string acc alloca is queued for scope cleanup
+                        // and now aliases the new binding's heap buffer.
+                        // See the Assign arm's matching block for the
+                        // double-free rationale.
+                        if let Some(acc) = staged_fstr_acc {
+                            self.zero_vec_alloca_cap(acc);
+                        }
                     }
                 }
                 // Phase 7.2 Slice DP — track value-type enum bindings
@@ -1061,7 +1080,18 @@ impl<'ctx> super::Codegen<'ctx> {
                 // `x = if cond { make_a() } else { make_b() };` and the
                 // `Match` / `IfLet` / `Block` equivalents.
                 let rhs_is_fresh = rhs_yields_fresh_ref(value);
+                let rhs_is_fstring = matches!(&value.kind, ExprKind::InterpolatedStringLit(_));
                 let val = self.compile_expr(value)?;
+                // Consume the f-string acc staging slot once compile_expr
+                // returns — even on the rare paths where the Assign arm
+                // doesn't reach the transfer step below, the slot must not
+                // leak into a subsequent unrelated Let / Assign whose RHS
+                // is not an f-string.
+                let staged_fstr_acc = if rhs_is_fstring {
+                    self.last_fstr_acc.take()
+                } else {
+                    None
+                };
                 if let ExprKind::Identifier(name) = &target.kind {
                     // For shared types: rc_dec old value, rc_inc new value
                     // (only when the RHS is not itself a fresh-ref source).
@@ -1090,6 +1120,25 @@ impl<'ctx> super::Codegen<'ctx> {
                             }
                         }
                     }
+                    // Free the LHS's existing heap buffer before writing
+                    // the new value, when both LHS is a tracked Vec /
+                    // String AND the RHS materializes a fresh heap buffer
+                    // (currently `InterpolatedStringLit`). Without the
+                    // free, the OLD buffer leaks on every assignment —
+                    // a loop of `s = f"…"` accumulates one leaked buffer
+                    // per iteration. The `cap > 0` guard skips static
+                    // string-literal slots (cap = 0) so the inert
+                    // `let mut s: String = "[";` → first assignment is
+                    // free of any free; only previously heap-grown slots
+                    // get reclaimed. Symmetric guard is already in the
+                    // `FreeVecBuffer` cleanup walker; this is the eager-
+                    // free analogue for the move-overwrite path.
+                    let lhs_is_tracked_vec = self.vec_elem_types.contains_key(name.as_str());
+                    if lhs_is_tracked_vec && staged_fstr_acc.is_some() {
+                        if let Some(slot) = self.variables.get(name).copied() {
+                            self.emit_free_vec_buffer_if_owned(slot.ptr);
+                        }
+                    }
                     if let Some(slot) = self.variables.get(name).copied() {
                         self.builder.build_store(slot.ptr, val).unwrap();
                     }
@@ -1103,8 +1152,23 @@ impl<'ctx> super::Codegen<'ctx> {
                     // the unique cleanup owner. No-op for non-
                     // Identifier RHS — fresh-value RHS shapes can't
                     // alias an existing tracked binding.
-                    if self.vec_elem_types.contains_key(name.as_str()) {
+                    if lhs_is_tracked_vec {
                         self.suppress_source_vec_cleanup_for_arg(value);
+                        // Sibling case for the InterpolatedStringLit RHS
+                        // shape: the f-string accumulator alloca is queued
+                        // for scope-exit cleanup (see `compile_expr`'s
+                        // `InterpolatedStringLit` arm at exprs.rs ~85).
+                        // After `s = f"…"` the LHS's slot points at the
+                        // same heap buffer as the staged acc; firing both
+                        // cleanups double-frees and hangs in macOS
+                        // malloc_printf. Zero the acc's `cap` so its
+                        // `FreeVecBuffer` no-ops on the `cap > 0` guard;
+                        // the LHS slot's own cleanup stays the unique
+                        // owner. Symmetric to the Identifier-RHS path
+                        // above which zeroes the source-binding's cap.
+                        if let Some(acc) = staged_fstr_acc {
+                            self.zero_vec_alloca_cap(acc);
+                        }
                     }
                 } else if let ExprKind::FieldAccess { object, field } = &target.kind {
                     self.compile_field_store(object, field, val)?;

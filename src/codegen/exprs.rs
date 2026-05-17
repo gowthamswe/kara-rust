@@ -106,6 +106,16 @@ impl<'ctx> super::Codegen<'ctx> {
 
                 // Load the final String struct from the accumulator alloca.
                 let result = self.builder.build_load(vec_ty, acc, "fstr.result").unwrap();
+                // Stage the acc pointer so a consuming Let / Assign whose
+                // LHS is a tracked Vec/String slot can suppress the acc's
+                // scope-exit cleanup (the LHS now owns the buffer; without
+                // suppression both cleanups fire on the same pointer and
+                // double-free hangs in macOS malloc_printf). Discard / pass-
+                // through consumers (println(f"..."), function args, etc.)
+                // leave the staged value in place — the next compile_expr
+                // overwrites it, or the surrounding scope's cleanup walk
+                // ignores it.
+                self.last_fstr_acc = Some(acc);
                 Ok(result)
             }
             ExprKind::Identifier(name) => {

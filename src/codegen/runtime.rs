@@ -255,6 +255,81 @@ impl<'ctx> super::Codegen<'ctx> {
         }
     }
 
+    /// Emit a runtime zero-store to a Vec/String alloca's `cap` field
+    /// (slot index 2 of the `{data, len, cap}` struct). Used to suppress
+    /// a queued `FreeVecBuffer` whose buffer ownership has moved to a
+    /// different slot — the `cap > 0` guard in `emit_scope_cleanup`'s
+    /// `FreeVecBuffer` walker turns the free into a no-op, leaving the
+    /// new owner's own cleanup to run once.
+    pub(super) fn zero_vec_alloca_cap(&self, vec_alloca: PointerValue<'ctx>) {
+        let vec_ty = self.vec_struct_type();
+        let i64_t = self.context.i64_type();
+        if let Ok(cap_ptr) =
+            self.builder
+                .build_struct_gep(vec_ty, vec_alloca, 2, "fstr.acc.cap.suppress")
+        {
+            let _ = self.builder.build_store(cap_ptr, i64_t.const_int(0, false));
+        }
+    }
+
+    /// Emit an eager free of a Vec/String slot's heap buffer, guarded on
+    /// `cap > 0`. Used at move-overwrite sites where the slot is about to
+    /// be reassigned to a new heap buffer — without this, the prior
+    /// buffer leaks (the slot loses its only reference before scope-exit
+    /// cleanup can reach it). Mirrors the runtime shape of `FreeVecBuffer`
+    /// for the eager-free position. `cap = 0` slots (string literals,
+    /// already-transferred sources) skip the free, preserving the static-
+    /// vs-heap invariant the scope walker also relies on.
+    pub(super) fn emit_free_vec_buffer_if_owned(&mut self, vec_alloca: PointerValue<'ctx>) {
+        let vec_ty = self.vec_struct_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_t = self.context.i64_type();
+        let fn_val = match self.current_fn {
+            Some(f) => f,
+            None => return,
+        };
+        let data_ptr = match self
+            .builder
+            .build_struct_gep(vec_ty, vec_alloca, 0, "ov.data.pp")
+        {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cap_ptr = match self
+            .builder
+            .build_struct_gep(vec_ty, vec_alloca, 2, "ov.cap.pp")
+        {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let data = self
+            .builder
+            .build_load(ptr_ty, data_ptr, "ov.data")
+            .unwrap()
+            .into_pointer_value();
+        let cap = self
+            .builder
+            .build_load(i64_t, cap_ptr, "ov.cap")
+            .unwrap()
+            .into_int_value();
+        let zero = i64_t.const_int(0, false);
+        let owned = self
+            .builder
+            .build_int_compare(IntPredicate::UGT, cap, zero, "ov.owned")
+            .unwrap();
+        let free_bb = self.context.append_basic_block(fn_val, "ov.free");
+        let after_bb = self.context.append_basic_block(fn_val, "ov.after");
+        self.builder
+            .build_conditional_branch(owned, free_bb, after_bb)
+            .unwrap();
+        self.builder.position_at_end(free_bb);
+        self.builder
+            .build_call(self.free_fn, &[data.into()], "")
+            .unwrap();
+        self.builder.build_unconditional_branch(after_bb).unwrap();
+        self.builder.position_at_end(after_bb);
+    }
+
     /// Track a Map / Set alloca for scope-exit free. `key_is_vec` /
     /// `val_is_vec` tell the cleanup whether each side follows the
     /// Vec/String `{ptr, len, cap}` layout and therefore needs per-entry
