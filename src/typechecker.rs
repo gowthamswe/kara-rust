@@ -404,6 +404,15 @@ pub enum TypeErrorKind {
     /// `#[allow(removed_lint)]` continues to compile"* — the
     /// unknown name itself surfaces as a (suppressible) warning.
     UnknownLint,
+    /// `#[deprecated]` slice 4 — a reference resolved to a symbol that
+    /// carries a `Deprecation` payload (recorded in the resolver's
+    /// symbol table by slice 3b). Routed through `type_lint_warning`
+    /// with the `deprecated` lint name; the cascade walker (slice 4b)
+    /// decides whether to suppress / warn / promote-to-error based on
+    /// enclosing `#[allow(deprecated)]` / `#[warn(deprecated)]` /
+    /// `#[deny(deprecated)]` / `#[expect(deprecated)]` attributes. The
+    /// message surfaces the optional `note` / `since` fields when set.
+    Deprecated,
 }
 
 impl std::fmt::Display for TypeError {
@@ -1143,6 +1152,61 @@ impl<'a> TypeChecker<'a> {
         crate::lints::lint_by_name(lint_name)
             .map(|info| info.default_level)
             .unwrap_or(crate::lints::LintLevel::Warn)
+    }
+
+    /// `#[deprecated]` slice 4 — at a reference site, check whether
+    /// the resolved name is a deprecated symbol and emit the
+    /// `deprecated` lint warning through `type_lint_warning` if so.
+    /// Routes via the slice-4b cascade so `#[allow(deprecated)]` on
+    /// the enclosing scope suppresses, `#[deny(deprecated)]` promotes
+    /// to error, etc.
+    ///
+    /// The resolver's symbol table (extended by slice 3b) carries a
+    /// `Deprecation` payload keyed by `SymbolId`; the resolver's
+    /// resolution map (`SpanKey → SymbolId`) connects the reference's
+    /// span to its target. When the reference's span is not in the
+    /// resolutions map (e.g., the typechecker resolved the name via
+    /// its own env rather than the resolver, as it does for free
+    /// functions and constants), `display_name` is used to look up the
+    /// symbol by name in the global scope as a fallback.
+    pub(super) fn check_deprecated_use_at(&mut self, span: &Span, display_name: &str) {
+        use crate::resolver::ScopeId;
+        let span_key = SpanKey::from_span(span);
+        // First try the per-span resolution map (the precise path).
+        let sym_id = self
+            .resolve_result
+            .resolutions
+            .get(&span_key)
+            .copied()
+            .or_else(|| {
+                // Fallback: look up by name in global scope. The
+                // typechecker often resolves free fns / consts /
+                // variants by env-lookup rather than threading the
+                // resolver's SpanKey — global-scope name lookup is
+                // the next-best signal.
+                self.resolve_result
+                    .symbol_table
+                    .lookup_in_scope(ScopeId(0), display_name)
+                    .map(|s| s.id)
+            });
+        let Some(sym_id) = sym_id else { return };
+        let Some(dep) = self.resolve_result.symbol_table.deprecation_for(sym_id) else {
+            return;
+        };
+        let mut message = format!("warning[deprecated]: use of deprecated item `{display_name}`");
+        if let Some(ref note) = dep.note {
+            message.push_str(&format!(": {note}"));
+        }
+        if let Some(ref since) = dep.since {
+            message.push_str(&format!(" (since {since})"));
+        }
+        message.push_str(" — suppress with `#[allow(deprecated)]` on the enclosing item");
+        self.type_lint_warning(
+            message,
+            span.clone(),
+            TypeErrorKind::Deprecated,
+            "deprecated",
+        );
     }
 
     /// Validate an `as` cast (`from as to`) and emit a focused diagnostic

@@ -350,6 +350,19 @@ impl<'a> super::TypeChecker<'a> {
                     return Type::Shared(name.clone());
                 }
             }
+            // `#[deprecated]` slice 4 — emit deprecation warning when
+            // a type-position reference resolves to a deprecated
+            // struct / enum / trait. Lowering happens AFTER the
+            // enclosing item's `lint_override_stack` frame is pushed
+            // (the typechecker walks signatures inside `check_function`
+            // / `check_impl_block` after pushing), so the cascade
+            // honours `#[allow(deprecated)]` on the enclosing scope.
+            if self.env.structs.contains_key(name)
+                || self.env.enums.contains_key(name)
+                || self.env.traits.contains_key(name)
+            {
+                self.check_deprecated_use_at(&path.span, name);
+            }
             Type::Named {
                 name: name.clone(),
                 args,

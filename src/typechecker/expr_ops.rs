@@ -177,15 +177,27 @@ impl<'a> super::TypeChecker<'a> {
             return ty.clone();
         }
         // Check functions
-        if let Some(sig) = self.env.functions.get(name) {
+        if let Some((params, return_type)) = self
+            .env
+            .functions
+            .get(name)
+            .map(|sig| (sig.params.clone(), sig.return_type.clone()))
+        {
+            // `#[deprecated]` slice 4 — emit the deprecation warning
+            // BEFORE returning so the cascade has the enclosing fn /
+            // impl scope on the stack (the fn body that contains this
+            // identifier reference). The lookup queries the resolver's
+            // symbol table by name to find the deprecation payload.
+            self.check_deprecated_use_at(span, name);
             return Type::Function {
-                params: sig.params.clone(),
-                return_type: Box::new(sig.return_type.clone()),
+                params,
+                return_type: Box::new(return_type),
             };
         }
         // Check constants
-        if let Some(ty) = self.env.constants.get(name) {
-            return ty.clone();
+        if let Some(ty) = self.env.constants.get(name).cloned() {
+            self.check_deprecated_use_at(span, name);
+            return ty;
         }
         // Check enum variants (unit variants used as values; tuple variants
         // as constructor functions). Generic enums thread their declared

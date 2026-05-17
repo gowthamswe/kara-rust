@@ -15074,3 +15074,136 @@ fn impl_trait_slice6_tait_use_with_non_trait_method_emits_stub_diagnostic() {
         result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
     );
 }
+
+// ── `#[deprecated]` slice 4 — use-site warning emission ─────────
+//
+// At every reference site that resolves to a `Deprecation`-bearing
+// symbol, the typechecker emits a `deprecated` lint warning through
+// `type_lint_warning`. The slice-4b cascade decides Allow/Warn/Deny
+// based on `#[allow(deprecated)]` / `#[warn(deprecated)]` /
+// `#[deny(deprecated)]` on the enclosing scope. Without an override,
+// the lint's registered default (`Warn`) fires.
+
+#[test]
+fn deprecated_slice4_call_to_deprecated_fn_emits_warning() {
+    let result = typecheck_ok(
+        "#[deprecated]\npub fn old_api() -> i64 { 0 }\n\
+         fn caller() -> i64 { old_api() }",
+    );
+    let warn = result
+        .warnings
+        .iter()
+        .find(|w| w.lint_name.as_deref() == Some("deprecated"))
+        .expect("expected a `deprecated` warning at the call site");
+    assert!(warn.message.contains("old_api"));
+    assert!(warn.message.contains("deprecated"));
+    assert!(warn.message.contains("#[allow(deprecated)]"));
+}
+
+#[test]
+fn deprecated_slice4_long_form_surfaces_note_and_since() {
+    let result = typecheck_ok(
+        "#[deprecated(since: \"1.2.0\", note: \"use `new_api` instead\")]\n\
+         pub fn old_api() -> i64 { 0 }\n\
+         fn caller() -> i64 { old_api() }",
+    );
+    let warn = result
+        .warnings
+        .iter()
+        .find(|w| w.lint_name.as_deref() == Some("deprecated"))
+        .expect("expected a `deprecated` warning");
+    assert!(warn.message.contains("use `new_api` instead"));
+    assert!(warn.message.contains("1.2.0"));
+}
+
+#[test]
+fn deprecated_slice4_allow_suppresses_at_caller() {
+    let result = typecheck_ok(
+        "#[deprecated]\npub fn old_api() -> i64 { 0 }\n\
+         #[allow(deprecated)]\n\
+         fn caller() -> i64 { old_api() }",
+    );
+    assert!(!result
+        .warnings
+        .iter()
+        .any(|w| w.lint_name.as_deref() == Some("deprecated")));
+}
+
+#[test]
+fn deprecated_slice4_deny_promotes_to_error() {
+    let parsed = parse(
+        "#[deprecated]\npub fn old_api() -> i64 { 0 }\n\
+         #[deny(deprecated)]\n\
+         fn caller() -> i64 { old_api() }",
+    );
+    assert!(parsed.errors.is_empty());
+    let resolved = resolve(&parsed.program);
+    assert!(resolved.errors.is_empty());
+    let result = typecheck(&parsed.program, &resolved);
+    assert!(result
+        .errors
+        .iter()
+        .any(|e| e.lint_name.as_deref() == Some("deprecated")));
+}
+
+#[test]
+fn deprecated_slice4_non_deprecated_fn_no_warning() {
+    let result = typecheck_ok("pub fn fresh() -> i64 { 0 }\nfn caller() -> i64 { fresh() }");
+    assert!(!result
+        .warnings
+        .iter()
+        .any(|w| w.lint_name.as_deref() == Some("deprecated")));
+}
+
+#[test]
+fn deprecated_slice4_deprecated_const_use_emits_warning() {
+    let result = typecheck_ok(
+        "#[deprecated]\npub const OLD_LIMIT: i64 = 100;\n\
+         fn ceiling() -> i64 { OLD_LIMIT }",
+    );
+    let warn = result
+        .warnings
+        .iter()
+        .find(|w| w.lint_name.as_deref() == Some("deprecated") && w.message.contains("OLD_LIMIT"))
+        .expect("expected a `deprecated` warning naming OLD_LIMIT");
+    assert!(warn.message.contains("deprecated"));
+}
+
+#[test]
+fn deprecated_slice4_type_position_use_emits_warning() {
+    let result = typecheck_ok(
+        "#[deprecated]\npub struct OldShape { x: i64 }\n\
+         fn use_it(s: OldShape) -> i64 { s.x }",
+    );
+    let warn = result
+        .warnings
+        .iter()
+        .find(|w| w.lint_name.as_deref() == Some("deprecated"))
+        .expect("expected a `deprecated` warning on the type-position use");
+    assert!(warn.message.contains("OldShape"));
+}
+
+#[test]
+fn deprecated_slice4_struct_literal_emits_warning() {
+    let result = typecheck_ok(
+        "#[deprecated]\npub struct OldShape { x: i64 }\n\
+         fn make() -> OldShape { OldShape { x: 0 } }",
+    );
+    let warnings_count = result
+        .warnings
+        .iter()
+        .filter(|w| w.lint_name.as_deref() == Some("deprecated") && w.message.contains("OldShape"))
+        .count();
+    assert!(warnings_count >= 1);
+}
+
+#[test]
+fn deprecated_slice4_self_referential_use_inside_deprecated_fn_emits() {
+    let result = typecheck_ok(
+        "#[deprecated]\npub fn old_helper() -> i64 { 0 }\n\
+         #[deprecated]\npub fn old_api() -> i64 { old_helper() }",
+    );
+    assert!(result.warnings.iter().any(|w| {
+        w.lint_name.as_deref() == Some("deprecated") && w.message.contains("old_helper")
+    }));
+}

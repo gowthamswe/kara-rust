@@ -789,6 +789,10 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 crate::typechecker::TypeErrorKind::NonExhaustiveCrossPackageMatch => "E0242",
                 crate::typechecker::TypeErrorKind::NonExhaustiveCrossPackagePattern => "E0243",
                 crate::typechecker::TypeErrorKind::UnknownLint => "W0244",
+                // `Deprecated` only appears as a warning under default
+                // settings; if `#[deny(deprecated)]` promotes it to an
+                // error the same code is reused as `E0245`.
+                crate::typechecker::TypeErrorKind::Deprecated => "E0245",
             };
             diags.add(DiagEntry {
                 id: &format!("d{id_counter}"),
@@ -809,6 +813,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
             let code = match warn.kind {
                 crate::typechecker::TypeErrorKind::UnreachableArm => "W0237",
                 crate::typechecker::TypeErrorKind::UnknownLint => "W0244",
+                crate::typechecker::TypeErrorKind::Deprecated => "W0245",
                 // Other kinds aren't expected to appear as warnings today.
                 _ => "W0299",
             };

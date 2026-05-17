@@ -242,6 +242,14 @@ impl<'a> super::TypeChecker<'a> {
             }
         };
 
+        // `#[deprecated]` slice 4 — emit the deprecation warning when
+        // the struct's defining decl carries a `Deprecation` payload.
+        // Surface here is struct-literal construction (`Foo { ... }`);
+        // the type-position reference (`var: Foo`) is covered by the
+        // `lower_path_type` site, and the pattern reference is covered
+        // by `check_pattern_against`'s struct-pattern arm.
+        self.check_deprecated_use_at(span, &struct_name);
+
         // `#[non_exhaustive]` slice 4 — cross-package struct-literal
         // enforcement. A `pub struct` marked `#[non_exhaustive]` may
         // grow additional fields without breaking source compatibility;
