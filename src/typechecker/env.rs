@@ -62,6 +62,18 @@ pub struct EnumInfo {
     /// See [`StructInfo::must_use_message`]. Same role on enum
     /// declarations; slice 4 of the `#[must_use]` mandate.
     pub must_use_message: Option<String>,
+    /// `#[non_exhaustive]` flag carried on the `pub enum` declaration
+    /// (slice 1+2 parser captured this on `EnumDef.is_non_exhaustive`).
+    /// Read at the match exhaustiveness site to enforce the cross-package
+    /// wildcard rule (slice 5): a `match` on a non-exhaustive enum from
+    /// another package must include a `_ =>` arm regardless of variant
+    /// coverage, because new variants may land without breaking source
+    /// compatibility. Same-package matches keep the strict
+    /// variant-by-variant exhaustiveness check.
+    pub is_non_exhaustive: bool,
+    /// See [`StructInfo::defining_stdlib_origin`]. Same role on enums;
+    /// today the only inter-package boundary is stdlib-vs-user.
+    pub defining_stdlib_origin: bool,
 }
 
 #[derive(Debug, Clone)]

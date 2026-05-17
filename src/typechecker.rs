@@ -368,6 +368,15 @@ pub enum TypeErrorKind {
     /// fires at the cross-package boundary. See design.md
     /// § `#[non_exhaustive]` for Evolvable Public Types.
     NonExhaustiveCrossPackageLiteral,
+    /// `#[non_exhaustive]` slice 5 — a cross-package consumer wrote a
+    /// `match` on a `#[non_exhaustive]` enum without a wildcard arm.
+    /// New variants may land without breaking source compatibility, so
+    /// outside-package consumers cannot enumerate the current variant
+    /// set exhaustively. Distinct from `NonExhaustiveMatch` (the
+    /// strict variant-by-variant rule) because the wildcard requirement
+    /// here is unconditional regardless of which variants are covered;
+    /// same-package matches keep the strict rule.
+    NonExhaustiveCrossPackageMatch,
 }
 
 impl std::fmt::Display for TypeError {

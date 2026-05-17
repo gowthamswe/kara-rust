@@ -84,6 +84,8 @@ impl<'a> super::TypeChecker<'a> {
                             derived_traits,
                             is_shared: e.is_shared,
                             must_use_message,
+                            is_non_exhaustive: e.is_non_exhaustive,
+                            defining_stdlib_origin: e.stdlib_origin,
                         },
                     );
                 }
@@ -896,6 +898,8 @@ impl<'a> super::TypeChecker<'a> {
                 derived_traits,
                 is_shared: e.is_shared,
                 must_use_message,
+                is_non_exhaustive: e.is_non_exhaustive,
+                defining_stdlib_origin: e.stdlib_origin,
             },
         );
     }

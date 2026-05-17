@@ -563,6 +563,50 @@ impl<'a> super::TypeChecker<'a> {
                 TypeErrorKind::UnreachableArm,
             );
         }
+
+        // `#[non_exhaustive]` slice 5 — cross-package enum match must
+        // include a wildcard arm regardless of variant coverage. The
+        // defining package may add variants without breaking source
+        // compatibility, so outside-package consumers cannot enumerate
+        // the current variant set exhaustively. Same-package matches
+        // fall through to the strict variant-by-variant rule below.
+        // The check fires BEFORE `check_match_exhaustive` so a missing
+        // wildcard surfaces as the slice-5 diagnostic, not as a
+        // generic "missing variant Vn" tail (which would mislead the
+        // author into adding the listed variant rather than `_`).
+        if let Type::Named { name, .. } = scrutinee_type {
+            if let Some(enum_info) = self.env.enums.get(name) {
+                // Variant names short-circuit `PatternKind::Binding`'s
+                // catch-all classification: `Read` in pattern position
+                // parses as `Binding("Read")` but is actually a
+                // unit-variant constructor, not a fresh binding.
+                let variant_names: std::collections::HashSet<&str> =
+                    enum_info.variants.iter().map(|(n, _)| n.as_str()).collect();
+                if enum_info.is_non_exhaustive
+                    && enum_info.defining_stdlib_origin
+                    && !self.current_fn_stdlib_origin
+                    && !arms_contain_catchall(arms, &variant_names)
+                {
+                    self.type_error(
+                        format!(
+                            "error[E_NON_EXHAUSTIVE_CROSS_PACKAGE_MATCH]: \
+                             match on `{name}` must include a wildcard arm \
+                             (`_ => ...`) — `{name}` is `#[non_exhaustive]` \
+                             and defined in another package, so new variants \
+                             may land without breaking source compatibility. \
+                             Add `_ => todo!(\"handle new variant\")` (or a \
+                             real handler) before the closing brace. \
+                             See design.md § `#[non_exhaustive]` for \
+                             Evolvable Public Types."
+                        ),
+                        span.clone(),
+                        TypeErrorKind::NonExhaustiveCrossPackageMatch,
+                    );
+                    return;
+                }
+            }
+        }
+
         match check_match_exhaustive(scrutinee_type, arms, &self.env) {
             ExhaustiveResult::Exhaustive | ExhaustiveResult::Skipped => {}
             ExhaustiveResult::NonExhaustive { witness } => {
@@ -1061,5 +1105,37 @@ impl<'a> super::TypeChecker<'a> {
                 TypeErrorKind::RefutablePattern,
             );
         }
+    }
+}
+
+/// Slice 5 helper — does the arm list include a catch-all pattern?
+/// `_` (Wildcard) is the canonical form; a bare binding (`x`) whose
+/// name is NOT one of the scrutinee enum's variants without a guard
+/// also catches every value and counts as a catch-all. Or-patterns
+/// whose alternatives include a wildcard, and `name @ _` at-bindings,
+/// are also catch-alls. A guarded arm (`x if cond =>`) is NOT a
+/// catch-all because the guard can fail.
+///
+/// `variant_names` is the scrutinee enum's variant-name set:
+/// `PatternKind::Binding("Read")` matches a `Read` variant constructor
+/// when `Read` is in the set (not a catch-all) but a free binding
+/// otherwise (catch-all). The parser cannot distinguish these at
+/// parse time — `Binding(name)` is the surface for both — so the
+/// typechecker discriminates here using its env.
+fn arms_contain_catchall(
+    arms: &[MatchArm],
+    variant_names: &std::collections::HashSet<&str>,
+) -> bool {
+    arms.iter()
+        .any(|arm| arm.guard.is_none() && pattern_is_catchall(&arm.pattern, variant_names))
+}
+
+fn pattern_is_catchall(p: &Pattern, variant_names: &std::collections::HashSet<&str>) -> bool {
+    match &p.kind {
+        PatternKind::Wildcard => true,
+        PatternKind::Binding(name) => !variant_names.contains(name.as_str()),
+        PatternKind::AtBinding { pattern, .. } => pattern_is_catchall(pattern, variant_names),
+        PatternKind::Or(alts) => alts.iter().any(|p| pattern_is_catchall(p, variant_names)),
+        _ => false,
     }
 }

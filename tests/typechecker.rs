@@ -14039,3 +14039,279 @@ fn impl_trait_slice4_captures_all_ref_inputs_on_ambiguous_elision() {
     got.sort();
     assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
 }
+
+// ── `#[non_exhaustive]` slice 5 — enum exhaustiveness wildcard rule ──
+//
+// A `match` on a cross-package `#[non_exhaustive]` enum must include a
+// wildcard arm (`_ => ...`) **regardless** of variant coverage — even
+// if the match lists every current variant, the defining package may
+// add a new variant later and the consumer's code must keep compiling.
+// The same-package case is unchanged: the strict variant-by-variant
+// rule catches "you added a variant and forgot to handle it" locally.
+
+fn typecheck_with_stdlib_origin_on_enums(source: &str) -> Vec<TypeError> {
+    use karac::ast::Item;
+    let mut parsed = parse(source);
+    assert!(
+        parsed.errors.is_empty(),
+        "Parse errors: {:?}",
+        parsed.errors
+    );
+    for item in &mut parsed.program.items {
+        if let Item::EnumDef(e) = item {
+            e.stdlib_origin = true;
+        }
+    }
+    let resolved = resolve(&parsed.program);
+    assert!(
+        resolved.errors.is_empty(),
+        "Resolve errors: {:?}",
+        resolved
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+    typecheck(&parsed.program, &resolved).errors
+}
+
+#[test]
+fn non_exhaustive_slice5_cross_package_match_without_wildcard_rejected() {
+    // Headline negative — every variant listed but no `_` arm; the
+    // cross-package non-exhaustive rule still fires because new
+    // variants may land later.
+    let errs = typecheck_with_stdlib_origin_on_enums(
+        "#[non_exhaustive]\npub enum Op { Read, Write }\n\
+         fn classify(o: Op) -> i64 { match o { Read => 1, Write => 2 } }",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NonExhaustiveCrossPackageMatch)),
+        "expected NonExhaustiveCrossPackageMatch; got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    assert!(
+        errs.iter().any(|e| {
+            matches!(e.kind, TypeErrorKind::NonExhaustiveCrossPackageMatch)
+                && e.message.contains("E_NON_EXHAUSTIVE_CROSS_PACKAGE_MATCH")
+                && e.message.contains("Op")
+                && e.message.contains("_ =>")
+        }),
+        "diagnostic must carry symbolic code, name the enum, and \
+         suggest the `_ =>` fix-it; got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    assert!(
+        errs.iter().any(|e| {
+            matches!(e.kind, TypeErrorKind::NonExhaustiveCrossPackageMatch)
+                && e.message.contains("todo!(")
+        }),
+        "diagnostic should include the `todo!(...)` placeholder in the \
+         fix-it as the spec mandates; got: {:?}",
+        errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_exhaustive_slice5_cross_package_match_with_wildcard_accepted() {
+    // Positive — same code, with `_ =>` added, must typecheck cleanly.
+    let errs = typecheck_with_stdlib_origin_on_enums(
+        "#[non_exhaustive]\npub enum Op { Read, Write }\n\
+         fn classify(o: Op) -> i64 { \
+             match o { Read => 1, Write => 2, _ => 0 } \
+         }",
+    );
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NonExhaustiveCrossPackageMatch)),
+        "wildcard arm should silence the cross-package rule; got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_exhaustive_slice5_same_package_match_uses_strict_rule() {
+    // The defining package is checked with the strict rule — every
+    // variant must be listed (or `_` provided). Listing all variants
+    // without `_` is fine because there are no unseen variants from
+    // the defining package's perspective. This pins the
+    // package-relative carve-out from the spec.
+    let parsed = parse(
+        "#[non_exhaustive]\npub enum Op { Read, Write }\n\
+         fn classify(o: Op) -> i64 { match o { Read => 1, Write => 2 } }",
+    );
+    assert!(parsed.errors.is_empty());
+    let resolved = resolve(&parsed.program);
+    assert!(resolved.errors.is_empty());
+    let result = typecheck(&parsed.program, &resolved);
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NonExhaustiveCrossPackageMatch)),
+        "same-package match listing all variants is fine; got: {:?}",
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NonExhaustiveMatch)),
+        "and the strict-rule diagnostic must also be silent because all \
+         variants are listed; got: {:?}",
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_exhaustive_slice5_same_package_strict_rule_fires_on_missing_variant() {
+    // Sibling positive pin — same-package match missing a variant
+    // and with no wildcard fires the existing `NonExhaustiveMatch`
+    // (strict) rule, NOT the new cross-package rule. This is the
+    // "local code catches `you added a variant and forgot to handle
+    // it`" guarantee.
+    let parsed = parse(
+        "#[non_exhaustive]\npub enum Op { Read, Write }\n\
+         fn classify(o: Op) -> i64 { match o { Read => 1 } }",
+    );
+    assert!(parsed.errors.is_empty());
+    let resolved = resolve(&parsed.program);
+    assert!(resolved.errors.is_empty());
+    let result = typecheck(&parsed.program, &resolved);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NonExhaustiveMatch)),
+        "missing `Write` arm should fire the strict rule; got: {:?}",
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NonExhaustiveCrossPackageMatch)),
+        "the cross-package rule must NOT fire on same-package matches; got: {:?}",
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_exhaustive_slice5_cross_package_match_without_attribute_uses_strict_rule() {
+    // Plain `pub enum` (no `#[non_exhaustive]`) used cross-package
+    // continues to use the strict rule — listing all variants is
+    // fine, missing one fires `NonExhaustiveMatch`, not the slice-5
+    // rule.
+    let errs = typecheck_with_stdlib_origin_on_enums(
+        "pub enum Plain { A, B }\n\
+         fn classify(p: Plain) -> i64 { match p { A => 1, B => 2 } }",
+    );
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NonExhaustiveCrossPackageMatch)),
+        "no #[non_exhaustive] means no slice-5 rule; got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_exhaustive_slice5_stdlib_internal_match_accepted() {
+    // The defining package retains exhaustive-match access — flip
+    // BOTH the enum and the function to stdlib_origin and confirm
+    // no cross-package rule fires.
+    use karac::ast::Item;
+    let mut parsed = parse(
+        "#[non_exhaustive]\npub enum Op { Read, Write }\n\
+         fn classify(o: Op) -> i64 { match o { Read => 1, Write => 2 } }",
+    );
+    assert!(parsed.errors.is_empty());
+    for item in &mut parsed.program.items {
+        match item {
+            Item::EnumDef(e) => e.stdlib_origin = true,
+            Item::Function(f) => f.stdlib_origin = true,
+            _ => {}
+        }
+    }
+    let resolved = resolve(&parsed.program);
+    assert!(resolved.errors.is_empty());
+    let result = typecheck(&parsed.program, &resolved);
+    assert!(
+        !result
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NonExhaustiveCrossPackageMatch)),
+        "stdlib-internal match on its own #[non_exhaustive] enum is \
+         fine; got: {:?}",
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_exhaustive_slice5_bare_binding_arm_counts_as_catchall() {
+    // A bare binding (`other => ...`) at the tail of the arms is a
+    // catch-all without a guard — slice-5 must accept it just like
+    // `_ => ...`. Pins the `pattern_is_catchall` helper.
+    let errs = typecheck_with_stdlib_origin_on_enums(
+        "#[non_exhaustive]\npub enum Op { Read, Write }\n\
+         fn classify(o: Op) -> i64 { \
+             match o { Read => 1, Write => 2, other => 0 } \
+         }",
+    );
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e.kind, TypeErrorKind::NonExhaustiveCrossPackageMatch)),
+        "bare binding tail should count as catch-all; got: {:?}",
+        errs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_exhaustive_slice5_enum_info_carries_flag() {
+    // Plumbing pin — `EnumInfo` round-trips `is_non_exhaustive` and
+    // `defining_stdlib_origin` from the AST through env-building.
+    use karac::ast::Item;
+    let mut parsed = parse(
+        "#[non_exhaustive]\npub enum A { X, Y }\n\
+         pub enum B { P, Q }",
+    );
+    assert!(parsed.errors.is_empty());
+    for item in &mut parsed.program.items {
+        if let Item::EnumDef(e) = item {
+            if e.name == "A" {
+                e.stdlib_origin = true;
+            }
+        }
+    }
+    let resolved = resolve(&parsed.program);
+    assert!(resolved.errors.is_empty());
+    let result = typecheck(&parsed.program, &resolved);
+    let a = result.enum_info.get("A").expect("A registered");
+    let b = result.enum_info.get("B").expect("B registered");
+    assert!(a.is_non_exhaustive);
+    assert!(a.defining_stdlib_origin);
+    assert!(!b.is_non_exhaustive);
+    assert!(!b.defining_stdlib_origin);
+}
