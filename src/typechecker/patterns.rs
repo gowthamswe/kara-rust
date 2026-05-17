@@ -596,10 +596,11 @@ impl<'a> super::TypeChecker<'a> {
     fn check_exhaustiveness(&mut self, scrutinee_type: &Type, arms: &[MatchArm], span: Span) {
         use crate::exhaustive::{check_match_exhaustive, unreachable_arms, ExhaustiveResult};
         for idx in unreachable_arms(scrutinee_type, arms, &self.env) {
-            self.type_warning(
+            self.type_lint_warning(
                 "unreachable match arm: pattern is fully covered by an earlier arm".to_string(),
                 arms[idx].pattern.span.clone(),
                 TypeErrorKind::UnreachableArm,
+                "unreachable_arm",
             );
         }
 

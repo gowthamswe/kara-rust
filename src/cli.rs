@@ -620,6 +620,13 @@ struct DiagEntry<'a> {
     suggestion: Option<&'a str>,
     /// Optional pre-formatted JSON fields appended verbatim to the entry object.
     extra_json: Option<String>,
+    /// Registered lint name when this entry is a warning routed through
+    /// a lint (slice 7 of the lint-level entry — see
+    /// `phase-5-diagnostics.md`). Surfaced as `"lint_name":"..."` in the
+    /// JSON output so `karac --output=json` consumers can route, group,
+    /// and filter by lint. `None` on hard errors and on warnings that
+    /// haven't migrated to a registered lint yet.
+    lint_name: Option<&'a str>,
 }
 
 struct DiagnosticJson {
@@ -646,6 +653,9 @@ impl DiagnosticJson {
         );
         if let Some(s) = d.suggestion {
             write!(entry, ",\"hints\":[{{\"description\":{}}}]", json_string(s)).unwrap();
+        }
+        if let Some(name) = d.lint_name {
+            write!(entry, ",\"lint_name\":{}", json_string(name)).unwrap();
         }
         if let Some(ref extra) = d.extra_json {
             write!(entry, ",{}", extra).unwrap();
@@ -680,6 +690,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
             span: &err.span,
             suggestion: None,
             extra_json: None,
+            lint_name: None,
         });
     }
 
@@ -732,6 +743,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 span: &err.span,
                 suggestion: err.suggestion.as_deref(),
                 extra_json: replacement_json,
+                lint_name: None,
             });
         }
     }
@@ -788,6 +800,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 span: &err.span,
                 suggestion: None,
                 extra_json: None,
+                lint_name: None,
             });
         }
         for warn in &t.warnings {
@@ -808,6 +821,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 span: &warn.span,
                 suggestion: None,
                 extra_json: None,
+                lint_name: warn.lint_name.as_deref(),
             });
         }
     }
@@ -856,6 +870,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 span: &err.span,
                 suggestion: None,
                 extra_json,
+                lint_name: None,
             });
         }
     }
@@ -905,6 +920,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 span: &err.span,
                 suggestion: err.suggestion.as_deref(),
                 extra_json: replacement_json,
+                lint_name: None,
             });
         }
         for note in &o.notes {
@@ -932,6 +948,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 span: &note.span,
                 suggestion: note.suggestion.as_deref(),
                 extra_json: replacement_json,
+                lint_name: None,
             });
         }
     }
@@ -951,6 +968,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 span: &err.closure_span,
                 suggestion: None,
                 extra_json: None,
+                lint_name: None,
             });
         }
     }

@@ -174,6 +174,13 @@ pub const STARTER_LINTS: &[LintInfo] = &[
         default_level: LintLevel::Warn,
         description: "A lint-level attribute names a lint the compiler does not recognise.",
     },
+    LintInfo {
+        name: "unreachable_arm",
+        default_level: LintLevel::Warn,
+        description:
+            "A match arm pattern is fully covered by an earlier (unguarded) arm, so its body \
+             can never execute.",
+    },
 ];
 
 /// Look up a lint by its registered name. Returns `None` for

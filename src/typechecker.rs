@@ -255,6 +255,14 @@ pub struct TypeError {
     pub message: String,
     pub span: Span,
     pub kind: TypeErrorKind,
+    /// Lint name when this entry is a warning emitted via the lint
+    /// machinery (e.g., `UnreachableArm` → `Some("unreachable_arm")`).
+    /// `None` on hard errors and on warnings that don't yet route
+    /// through a registered lint. Surfaced into the structured JSON
+    /// diagnostic so `karac --output=json` consumers can filter,
+    /// group, and route by lint name. Slice 7 of the lint-level
+    /// entry — see `phase-5-diagnostics.md` § "Lint level attributes".
+    pub lint_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -855,6 +863,7 @@ impl<'a> TypeChecker<'a> {
             message,
             span,
             kind,
+            lint_name: None,
         });
     }
 
@@ -962,11 +971,27 @@ impl<'a> TypeChecker<'a> {
         self.type_error(msg, span, TypeErrorKind::TypeMismatch);
     }
 
-    pub(super) fn type_warning(&mut self, message: String, span: Span, kind: TypeErrorKind) {
+    /// Push a structured warning carrying the registered lint name so
+    /// downstream JSON consumers can route by lint (slice 7 of the
+    /// lint-level entry). All typechecker warnings flow through this
+    /// helper — bare lint-less warnings are rejected by the spec
+    /// ("every warning emitted by the compiler must record the lint
+    /// name in the structured diagnostic"). Caller names a lint that
+    /// exists in `crate::lints::STARTER_LINTS`; an unknown name parses
+    /// fine but future cascade lookups (slice 4b) will fall through to
+    /// the default level.
+    pub(super) fn type_lint_warning(
+        &mut self,
+        message: String,
+        span: Span,
+        kind: TypeErrorKind,
+        lint_name: &'static str,
+    ) {
         self.warnings.push(TypeError {
             message,
             span,
             kind,
+            lint_name: Some(lint_name.to_string()),
         });
     }
 

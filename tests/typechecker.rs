@@ -971,6 +971,99 @@ fn test_reachability_clean_match_no_warnings() {
     );
 }
 
+// ── Lint-level slice 7 — lint_name on TypeError carry-through ──
+//
+// Every warning emitted by the compiler must record the lint name in
+// the structured diagnostic so `karac --output=json` consumers can
+// route, group, and filter by lint. Today the typechecker emits one
+// kind of warning (`UnreachableArm`); slice 7 sets its `lint_name`
+// to `"unreachable_arm"` so downstream tooling can filter on it.
+// Future warnings emitted via `type_lint_warning` plug into the same
+// channel; the cascade reader (slice 4b) will key off the same field
+// to decide whether each warning is suppressed / promoted to error.
+
+#[test]
+fn lint_attrs_slice7_unreachable_arm_warning_carries_lint_name() {
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         fn name(c: Color) -> i64 {\n\
+             match c {\n\
+                 Red   => 1,\n\
+                 Red   => 2,\n\
+                 Green => 3,\n\
+                 Blue  => 4,\n\
+             }\n\
+         }",
+    );
+    let warn = result
+        .warnings
+        .iter()
+        .find(|w| w.kind == TypeErrorKind::UnreachableArm)
+        .expect("expected UnreachableArm warning");
+    assert_eq!(
+        warn.lint_name.as_deref(),
+        Some("unreachable_arm"),
+        "UnreachableArm warning should carry lint_name=\"unreachable_arm\"; got: {:?}",
+        warn.lint_name
+    );
+}
+
+#[test]
+fn lint_attrs_slice7_clean_match_has_no_warnings_with_lint_name() {
+    // Regression pin — a clean match emits no warnings; the lint_name
+    // field is only populated when a warning fires.
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         fn name(c: Color) -> i64 {\n\
+             match c {\n\
+                 Red   => 1,\n\
+                 Green => 2,\n\
+                 Blue  => 3,\n\
+             }\n\
+         }",
+    );
+    assert!(result.warnings.is_empty());
+}
+
+#[test]
+fn lint_attrs_slice7_unreachable_arm_lint_is_registered() {
+    // Pin that the lint name surfaced by the typechecker is in the
+    // central registry, so the future cascade reader (slice 4b) can
+    // look up the default level and respect any `#[allow]` /
+    // `#[warn]` / `#[deny]` / `#[expect]` override.
+    assert!(
+        karac::lints::lint_by_name("unreachable_arm").is_some(),
+        "unreachable_arm should be registered in STARTER_LINTS"
+    );
+}
+
+#[test]
+fn lint_attrs_slice7_error_kinds_have_lint_name_none() {
+    // Regression pin — hard errors (TypeMismatch, etc.) do NOT carry
+    // a lint_name. A future drift that auto-populates lint_name on
+    // every TypeError would silence the slice-7 surface; the field
+    // must remain optional and explicitly opt-in via
+    // `type_lint_warning`.
+    let parsed = parse("fn f() -> i64 { \"not an int\" }");
+    assert!(parsed.errors.is_empty());
+    let resolved = resolve(&parsed.program);
+    assert!(resolved.errors.is_empty());
+    let result = typecheck(&parsed.program, &resolved);
+    assert!(
+        !result.errors.is_empty(),
+        "expected a TypeMismatch error for returning a string from -> i64"
+    );
+    assert!(
+        result.errors.iter().all(|e| e.lint_name.is_none()),
+        "hard errors must not carry lint_name; got: {:?}",
+        result
+            .errors
+            .iter()
+            .map(|e| &e.lint_name)
+            .collect::<Vec<_>>()
+    );
+}
+
 // ── Maranget witness construction (exhaustiveness slice 4) ──────
 
 #[test]
