@@ -4,6 +4,8 @@ Items to validate, benchmark, or revisit during specific implementation phases. 
 
 Sourced from open gaps identified during design review that don't require design decisions but do require action during implementation.
 
+Status-marker convention (including the `[->]` "explicitly deferred" state) is documented in [`docs/deferred.md § Tracker status markers`](../deferred.md#tracker-status-markers).
+
 ---
 
 ## Work in Progress (updated 2026-05-04)

@@ -21,6 +21,19 @@ The project uses four tiers to express both *when* a feature ships and *how comm
 - P2 entries use **promotion gates** when the mechanism is genuinely uncertain — explicit conditions under which the design would solidify (e.g., "promote to P1 when Phase 9 prover handles X reliably and a corpus of N projects exists"). The gates exist so P2 doesn't become indefinitely deferred.
 - P1 entries also have a corresponding `[→ P1]` line in [`implementation_checklist/`](implementation_checklist/) for v1 tracking. P2 / P3 entries don't (they're not v1 work) — the deferred.md entry is the tracking surface.
 
+## Tracker status markers
+
+The phase trackers under [`implementation_checklist/`](implementation_checklist/) use four checkbox states. The fourth — `[->]` — is specifically about intra-epic deferrals (a slice acknowledged-but-skipped within an otherwise shipping epic), distinct from the P0/P1/P2/P3 *feature*-level deferrals above.
+
+| Marker | Meaning |
+|--------|---------|
+| `[ ]` | Not yet started. |
+| `[~]` | Partially shipped — one or more slices done, others still open and scheduled. |
+| `[x]` | Fully shipped. |
+| `[->]` | Explicitly deferred. The body must record the **reason** and the **reopen condition** (a concrete trigger that flips the entry back to `[~]`). Greppable as `\[->\]` for ledger sweeps. |
+
+`[x]` and `[->]` are both "no further work scheduled today"; the difference is whether the rest of the item is *done* or *acknowledged-but-skipped*. Use `[->]` when shipping the placeholder annotation would be busywork without a real motivating signal — it preserves the decision so a future reader doesn't mistake the gap for forgotten scope. `[~]` is reserved for work actively in flight or with an identified next step; once that step is "wait for an external trigger," the marker should flip to `[->]`.
+
 ---
 
 ## P1 — Decided, Non-Breaking
