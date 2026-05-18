@@ -188,6 +188,42 @@ pub const STARTER_LINTS: &[LintInfo] = &[
             "A stdlib `pub enum` whose name ends in `Error` lacks `#[non_exhaustive]`, blocking \
              future variant additions across packages without a source break.",
     },
+    // Slice 4b cross-cutting — registry entries for the per-module
+    // lint names so CLI `-A`/`-W`/`-D`/`-F` fall-through works for
+    // them and so source-level `#[allow(NAME)]` doesn't trigger
+    // spurious `unknown_lint` warnings. The lint *emitters* live in
+    // dedicated modules (`must_use_lint`, `missing_must_use_lint`,
+    // `logical_lint`, `ffi_lint`); registering the names here makes
+    // the cascade walker treat them like any other registered lint.
+    LintInfo {
+        name: "must_use",
+        default_level: LintLevel::Warn,
+        description:
+            "Discarded value of an implicitly-must-use type (`Result[T, E]` or `Option[T]`) \
+             at statement position — silently dropping the value abandons the error / absence \
+             branch the author meant to handle.",
+    },
+    LintInfo {
+        name: "missing_must_use",
+        default_level: LintLevel::Warn,
+        description:
+            "A stdlib `pub fn` returns an iterator-shaped or new-value-from-self value but \
+             lacks `#[must_use]` — discarding the return drops the work without surfacing.",
+    },
+    LintInfo {
+        name: "ambiguous_not_comparison",
+        default_level: LintLevel::Warn,
+        description:
+            "`not` is adjacent to a comparison operator (`not x == y` parses as `(not x) == y`); \
+             disambiguate with explicit parentheses.",
+    },
+    LintInfo {
+        name: "ffi_float_eq",
+        default_level: LintLevel::Warn,
+        description:
+            "An `extern \"C\"` function returning a float is directly compared with `==` or `!=`; \
+             FFI floats may not round-trip exactly, so prefer an epsilon comparison.",
+    },
 ];
 
 /// Look up a lint by its registered name. Returns `None` for
@@ -299,6 +335,76 @@ impl CliLintOverrides {
     }
 }
 
+/// The post-cascade severity for a per-module lint emission
+/// (slice 4b cross-cutting helper). Each lint module —
+/// `unsafe_lint`, `must_use_lint`, `missing_must_use_lint`,
+/// `logical_lint`, `ffi_lint` — has its own `LintDiagnostic` shape
+/// with a `Warning` / `Error` severity field. This enum is the
+/// shared output type the cascade helper hands back, with a
+/// `Suppress` variant covering the cases where the lint should not
+/// emit at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleLintSeverity {
+    /// Don't emit — `#[allow]` / `#[expect]` / CLI `-A` resolved
+    /// the lint to silence.
+    Suppress,
+    /// Emit as a warning (the default for un-promoted Warn lints).
+    Warn,
+    /// Emit as an error — `#[deny]` / CLI `-D` promoted the lint.
+    Deny,
+}
+
+/// Resolve the post-cascade severity for a per-module lint
+/// emission given the in-source `#[allow]` / `#[deny]` / `#[expect]`
+/// flags at the enclosing scope and the CLI build-wide overrides
+/// (slice 4b cross-cutting).
+///
+/// **Precedence (innermost wins, matching the typechecker's
+/// `effective_lint_level` rule):**
+///
+/// 1. Source `#[allow(NAME)]` → `Suppress`.
+/// 2. Source `#[expect(NAME)]` → `Suppress`. **Note:** the per-module
+///    lint walkers don't record fulfilment back into the typechecker's
+///    `fulfilled_expectations` set, so an `#[expect]` whose firing
+///    came from one of these modules will surface as `unfulfilled_lint_expectation`
+///    at end-of-typecheck. Fixing this requires a fulfilment
+///    side-channel from the lint modules into the typechecker —
+///    deferred until a concrete need arises (cross-reference the
+///    `[->]` sub-bullet under the parent lint-level epic).
+/// 3. Source `#[deny(NAME)]` → `Deny`.
+/// 4. CLI `-A` / `-W` / `-D` for this lint name → corresponding
+///    severity.
+/// 5. CLI `-D warnings` catch-all → `Deny` for default-`Warn` lints.
+/// 6. Else → registry default level (`Warn` for un-registered names).
+///
+/// The order pins that source attributes always beat CLI flags —
+/// the inner scope is the most specific authority.
+pub fn effective_level_for_module_lint(
+    source_allow: bool,
+    source_deny: bool,
+    source_expect: bool,
+    cli: &CliLintOverrides,
+    lint_name: &str,
+) -> ModuleLintSeverity {
+    if source_allow || source_expect {
+        return ModuleLintSeverity::Suppress;
+    }
+    if source_deny {
+        return ModuleLintSeverity::Deny;
+    }
+    let registry_default = lint_by_name(lint_name)
+        .map(|info| info.default_level)
+        .unwrap_or(LintLevel::Warn);
+    let resolved = cli
+        .level_for(lint_name, registry_default)
+        .unwrap_or(registry_default);
+    match resolved {
+        LintLevel::Allow | LintLevel::Expect => ModuleLintSeverity::Suppress,
+        LintLevel::Warn => ModuleLintSeverity::Warn,
+        LintLevel::Deny => ModuleLintSeverity::Deny,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +492,65 @@ mod tests {
         let o = CliLintOverrides::default();
         assert_eq!(o.level_for("anything", LintLevel::Warn), None);
         assert!(!o.is_forbidden("anything"));
+    }
+
+    #[test]
+    fn effective_level_for_module_lint_source_allow_suppresses() {
+        let cli = CliLintOverrides::default();
+        let sev = effective_level_for_module_lint(true, false, false, &cli, "undocumented_unsafe");
+        assert_eq!(sev, ModuleLintSeverity::Suppress);
+    }
+
+    #[test]
+    fn effective_level_for_module_lint_source_expect_suppresses() {
+        let cli = CliLintOverrides::default();
+        let sev = effective_level_for_module_lint(false, false, true, &cli, "must_use");
+        assert_eq!(sev, ModuleLintSeverity::Suppress);
+    }
+
+    #[test]
+    fn effective_level_for_module_lint_source_deny_promotes() {
+        let cli = CliLintOverrides::default();
+        let sev = effective_level_for_module_lint(false, true, false, &cli, "ffi_float_eq");
+        assert_eq!(sev, ModuleLintSeverity::Deny);
+    }
+
+    #[test]
+    fn effective_level_for_module_lint_cli_deny_promotes_default_warn() {
+        let cli = CliLintOverrides::with_level("must_use", LintLevel::Deny);
+        let sev = effective_level_for_module_lint(false, false, false, &cli, "must_use");
+        assert_eq!(sev, ModuleLintSeverity::Deny);
+    }
+
+    #[test]
+    fn effective_level_for_module_lint_cli_allow_suppresses_default_warn() {
+        let cli = CliLintOverrides::with_level("must_use", LintLevel::Allow);
+        let sev = effective_level_for_module_lint(false, false, false, &cli, "must_use");
+        assert_eq!(sev, ModuleLintSeverity::Suppress);
+    }
+
+    #[test]
+    fn effective_level_for_module_lint_deny_warnings_catch_all_promotes() {
+        let cli = CliLintOverrides::with_deny_warnings();
+        let sev =
+            effective_level_for_module_lint(false, false, false, &cli, "ambiguous_not_comparison");
+        assert_eq!(sev, ModuleLintSeverity::Deny);
+    }
+
+    #[test]
+    fn effective_level_for_module_lint_source_beats_cli() {
+        // Source `#[allow]` should win over CLI `-D` per the cascade
+        // precedence rule (inner scope is most specific).
+        let cli = CliLintOverrides::with_level("must_use", LintLevel::Deny);
+        let sev = effective_level_for_module_lint(true, false, false, &cli, "must_use");
+        assert_eq!(sev, ModuleLintSeverity::Suppress);
+    }
+
+    #[test]
+    fn effective_level_for_module_lint_no_overrides_defaults_to_warn() {
+        let cli = CliLintOverrides::default();
+        let sev = effective_level_for_module_lint(false, false, false, &cli, "undocumented_unsafe");
+        assert_eq!(sev, ModuleLintSeverity::Warn);
     }
 
     #[test]

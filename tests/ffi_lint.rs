@@ -16,7 +16,10 @@ fn parse_program(source: &str) -> karac::ast::Program {
 }
 
 fn lint(source: &str) -> Vec<karac::ffi_lint::FfiFloatEqDiagnostic> {
-    check_ffi_float_eq(&parse_program(source))
+    check_ffi_float_eq(
+        &parse_program(source),
+        &karac::lints::CliLintOverrides::default(),
+    )
 }
 
 #[test]
@@ -92,4 +95,34 @@ fn test_ffi_float_less_than_no_warn() {
         "< on FFI float should not warn, got: {:?}",
         diags
     );
+}
+
+// ── Slice 4b cross-cutting — CLI fall-through ──────────────────
+
+#[test]
+fn test_cli_allow_suppresses_ffi_float_eq() {
+    let prog = parse_program(
+        r#"unsafe extern "C" { fn norm(x: f64) -> f64; }
+           fn f() { let _ok = norm(1.0) == 0.0; }"#,
+    );
+    let cli =
+        karac::lints::CliLintOverrides::with_level("ffi_float_eq", karac::lints::LintLevel::Allow);
+    let diags = check_ffi_float_eq(&prog, &cli);
+    assert!(
+        diags.is_empty(),
+        "`-A ffi_float_eq` should suppress; got: {diags:?}",
+    );
+}
+
+#[test]
+fn test_cli_deny_promotes_ffi_float_eq() {
+    let prog = parse_program(
+        r#"unsafe extern "C" { fn norm(x: f64) -> f64; }
+           fn f() { let _ok = norm(1.0) == 0.0; }"#,
+    );
+    let cli =
+        karac::lints::CliLintOverrides::with_level("ffi_float_eq", karac::lints::LintLevel::Deny);
+    let diags = check_ffi_float_eq(&prog, &cli);
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0].level, karac::ffi_lint::LintLevel::Error);
 }

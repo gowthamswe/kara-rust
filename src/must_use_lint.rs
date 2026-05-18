@@ -51,7 +51,7 @@ fn implicit_must_use_kind(name: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintLevel {
     Warning,
     Error,
@@ -83,14 +83,34 @@ pub struct LintDiagnostic {
 pub fn check_implicit_must_use(
     program: &Program,
     typed: Option<&TypeCheckResult>,
+    cli_lint_overrides: &crate::lints::CliLintOverrides,
 ) -> Vec<LintDiagnostic> {
     let Some(typed) = typed else {
         return Vec::new();
+    };
+    // Slice 4b cross-cutting — resolve the CLI fall-through severity
+    // once (the lint name is constant per pass). Suppress is a fast
+    // exit; Warn / Deny set the level the walker stamps on each
+    // emitted diagnostic.
+    let severity = crate::lints::effective_level_for_module_lint(
+        false,
+        false,
+        false,
+        cli_lint_overrides,
+        "must_use",
+    );
+    if matches!(severity, crate::lints::ModuleLintSeverity::Suppress) {
+        return Vec::new();
+    }
+    let level = match severity {
+        crate::lints::ModuleLintSeverity::Deny => LintLevel::Error,
+        _ => LintLevel::Warning,
     };
     let mut diags: Vec<LintDiagnostic> = Vec::new();
     {
         let mut walker = Walker {
             typed,
+            level,
             diags: &mut diags,
         };
         for item in &program.items {
@@ -121,6 +141,10 @@ pub fn check_implicit_must_use(
 
 struct Walker<'a> {
     typed: &'a TypeCheckResult,
+    /// Slice 4b cross-cutting — the post-cascade severity for every
+    /// emission this walker produces. Computed once at the entry
+    /// point so the per-emission path is just a `level` field read.
+    level: LintLevel,
     diags: &'a mut Vec<LintDiagnostic>,
 }
 
@@ -290,7 +314,7 @@ impl Walker<'_> {
 
     fn make_implicit_diag(&self, expr: &Expr, kind: &str, why: &str) -> LintDiagnostic {
         LintDiagnostic {
-            level: LintLevel::Warning,
+            level: self.level,
             span: expr.span.clone(),
             message: format!("discarded `{kind}` value — `{kind}` is implicitly `#[must_use]`",),
             lint_name: "must_use".to_string(),
@@ -320,7 +344,7 @@ impl Walker<'_> {
             format!("`{type_name}` is annotated `#[must_use = \"{msg}\"]`. {msg}.")
         };
         LintDiagnostic {
-            level: LintLevel::Warning,
+            level: self.level,
             span: expr.span.clone(),
             message: format!(
                 "discarded `{type_name}` value — `{type_name}` is annotated `#[must_use]`"
@@ -350,7 +374,7 @@ impl Walker<'_> {
             format!("`{callee_name}` is annotated `#[must_use = \"{msg}\"]`. {msg}.")
         };
         LintDiagnostic {
-            level: LintLevel::Warning,
+            level: self.level,
             span: expr.span.clone(),
             message: format!(
                 "discarded return value of `{callee_name}` — the function is annotated \

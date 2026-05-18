@@ -68,7 +68,7 @@ use crate::ast::{
 };
 use crate::token::Span;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintLevel {
     Warning,
     Error,
@@ -99,19 +99,52 @@ enum FireReason {
 /// Walks every `Item::Function` and every inherent-impl method. Fires
 /// only on items where `Function.stdlib_origin == true` — see the
 /// module-level comment for the stdlib-vs-user scoping rationale.
-pub fn check_missing_must_use(program: &Program) -> Vec<LintDiagnostic> {
+pub fn check_missing_must_use(
+    program: &Program,
+    cli_lint_overrides: &crate::lints::CliLintOverrides,
+) -> Vec<LintDiagnostic> {
+    // Slice 4b cross-cutting — `-A missing_must_use` short-circuits
+    // the whole pass; `-D missing_must_use` (or `-D warnings`)
+    // promotes every emission to Error. The per-function `#[allow]`
+    // and `#[deny]` checks layered on top of this still let
+    // individual stdlib `pub fn`s opt out (or opt into stricter
+    // treatment) — source attributes win over CLI per the cascade
+    // precedence rule.
+    let cli_severity = crate::lints::effective_level_for_module_lint(
+        false,
+        false,
+        false,
+        cli_lint_overrides,
+        "missing_must_use",
+    );
+    if matches!(cli_severity, crate::lints::ModuleLintSeverity::Suppress) {
+        return Vec::new();
+    }
+    let default_level = match cli_severity {
+        crate::lints::ModuleLintSeverity::Deny => LintLevel::Error,
+        _ => LintLevel::Warning,
+    };
     let mut diags: Vec<LintDiagnostic> = Vec::new();
     for item in &program.items {
         match item {
-            Item::Function(f) => check_free_function(f, &mut diags),
-            Item::ImplBlock(imp) => check_impl_block(imp, &mut diags),
+            Item::Function(f) => {
+                check_free_function(f, default_level, cli_lint_overrides, &mut diags)
+            }
+            Item::ImplBlock(imp) => {
+                check_impl_block(imp, default_level, cli_lint_overrides, &mut diags)
+            }
             _ => {}
         }
     }
     diags
 }
 
-fn check_free_function(f: &Function, diags: &mut Vec<LintDiagnostic>) {
+fn check_free_function(
+    f: &Function,
+    default_level: LintLevel,
+    cli: &crate::lints::CliLintOverrides,
+    diags: &mut Vec<LintDiagnostic>,
+) {
     if !f.stdlib_origin {
         return;
     }
@@ -121,10 +154,15 @@ fn check_free_function(f: &Function, diags: &mut Vec<LintDiagnostic>) {
     if !f.is_pub {
         return;
     }
-    check_function_with_impl_target(f, None, diags);
+    check_function_with_impl_target(f, None, default_level, cli, diags);
 }
 
-fn check_impl_block(imp: &ImplBlock, diags: &mut Vec<LintDiagnostic>) {
+fn check_impl_block(
+    imp: &ImplBlock,
+    default_level: LintLevel,
+    cli: &crate::lints::CliLintOverrides,
+    diags: &mut Vec<LintDiagnostic>,
+) {
     // Trait-impl methods inherit `#[must_use]` from the trait
     // declaration (when slice 4 wires the must-use registry, the
     // attribute on the trait method flows to every impl). Linting
@@ -146,7 +184,7 @@ fn check_impl_block(imp: &ImplBlock, diags: &mut Vec<LintDiagnostic>) {
             if !m.stdlib_origin {
                 continue;
             }
-            check_function_with_impl_target(m, Some(target), diags);
+            check_function_with_impl_target(m, Some(target), default_level, cli, diags);
         }
     }
 }
@@ -154,6 +192,8 @@ fn check_impl_block(imp: &ImplBlock, diags: &mut Vec<LintDiagnostic>) {
 fn check_function_with_impl_target(
     f: &Function,
     impl_target: Option<&TypeExpr>,
+    default_level: LintLevel,
+    cli: &crate::lints::CliLintOverrides,
     diags: &mut Vec<LintDiagnostic>,
 ) {
     // Already-annotated functions are out of scope — slice 4's
@@ -162,16 +202,26 @@ fn check_function_with_impl_target(
     if has_attr_named(&f.attributes, "must_use") {
         return;
     }
-    // `#[allow(missing_must_use)]` future-proofing: even though the
-    // lint-level-attributes framework isn't wired yet (deferred — see
-    // phase-5-diagnostics.md § "Lint level attributes"), recognise the
-    // suppression marker here so stdlib authors can pre-author it
-    // against the planned framework. The check is purely syntactic;
-    // no diagnostic if the attribute is malformed (the malformed-attr
-    // path is owned by the parser).
-    if has_lint_allow_attr(&f.attributes, "missing_must_use") {
-        return;
-    }
+    // Per-function source-attribute cascade. The function's
+    // `#[allow]` / `#[deny]` / `#[expect]` on `missing_must_use`
+    // override the CLI default — source is more specific than CLI.
+    // `#[warn]` is the default behavior; recognising it as a
+    // no-op keeps round-trip semantics.
+    let source_allow = has_lint_allow_attr(&f.attributes, "missing_must_use");
+    let source_deny = has_lint_level_attr(&f.attributes, "deny", "missing_must_use");
+    let source_expect = has_lint_level_attr(&f.attributes, "expect", "missing_must_use");
+    let per_fn_severity = crate::lints::effective_level_for_module_lint(
+        source_allow,
+        source_deny,
+        source_expect,
+        cli,
+        "missing_must_use",
+    );
+    let level = match per_fn_severity {
+        crate::lints::ModuleLintSeverity::Suppress => return,
+        crate::lints::ModuleLintSeverity::Deny => LintLevel::Error,
+        crate::lints::ModuleLintSeverity::Warn => default_level,
+    };
     let Some(return_ty) = &f.return_type else {
         return;
     };
@@ -200,7 +250,7 @@ fn check_function_with_impl_target(
     let Some(reason) = reason else {
         return;
     };
-    diags.push(make_diagnostic(f, reason));
+    diags.push(make_diagnostic(f, reason, level));
 }
 
 /// Apply the two slice-3 heuristics in order: iterator-adapter return
@@ -223,7 +273,7 @@ fn classify(f: &Function, return_ty: &TypeExpr) -> Option<FireReason> {
     }
 }
 
-fn make_diagnostic(f: &Function, reason: FireReason) -> LintDiagnostic {
+fn make_diagnostic(f: &Function, reason: FireReason, level: LintLevel) -> LintDiagnostic {
     let (message, help, note) = match reason {
         FireReason::IteratorReturn => (
             format!(
@@ -255,7 +305,7 @@ fn make_diagnostic(f: &Function, reason: FireReason) -> LintDiagnostic {
         ),
     };
     LintDiagnostic {
-        level: LintLevel::Warning,
+        level,
         span: f.span.clone(),
         message,
         lint_name: "missing_must_use".to_string(),
@@ -276,8 +326,18 @@ fn has_attr_named(attrs: &[Attribute], name: &str) -> bool {
 /// framework lands and grows `#[expect(missing_must_use)]` / per-
 /// module configuration, extend this helper.
 fn has_lint_allow_attr(attrs: &[Attribute], rule_name: &str) -> bool {
+    has_lint_level_attr(attrs, "allow", rule_name)
+}
+
+/// Generalised variant of `has_lint_allow_attr` — recognise any of
+/// the four lint-level attributes (`#[allow]` / `#[warn]` / `#[deny]`
+/// / `#[expect]`) naming `rule_name`. Slice 4b cross-cutting added
+/// this so the per-function effective-level computation can read
+/// `#[deny(missing_must_use)]` and `#[expect(missing_must_use)]`
+/// alongside the existing `#[allow]` form.
+fn has_lint_level_attr(attrs: &[Attribute], level_kind: &str, rule_name: &str) -> bool {
     attrs.iter().any(|a| {
-        if a.name != "allow" {
+        if a.name != level_kind {
             return false;
         }
         a.args.iter().any(|arg| {

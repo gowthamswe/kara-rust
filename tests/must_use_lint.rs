@@ -45,7 +45,11 @@ fn parse_and_typecheck(source: &str) -> (Program, TypeCheckResult) {
 
 fn lint(source: &str) -> Vec<LintDiagnostic> {
     let (prog, typed) = parse_and_typecheck(source);
-    check_implicit_must_use(&prog, Some(&typed))
+    check_implicit_must_use(
+        &prog,
+        Some(&typed),
+        &karac::lints::CliLintOverrides::default(),
+    )
 }
 
 fn assert_must_use_warning(diags: &[LintDiagnostic], needle: &str) {
@@ -874,4 +878,36 @@ fn test_must_use_functions_registry_populates_from_impl_method() {
         .get("Foo.make")
         .expect("impl method with #[must_use] should be in registry under `Type.method` key");
     assert_eq!(entry.as_deref(), Some("why"));
+}
+
+// ── Slice 4b cross-cutting — CLI fall-through ──────────────────
+
+#[test]
+fn test_cli_allow_suppresses_must_use() {
+    let (prog, typed) = parse_and_typecheck(
+        "fn returns_opt() -> Option[i64] { Some(1) }\n\
+         fn main() { returns_opt(); }",
+    );
+    let cli =
+        karac::lints::CliLintOverrides::with_level("must_use", karac::lints::LintLevel::Allow);
+    let diags = check_implicit_must_use(&prog, Some(&typed), &cli);
+    assert!(
+        diags.is_empty(),
+        "`-A must_use` should suppress; got: {diags:?}",
+    );
+}
+
+#[test]
+fn test_cli_deny_promotes_must_use() {
+    let (prog, typed) = parse_and_typecheck(
+        "fn returns_opt() -> Option[i64] { Some(1) }\n\
+         fn main() { returns_opt(); }",
+    );
+    let cli = karac::lints::CliLintOverrides::with_level("must_use", karac::lints::LintLevel::Deny);
+    let diags = check_implicit_must_use(&prog, Some(&typed), &cli);
+    assert!(!diags.is_empty(), "expected at least one diagnostic");
+    assert!(
+        diags.iter().all(|d| d.level == LintLevel::Error),
+        "`-D must_use` should promote every emission; got: {diags:?}",
+    );
 }

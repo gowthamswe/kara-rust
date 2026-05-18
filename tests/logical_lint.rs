@@ -18,7 +18,7 @@ fn parse_program(source: &str) -> Program {
 
 fn lint(source: &str) -> Vec<LintDiagnostic> {
     let prog = parse_program(source);
-    check_ambiguous_not_comparison(&prog)
+    check_ambiguous_not_comparison(&prog, &karac::lints::CliLintOverrides::default())
 }
 
 #[test]
@@ -110,4 +110,46 @@ fn test_lint_inside_if_condition() {
 fn test_lint_walks_into_method_calls() {
     let diags = lint("fn main() { let xs = vec.filter(|item| not item.value == threshold); }");
     assert_eq!(diags.len(), 1);
+}
+
+// ── Slice 4b cross-cutting — CLI fall-through ──────────────────
+
+#[test]
+fn test_cli_allow_suppresses_emission() {
+    let prog = parse_program("fn main() { let r = not x == y; }");
+    let cli = karac::lints::CliLintOverrides::with_level(
+        "ambiguous_not_comparison",
+        karac::lints::LintLevel::Allow,
+    );
+    let diags = check_ambiguous_not_comparison(&prog, &cli);
+    assert!(
+        diags.is_empty(),
+        "`-A ambiguous_not_comparison` should suppress all emissions; got: {diags:?}",
+    );
+}
+
+#[test]
+fn test_cli_deny_promotes_to_error() {
+    let prog = parse_program("fn main() { let r = not x == y; }");
+    let cli = karac::lints::CliLintOverrides::with_level(
+        "ambiguous_not_comparison",
+        karac::lints::LintLevel::Deny,
+    );
+    let diags = check_ambiguous_not_comparison(&prog, &cli);
+    assert_eq!(diags.len(), 1);
+    assert_eq!(
+        diags[0].level,
+        LintLevel::Error,
+        "`-D ambiguous_not_comparison` should promote to Error; got: {:?}",
+        diags[0].level,
+    );
+}
+
+#[test]
+fn test_cli_deny_warnings_promotes_default_warn() {
+    let prog = parse_program("fn main() { let r = not x == y; }");
+    let cli = karac::lints::CliLintOverrides::with_deny_warnings();
+    let diags = check_ambiguous_not_comparison(&prog, &cli);
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0].level, LintLevel::Error);
 }

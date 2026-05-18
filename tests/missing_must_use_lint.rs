@@ -188,7 +188,7 @@ fn impl_block_trait(trait_name: &str, target: &str, methods: Vec<Function>) -> I
 }
 
 fn lint_one(program: Program) -> Vec<LintDiagnostic> {
-    check_missing_must_use(&program)
+    check_missing_must_use(&program, &karac::lints::CliLintOverrides::default())
 }
 
 fn assert_fires_with(diags: &[LintDiagnostic], expected_substring: &str) {
@@ -628,7 +628,7 @@ fn test_stdlib_hygiene_baseline_lint_runs_against_real_baked_source() {
         }
     }
     let synthetic = program_with(all_items);
-    let diags = check_missing_must_use(&synthetic);
+    let diags = check_missing_must_use(&synthetic, &karac::lints::CliLintOverrides::default());
     assert!(
         !diags.is_empty(),
         "slice 3 baseline: lint should find at least one stdlib pub fn missing `#[must_use]` (no annotation triage has landed yet — this asserts the lint is wired against real baked source). Got an empty list, which means either the lint regressed or every stdlib candidate has been annotated (in which case flip this assertion to `assert!(diags.is_empty())` and remove the comment)."
@@ -643,4 +643,75 @@ fn test_stdlib_hygiene_baseline_lint_runs_against_real_baked_source() {
         );
         assert_eq!(d.level, LintLevel::Warning);
     }
+}
+
+// ── Slice 4b cross-cutting — CLI fall-through ──────────────────
+
+fn iter_returning_fn(name: &'static str) -> FnSpec<'static> {
+    FnSpec {
+        name,
+        is_pub: true,
+        stdlib_origin: true,
+        self_param: None,
+        return_type: Some(path_type("Iterator")),
+        attrs: &[],
+    }
+}
+
+#[test]
+fn test_cli_allow_suppresses_missing_must_use() {
+    let prog = program_with(vec![free_fn(iter_returning_fn("baseline_fn"))]);
+    let baseline = check_missing_must_use(&prog, &karac::lints::CliLintOverrides::default());
+    assert!(
+        !baseline.is_empty(),
+        "baseline fixture should fire missing_must_use",
+    );
+    let cli = karac::lints::CliLintOverrides::with_level(
+        "missing_must_use",
+        karac::lints::LintLevel::Allow,
+    );
+    let diags = check_missing_must_use(&prog, &cli);
+    assert!(
+        diags.is_empty(),
+        "`-A missing_must_use` should suppress; got: {diags:?}",
+    );
+}
+
+#[test]
+fn test_cli_deny_promotes_missing_must_use() {
+    let prog = program_with(vec![free_fn(iter_returning_fn("foo"))]);
+    let cli = karac::lints::CliLintOverrides::with_level(
+        "missing_must_use",
+        karac::lints::LintLevel::Deny,
+    );
+    let diags = check_missing_must_use(&prog, &cli);
+    assert!(!diags.is_empty());
+    assert!(
+        diags.iter().all(|d| d.level == LintLevel::Error),
+        "`-D missing_must_use` should promote; got: {diags:?}",
+    );
+}
+
+#[test]
+fn test_source_allow_beats_cli_deny() {
+    // Per-function `#[allow(missing_must_use)]` wins over CLI `-D`.
+    let allow = allow_missing_must_use_attr();
+    let spec = FnSpec {
+        name: "annotated",
+        is_pub: true,
+        stdlib_origin: true,
+        self_param: None,
+        return_type: Some(path_type("Iterator")),
+        attrs: &[&allow],
+    };
+    let prog = program_with(vec![free_fn(spec)]);
+    let cli = karac::lints::CliLintOverrides::with_level(
+        "missing_must_use",
+        karac::lints::LintLevel::Deny,
+    );
+    let diags = check_missing_must_use(&prog, &cli);
+    assert!(
+        diags.is_empty(),
+        "source `#[allow]` should win over CLI `-D`; got: {diags:?}",
+    );
 }

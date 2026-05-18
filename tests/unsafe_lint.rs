@@ -21,7 +21,7 @@ fn parse_program(source: &str) -> Program {
 
 fn lint(source: &str) -> Vec<karac::unsafe_lint::LintDiagnostic> {
     let prog = parse_program(source);
-    check_undocumented_unsafe(&prog, source)
+    check_undocumented_unsafe(&prog, source, &karac::lints::CliLintOverrides::default())
 }
 
 fn parse_and_typecheck(source: &str) -> (Program, TypeCheckResult) {
@@ -651,4 +651,56 @@ fn test_vec_get_unchecked_inside_unsafe_block_silent() {
          }",
     );
     assert!(diags.is_empty(), "expected no diagnostics, got: {diags:?}");
+}
+
+// ── Slice 4b cross-cutting — CLI fall-through ──────────────────
+
+#[test]
+fn test_cli_allow_suppresses_undocumented_unsafe() {
+    let source = "fn main() { unsafe { let _x = 0; } }";
+    let prog = parse_program(source);
+    let cli = karac::lints::CliLintOverrides::with_level(
+        "undocumented_unsafe",
+        karac::lints::LintLevel::Allow,
+    );
+    let diags = check_undocumented_unsafe(&prog, source, &cli);
+    assert!(
+        diags.is_empty(),
+        "`-A undocumented_unsafe` should suppress; got: {diags:?}",
+    );
+}
+
+#[test]
+fn test_cli_deny_promotes_undocumented_unsafe() {
+    let source = "fn main() { unsafe { let _x = 0; } }";
+    let prog = parse_program(source);
+    let cli = karac::lints::CliLintOverrides::with_level(
+        "undocumented_unsafe",
+        karac::lints::LintLevel::Deny,
+    );
+    let diags = check_undocumented_unsafe(&prog, source, &cli);
+    assert!(!diags.is_empty(), "expected at least one diagnostic");
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.level == karac::unsafe_lint::LintLevel::Error),
+        "`-D undocumented_unsafe` should promote every emission; got: {diags:?}",
+    );
+}
+
+#[test]
+fn test_source_allow_beats_cli_deny() {
+    // Cascade precedence — source `#[allow]` on the enclosing fn wins
+    // over CLI `-D undocumented_unsafe`.
+    let source = "#[allow(undocumented_unsafe)]\nfn main() { unsafe { let _x = 0; } }";
+    let prog = parse_program(source);
+    let cli = karac::lints::CliLintOverrides::with_level(
+        "undocumented_unsafe",
+        karac::lints::LintLevel::Deny,
+    );
+    let diags = check_undocumented_unsafe(&prog, source, &cli);
+    assert!(
+        diags.is_empty(),
+        "source `#[allow]` should beat CLI `-D`; got: {diags:?}",
+    );
 }

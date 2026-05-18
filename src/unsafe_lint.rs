@@ -27,7 +27,7 @@ use crate::token::Span;
 use crate::typechecker::{Type, TypeCheckResult};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintLevel {
     Warning,
     Error,
@@ -65,34 +65,68 @@ const UNSAFE_TWO_ROLES_NOTE: &str =
 ///
 /// `source` is the raw source text used to look up comment lines preceding
 /// each `unsafe` block. Returns a (possibly empty) list of diagnostics.
-pub fn check_undocumented_unsafe(program: &Program, source: &str) -> Vec<LintDiagnostic> {
+pub fn check_undocumented_unsafe(
+    program: &Program,
+    source: &str,
+    cli_lint_overrides: &crate::lints::CliLintOverrides,
+) -> Vec<LintDiagnostic> {
     let lines: Vec<&str> = source.lines().collect();
     let mut diags = Vec::new();
     for item in &program.items {
         if let Item::ExternBlock(b) = item {
-            let allow = has_lint_attr(&b.attributes, "allow");
-            let deny = has_lint_attr(&b.attributes, "deny");
-            if !allow {
-                check_extern_block_safety_doc(b, deny, &mut diags);
+            let source_allow = has_lint_attr(&b.attributes, "allow");
+            let source_deny = has_lint_attr(&b.attributes, "deny");
+            let source_expect = has_lint_attr(&b.attributes, "expect");
+            // Slice 4b cross-cutting — fold source attrs + CLI
+            // fall-through through the shared cascade helper.
+            let severity = crate::lints::effective_level_for_module_lint(
+                source_allow,
+                source_deny,
+                source_expect,
+                cli_lint_overrides,
+                "undocumented_unsafe",
+            );
+            if let Some(level) = severity_to_level(severity) {
+                check_extern_block_safety_doc(b, level, &mut diags);
             }
             continue;
         }
-        let (fn_allow, fn_deny) = match item {
+        let (fn_allow, fn_deny, fn_expect) = match item {
             Item::Function(f) => (
                 has_lint_attr(&f.attributes, "allow"),
                 has_lint_attr(&f.attributes, "deny"),
+                has_lint_attr(&f.attributes, "expect"),
             ),
-            _ => (false, false),
+            _ => (false, false, false),
         };
-        if fn_allow {
+        let severity = crate::lints::effective_level_for_module_lint(
+            fn_allow,
+            fn_deny,
+            fn_expect,
+            cli_lint_overrides,
+            "undocumented_unsafe",
+        );
+        let Some(fn_level) = severity_to_level(severity) else {
             continue;
-        }
-        collect_item_unsafe(item, &lines, fn_deny, &mut diags);
+        };
+        collect_item_unsafe(item, &lines, fn_level, cli_lint_overrides, &mut diags);
     }
     diags
 }
 
-fn check_extern_block_safety_doc(block: &ExternBlock, deny: bool, diags: &mut Vec<LintDiagnostic>) {
+fn severity_to_level(severity: crate::lints::ModuleLintSeverity) -> Option<LintLevel> {
+    match severity {
+        crate::lints::ModuleLintSeverity::Suppress => None,
+        crate::lints::ModuleLintSeverity::Warn => Some(LintLevel::Warning),
+        crate::lints::ModuleLintSeverity::Deny => Some(LintLevel::Error),
+    }
+}
+
+fn check_extern_block_safety_doc(
+    block: &ExternBlock,
+    level: LintLevel,
+    diags: &mut Vec<LintDiagnostic>,
+) {
     let has_safety = block
         .doc_comment
         .as_deref()
@@ -100,11 +134,7 @@ fn check_extern_block_safety_doc(block: &ExternBlock, deny: bool, diags: &mut Ve
         .unwrap_or(false);
     if !has_safety {
         diags.push(LintDiagnostic {
-            level: if deny {
-                LintLevel::Error
-            } else {
-                LintLevel::Warning
-            },
+            level,
             span: block.span.clone(),
             message: "unsafe extern block is missing a `# Safety` doc-comment \
                       section explaining the trust contract for its imports"
@@ -157,17 +187,43 @@ fn has_lint_attr(attrs: &[Attribute], kind: &str) -> bool {
     })
 }
 
-fn collect_item_unsafe(item: &Item, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagnostic>) {
+fn collect_item_unsafe(
+    item: &Item,
+    lines: &[&str],
+    outer_level: LintLevel,
+    cli: &crate::lints::CliLintOverrides,
+    diags: &mut Vec<LintDiagnostic>,
+) {
     match item {
-        Item::Function(f) => walk_block(&f.body, lines, deny, diags),
+        Item::Function(f) => walk_block(&f.body, lines, outer_level, diags),
         Item::ImplBlock(imp) => {
             for item in &imp.items {
                 if let crate::ast::ImplItem::Method(method) = item {
-                    let allow = has_lint_attr(&method.attributes, "allow");
-                    let deny_m = has_lint_attr(&method.attributes, "deny");
-                    if !allow {
-                        walk_block(&method.body, lines, deny || deny_m, diags);
-                    }
+                    // Per-method source attrs win over the outer
+                    // (impl-block) level — innermost cascade rule.
+                    // Re-resolve via the shared helper so source +
+                    // CLI compose consistently.
+                    let m_allow = has_lint_attr(&method.attributes, "allow");
+                    let m_deny = has_lint_attr(&method.attributes, "deny");
+                    let m_expect = has_lint_attr(&method.attributes, "expect");
+                    let method_severity = crate::lints::effective_level_for_module_lint(
+                        m_allow,
+                        m_deny,
+                        m_expect,
+                        cli,
+                        "undocumented_unsafe",
+                    );
+                    let method_level = match method_severity {
+                        crate::lints::ModuleLintSeverity::Suppress => continue,
+                        crate::lints::ModuleLintSeverity::Deny => LintLevel::Error,
+                        crate::lints::ModuleLintSeverity::Warn => {
+                            // No source / CLI override fired on this
+                            // method — inherit the outer level
+                            // (which already folded in CLI).
+                            outer_level
+                        }
+                    };
+                    walk_block(&method.body, lines, method_level, diags);
                 }
             }
         }
@@ -175,7 +231,12 @@ fn collect_item_unsafe(item: &Item, lines: &[&str], deny: bool, diags: &mut Vec<
     }
 }
 
-fn check_unsafe_span(span: &Span, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagnostic>) {
+fn check_unsafe_span(
+    span: &Span,
+    lines: &[&str],
+    level: LintLevel,
+    diags: &mut Vec<LintDiagnostic>,
+) {
     // span.line is 1-indexed. The preceding line is at index span.line - 2.
     let preceding_ok = if span.line >= 2 {
         let preceding = lines[span.line - 2];
@@ -185,11 +246,7 @@ fn check_unsafe_span(span: &Span, lines: &[&str], deny: bool, diags: &mut Vec<Li
     };
     if !preceding_ok {
         diags.push(LintDiagnostic {
-            level: if deny {
-                LintLevel::Error
-            } else {
-                LintLevel::Warning
-            },
+            level,
             span: span.clone(),
             message: "unsafe block is not preceded by a `// Safety:` comment".to_string(),
             lint_name: "undocumented_unsafe".to_string(),
@@ -214,60 +271,60 @@ fn is_safety_comment(line: &str) -> bool {
 
 // ── AST walker ────────────────────────────────────────────────────
 
-fn walk_block(block: &Block, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagnostic>) {
+fn walk_block(block: &Block, lines: &[&str], level: LintLevel, diags: &mut Vec<LintDiagnostic>) {
     for stmt in &block.stmts {
-        walk_stmt(stmt, lines, deny, diags);
+        walk_stmt(stmt, lines, level, diags);
     }
     if let Some(tail) = &block.final_expr {
-        walk_expr(tail, lines, deny, diags);
+        walk_expr(tail, lines, level, diags);
     }
 }
 
-fn walk_stmt(stmt: &Stmt, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagnostic>) {
+fn walk_stmt(stmt: &Stmt, lines: &[&str], level: LintLevel, diags: &mut Vec<LintDiagnostic>) {
     match &stmt.kind {
-        StmtKind::Let { value, .. } => walk_expr(value, lines, deny, diags),
+        StmtKind::Let { value, .. } => walk_expr(value, lines, level, diags),
         StmtKind::LetUninit { .. } => {}
         StmtKind::LetElse {
             value, else_block, ..
         } => {
-            walk_expr(value, lines, deny, diags);
-            walk_block(else_block, lines, deny, diags);
+            walk_expr(value, lines, level, diags);
+            walk_block(else_block, lines, level, diags);
         }
-        StmtKind::Expr(e) => walk_expr(e, lines, deny, diags),
+        StmtKind::Expr(e) => walk_expr(e, lines, level, diags),
         StmtKind::Assign { target, value } | StmtKind::CompoundAssign { target, value, .. } => {
-            walk_expr(target, lines, deny, diags);
-            walk_expr(value, lines, deny, diags);
+            walk_expr(target, lines, level, diags);
+            walk_expr(value, lines, level, diags);
         }
         StmtKind::Defer { body } | StmtKind::ErrDefer { body, .. } => {
-            walk_block(body, lines, deny, diags);
+            walk_block(body, lines, level, diags);
         }
     }
 }
 
-fn walk_expr(expr: &Expr, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagnostic>) {
+fn walk_expr(expr: &Expr, lines: &[&str], level: LintLevel, diags: &mut Vec<LintDiagnostic>) {
     match &expr.kind {
         ExprKind::Unsafe(block) => {
-            check_unsafe_span(&expr.span, lines, deny, diags);
-            walk_block(block, lines, deny, diags);
+            check_unsafe_span(&expr.span, lines, level, diags);
+            walk_block(block, lines, level, diags);
         }
         ExprKind::Block(block)
         | ExprKind::Loop { body: block, .. }
         | ExprKind::LabeledBlock { body: block, .. }
         | ExprKind::Seq(block)
         | ExprKind::Par(block)
-        | ExprKind::Try(block) => walk_block(block, lines, deny, diags),
+        | ExprKind::Try(block) => walk_block(block, lines, level, diags),
         ExprKind::Lock { body, .. } | ExprKind::Providers { body, .. } => {
-            walk_block(body, lines, deny, diags)
+            walk_block(body, lines, level, diags)
         }
         ExprKind::If {
             condition,
             then_block,
             else_branch,
         } => {
-            walk_expr(condition, lines, deny, diags);
-            walk_block(then_block, lines, deny, diags);
+            walk_expr(condition, lines, level, diags);
+            walk_block(then_block, lines, level, diags);
             if let Some(e) = else_branch {
-                walk_expr(e, lines, deny, diags);
+                walk_expr(e, lines, level, diags);
             }
         }
         ExprKind::IfLet {
@@ -276,10 +333,10 @@ fn walk_expr(expr: &Expr, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagno
             else_branch,
             ..
         } => {
-            walk_expr(value, lines, deny, diags);
-            walk_block(then_block, lines, deny, diags);
+            walk_expr(value, lines, level, diags);
+            walk_block(then_block, lines, level, diags);
             if let Some(e) = else_branch {
-                walk_expr(e, lines, deny, diags);
+                walk_expr(e, lines, level, diags);
             }
         }
         ExprKind::While {
@@ -290,32 +347,32 @@ fn walk_expr(expr: &Expr, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagno
             body,
             ..
         } => {
-            walk_expr(condition, lines, deny, diags);
-            walk_block(body, lines, deny, diags);
+            walk_expr(condition, lines, level, diags);
+            walk_block(body, lines, level, diags);
         }
         ExprKind::For { iterable, body, .. } => {
-            walk_expr(iterable, lines, deny, diags);
-            walk_block(body, lines, deny, diags);
+            walk_expr(iterable, lines, level, diags);
+            walk_block(body, lines, level, diags);
         }
         ExprKind::Match { scrutinee, arms } => {
-            walk_expr(scrutinee, lines, deny, diags);
+            walk_expr(scrutinee, lines, level, diags);
             for arm in arms {
-                walk_match_arm(arm, lines, deny, diags);
+                walk_match_arm(arm, lines, level, diags);
             }
         }
         ExprKind::Binary { left, right, .. } => {
-            walk_expr(left, lines, deny, diags);
-            walk_expr(right, lines, deny, diags);
+            walk_expr(left, lines, level, diags);
+            walk_expr(right, lines, level, diags);
         }
-        ExprKind::Unary { operand, .. } => walk_expr(operand, lines, deny, diags),
+        ExprKind::Unary { operand, .. } => walk_expr(operand, lines, level, diags),
         ExprKind::NilCoalesce { left, right } | ExprKind::Pipe { left, right } => {
-            walk_expr(left, lines, deny, diags);
-            walk_expr(right, lines, deny, diags);
+            walk_expr(left, lines, level, diags);
+            walk_expr(right, lines, level, diags);
         }
         ExprKind::Call { callee, args } => {
-            walk_expr(callee, lines, deny, diags);
+            walk_expr(callee, lines, level, diags);
             for a in args {
-                walk_expr(&a.value, lines, deny, diags);
+                walk_expr(&a.value, lines, level, diags);
             }
         }
         ExprKind::MethodCall { object, args, .. }
@@ -324,62 +381,62 @@ fn walk_expr(expr: &Expr, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagno
             args: Some(args),
             ..
         } => {
-            walk_expr(object, lines, deny, diags);
+            walk_expr(object, lines, level, diags);
             for a in args {
-                walk_expr(&a.value, lines, deny, diags);
+                walk_expr(&a.value, lines, level, diags);
             }
         }
         ExprKind::OptionalChain {
             object, args: None, ..
         } => {
-            walk_expr(object, lines, deny, diags);
+            walk_expr(object, lines, level, diags);
         }
         ExprKind::FieldAccess { object, .. } | ExprKind::TupleIndex { object, .. } => {
-            walk_expr(object, lines, deny, diags);
+            walk_expr(object, lines, level, diags);
         }
         ExprKind::Index { object, index } => {
-            walk_expr(object, lines, deny, diags);
-            walk_expr(index, lines, deny, diags);
+            walk_expr(object, lines, level, diags);
+            walk_expr(index, lines, level, diags);
         }
-        ExprKind::Closure { body, .. } => walk_expr(body, lines, deny, diags),
+        ExprKind::Closure { body, .. } => walk_expr(body, lines, level, diags),
         ExprKind::Return(Some(e)) | ExprKind::Question(e) | ExprKind::Cast { expr: e, .. } => {
-            walk_expr(e, lines, deny, diags);
+            walk_expr(e, lines, level, diags);
         }
-        ExprKind::Break { value: Some(e), .. } => walk_expr(e, lines, deny, diags),
+        ExprKind::Break { value: Some(e), .. } => walk_expr(e, lines, level, diags),
         ExprKind::Tuple(elems) | ExprKind::ArrayLiteral(elems) => {
             for e in elems {
-                walk_expr(e, lines, deny, diags);
+                walk_expr(e, lines, level, diags);
             }
         }
         ExprKind::RepeatLiteral { value, count, .. } => {
-            walk_expr(value, lines, deny, diags);
-            walk_expr(count, lines, deny, diags);
+            walk_expr(value, lines, level, diags);
+            walk_expr(count, lines, level, diags);
         }
         ExprKind::PrefixCollectionLiteral { items, .. } => {
             for e in items {
-                walk_expr(e, lines, deny, diags);
+                walk_expr(e, lines, level, diags);
             }
         }
         ExprKind::MapLiteral(pairs) => {
             for (k, v) in pairs {
-                walk_expr(k, lines, deny, diags);
-                walk_expr(v, lines, deny, diags);
+                walk_expr(k, lines, level, diags);
+                walk_expr(v, lines, level, diags);
             }
         }
         ExprKind::StructLiteral { fields, spread, .. } => {
             for f in fields {
-                walk_field_init(f, lines, deny, diags);
+                walk_field_init(f, lines, level, diags);
             }
             if let Some(s) = spread {
-                walk_expr(s, lines, deny, diags);
+                walk_expr(s, lines, level, diags);
             }
         }
         ExprKind::Range { start, end, .. } => {
             if let Some(s) = start {
-                walk_expr(s, lines, deny, diags);
+                walk_expr(s, lines, level, diags);
             }
             if let Some(e) = end {
-                walk_expr(e, lines, deny, diags);
+                walk_expr(e, lines, level, diags);
             }
         }
         // Terminals — no sub-expressions.
@@ -403,15 +460,25 @@ fn walk_expr(expr: &Expr, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagno
     }
 }
 
-fn walk_match_arm(arm: &MatchArm, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagnostic>) {
+fn walk_match_arm(
+    arm: &MatchArm,
+    lines: &[&str],
+    level: LintLevel,
+    diags: &mut Vec<LintDiagnostic>,
+) {
     if let Some(guard) = &arm.guard {
-        walk_expr(guard, lines, deny, diags);
+        walk_expr(guard, lines, level, diags);
     }
-    walk_expr(&arm.body, lines, deny, diags);
+    walk_expr(&arm.body, lines, level, diags);
 }
 
-fn walk_field_init(f: &FieldInit, lines: &[&str], deny: bool, diags: &mut Vec<LintDiagnostic>) {
-    walk_expr(&f.value, lines, deny, diags);
+fn walk_field_init(
+    f: &FieldInit,
+    lines: &[&str],
+    level: LintLevel,
+    diags: &mut Vec<LintDiagnostic>,
+) {
+    walk_expr(&f.value, lines, level, diags);
 }
 
 // ── Slice 3: `unsafe_op_in_unsafe_fn` operation lint ───────────────

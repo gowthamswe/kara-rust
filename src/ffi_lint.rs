@@ -16,8 +16,19 @@ use crate::ast::{
 };
 use crate::token::Span;
 
+/// Severity of an emitted `ffi_float_eq` diagnostic — slice 4b
+/// cross-cutting added this so `-D ffi_float_eq` / `-D warnings`
+/// can promote the lint to an error end-to-end. Mirrors the
+/// `Warning` / `Error` shape used by the other per-module lints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LintLevel {
+    Warning,
+    Error,
+}
+
 #[derive(Debug, Clone)]
 pub struct FfiFloatEqDiagnostic {
+    pub level: LintLevel,
     pub span: Span,
     pub extern_fn: String,
     pub message: String,
@@ -27,17 +38,36 @@ pub struct FfiFloatEqDiagnostic {
 ///
 /// Returns diagnostics for every direct `extern_fn() == expr` or
 /// `extern_fn() != expr` call where `extern_fn` is declared `extern "C"` and
-/// returns a float type.
-pub fn check_ffi_float_eq(program: &Program) -> Vec<FfiFloatEqDiagnostic> {
+/// returns a float type. Slice 4b cross-cutting threads CLI build-wide
+/// lint overrides so `-A ffi_float_eq` suppresses and `-D ffi_float_eq`
+/// (or `-D warnings`) promotes to error.
+pub fn check_ffi_float_eq(
+    program: &Program,
+    cli_lint_overrides: &crate::lints::CliLintOverrides,
+) -> Vec<FfiFloatEqDiagnostic> {
+    let severity = crate::lints::effective_level_for_module_lint(
+        false,
+        false,
+        false,
+        cli_lint_overrides,
+        "ffi_float_eq",
+    );
+    if matches!(severity, crate::lints::ModuleLintSeverity::Suppress) {
+        return Vec::new();
+    }
+    let level = match severity {
+        crate::lints::ModuleLintSeverity::Deny => LintLevel::Error,
+        _ => LintLevel::Warning,
+    };
     let ffi_float_fns = collect_ffi_float_fns(program);
     let mut diags = Vec::new();
     for item in &program.items {
         match item {
-            Item::Function(f) => walk_block(&f.body, &ffi_float_fns, &mut diags),
+            Item::Function(f) => walk_block(&f.body, level, &ffi_float_fns, &mut diags),
             Item::ImplBlock(imp) => {
                 for iitem in &imp.items {
                     if let crate::ast::ImplItem::Method(m) = iitem {
-                        walk_block(&m.body, &ffi_float_fns, &mut diags);
+                        walk_block(&m.body, level, &ffi_float_fns, &mut diags);
                     }
                 }
             }
@@ -108,44 +138,47 @@ fn is_ffi_float_call(expr: &Expr, ffi_fns: &std::collections::HashSet<String>) -
 
 fn walk_block(
     block: &Block,
+    level: LintLevel,
     ffi_fns: &std::collections::HashSet<String>,
     diags: &mut Vec<FfiFloatEqDiagnostic>,
 ) {
     for stmt in &block.stmts {
-        walk_stmt(stmt, ffi_fns, diags);
+        walk_stmt(stmt, level, ffi_fns, diags);
     }
     if let Some(tail) = &block.final_expr {
-        walk_expr(tail, ffi_fns, diags);
+        walk_expr(tail, level, ffi_fns, diags);
     }
 }
 
 fn walk_stmt(
     stmt: &Stmt,
+    level: LintLevel,
     ffi_fns: &std::collections::HashSet<String>,
     diags: &mut Vec<FfiFloatEqDiagnostic>,
 ) {
     match &stmt.kind {
-        StmtKind::Let { value, .. } => walk_expr(value, ffi_fns, diags),
+        StmtKind::Let { value, .. } => walk_expr(value, level, ffi_fns, diags),
         StmtKind::LetUninit { .. } => {}
         StmtKind::LetElse {
             value, else_block, ..
         } => {
-            walk_expr(value, ffi_fns, diags);
-            walk_block(else_block, ffi_fns, diags);
+            walk_expr(value, level, ffi_fns, diags);
+            walk_block(else_block, level, ffi_fns, diags);
         }
-        StmtKind::Expr(e) => walk_expr(e, ffi_fns, diags),
+        StmtKind::Expr(e) => walk_expr(e, level, ffi_fns, diags),
         StmtKind::Assign { target, value } | StmtKind::CompoundAssign { target, value, .. } => {
-            walk_expr(target, ffi_fns, diags);
-            walk_expr(value, ffi_fns, diags);
+            walk_expr(target, level, ffi_fns, diags);
+            walk_expr(value, level, ffi_fns, diags);
         }
         StmtKind::Defer { body } | StmtKind::ErrDefer { body, .. } => {
-            walk_block(body, ffi_fns, diags);
+            walk_block(body, level, ffi_fns, diags);
         }
     }
 }
 
 fn walk_expr(
     expr: &Expr,
+    level: LintLevel,
     ffi_fns: &std::collections::HashSet<String>,
     diags: &mut Vec<FfiFloatEqDiagnostic>,
 ) {
@@ -155,6 +188,7 @@ fn walk_expr(
             if matches!(op, BinOp::Eq | BinOp::NotEq) {
                 if let Some(fn_name) = is_ffi_float_call(left, ffi_fns) {
                     diags.push(FfiFloatEqDiagnostic {
+                        level,
                         span: expr.span.clone(),
                         extern_fn: fn_name.clone(),
                         message: format!(
@@ -165,6 +199,7 @@ fn walk_expr(
                     });
                 } else if let Some(fn_name) = is_ffi_float_call(right, ffi_fns) {
                     diags.push(FfiFloatEqDiagnostic {
+                        level,
                         span: expr.span.clone(),
                         extern_fn: fn_name.clone(),
                         message: format!(
@@ -175,8 +210,8 @@ fn walk_expr(
                     });
                 }
             }
-            walk_expr(left, ffi_fns, diags);
-            walk_expr(right, ffi_fns, diags);
+            walk_expr(left, level, ffi_fns, diags);
+            walk_expr(right, level, ffi_fns, diags);
         }
         ExprKind::Block(block)
         | ExprKind::Loop { body: block, .. }
@@ -184,19 +219,19 @@ fn walk_expr(
         | ExprKind::Seq(block)
         | ExprKind::Par(block)
         | ExprKind::Unsafe(block)
-        | ExprKind::Try(block) => walk_block(block, ffi_fns, diags),
+        | ExprKind::Try(block) => walk_block(block, level, ffi_fns, diags),
         ExprKind::Lock { body, .. } | ExprKind::Providers { body, .. } => {
-            walk_block(body, ffi_fns, diags)
+            walk_block(body, level, ffi_fns, diags)
         }
         ExprKind::If {
             condition,
             then_block,
             else_branch,
         } => {
-            walk_expr(condition, ffi_fns, diags);
-            walk_block(then_block, ffi_fns, diags);
+            walk_expr(condition, level, ffi_fns, diags);
+            walk_block(then_block, level, ffi_fns, diags);
             if let Some(e) = else_branch {
-                walk_expr(e, ffi_fns, diags);
+                walk_expr(e, level, ffi_fns, diags);
             }
         }
         ExprKind::IfLet {
@@ -205,10 +240,10 @@ fn walk_expr(
             else_branch,
             ..
         } => {
-            walk_expr(value, ffi_fns, diags);
-            walk_block(then_block, ffi_fns, diags);
+            walk_expr(value, level, ffi_fns, diags);
+            walk_block(then_block, level, ffi_fns, diags);
             if let Some(e) = else_branch {
-                walk_expr(e, ffi_fns, diags);
+                walk_expr(e, level, ffi_fns, diags);
             }
         }
         ExprKind::While {
@@ -219,28 +254,28 @@ fn walk_expr(
             body,
             ..
         } => {
-            walk_expr(condition, ffi_fns, diags);
-            walk_block(body, ffi_fns, diags);
+            walk_expr(condition, level, ffi_fns, diags);
+            walk_block(body, level, ffi_fns, diags);
         }
         ExprKind::For { iterable, body, .. } => {
-            walk_expr(iterable, ffi_fns, diags);
-            walk_block(body, ffi_fns, diags);
+            walk_expr(iterable, level, ffi_fns, diags);
+            walk_block(body, level, ffi_fns, diags);
         }
         ExprKind::Match { scrutinee, arms } => {
-            walk_expr(scrutinee, ffi_fns, diags);
+            walk_expr(scrutinee, level, ffi_fns, diags);
             for arm in arms {
-                walk_match_arm(arm, ffi_fns, diags);
+                walk_match_arm(arm, level, ffi_fns, diags);
             }
         }
-        ExprKind::Unary { operand, .. } => walk_expr(operand, ffi_fns, diags),
+        ExprKind::Unary { operand, .. } => walk_expr(operand, level, ffi_fns, diags),
         ExprKind::NilCoalesce { left, right } | ExprKind::Pipe { left, right } => {
-            walk_expr(left, ffi_fns, diags);
-            walk_expr(right, ffi_fns, diags);
+            walk_expr(left, level, ffi_fns, diags);
+            walk_expr(right, level, ffi_fns, diags);
         }
         ExprKind::Call { callee, args } => {
-            walk_expr(callee, ffi_fns, diags);
+            walk_expr(callee, level, ffi_fns, diags);
             for a in args {
-                walk_expr(&a.value, ffi_fns, diags);
+                walk_expr(&a.value, level, ffi_fns, diags);
             }
         }
         ExprKind::MethodCall { object, args, .. }
@@ -249,59 +284,59 @@ fn walk_expr(
             args: Some(args),
             ..
         } => {
-            walk_expr(object, ffi_fns, diags);
+            walk_expr(object, level, ffi_fns, diags);
             for a in args {
-                walk_expr(&a.value, ffi_fns, diags);
+                walk_expr(&a.value, level, ffi_fns, diags);
             }
         }
         ExprKind::OptionalChain {
             object, args: None, ..
         }
         | ExprKind::FieldAccess { object, .. }
-        | ExprKind::TupleIndex { object, .. } => walk_expr(object, ffi_fns, diags),
+        | ExprKind::TupleIndex { object, .. } => walk_expr(object, level, ffi_fns, diags),
         ExprKind::Index { object, index } => {
-            walk_expr(object, ffi_fns, diags);
-            walk_expr(index, ffi_fns, diags);
+            walk_expr(object, level, ffi_fns, diags);
+            walk_expr(index, level, ffi_fns, diags);
         }
-        ExprKind::Closure { body, .. } => walk_expr(body, ffi_fns, diags),
+        ExprKind::Closure { body, .. } => walk_expr(body, level, ffi_fns, diags),
         ExprKind::Return(Some(e)) | ExprKind::Question(e) | ExprKind::Cast { expr: e, .. } => {
-            walk_expr(e, ffi_fns, diags);
+            walk_expr(e, level, ffi_fns, diags);
         }
-        ExprKind::Break { value: Some(e), .. } => walk_expr(e, ffi_fns, diags),
+        ExprKind::Break { value: Some(e), .. } => walk_expr(e, level, ffi_fns, diags),
         ExprKind::Tuple(elems) | ExprKind::ArrayLiteral(elems) => {
             for e in elems {
-                walk_expr(e, ffi_fns, diags);
+                walk_expr(e, level, ffi_fns, diags);
             }
         }
         ExprKind::RepeatLiteral { value, count, .. } => {
-            walk_expr(value, ffi_fns, diags);
-            walk_expr(count, ffi_fns, diags);
+            walk_expr(value, level, ffi_fns, diags);
+            walk_expr(count, level, ffi_fns, diags);
         }
         ExprKind::PrefixCollectionLiteral { items, .. } => {
             for e in items {
-                walk_expr(e, ffi_fns, diags);
+                walk_expr(e, level, ffi_fns, diags);
             }
         }
         ExprKind::MapLiteral(pairs) => {
             for (k, v) in pairs {
-                walk_expr(k, ffi_fns, diags);
-                walk_expr(v, ffi_fns, diags);
+                walk_expr(k, level, ffi_fns, diags);
+                walk_expr(v, level, ffi_fns, diags);
             }
         }
         ExprKind::StructLiteral { fields, spread, .. } => {
             for f in fields {
-                walk_expr(&f.value, ffi_fns, diags);
+                walk_expr(&f.value, level, ffi_fns, diags);
             }
             if let Some(s) = spread {
-                walk_expr(s, ffi_fns, diags);
+                walk_expr(s, level, ffi_fns, diags);
             }
         }
         ExprKind::Range { start, end, .. } => {
             if let Some(s) = start {
-                walk_expr(s, ffi_fns, diags);
+                walk_expr(s, level, ffi_fns, diags);
             }
             if let Some(e) = end {
-                walk_expr(e, ffi_fns, diags);
+                walk_expr(e, level, ffi_fns, diags);
             }
         }
         ExprKind::Integer(..)
@@ -326,11 +361,12 @@ fn walk_expr(
 
 fn walk_match_arm(
     arm: &MatchArm,
+    level: LintLevel,
     ffi_fns: &std::collections::HashSet<String>,
     diags: &mut Vec<FfiFloatEqDiagnostic>,
 ) {
     if let Some(guard) = &arm.guard {
-        walk_expr(guard, ffi_fns, diags);
+        walk_expr(guard, level, ffi_fns, diags);
     }
-    walk_expr(&arm.body, ffi_fns, diags);
+    walk_expr(&arm.body, level, ffi_fns, diags);
 }

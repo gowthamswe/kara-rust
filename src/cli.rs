@@ -1547,8 +1547,11 @@ fn cmd_run(
             }
         }
         // Lint: undocumented_unsafe
-        for diag in crate::unsafe_lint::check_undocumented_unsafe(&pipeline.parsed.program, &source)
-        {
+        for diag in crate::unsafe_lint::check_undocumented_unsafe(
+            &pipeline.parsed.program,
+            &source,
+            &pipeline.lint_overrides,
+        ) {
             render_unsafe_lint_diag(&diag, filename);
         }
         // Lint: unsafe_op_in_unsafe_fn (slice 3) — walks every fn body
@@ -1570,6 +1573,7 @@ fn cmd_run(
         for diag in crate::must_use_lint::check_implicit_must_use(
             &pipeline.parsed.program,
             pipeline.typed.as_ref(),
+            &pipeline.lint_overrides,
         ) {
             render_must_use_lint_diag(&diag, filename);
         }
@@ -1582,18 +1586,31 @@ fn cmd_run(
         // program AST; the lint surfaces during karac's own stdlib-
         // hygiene tests (`tests/missing_must_use_lint.rs`) and during
         // any future bundled-stdlib-source compile mode.
-        for diag in crate::missing_must_use_lint::check_missing_must_use(&pipeline.parsed.program) {
+        for diag in crate::missing_must_use_lint::check_missing_must_use(
+            &pipeline.parsed.program,
+            &pipeline.lint_overrides,
+        ) {
             render_missing_must_use_lint_diag(&diag, filename);
         }
         // Lint: ffi_float_eq
-        for diag in crate::ffi_lint::check_ffi_float_eq(&pipeline.parsed.program) {
+        for diag in
+            crate::ffi_lint::check_ffi_float_eq(&pipeline.parsed.program, &pipeline.lint_overrides)
+        {
+            let prefix = if diag.level == crate::ffi_lint::LintLevel::Error {
+                "error"
+            } else {
+                "warning"
+            };
             eprintln!(
-                "warning[ffi_float_eq]: {}:{}:{}: {}",
+                "{prefix}[ffi_float_eq]: {}:{}:{}: {}",
                 filename, diag.span.line, diag.span.column, diag.message
             );
         }
         // Lint: ambiguous_not_comparison
-        for diag in crate::logical_lint::check_ambiguous_not_comparison(&pipeline.parsed.program) {
+        for diag in crate::logical_lint::check_ambiguous_not_comparison(
+            &pipeline.parsed.program,
+            &pipeline.lint_overrides,
+        ) {
             eprintln!(
                 "{}[{}]: {}:{}:{}: {}",
                 if diag.level == crate::logical_lint::LintLevel::Error {
