@@ -999,6 +999,68 @@ pub extern "C" fn karac_runtime_scheduler_shutdown_dispatcher() -> i32 {
     0
 }
 
+/// Snapshot of the scheduler dispatcher's atomic counters.
+///
+/// `#[repr(C)]` pins the layout for callers reading through FFI.
+/// Counter semantics:
+/// - `polls`: total number of `poll_fn` invocations the dispatcher has
+///   made since process start (cumulative; never decreases).
+/// - `ready_observations`: count of poll calls that returned `Ready` (1).
+/// - `err_observations`: count of poll calls that returned `Err` (2)
+///   or any unknown non-zero discriminant.
+/// - `pending_observations`: count of poll calls that returned
+///   `Pending` (0).
+///
+/// Invariant: `polls == ready_observations + err_observations +
+/// pending_observations`. The counters are read with `Relaxed`
+/// ordering (each independently), so a snapshot can transiently
+/// observe the sum mismatching the total by one if a poll completes
+/// between reads. Treat the values as approximate for diagnostics;
+/// don't rely on cross-counter consistency.
+#[repr(C)]
+pub struct KaracSchedulerStats {
+    pub polls: u64,
+    pub ready_observations: u64,
+    pub err_observations: u64,
+    pub pending_observations: u64,
+}
+
+/// Read the dispatcher's counter snapshot into the caller's buffer.
+///
+/// Returns 0 on success, -1 if the dispatcher is not running. On -1
+/// the contents of `*out` are unspecified — callers must check the
+/// return value before reading.
+///
+/// # Safety
+///
+/// `out` must point to a writable `KaracSchedulerStats`. The fn writes
+/// the four counters as one atomic write per field (no struct-level
+/// atomicity).
+#[no_mangle]
+pub unsafe extern "C" fn karac_runtime_scheduler_stats_snapshot(
+    out: *mut KaracSchedulerStats,
+) -> i32 {
+    let disp = {
+        let slot = lock_scheduler_dispatcher_slot();
+        match slot.as_ref() {
+            Some(d) => Arc::clone(d),
+            None => return -1,
+        }
+    };
+    let snapshot = KaracSchedulerStats {
+        polls: disp.polls.load(Ordering::Relaxed),
+        ready_observations: disp.ready_observations.load(Ordering::Relaxed),
+        err_observations: disp.err_observations.load(Ordering::Relaxed),
+        pending_observations: disp.pending_observations.load(Ordering::Relaxed),
+    };
+    // SAFETY: caller guarantees `out` is writable for one
+    // `KaracSchedulerStats`.
+    unsafe {
+        out.write(snapshot);
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1663,5 +1725,109 @@ mod tests {
         let _ = karac_runtime_scheduler_shutdown_dispatcher();
         let rc = karac_runtime_scheduler_shutdown_dispatcher();
         assert_eq!(rc, -1);
+    }
+
+    #[test]
+    fn scheduler_stats_snapshot_returns_minus_one_when_dispatcher_not_running() {
+        let _guard = ffi_test_guard();
+        let _ = karac_runtime_scheduler_shutdown_dispatcher();
+        let mut stats = KaracSchedulerStats {
+            polls: 0,
+            ready_observations: 0,
+            err_observations: 0,
+            pending_observations: 0,
+        };
+        let rc = unsafe { karac_runtime_scheduler_stats_snapshot(&mut stats) };
+        assert_eq!(rc, -1, "should report not-running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_stats_track_dispatcher_polls() {
+        let _guard = start_scheduler_for_test();
+        use std::os::fd::AsRawFd;
+
+        // Initial snapshot — dispatcher just started, counters at 0.
+        let mut before = KaracSchedulerStats {
+            polls: 0,
+            ready_observations: 0,
+            err_observations: 0,
+            pending_observations: 0,
+        };
+        let rc = unsafe { karac_runtime_scheduler_stats_snapshot(&mut before) };
+        assert_eq!(rc, 0);
+        assert_eq!(before.polls, 0);
+        assert_eq!(before.ready_observations, 0);
+
+        // Drive one parked task to completion (same shape as the
+        // earlier dispatcher test).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let local = listener.local_addr().unwrap();
+        let listener_fd = listener.as_raw_fd();
+
+        let mut state = Box::new(SchedulerTestState {
+            tag: 0,
+            listener_fd,
+            token: 0,
+            completed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let task = Box::new(KaracParkedTask {
+            poll_fn: scheduler_test_poll_fn,
+            state: &mut *state as *mut SchedulerTestState as *mut c_void,
+        });
+        let task_ptr = &*task as *const KaracParkedTask as *mut c_void;
+        let token = karac_runtime_event_loop_register_fd(listener_fd, 0, task_ptr);
+        assert_ne!(token, 0);
+        state.token = token;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let _initial = unsafe { (task.poll_fn)(task.state, &cancel) };
+
+        let connector = thread::spawn(move || {
+            let _stream = std::net::TcpStream::connect(local).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let start = Instant::now();
+        while !state.completed.load(Ordering::Acquire) {
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("dispatcher did not drive task to completion within 2s");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        connector.join().unwrap();
+
+        // After-snapshot. Dispatcher should have polled exactly once
+        // (the resume after fd readiness), observing Ready. Counters
+        // are monotonic, so we assert lower bounds rather than exact
+        // equality — a spurious extra poll would be unusual but not
+        // an outright bug.
+        let mut after = KaracSchedulerStats {
+            polls: 0,
+            ready_observations: 0,
+            err_observations: 0,
+            pending_observations: 0,
+        };
+        let rc = unsafe { karac_runtime_scheduler_stats_snapshot(&mut after) };
+        assert_eq!(rc, 0);
+        assert!(
+            after.polls >= 1,
+            "dispatcher should have polled at least once, got {}",
+            after.polls
+        );
+        assert!(
+            after.ready_observations >= 1,
+            "at least one Ready observation expected, got {}",
+            after.ready_observations
+        );
+        // The total invariant — polls = ready + err + pending.
+        assert_eq!(
+            after.polls,
+            after.ready_observations + after.err_observations + after.pending_observations,
+            "polls should equal sum of category observations"
+        );
+
+        drop(task);
+        drop(state);
     }
 }

@@ -109,6 +109,9 @@ transform (phase 6 line 18). Unix-only on the fd-registration entries;
 | `karac_runtime_event_loop_shutdown_background_thread` | `extern "C" fn() -> i32` | Slice 3. Signal the background poller to stop, unblock its poll via the waker, join, and clear the global slot. -1 if not running. |
 | `karac_runtime_scheduler_start_dispatcher` | `extern "C" fn() -> i32` | Slice 4. Spawn the scheduler dispatcher thread; auto-starts the background poller if not running. Idempotent. |
 | `karac_runtime_scheduler_shutdown_dispatcher` | `extern "C" fn() -> i32` | Slice 4. Signal the dispatcher to stop, join the thread, clear the global slot. -1 if not running. Does NOT stop the poller. |
+| `karac_runtime_scheduler_stats_snapshot` | `unsafe extern "C" fn(out: *mut KaracSchedulerStats) -> i32` | Slice 5. Read the dispatcher's atomic counters (polls / ready_observations / err_observations / pending_observations) into a caller-allocated buffer. -1 if not running. |
+
+Repr-C type also exported: `KaracSchedulerStats { polls: u64, ready_observations: u64, err_observations: u64, pending_observations: u64 }` — written by `karac_runtime_scheduler_stats_snapshot` into the caller-allocated buffer.
 
 Repr-C type also exported: `KaracWakeup { token: u64, parked: *mut c_void, direction: u8 }` — written by `karac_runtime_event_loop_poll` into the caller-allocated buffer.
 
@@ -165,13 +168,14 @@ an explicit keep-list at the codegen end.
 
 ## Summary
 
-- **Total `#[no_mangle]` exports (2026-05-17 audit):** 46.
+- **Total `#[no_mangle]` exports (2026-05-17 audit):** 47.
   - 4 carried over from 2026-05-07: `karac_par_run`, `karac_error_trace_push`, `karac_error_trace_clear`, `karac_string_clone`.
   - 15 `karac_map_*` (unchanged from 2026-05-07).
   - 18 added 2026-05-07 → 2026-05-12: 5 `karac_provider_*`, `karac_runtime_get_current_frame`, `karac_runtime_for_each_active_frame`, `karac_runtime_has_debug_metadata`, `karac_runtime_list_par_blocks_into`, 4 `karac_runtime_http_*` getters/setters, 2 `karac_runtime_serve_http*`, 4 `karac_runtime_json_*`, `karac_vec_sort_by`.
   - 4 added 2026-05-17 (slice 1): `karac_runtime_event_loop_register_fd` (unix), `karac_runtime_event_loop_deregister_fd` (unix), `karac_runtime_event_loop_poll`, `karac_runtime_event_loop_wake` — phase 6 line 17 slice 1 (network event loop FFI surface).
   - 3 added 2026-05-17 (slice 3): `karac_runtime_event_loop_start_background_thread`, `karac_runtime_event_loop_take_wakeups`, `karac_runtime_event_loop_shutdown_background_thread` — phase 6 line 17 slice 3 (background poller thread + wakeup queue).
   - 2 added 2026-05-17 (slice 4): `karac_runtime_scheduler_start_dispatcher`, `karac_runtime_scheduler_shutdown_dispatcher` — phase 6 line 17 slice 4 (scheduler dispatcher thread that drives parked tasks on wakeup).
+  - 1 added 2026-05-17 (slice 5): `karac_runtime_scheduler_stats_snapshot` — phase 6 line 17 slice 5 (atomic-counter snapshot for diagnostics + tests).
 - **Total libc `extern "C"` imports:** 1 (`atexit`).
 - **Total private `extern "C"` callbacks:** 1 (`print_trace_at_exit`, registered with `atexit`).
 - **`#[used]` / `#[link_section(…)]` / `#[ctor]` / `#[dtor]`:** none.
