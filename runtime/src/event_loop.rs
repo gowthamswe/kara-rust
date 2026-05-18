@@ -815,6 +815,19 @@ pub extern "C" fn karac_runtime_event_loop_shutdown_background_thread() -> i32 {
     if let Some(h) = join {
         let _ = h.join();
     }
+    // Drain any pending waker event. If the poller thread observed
+    // the shutdown flag *before* our `wake()` was delivered to its
+    // `poll()` call (i.e., the thread had already returned from one
+    // `run_once` and was about to check the flag for the next loop
+    // iteration), mio's edge-armed waker leaves the event pending —
+    // the next thread to call `poll()` would receive it as a spurious
+    // empty wakeup. A non-blocking `run_once` here consumes it and
+    // leaves the event loop in a known-clean state for follow-up
+    // callers. BACKGROUND_POLLER is already None at this point (we
+    // took the Arc out at the top of this fn), so this `run_once`
+    // doesn't compete with any background polling.
+    let ev = global_event_loop();
+    let _ = ev.run_once(Some(Duration::ZERO));
     0
 }
 
