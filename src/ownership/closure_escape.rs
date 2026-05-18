@@ -476,7 +476,7 @@ impl<'a> super::OwnershipChecker<'a> {
     /// programmer should always see.
     fn fn_allows_ref_capture_escape(f: &Function) -> bool {
         f.attributes.iter().any(|a| {
-            a.name == "allow"
+            a.is_bare("allow")
                 && a.args.iter().any(|arg| {
                     if let Some(Expr {
                         kind: ExprKind::Identifier(name),

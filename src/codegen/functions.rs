@@ -17,7 +17,12 @@ use super::state::VarSlot;
 impl<'ctx> super::Codegen<'ctx> {
     pub(super) fn apply_linker_attrs(&mut self, fn_val: FunctionValue<'ctx>, attrs: &[Attribute]) {
         for attr in attrs {
-            match attr.name.as_str() {
+            // Linker attributes are bare-name only; namespaced paths
+            // (`#[diagnostic::*]`, tool namespaces) never reach codegen.
+            if attr.path.len() != 1 {
+                continue;
+            }
+            match attr.path[0].as_str() {
                 "link_section" => {
                     // `#[link_section("name")]` — first positional arg or
                     // `string_value` carries the section literal. Skip
@@ -123,10 +128,11 @@ impl<'ctx> super::Codegen<'ctx> {
         // and `#[no_mangle]` / `#[used]` keep external so the symbol survives
         // for FFI consumers / link-section anchors. `main` is handled above.
         let linkage = if func.is_pub
-            || func.attributes.iter().any(|a| {
-                let n = a.name.as_str();
-                n == "no_mangle" || n == "used"
-            }) {
+            || func
+                .attributes
+                .iter()
+                .any(|a| a.is_bare("no_mangle") || a.is_bare("used"))
+        {
             Some(Linkage::External)
         } else {
             Some(Linkage::Internal)

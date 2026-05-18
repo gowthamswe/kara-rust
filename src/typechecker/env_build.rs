@@ -937,7 +937,7 @@ impl<'a> super::TypeChecker<'a> {
                 ),
             },
         );
-        if f.attributes.iter().any(|a| a.name == "compiler_builtin") {
+        if f.attributes.iter().any(|a| a.is_bare("compiler_builtin")) {
             self.env.compiler_builtins.insert(f.name.clone());
         }
         // Slice 4 of the `#[must_use]` mandate: record the attribute on

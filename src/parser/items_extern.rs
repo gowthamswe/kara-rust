@@ -163,7 +163,7 @@ impl super::Parser {
         // Skip naming check when `#[kara_name]` is present — the C-side
         // name is the canonical identifier; the Kāra binding name is
         // whatever the user wants.
-        if !attributes.iter().any(|a| a.name == "kara_name") {
+        if !attributes.iter().any(|a| a.is_bare("kara_name")) {
             let name_span = self.span_from(&start);
             self.check_ident_class(&name, IdentClass::Value, "extern function", name_span);
         }
@@ -226,7 +226,7 @@ impl super::Parser {
         // Opaque foreign type names follow CN-1 (Type-class identifier)
         // when surfaced on the Kāra side; `#[kara_name = "..."]` rebinds
         // a non-conforming foreign name per CN-8.
-        if !attributes.iter().any(|a| a.name == "kara_name") {
+        if !attributes.iter().any(|a| a.is_bare("kara_name")) {
             let name_span = self.span_from(&name_start);
             self.check_ident_class(&name, IdentClass::Type, "opaque foreign type", name_span);
         }

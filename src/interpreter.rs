@@ -707,7 +707,7 @@ impl<'a> Interpreter<'a> {
                 && method
                     .attributes
                     .iter()
-                    .any(|a| a.name == "compiler_builtin")
+                    .any(|a| a.is_bare("compiler_builtin"))
             {
                 continue;
             }

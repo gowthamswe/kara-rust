@@ -91,10 +91,13 @@ impl super::Formatter {
             // wrap so downstream consumers stay simple; the formatter
             // restores it for round-trip idempotence and for the visual
             // grep-for-`#[unsafe(` review pattern the spec describes.
-            let unsafe_wrapped = matches!(attr.name.as_str(), "no_mangle" | "link_section");
+            // Linker attributes are bare-name only — namespaced paths
+            // (`#[diagnostic::*]`, `#[TOOL::*]`) never carry the wrap.
+            let unsafe_wrapped = attr.path.len() == 1
+                && matches!(attr.path[0].as_str(), "no_mangle" | "link_section");
             if unsafe_wrapped {
                 self.write_str("#[unsafe(");
-                self.write_ident(&attr.name);
+                self.write_ident(&attr.path[0]);
                 if let Some(ref s) = attr.string_value {
                     self.write_str("(\"");
                     self.write_str(s);
@@ -105,7 +108,15 @@ impl super::Formatter {
             }
 
             self.write_str("#[");
-            self.write_ident(&attr.name);
+            // Multi-segment paths (`#[diagnostic::on_unimplemented]`,
+            // `#[karafmt::skip]`) round-trip with `::` between segments
+            // per syntax.md §8. Single-segment paths emit unchanged.
+            for (i, seg) in attr.path.iter().enumerate() {
+                if i > 0 {
+                    self.write_str("::");
+                }
+                self.write_ident(seg);
+            }
             if !attr.args.is_empty() {
                 self.write_str("(");
                 for (i, arg) in attr.args.iter().enumerate() {

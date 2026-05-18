@@ -1094,7 +1094,7 @@ impl<'a> OwnershipChecker<'a> {
 
         self.current_function = fn_key.clone();
         self.suppress_rc_notes = f.attributes.iter().any(|a| {
-            a.name == "allow"
+            a.is_bare("allow")
                 && a.args.iter().any(|arg| {
                     // `#[allow(rc_fallback)]` — positional arg whose value
                     // is the bare identifier `rc_fallback`.

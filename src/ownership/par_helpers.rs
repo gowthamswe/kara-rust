@@ -19,7 +19,7 @@ use crate::resolver::SpanKey;
 use super::OwnershipMode;
 
 pub(crate) fn has_attr(attrs: &[Attribute], name: &str) -> bool {
-    attrs.iter().any(|a| a.name == name)
+    attrs.iter().any(|a| a.is_bare(name))
 }
 
 /// Extract `Sender` / `Receiver` annotations from a function or method's

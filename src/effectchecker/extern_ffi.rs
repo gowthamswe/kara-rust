@@ -44,8 +44,8 @@ impl<'a> super::EffectChecker<'a> {
             offset: 0,
             length: 0,
         };
-        let has_noblock = e.attributes.iter().any(|a| a.name == "noblock")
-            || block_attrs.iter().any(|a| a.name == "noblock");
+        let has_noblock = e.attributes.iter().any(|a| a.is_bare("noblock"))
+            || block_attrs.iter().any(|a| a.is_bare("noblock"));
         let mut abi_defaults = EffectSet::new();
         match e.abi.as_str() {
             "C" if !has_noblock => {

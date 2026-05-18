@@ -379,7 +379,7 @@ fn test_slice2_peekable_carries_must_use_annotation() {
     let attr = s
         .attributes
         .iter()
-        .find(|a| a.name == "must_use")
+        .find(|a| a.is_bare("must_use"))
         .expect("Peekable[T] should carry #[must_use] (slice 2 — iterator-adapter category)");
     let msg = attr
         .string_value
@@ -407,7 +407,7 @@ fn test_slice2_pooled_connection_carries_must_use_annotation() {
     let attr = s
         .attributes
         .iter()
-        .find(|a| a.name == "must_use")
+        .find(|a| a.is_bare("must_use"))
         .expect("PooledConnection[T] should carry #[must_use] (slice 2 — guard category)");
     let msg = attr
         .string_value
@@ -435,7 +435,7 @@ fn test_slice2_pool_struct_does_not_carry_must_use() {
     let prog = parse_stdlib_file("pool.kara");
     let s = find_struct(&prog, "Pool");
     assert!(
-        s.attributes.iter().all(|a| a.name != "must_use"),
+        s.attributes.iter().all(|a| !a.is_bare("must_use")),
         "Pool[T] should NOT carry #[must_use] (only PooledConnection[T] does)"
     );
 }
@@ -449,7 +449,7 @@ fn test_slice2_vec_does_not_carry_must_use() {
     let prog = parse_stdlib_file("vec.kara");
     let s = find_struct(&prog, "Vec");
     assert!(
-        s.attributes.iter().all(|a| a.name != "must_use"),
+        s.attributes.iter().all(|a| !a.is_bare("must_use")),
         "Vec[T] should NOT carry #[must_use] (data container, not guard / adapter)"
     );
 }
@@ -464,7 +464,7 @@ fn test_slice2_sender_and_receiver_do_not_carry_must_use() {
         let prog = parse_stdlib_file(basename);
         let s = find_struct(&prog, struct_name);
         assert!(
-            s.attributes.iter().all(|a| a.name != "must_use"),
+            s.attributes.iter().all(|a| !a.is_bare("must_use")),
             "{struct_name}[T] should NOT carry #[must_use] (channel half, not a guard)"
         );
     }

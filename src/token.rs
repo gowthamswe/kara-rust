@@ -161,6 +161,7 @@ pub enum Token {
 
     // Punctuation
     Colon,            // :
+    ColonColon,       // :: (attribute path separator only — syntax.md §8)
     Comma,            // ,
     Semicolon,        // ;
     Dot,              // .

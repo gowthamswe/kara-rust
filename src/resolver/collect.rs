@@ -308,7 +308,7 @@ impl<'a> super::Resolver<'a> {
     /// individual methods instead.
     fn reject_deprecated_on_impl(&mut self, attrs: &[Attribute]) {
         for attr in attrs {
-            if attr.name == "deprecated" {
+            if attr.is_bare("deprecated") {
                 self.errors.push(ResolveError {
                     message: "error[E_DEPRECATED_ON_IMPL]: \
                               `#[deprecated]` is not valid on an `impl` \
@@ -332,7 +332,7 @@ impl<'a> super::Resolver<'a> {
     /// Deprecation > "Where it cannot appear".
     fn reject_deprecated_on_field(&mut self, attrs: &[Attribute]) {
         for attr in attrs {
-            if attr.name == "deprecated" {
+            if attr.is_bare("deprecated") {
                 self.errors.push(ResolveError {
                     message: "error[E_DEPRECATED_ON_FIELD]: \
                               `#[deprecated]` on individual struct fields \
@@ -367,7 +367,7 @@ impl<'a> super::Resolver<'a> {
     /// helper entirely — the attribute is legal at those sites.
     fn reject_track_caller_attr(&mut self, attrs: &[Attribute], target_kind: &str) {
         for attr in attrs {
-            if attr.name == "track_caller" {
+            if attr.is_bare("track_caller") {
                 self.errors.push(ResolveError {
                     message: format!(
                         "error[E_TRACK_CALLER_INVALID_TARGET]: \
@@ -403,7 +403,7 @@ impl<'a> super::Resolver<'a> {
     /// the kind name that fits their item.
     fn reject_non_exhaustive_attr(&mut self, attrs: &[Attribute], target_kind: &str) {
         for attr in attrs {
-            if attr.name == "non_exhaustive" {
+            if attr.is_bare("non_exhaustive") {
                 self.errors.push(ResolveError {
                     message: format!(
                         "error[E_NON_EXHAUSTIVE_INVALID_TARGET]: \
@@ -433,7 +433,7 @@ impl<'a> super::Resolver<'a> {
             return;
         }
         for attr in attrs {
-            if attr.name == "compiler_builtin" {
+            if attr.is_bare("compiler_builtin") {
                 self.errors.push(ResolveError {
                     message: "`#[compiler_builtin]` is reserved for stdlib source baked into the compiler binary"
                         .to_string(),

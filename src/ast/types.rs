@@ -14,9 +14,22 @@ use super::{EffectList, Expr};
 #[derive(Debug, Clone)]
 pub struct Attribute {
     pub span: Span,
-    pub name: String,
+    /// Path segments — `["allow"]` for bare `#[allow]`, `["diagnostic",
+    /// "on_unimplemented"]` for namespaced `#[diagnostic::on_unimplemented]`
+    /// (per syntax.md §8). Always at least one segment.
+    pub path: Vec<String>,
     pub args: Vec<AttrArg>,
     pub string_value: Option<String>,
+}
+
+impl Attribute {
+    /// True iff the attribute is a bare single-segment path matching `name`.
+    /// Use this for matching compiler-recognised attributes — e.g.
+    /// `attr.is_bare("allow")` does NOT match `#[diagnostic::allow]`. The
+    /// namespace dispatch for multi-segment paths is handled separately.
+    pub fn is_bare(&self, name: &str) -> bool {
+        self.path.len() == 1 && self.path[0] == name
+    }
 }
 
 #[derive(Debug, Clone)]

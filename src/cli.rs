@@ -3897,7 +3897,7 @@ fn discover_tests(tree: &ProgramTree) -> Vec<DiscoveredTest> {
 fn extract_requires(attributes: &[crate::ast::Attribute]) -> Vec<String> {
     let mut out = Vec::new();
     for attr in attributes {
-        if attr.name != "test" {
+        if !attr.is_bare("test") {
             continue;
         }
         for arg in &attr.args {
@@ -3928,7 +3928,7 @@ fn extract_requires(attributes: &[crate::ast::Attribute]) -> Vec<String> {
 fn extract_with_providers(attributes: &[crate::ast::Attribute]) -> Vec<WithProviderFixture> {
     let mut out = Vec::new();
     for attr in attributes {
-        if attr.name != "with_provider" {
+        if !attr.is_bare("with_provider") {
             continue;
         }
         if attr.args.len() < 2 {

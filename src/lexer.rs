@@ -69,8 +69,17 @@ impl<'a> Lexer<'a> {
             b'@' => self.make_spanned(Token::At),
             b'~' => self.make_spanned(Token::Tilde),
 
-            // Colon (path separator is now `.`)
-            b':' => self.make_spanned(Token::Colon),
+            // Colon — `.` is the general path separator, but attribute paths
+            // (`#[diagnostic::on_unimplemented]`) use `::` per syntax.md §8.
+            // Greedy two-char lookahead emits `ColonColon` for contiguous `::`;
+            // a lone `:` stays `Token::Colon` (named args, type ascription).
+            b':' => {
+                if self.match_char(b':') {
+                    self.make_spanned(Token::ColonColon)
+                } else {
+                    self.make_spanned(Token::Colon)
+                }
+            }
 
             // Dot / DotDot / DotDotEq
             b'.' => {

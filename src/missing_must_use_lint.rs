@@ -317,7 +317,7 @@ fn make_diagnostic(f: &Function, reason: FireReason, level: LintLevel) -> LintDi
 // ── Attribute helpers ────────────────────────────────────────────────
 
 fn has_attr_named(attrs: &[Attribute], name: &str) -> bool {
-    attrs.iter().any(|a| a.name == name)
+    attrs.iter().any(|a| a.is_bare(name))
 }
 
 /// Recognise `#[allow(missing_must_use)]` in either of the two surface
@@ -337,7 +337,7 @@ fn has_lint_allow_attr(attrs: &[Attribute], rule_name: &str) -> bool {
 /// alongside the existing `#[allow]` form.
 fn has_lint_level_attr(attrs: &[Attribute], level_kind: &str, rule_name: &str) -> bool {
     attrs.iter().any(|a| {
-        if a.name != level_kind {
+        if !a.is_bare(level_kind) {
             return false;
         }
         a.args.iter().any(|arg| {

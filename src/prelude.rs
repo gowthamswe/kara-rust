@@ -1275,7 +1275,7 @@ mod tests {
                 method
                     .attributes
                     .iter()
-                    .any(|a| a.name == "compiler_builtin"),
+                    .any(|a| a.is_bare("compiler_builtin")),
                 "{}.{} should carry #[compiler_builtin]",
                 target_type,
                 name

@@ -1621,7 +1621,7 @@ fn test_attributes() {
     let prog = parse_ok("#[no_rc]\nfn hot_loop() { }");
     if let Item::Function(f) = &prog.items[0] {
         assert_eq!(f.attributes.len(), 1);
-        assert_eq!(f.attributes[0].name, "no_rc");
+        assert_eq!(f.attributes[0].path[0], "no_rc");
     }
 }
 
@@ -1629,7 +1629,7 @@ fn test_attributes() {
 fn test_attribute_with_args() {
     let prog = parse_ok("#[rc_budget(max: 5)]\nfn thing() { }");
     if let Item::Function(f) = &prog.items[0] {
-        assert_eq!(f.attributes[0].name, "rc_budget");
+        assert_eq!(f.attributes[0].path[0], "rc_budget");
         assert_eq!(f.attributes[0].args.len(), 1);
         assert_eq!(f.attributes[0].args[0].name.as_deref(), Some("max"));
     }
@@ -1645,7 +1645,7 @@ fn test_attribute_with_equal_sign_args() {
     let prog =
         parse_ok("#[test(requires = [db.UserDB, payment.PaymentAPI])]\nfn test_checkout() { }");
     if let Item::Function(f) = &prog.items[0] {
-        assert_eq!(f.attributes[0].name, "test");
+        assert_eq!(f.attributes[0].path[0], "test");
         assert_eq!(f.attributes[0].args.len(), 1);
         assert_eq!(f.attributes[0].args[0].name.as_deref(), Some("requires"));
         let value = f.attributes[0].args[0]
@@ -1666,7 +1666,7 @@ fn test_attribute_string_value() {
     let prog =
         parse_ok("#[must_use = \"connections must be explicitly disconnected\"]\nstruct Conn { }");
     if let Item::StructDef(s) = &prog.items[0] {
-        assert_eq!(s.attributes[0].name, "must_use");
+        assert_eq!(s.attributes[0].path[0], "must_use");
         assert_eq!(
             s.attributes[0].string_value.as_deref(),
             Some("connections must be explicitly disconnected")
@@ -1687,7 +1687,7 @@ fn test_compiler_builtin_on_function() {
     let prog = parse_ok("#[compiler_builtin]\nfn dbg[T](value: T) -> T { value }");
     if let Item::Function(f) = &prog.items[0] {
         assert_eq!(f.attributes.len(), 1);
-        assert_eq!(f.attributes[0].name, "compiler_builtin");
+        assert_eq!(f.attributes[0].path[0], "compiler_builtin");
         assert!(f.attributes[0].args.is_empty());
         assert!(f.attributes[0].string_value.is_none());
     } else {
@@ -1700,7 +1700,7 @@ fn test_compiler_builtin_on_struct() {
     let prog = parse_ok("#[compiler_builtin]\nstruct Vec[T] { }");
     if let Item::StructDef(s) = &prog.items[0] {
         assert_eq!(s.attributes.len(), 1);
-        assert_eq!(s.attributes[0].name, "compiler_builtin");
+        assert_eq!(s.attributes[0].path[0], "compiler_builtin");
         assert!(s.attributes[0].args.is_empty());
     } else {
         panic!("Expected StructDef");
@@ -1712,7 +1712,7 @@ fn test_compiler_builtin_on_enum() {
     let prog = parse_ok("#[compiler_builtin]\nenum Option[T] { Some(T), None }");
     if let Item::EnumDef(e) = &prog.items[0] {
         assert_eq!(e.attributes.len(), 1);
-        assert_eq!(e.attributes[0].name, "compiler_builtin");
+        assert_eq!(e.attributes[0].path[0], "compiler_builtin");
         assert!(e.attributes[0].args.is_empty());
     } else {
         panic!("Expected EnumDef");
@@ -1724,7 +1724,7 @@ fn test_compiler_builtin_on_trait() {
     let prog = parse_ok("#[compiler_builtin]\ntrait Display { fn fmt(ref self) -> String; }");
     if let Item::TraitDef(t) = &prog.items[0] {
         assert_eq!(t.attributes.len(), 1);
-        assert_eq!(t.attributes[0].name, "compiler_builtin");
+        assert_eq!(t.attributes[0].path[0], "compiler_builtin");
         assert!(t.attributes[0].args.is_empty());
     } else {
         panic!("Expected TraitDef");
@@ -1749,7 +1749,7 @@ fn non_exhaustive_slice1_struct_sets_flag() {
     };
     assert!(s.is_non_exhaustive);
     assert_eq!(s.attributes.len(), 1);
-    assert_eq!(s.attributes[0].name, "non_exhaustive");
+    assert_eq!(s.attributes[0].path[0], "non_exhaustive");
     assert!(s.attributes[0].args.is_empty());
     assert!(s.attributes[0].string_value.is_none());
 }
@@ -1762,7 +1762,7 @@ fn non_exhaustive_slice1_enum_sets_flag() {
     };
     assert!(e.is_non_exhaustive);
     assert_eq!(e.attributes.len(), 1);
-    assert_eq!(e.attributes[0].name, "non_exhaustive");
+    assert_eq!(e.attributes[0].path[0], "non_exhaustive");
 }
 
 #[test]
@@ -1807,8 +1807,8 @@ fn non_exhaustive_slice1_coexists_with_other_attributes_on_struct() {
     };
     assert!(s.is_non_exhaustive);
     assert_eq!(s.attributes.len(), 2);
-    assert!(s.attributes.iter().any(|a| a.name == "non_exhaustive"));
-    assert!(s.attributes.iter().any(|a| a.name == "must_use"));
+    assert!(s.attributes.iter().any(|a| a.is_bare("non_exhaustive")));
+    assert!(s.attributes.iter().any(|a| a.is_bare("must_use")));
 }
 
 // ── #[track_caller] slice 1 ────────────────────────────────────────
@@ -1831,7 +1831,7 @@ fn track_caller_slice1_sets_flag_on_function() {
     };
     assert!(f.is_track_caller);
     assert_eq!(f.attributes.len(), 1);
-    assert_eq!(f.attributes[0].name, "track_caller");
+    assert_eq!(f.attributes[0].path[0], "track_caller");
     assert!(f.attributes[0].args.is_empty());
     assert!(f.attributes[0].string_value.is_none());
 }
@@ -1900,7 +1900,7 @@ fn track_caller_slice1_set_on_non_fn_item_parser_does_not_reject() {
         panic!("Expected StructDef");
     };
     assert_eq!(s.attributes.len(), 1);
-    assert_eq!(s.attributes[0].name, "track_caller");
+    assert_eq!(s.attributes[0].path[0], "track_caller");
 }
 
 // ── #[deprecated] slices 1+2 — parser + AST payload ───────────────
@@ -2161,7 +2161,7 @@ fn deprecated_slice1_set_on_impl_block_parser_does_not_reject() {
         panic!("Expected ImplBlock");
     };
     assert_eq!(imp.attributes.len(), 1);
-    assert_eq!(imp.attributes[0].name, "deprecated");
+    assert_eq!(imp.attributes[0].path[0], "deprecated");
 }
 
 // ── TraitMethod + Variant attributes enabling change ─────────────
@@ -2195,7 +2195,7 @@ fn enabling_change_variant_captures_attributes() {
     assert_eq!(e.variants.len(), 2);
     assert_eq!(e.variants[0].name, "Legacy");
     assert_eq!(e.variants[0].attributes.len(), 1);
-    assert_eq!(e.variants[0].attributes[0].name, "deprecated");
+    assert_eq!(e.variants[0].attributes[0].path[0], "deprecated");
     let d = e.variants[0]
         .deprecation
         .as_ref()
@@ -2231,7 +2231,7 @@ fn enabling_change_trait_method_captures_attributes() {
     assert_eq!(methods.len(), 2);
     assert_eq!(methods[0].name, "fmt");
     assert_eq!(methods[0].attributes.len(), 1);
-    assert_eq!(methods[0].attributes[0].name, "deprecated");
+    assert_eq!(methods[0].attributes[0].path[0], "deprecated");
     let d = methods[0]
         .deprecation
         .as_ref()
@@ -2258,7 +2258,7 @@ fn enabling_change_trait_method_track_caller_attaches() {
     let methods = trait_methods(t);
     assert!(methods[0].is_track_caller);
     assert_eq!(methods[0].attributes.len(), 1);
-    assert_eq!(methods[0].attributes[0].name, "track_caller");
+    assert_eq!(methods[0].attributes[0].path[0], "track_caller");
 }
 
 #[test]
@@ -2332,6 +2332,101 @@ fn enabling_change_attr_on_struct_variant() {
     };
     assert!(e.variants[0].deprecation.is_some());
     assert!(matches!(e.variants[0].kind, VariantKind::Struct(_)));
+}
+
+// ── Attribute path namespace (item 36 slice 1) ───────────────────
+//
+// Per syntax.md §8, attribute paths are `IDENT { "::" IDENT }`. Slice 1
+// of `#[diagnostic::*]` extends the parser and AST from single-segment
+// names to multi-segment paths so namespace dispatch and tool-namespaced
+// attributes (item 37) have data to consume. Bare attributes still parse
+// to a single-segment path — purely additive surface.
+
+#[test]
+fn attr_path_slice1_bare_name_parses_as_single_segment() {
+    let prog = parse_ok("#[derive(Eq)]\nstruct S { x: i64 }");
+    let Item::StructDef(s) = &prog.items[0] else {
+        panic!("Expected StructDef");
+    };
+    assert_eq!(s.attributes[0].path, vec!["derive".to_string()]);
+    assert!(s.attributes[0].is_bare("derive"));
+}
+
+#[test]
+fn attr_path_slice1_two_segment_namespaced_parses() {
+    let prog = parse_ok("#[diagnostic::on_unimplemented]\ntrait T { }");
+    let Item::TraitDef(t) = &prog.items[0] else {
+        panic!("Expected TraitDef");
+    };
+    assert_eq!(
+        t.attributes[0].path,
+        vec!["diagnostic".to_string(), "on_unimplemented".to_string()],
+    );
+    assert!(!t.attributes[0].is_bare("on_unimplemented"));
+    assert!(!t.attributes[0].is_bare("diagnostic"));
+}
+
+#[test]
+fn attr_path_slice1_three_segment_path_parses() {
+    let prog = parse_ok("#[a::b::c]\nfn f() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert_eq!(
+        f.attributes[0].path,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+    );
+}
+
+#[test]
+fn attr_path_slice1_namespaced_with_args_round_trips() {
+    let prog = parse_ok(
+        "#[diagnostic::on_unimplemented(message: \"x\", label: \"y\")]\n\
+         trait T { }",
+    );
+    let Item::TraitDef(t) = &prog.items[0] else {
+        panic!("Expected TraitDef");
+    };
+    let attr = &t.attributes[0];
+    assert_eq!(
+        attr.path,
+        vec!["diagnostic".to_string(), "on_unimplemented".to_string()]
+    );
+    assert_eq!(attr.args.len(), 2);
+    assert_eq!(attr.args[0].name.as_deref(), Some("message"));
+    assert_eq!(attr.args[1].name.as_deref(), Some("label"));
+}
+
+#[test]
+fn attr_path_slice1_namespaced_path_does_not_trigger_bare_name_guards() {
+    // The `unsafe_op_in_unsafe_fn` hard-rule rejection and the
+    // `no_mangle` / `link_section` bare-form rejection are scoped to
+    // single-segment paths. `#[diagnostic::allow(unsafe_op_in_unsafe_fn)]`
+    // and `#[a::b::no_mangle]` are accepted at the parse layer (namespace
+    // dispatch in item 36 slice 2 may still reject them based on the
+    // namespace registry, but the parser does not).
+    let prog = parse_ok("#[diagnostic::allow(unsafe_op_in_unsafe_fn)]\nfn f() { }");
+    let Item::Function(f) = &prog.items[0] else {
+        panic!("Expected Function");
+    };
+    assert_eq!(
+        f.attributes[0].path,
+        vec!["diagnostic".to_string(), "allow".to_string()],
+    );
+    // Multi-segment paths do not populate lint_overrides — slice 1 of
+    // item 36 keeps lint-level recognition bare-name only.
+    assert!(f.lint_overrides.is_empty());
+}
+
+#[test]
+fn attr_path_slice1_at_attribute_stays_single_segment() {
+    // The `@name` shorthand is a Kāra compiler convenience for bare
+    // attributes; it has no namespace form by design.
+    let prog = parse_ok("@no_rc\nstruct S { x: i64 }");
+    let Item::StructDef(s) = &prog.items[0] else {
+        panic!("Expected StructDef");
+    };
+    assert_eq!(s.attributes[0].path, vec!["no_rc".to_string()]);
 }
 
 // ── Lint level attributes slice 1+2+3 ─────────────────────────────
@@ -2655,7 +2750,7 @@ fn const_attrs_module_const_captures_deprecated() {
         panic!("Expected ConstDecl");
     };
     assert_eq!(c.attributes.len(), 1);
-    assert_eq!(c.attributes[0].name, "deprecated");
+    assert_eq!(c.attributes[0].path[0], "deprecated");
     let d = c
         .deprecation
         .as_ref()
@@ -2879,7 +2974,7 @@ fn test_extern_function_accepts_pub_and_attributes() {
     };
     assert!(f.is_pub, "pub should be threaded to the inner fn");
     assert_eq!(f.attributes.len(), 1, "attribute should be captured");
-    assert_eq!(f.attributes[0].name, "link_name");
+    assert_eq!(f.attributes[0].path[0], "link_name");
     assert_eq!(f.abi, "C");
     assert_eq!(f.name, "puts");
 }
@@ -2933,7 +3028,7 @@ fn test_unsafe_extern_block_keeps_block_level_attribute_separate() {
         panic!("expected ExternBlock");
     };
     assert!(
-        b.attributes.iter().any(|a| a.name == "noblock"),
+        b.attributes.iter().any(|a| a.is_bare("noblock")),
         "block-level @noblock should live on ExternBlock.attributes"
     );
     for it in &b.items {
@@ -2941,7 +3036,7 @@ fn test_unsafe_extern_block_keeps_block_level_attribute_separate() {
             panic!("expected ExternItem::Function");
         };
         assert!(
-            !f.attributes.iter().any(|a| a.name == "noblock"),
+            !f.attributes.iter().any(|a| a.is_bare("noblock")),
             "block-level @noblock must NOT be pre-merged into per-item attributes"
         );
     }
@@ -2964,17 +3059,17 @@ fn test_unsafe_extern_block_per_item_attribute_stays_per_item() {
         panic!("expected ExternBlock");
     };
     assert!(
-        !b.attributes.iter().any(|a| a.name == "noblock"),
+        !b.attributes.iter().any(|a| a.is_bare("noblock")),
         "per-item @noblock must NOT bubble up to ExternBlock.attributes"
     );
     let ExternItem::Function(abs) = &b.items[0] else {
         panic!("expected ExternItem::Function");
     };
-    assert!(abs.attributes.iter().any(|a| a.name == "noblock"));
+    assert!(abs.attributes.iter().any(|a| a.is_bare("noblock")));
     let ExternItem::Function(sqrt) = &b.items[1] else {
         panic!("expected ExternItem::Function");
     };
-    assert!(!sqrt.attributes.iter().any(|a| a.name == "noblock"));
+    assert!(!sqrt.attributes.iter().any(|a| a.is_bare("noblock")));
 }
 
 #[test]
@@ -3007,7 +3102,7 @@ fn test_unsafe_no_mangle_wrap_parses() {
         _ => panic!("expected function"),
     };
     assert_eq!(f.attributes.len(), 1);
-    assert_eq!(f.attributes[0].name, "no_mangle");
+    assert_eq!(f.attributes[0].path[0], "no_mangle");
     assert!(f.attributes[0].args.is_empty());
     assert!(f.attributes[0].string_value.is_none());
 }
@@ -3020,7 +3115,7 @@ fn test_unsafe_link_section_wrap_parses() {
         _ => panic!("expected function"),
     };
     assert_eq!(f.attributes.len(), 1);
-    assert_eq!(f.attributes[0].name, "link_section");
+    assert_eq!(f.attributes[0].path[0], "link_section");
     assert_eq!(f.attributes[0].string_value.as_deref(), Some(".init_array"));
 }
 
@@ -3076,7 +3171,7 @@ fn test_used_attribute_stays_plain() {
         _ => panic!("expected function"),
     };
     assert_eq!(f.attributes.len(), 1);
-    assert_eq!(f.attributes[0].name, "used");
+    assert_eq!(f.attributes[0].path[0], "used");
 }
 
 #[test]
@@ -3186,7 +3281,7 @@ fn test_allow_other_lints_still_accepted() {
         _ => panic!("expected function"),
     };
     assert_eq!(f.attributes.len(), 1);
-    assert_eq!(f.attributes[0].name, "allow");
+    assert_eq!(f.attributes[0].path[0], "allow");
     assert_eq!(f.attributes[0].args.len(), 1);
 }
 
@@ -3321,9 +3416,9 @@ fn test_lint_level_attrs_with_other_lint_names_still_accepted() {
         _ => panic!("expected function"),
     };
     assert_eq!(f.attributes.len(), 3);
-    assert_eq!(f.attributes[0].name, "warn");
-    assert_eq!(f.attributes[1].name, "deny");
-    assert_eq!(f.attributes[2].name, "expect");
+    assert_eq!(f.attributes[0].path[0], "warn");
+    assert_eq!(f.attributes[1].path[0], "deny");
+    assert_eq!(f.attributes[2].path[0], "expect");
 }
 
 #[test]
@@ -3613,7 +3708,7 @@ fn test_extern_block_opaque_type_pub_doc_attributes() {
         Some("Opaque handle to an open file.")
     );
     assert_eq!(o.attributes.len(), 1);
-    assert_eq!(o.attributes[0].name, "link_name");
+    assert_eq!(o.attributes[0].path[0], "link_name");
 }
 
 #[test]
@@ -3665,7 +3760,7 @@ fn test_extern_block_opaque_type_kara_name_skips_class_check() {
         panic!("expected ExternItem::OpaqueType");
     };
     assert_eq!(o.name, "File");
-    assert!(o.attributes.iter().any(|a| a.name == "kara_name"));
+    assert!(o.attributes.iter().any(|a| a.is_bare("kara_name")));
 }
 
 #[test]
@@ -3881,7 +3976,7 @@ fn test_layout_def_accepts_pub_and_attributes() {
     if let Item::LayoutDef(l) = &prog.items[0] {
         assert!(l.is_pub, "pub should be threaded to LayoutDef");
         assert_eq!(l.attributes.len(), 1, "attribute should be captured");
-        assert_eq!(l.attributes[0].name, "no_rc");
+        assert_eq!(l.attributes[0].path[0], "no_rc");
         assert_eq!(l.name, "entities");
     } else {
         panic!("expected LayoutDef");
@@ -3902,7 +3997,7 @@ fn test_struct_field_accepts_attributes() {
     if let Item::StructDef(s) = &prog.items[0] {
         assert_eq!(s.fields.len(), 2);
         assert_eq!(s.fields[0].attributes.len(), 1);
-        assert_eq!(s.fields[0].attributes[0].name, "must_use");
+        assert_eq!(s.fields[0].attributes[0].path[0], "must_use");
         assert_eq!(s.fields[0].name, "header");
         assert_eq!(s.fields[1].attributes.len(), 0);
         assert_eq!(s.fields[1].name, "body");
@@ -4650,7 +4745,7 @@ fn test_distinct_type_with_derive() {
     if let Item::DistinctType(d) = &prog.items[0] {
         assert_eq!(d.name, "UserId");
         assert_eq!(d.attributes.len(), 1);
-        assert_eq!(d.attributes[0].name, "derive");
+        assert_eq!(d.attributes[0].path[0], "derive");
         assert_eq!(d.attributes[0].args.len(), 2);
         // `#[derive(Eq, Hash)]` — positional arg whose value is the bare
         // trait-name identifier. The parser records `name = None` and
@@ -6454,7 +6549,7 @@ fn test_at_attribute_on_struct() {
     if let Item::StructDef(s) = &prog.items[0] {
         assert!(s.no_rc, "@no_rc should set no_rc = true");
         assert_eq!(s.name, "Particle");
-        assert!(s.attributes.iter().any(|a| a.name == "no_rc"));
+        assert!(s.attributes.iter().any(|a| a.is_bare("no_rc")));
     } else {
         panic!("Expected StructDef");
     }
@@ -6466,8 +6561,8 @@ fn test_at_attribute_with_pound_attribute() {
     let prog = parse_ok("@no_rc\n#[derive(Copy)]\nstruct Particle { x: f64 }");
     if let Item::StructDef(s) = &prog.items[0] {
         assert!(s.no_rc);
-        assert!(s.attributes.iter().any(|a| a.name == "no_rc"));
-        assert!(s.attributes.iter().any(|a| a.name == "derive"));
+        assert!(s.attributes.iter().any(|a| a.is_bare("no_rc")));
+        assert!(s.attributes.iter().any(|a| a.is_bare("derive")));
     } else {
         panic!("Expected StructDef");
     }
@@ -6508,7 +6603,7 @@ fn test_with_provider_attribute_parses_positional_args() {
     );
     if let Item::Function(f) = &prog.items[0] {
         let attr = &f.attributes[0];
-        assert_eq!(attr.name, "with_provider");
+        assert_eq!(attr.path[0], "with_provider");
         assert_eq!(attr.args.len(), 2);
         // Both args are positional — `name` is None.
         assert!(attr.args[0].name.is_none());
@@ -6571,8 +6666,8 @@ fn test_multiple_with_provider_attributes_on_one_fn() {
     );
     if let Item::Function(f) = &prog.items[0] {
         assert_eq!(f.attributes.len(), 2);
-        assert_eq!(f.attributes[0].name, "with_provider");
-        assert_eq!(f.attributes[1].name, "with_provider");
+        assert_eq!(f.attributes[0].path[0], "with_provider");
+        assert_eq!(f.attributes[1].path[0], "with_provider");
     } else {
         panic!("expected Function");
     }

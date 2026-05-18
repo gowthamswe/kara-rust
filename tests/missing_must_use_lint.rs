@@ -81,7 +81,7 @@ fn empty_block() -> Block {
 fn must_use_attr() -> Attribute {
     Attribute {
         span: syn_span(),
-        name: "must_use".to_string(),
+        path: vec!["must_use".to_string()],
         args: Vec::new(),
         string_value: Some("test reason".to_string()),
     }
@@ -90,7 +90,7 @@ fn must_use_attr() -> Attribute {
 fn allow_missing_must_use_attr() -> Attribute {
     Attribute {
         span: syn_span(),
-        name: "allow".to_string(),
+        path: vec!["allow".to_string()],
         args: vec![AttrArg {
             name: None,
             value: Some(karac::ast::Expr {

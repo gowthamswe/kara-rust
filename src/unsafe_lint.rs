@@ -168,7 +168,7 @@ fn doc_has_safety_section(doc: &str) -> bool {
 
 fn has_lint_attr(attrs: &[Attribute], kind: &str) -> bool {
     attrs.iter().any(|a| {
-        if a.name != kind {
+        if !a.is_bare(kind) {
             return false;
         }
         a.args.iter().any(|arg| {

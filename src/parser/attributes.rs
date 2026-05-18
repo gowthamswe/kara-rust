@@ -30,14 +30,17 @@ impl super::Parser {
         attrs
     }
 
-    /// Parse `@name` shorthand attribute (e.g. `@no_rc`, `@noblock`)
+    /// Parse `@name` shorthand attribute (e.g. `@no_rc`, `@noblock`). The
+    /// `@`-form is a Kāra compiler shorthand for bare-name attributes; it
+    /// never carries a namespace path, so the resulting `path` is always a
+    /// single segment.
     fn parse_at_attribute(&mut self) -> Option<Attribute> {
         let start = self.current_span();
         self.expect(&Token::At)?;
         let name = self.expect_identifier()?;
         Some(Attribute {
             span: self.span_from(&start),
-            name,
+            path: vec![name],
             args: Vec::new(),
             string_value: None,
         })
@@ -60,13 +63,27 @@ impl super::Parser {
             return self.parse_unsafe_wrapped_attribute(start);
         }
 
-        let name = self.expect_identifier()?;
+        // Parse the attribute path — `IDENT ("::" IDENT)*` per syntax.md §8.
+        // Bare-name attributes (`#[allow]`) produce a single-segment path;
+        // namespaced ones (`#[diagnostic::on_unimplemented]`) produce
+        // multi-segment paths that downstream namespace dispatch reads.
+        let first = self.expect_identifier()?;
+        let mut path = vec![first];
+        while self.eat(&Token::ColonColon) {
+            path.push(self.expect_identifier()?);
+        }
+        // `name` retained as the leading segment for the existing bare-name
+        // guards below; multi-segment paths bypass those guards via the
+        // `path.len() == 1` checks.
+        let name = path[0].clone();
 
         // Bare `#[no_mangle]` / `#[link_section(...)]` — reject with a
-        // focused diagnostic suggesting the `#[unsafe(...)]` wrap.
+        // focused diagnostic suggesting the `#[unsafe(...)]` wrap. The
+        // rejection is scoped to single-segment paths because the linker
+        // attributes never appear inside a namespace.
         // Errors do NOT bail; we keep parsing so error recovery remains
         // useful and the rest of the file still type-checks.
-        if name == "no_mangle" {
+        if path.len() == 1 && name == "no_mangle" {
             self.error(
                 "bare `#[no_mangle]` is not allowed — write `#[unsafe(no_mangle)]` \
                  instead. The `unsafe(...)` wrap is a visual trust-boundary marker: \
@@ -74,7 +91,7 @@ impl super::Parser {
                  obligation the compiler cannot verify. \
                  See design.md § Linker Control Attributes.",
             );
-        } else if name == "link_section" {
+        } else if path.len() == 1 && name == "link_section" {
             self.error(
                 "bare `#[link_section(...)]` is not allowed — write \
                  `#[unsafe(link_section(\"...\"))]` instead. The `unsafe(...)` wrap \
@@ -163,7 +180,8 @@ impl super::Parser {
         // call `LintLevel::from_attr_name` from inside `ast::*`
         // expression-walk code without a circular import, and the
         // four names are a fixed v1 surface per the spec.
-        if matches!(name.as_str(), "allow" | "warn" | "deny" | "expect")
+        if path.len() == 1
+            && matches!(name.as_str(), "allow" | "warn" | "deny" | "expect")
             && args.iter().any(|a| {
                 a.name.as_deref() == Some("unsafe_op_in_unsafe_fn")
                     || a.value
@@ -189,7 +207,7 @@ impl super::Parser {
 
         Some(Attribute {
             span: self.span_from(&start),
-            name,
+            path,
             args,
             string_value,
         })
@@ -258,7 +276,7 @@ impl super::Parser {
 
         Some(Attribute {
             span: self.span_from(&start),
-            name: inner_name,
+            path: vec![inner_name],
             args: Vec::new(),
             string_value: attr_string_value,
         })

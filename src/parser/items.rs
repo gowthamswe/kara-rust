@@ -277,7 +277,7 @@ impl super::Parser {
     pub(crate) fn scan_track_caller_attr(&mut self, attributes: &[Attribute]) -> bool {
         let mut present = false;
         for attr in attributes {
-            if attr.name != "track_caller" {
+            if !attr.is_bare("track_caller") {
                 continue;
             }
             present = true;
@@ -322,7 +322,7 @@ impl super::Parser {
     pub(crate) fn scan_deprecated_attr(&mut self, attributes: &[Attribute]) -> Option<Deprecation> {
         let mut first: Option<Deprecation> = None;
         for attr in attributes {
-            if attr.name != "deprecated" {
+            if !attr.is_bare("deprecated") {
                 continue;
             }
             if first.is_some() {
@@ -462,7 +462,13 @@ impl super::Parser {
         use crate::lints::{LintLevel, LintLevelOverride};
         let mut overrides = Vec::new();
         for attr in attributes {
-            let Some(level) = LintLevel::from_attr_name(&attr.name) else {
+            // Lint-level attributes are bare-name only — `#[allow(...)]`,
+            // not `#[diagnostic::allow(...)]`. Multi-segment paths fall
+            // through to namespace dispatch (item 36's `KnownAttributeNamespace`).
+            if attr.path.len() != 1 {
+                continue;
+            }
+            let Some(level) = LintLevel::from_attr_name(&attr.path[0]) else {
                 continue;
             };
             if attr.string_value.is_some() {
@@ -472,7 +478,7 @@ impl super::Parser {
                          `#[{}]` does not accept a string value — \
                          name the lint(s) inside parens, as in \
                          `#[{}(lint_name)]`",
-                        attr.name, attr.name,
+                        attr.path[0], attr.path[0],
                     ),
                     span: attr.span.clone(),
                 });
@@ -484,7 +490,7 @@ impl super::Parser {
                         "error[E_LINT_LEVEL_NO_ARGS]: \
                          `#[{}]` requires at least one lint name — \
                          write `#[{}(lint_name)]`",
-                        attr.name, attr.name,
+                        attr.path[0], attr.path[0],
                     ),
                     span: attr.span.clone(),
                 });
@@ -516,7 +522,7 @@ impl super::Parser {
                              `#[{}(...)]` accepts bare lint-name \
                              identifiers only — drop the value \
                              expression",
-                            attr.name,
+                            attr.path[0],
                         ),
                         span: arg.span.clone(),
                     });
@@ -528,7 +534,7 @@ impl super::Parser {
                             "error[E_DUPLICATE_LINT_LEVEL]: lint \
                              name `{}` appears more than once in \
                              `#[{}(...)]`",
-                            name, attr.name,
+                            name, attr.path[0],
                         ),
                         span: arg.span.clone(),
                     });
@@ -851,7 +857,7 @@ impl super::Parser {
         let (fields, invariants) = self.parse_struct_body()?;
         self.expect(&Token::RightBrace)?;
 
-        let no_rc = attributes.iter().any(|a| a.name == "no_rc");
+        let no_rc = attributes.iter().any(|a| a.is_bare("no_rc"));
         // `#[non_exhaustive]` is a bare type-level attribute. Set the
         // flag at parse so the resolver / typechecker / exhaustiveness
         // pass can consult it without re-walking attributes. Placement
@@ -859,7 +865,7 @@ impl super::Parser {
         // variants / impl blocks / type aliases) lives in the resolver
         // — mirrors the `#[compiler_builtin]` split between parser-
         // captures-flag and resolver-validates-placement.
-        let is_non_exhaustive = attributes.iter().any(|a| a.name == "non_exhaustive");
+        let is_non_exhaustive = attributes.iter().any(|a| a.is_bare("non_exhaustive"));
         let deprecation = self.scan_deprecated_attr(&attributes);
         let lint_overrides = self.scan_lint_level_attrs(&attributes);
 
@@ -945,7 +951,7 @@ impl super::Parser {
         }
         self.expect(&Token::RightBrace)?;
 
-        let is_non_exhaustive = attributes.iter().any(|a| a.name == "non_exhaustive");
+        let is_non_exhaustive = attributes.iter().any(|a| a.is_bare("non_exhaustive"));
         let deprecation = self.scan_deprecated_attr(&attributes);
         let lint_overrides = self.scan_lint_level_attrs(&attributes);
 

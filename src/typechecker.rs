@@ -66,7 +66,7 @@ use types::{
 pub(super) fn extract_derived_traits(attributes: &[Attribute]) -> HashSet<String> {
     let mut traits = HashSet::new();
     for attr in attributes {
-        if attr.name == "derive" {
+        if attr.is_bare("derive") {
             for arg in &attr.args {
                 match &arg.value {
                     // `#[derive(Eq)]` — bare identifier
@@ -116,14 +116,14 @@ pub(super) fn extract_derived_traits(attributes: &[Attribute]) -> HashSet<String
 pub(super) fn extract_must_use_message(attributes: &[Attribute]) -> Option<String> {
     attributes
         .iter()
-        .find(|a| a.name == "must_use")
+        .find(|a| a.is_bare("must_use"))
         .map(|a| a.string_value.clone().unwrap_or_default())
 }
 
 /// Returns `true` when `attributes` contains `#[derive(Display(snake_case))]`.
 pub(super) fn has_display_snake_case(attributes: &[Attribute]) -> bool {
     for attr in attributes {
-        if attr.name == "derive" {
+        if attr.is_bare("derive") {
             for arg in &attr.args {
                 if let Some(Expr {
                     kind:
