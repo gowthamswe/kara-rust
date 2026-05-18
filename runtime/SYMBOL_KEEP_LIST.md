@@ -102,8 +102,11 @@ transform (phase 6 line 18). Unix-only on the fd-registration entries;
 |---|---|---|
 | `karac_runtime_event_loop_register_fd` (unix) | `extern "C" fn(raw_fd: i32, direction: u8, parked: *mut c_void) -> u64` | Register a raw fd with the process-global event loop; returns a non-zero token on success. |
 | `karac_runtime_event_loop_deregister_fd` (unix) | `extern "C" fn(raw_fd: i32, token: u64) -> i32` | Remove a previously registered fd; 0 = success, -1 = error. |
-| `karac_runtime_event_loop_poll` | `unsafe extern "C" fn(max_wait_nanos: i64, wakeups_out: *mut KaracWakeup, max_wakeups: usize) -> usize` | Drive the loop once and write ready entries into the caller's buffer. -1 = block, 0 = non-blocking, n>0 = wait n ns. |
+| `karac_runtime_event_loop_poll` | `unsafe extern "C" fn(max_wait_nanos: i64, wakeups_out: *mut KaracWakeup, max_wakeups: usize) -> usize` | Drive the loop once and write ready entries into the caller's buffer. -1 = block, 0 = non-blocking, n>0 = wait n ns. Returns 0 immediately when the background poller thread is running (slice 3+). |
 | `karac_runtime_event_loop_wake` | `extern "C" fn() -> i32` | Wake the loop from a non-event-loop thread. Backed by `mio::Waker` (eventfd / pipe / IOCP-post). |
+| `karac_runtime_event_loop_start_background_thread` | `extern "C" fn() -> i32` | Slice 3. Spawn the background poller thread; idempotent (a second call returns 0 without re-spawning). |
+| `karac_runtime_event_loop_take_wakeups` | `unsafe extern "C" fn(out: *mut KaracWakeup, max: usize, timeout_nanos: i64) -> usize` | Slice 3. Drain wakeups from the background poller's queue. -1 = block, 0 = non-blocking, n>0 = wait n ns. |
+| `karac_runtime_event_loop_shutdown_background_thread` | `extern "C" fn() -> i32` | Slice 3. Signal the background poller to stop, unblock its poll via the waker, join, and clear the global slot. -1 if not running. |
 
 Repr-C type also exported: `KaracWakeup { token: u64, parked: *mut c_void, direction: u8 }` — written by `karac_runtime_event_loop_poll` into the caller-allocated buffer.
 
@@ -160,11 +163,12 @@ an explicit keep-list at the codegen end.
 
 ## Summary
 
-- **Total `#[no_mangle]` exports (2026-05-17 audit):** 41.
+- **Total `#[no_mangle]` exports (2026-05-17 audit):** 44.
   - 4 carried over from 2026-05-07: `karac_par_run`, `karac_error_trace_push`, `karac_error_trace_clear`, `karac_string_clone`.
   - 15 `karac_map_*` (unchanged from 2026-05-07).
   - 18 added 2026-05-07 → 2026-05-12: 5 `karac_provider_*`, `karac_runtime_get_current_frame`, `karac_runtime_for_each_active_frame`, `karac_runtime_has_debug_metadata`, `karac_runtime_list_par_blocks_into`, 4 `karac_runtime_http_*` getters/setters, 2 `karac_runtime_serve_http*`, 4 `karac_runtime_json_*`, `karac_vec_sort_by`.
-  - 4 added 2026-05-17: `karac_runtime_event_loop_register_fd` (unix), `karac_runtime_event_loop_deregister_fd` (unix), `karac_runtime_event_loop_poll`, `karac_runtime_event_loop_wake` — phase 6 line 17 slice 1 (network event loop FFI surface).
+  - 4 added 2026-05-17 (slice 1): `karac_runtime_event_loop_register_fd` (unix), `karac_runtime_event_loop_deregister_fd` (unix), `karac_runtime_event_loop_poll`, `karac_runtime_event_loop_wake` — phase 6 line 17 slice 1 (network event loop FFI surface).
+  - 3 added 2026-05-17 (slice 3): `karac_runtime_event_loop_start_background_thread`, `karac_runtime_event_loop_take_wakeups`, `karac_runtime_event_loop_shutdown_background_thread` — phase 6 line 17 slice 3 (background poller thread + wakeup queue).
 - **Total libc `extern "C"` imports:** 1 (`atexit`).
 - **Total private `extern "C"` callbacks:** 1 (`print_trace_at_exit`, registered with `atexit`).
 - **`#[used]` / `#[link_section(…)]` / `#[ctor]` / `#[dtor]`:** none.

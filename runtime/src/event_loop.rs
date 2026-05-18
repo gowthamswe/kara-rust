@@ -7,11 +7,13 @@
 //!
 //! ## v1 architectural commitments (per phase-6-runtime.md line 15)
 //!
-//! - **Single OS thread per event loop.** v1 runs exactly one loop per
-//!   process; M2 / M3 may shard across multiple loops to reach the 1M+
-//!   idle-connection target. `EventLoop` itself is `!Sync` and pinned
-//!   to its constructing thread; cross-thread interaction goes through
-//!   the clonable [`EventLoopHandle`].
+//! - **One event loop per process.** v1 runs exactly one loop; M2 / M3
+//!   may shard across multiple loops to reach the 1M+ idle-connection
+//!   target. The type is `Sync` — shared via `Arc<EventLoop>` from any
+//!   thread — with two interior Mutexes that split the polling and
+//!   registration code paths so a long-blocking `run_once` (held by
+//!   the background poller thread, slice 3) does not block concurrent
+//!   register / deregister calls.
 //! - **Registration / de-registration are crate-internal.** The public
 //!   language surface stays effect-typed (`sends(Network)` /
 //!   `receives(Network)`); codegen lowers those effects into runtime
@@ -28,10 +30,12 @@
 //!   phase-6 entry calls out by name.
 
 use mio::{Events, Interest, Poll, Token};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::io;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Direction(s) of I/O readiness we are polling on a given fd.
@@ -87,9 +91,9 @@ struct FdState {
 // becomes ready. The owner guarantees the pointer is valid from the
 // `register` call until the corresponding `deregister` returns (or
 // until the readiness wakeup is observed and consumed). `Send` is
-// required because the `EventLoop` may be moved across threads
-// before `run_once` is first called (though after that, the
-// architectural commitment pins it to one thread).
+// required because the `EventLoop` is shared across threads as
+// `Arc<EventLoop>`, so the inner `fds` HashMap (storing `FdState`)
+// must itself be `Send` to live inside the `Mutex`.
 unsafe impl Send for FdState {}
 
 /// A readiness wakeup surfaced by [`EventLoop::run_once`].
@@ -106,18 +110,44 @@ pub struct Wakeup {
     pub direction: IoDirection,
 }
 
-/// Single-threaded event loop.
+/// Event loop. `Sync` — register / deregister / wake from any thread;
+/// `run_once` serializes via an interior Mutex.
 ///
 /// Per the v1 architectural commitment, exactly one loop runs per
-/// process. The type is `!Sync` (via `Poll`'s own non-`Sync` bound)
-/// and intentionally not `Send`-erased to other threads after `run_once`
-/// has been called — cross-thread interaction goes through
-/// [`EventLoopHandle`].
+/// process. The interior splits state into two independently-locked
+/// halves so the long-blocking `run_once` (which holds the `poll`
+/// Mutex through the entire `mio::Poll::poll` call) does **not**
+/// block registration (which acquires only the `fds` Mutex briefly).
+/// This is what makes the background-poller architecture (slice 3)
+/// safe: the poller thread blocks indefinitely in `run_once` while
+/// other threads continue to register / deregister fds against the
+/// same loop.
 pub struct EventLoop {
-    poll: Poll,
+    /// Owned clone of `mio::Poll`'s registry. `mio::Registry` is
+    /// `Sync`, so register / deregister calls from arbitrary threads
+    /// hit the OS-level registration syscalls without external
+    /// synchronization — the only thing we lock is the `fds`
+    /// HashMap below.
+    registry: mio::Registry,
+    /// Cross-thread waker handle. `mio::Waker` is `Sync` (uses
+    /// eventfd / pipe / IOCP-post under the hood).
     waker: Arc<mio::Waker>,
+    /// Poll instance + events buffer. Only `run_once` touches this;
+    /// the Mutex enforces single-polling-thread-at-a-time.
+    poll: Mutex<EventLoopPoll>,
+    /// Per-fd state + token allocator. Briefly locked by register /
+    /// deregister, and during the post-poll wakeup-extraction phase
+    /// of `run_once`.
+    fds: Mutex<EventLoopFds>,
+}
+
+struct EventLoopPoll {
+    poll: Poll,
     events: Events,
-    fds: HashMap<Token, FdState>,
+}
+
+struct EventLoopFds {
+    by_token: HashMap<Token, FdState>,
     /// Monotonically increasing source of unique tokens. Reserved
     /// values: `0` is the cross-thread waker (see [`WAKER_TOKEN`]);
     /// user-fd tokens start at `1`.
@@ -127,17 +157,23 @@ pub struct EventLoop {
 const WAKER_TOKEN: Token = Token(0);
 
 impl EventLoop {
-    /// Construct a new event loop. Allocates the underlying `mio::Poll`
-    /// and registers the cross-thread waker.
+    /// Construct a new event loop. Allocates the underlying `mio::Poll`,
+    /// clones its registry handle, and registers the cross-thread waker.
     pub fn new() -> io::Result<Self> {
         let poll = Poll::new()?;
+        let registry = poll.registry().try_clone()?;
         let waker = Arc::new(mio::Waker::new(poll.registry(), WAKER_TOKEN)?);
         Ok(EventLoop {
-            poll,
+            registry,
             waker,
-            events: Events::with_capacity(256),
-            fds: HashMap::new(),
-            next_token: 1,
+            poll: Mutex::new(EventLoopPoll {
+                poll,
+                events: Events::with_capacity(256),
+            }),
+            fds: Mutex::new(EventLoopFds {
+                by_token: HashMap::new(),
+                next_token: 1,
+            }),
         })
     }
 
@@ -156,22 +192,29 @@ impl EventLoop {
     /// through [`Wakeup`] when the fd becomes ready. The event loop
     /// stores it but does not deref it; lifetime is the caller's
     /// responsibility (the codegen parking path / scheduler).
+    ///
+    /// Acquires only the `fds` Mutex briefly — concurrent `run_once`
+    /// calls are unaffected (different Mutex).
     pub fn register<S: mio::event::Source + ?Sized>(
-        &mut self,
+        &self,
         source: &mut S,
         direction: IoDirection,
         deadline: Option<Instant>,
         parked: *mut c_void,
     ) -> io::Result<RegistrationToken> {
-        let token = Token(self.next_token);
-        self.next_token = self
+        let mut fds = self.fds.lock().unwrap_or_else(|p| p.into_inner());
+        let token = Token(fds.next_token);
+        fds.next_token = fds
             .next_token
             .checked_add(1)
             .expect("event loop token exhaustion (usize wrap)");
-        self.poll
-            .registry()
+        // mio::Registry is Sync — safe to call without holding any
+        // additional lock. We still hold the fds lock through this
+        // call so the HashMap insert and OS-level registration appear
+        // atomic to other threads.
+        self.registry
             .register(source, token, direction.to_interest())?;
-        self.fds.insert(
+        fds.by_token.insert(
             token,
             FdState {
                 parked,
@@ -190,13 +233,16 @@ impl EventLoop {
     /// internal map is unconditional — a `RegistrationToken` produced
     /// by this loop is always present unless it has already been
     /// deregistered, in which case removing again is a silent no-op.
+    ///
+    /// Acquires only the `fds` Mutex briefly.
     pub fn deregister<S: mio::event::Source + ?Sized>(
-        &mut self,
+        &self,
         source: &mut S,
         token: RegistrationToken,
     ) -> io::Result<()> {
-        self.poll.registry().deregister(source)?;
-        self.fds.remove(&Token(token.0));
+        let mut fds = self.fds.lock().unwrap_or_else(|p| p.into_inner());
+        self.registry.deregister(source)?;
+        fds.by_token.remove(&Token(token.0));
         Ok(())
     }
 
@@ -215,14 +261,25 @@ impl EventLoop {
     /// re-check any external state (new registrations queued by the
     /// scheduler, cancellation, shutdown). An empty return with no
     /// readiness wakeups indicates a waker or timeout wakeup.
-    pub fn run_once(&mut self, max_wait: Option<Duration>) -> io::Result<Vec<Wakeup>> {
-        self.poll.poll(&mut self.events, max_wait)?;
+    ///
+    /// **Locking.** Holds the `poll` Mutex throughout (so only one
+    /// thread polls at a time). Acquires the `fds` Mutex briefly
+    /// after the poll syscall returns, to translate ready events
+    /// into [`Wakeup`]s. Lock order is consistently poll → fds.
+    pub fn run_once(&self, max_wait: Option<Duration>) -> io::Result<Vec<Wakeup>> {
+        let mut poll_guard = self.poll.lock().unwrap_or_else(|p| p.into_inner());
+        let EventLoopPoll {
+            ref mut poll,
+            ref mut events,
+        } = *poll_guard;
+        poll.poll(events, max_wait)?;
+        let fds = self.fds.lock().unwrap_or_else(|p| p.into_inner());
         let mut wakeups = Vec::new();
-        for event in self.events.iter() {
+        for event in events.iter() {
             if event.token() == WAKER_TOKEN {
                 continue;
             }
-            let Some(state) = self.fds.get(&event.token()) else {
+            let Some(state) = fds.by_token.get(&event.token()) else {
                 continue;
             };
             let direction = if event.is_readable() && event.is_writable() {
@@ -245,7 +302,11 @@ impl EventLoop {
 
     #[cfg(test)]
     fn registered_count(&self) -> usize {
-        self.fds.len()
+        self.fds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_token
+            .len()
     }
 }
 
@@ -277,12 +338,13 @@ impl EventLoopHandle {
 // and the scheduler-side wakeup-to-worker-queue glue land as follow-up
 // slices; this slice exposes only the ABI codegen will emit against.
 //
-// **Threading model (v1).** The process-global event loop is wrapped in
-// a `Mutex` so register / deregister / poll calls from any thread are
-// serialized. v1 prioritizes correctness over throughput here; M2 polish
-// layer may split this into a clonable `Registry` handle plus a
-// dedicated poller thread (no FFI signature change required — the
-// surface below is the contract).
+// **Threading model (v1, slice 3+).** The process-global event loop is
+// stored as an `Arc<EventLoop>` and is itself `Sync`. Register /
+// deregister calls from any thread acquire only the inner `fds` Mutex
+// briefly; `run_once` acquires the inner `poll` Mutex for the duration
+// of the blocking poll. Because the two locks are independent, a
+// long-blocking poll (the background poller thread in slice 3+) does
+// not block concurrent registrations.
 //
 // **Platform scope.** The fd-registration FFI fns are `#[cfg(unix)]`
 // only — Linux / macOS / BSD. Windows IOCP uses a completion-based
@@ -292,7 +354,7 @@ impl EventLoopHandle {
 
 /// Process-global event loop instance, lazily initialized.
 /// Per the v1 architectural commitment: exactly one EventLoop per process.
-static EVENT_LOOP: OnceLock<Mutex<EventLoop>> = OnceLock::new();
+static EVENT_LOOP: OnceLock<Arc<EventLoop>> = OnceLock::new();
 
 /// Cached handle to the process-global event loop's waker. Populated
 /// during the same `OnceLock::get_or_init` that constructs `EVENT_LOOP`,
@@ -300,28 +362,18 @@ static EVENT_LOOP: OnceLock<Mutex<EventLoop>> = OnceLock::new();
 /// also set.
 static EVENT_LOOP_HANDLE: OnceLock<EventLoopHandle> = OnceLock::new();
 
-fn global_event_loop() -> &'static Mutex<EventLoop> {
+fn global_event_loop() -> &'static Arc<EventLoop> {
     EVENT_LOOP.get_or_init(|| {
         let ev = EventLoop::new().expect("karac_runtime: process-global event loop init failed");
+        let arc = Arc::new(ev);
         // `set` may already have been populated by a racing initializer if
         // two threads called this concurrently; the `OnceLock::get_or_init`
         // contract guarantees we are the unique initializer of `EVENT_LOOP`,
         // but the handle write is a separate `OnceLock`, so ignore a
         // duplicate-set error.
-        let _ = EVENT_LOOP_HANDLE.set(ev.handle());
-        Mutex::new(ev)
+        let _ = EVENT_LOOP_HANDLE.set(arc.handle());
+        arc
     })
-}
-
-/// Recover from a poisoned global-event-loop mutex. The runtime's
-/// invariants do not depend on the lock being unpoisoned — the inner
-/// `EventLoop` is valid regardless of whether a previous holder
-/// panicked — so we proceed with the inner value rather than aborting.
-fn lock_global_event_loop() -> std::sync::MutexGuard<'static, EventLoop> {
-    match global_event_loop().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    }
 }
 
 /// Readiness wakeup entry written into the caller-allocated buffer by
@@ -336,6 +388,15 @@ pub struct KaracWakeup {
     pub parked: *mut c_void,
     pub direction: u8,
 }
+
+// SAFETY: `parked` is opaque to the runtime — stored at register time
+// and handed back through this value at wakeup time. The original
+// caller (codegen parking path) owns the pointer's lifetime and any
+// thread-safety concerns; the runtime moves `KaracWakeup` across
+// threads only when the background poller (slice 3) queues a wakeup
+// for consumption by a scheduler thread, and the pointer crosses
+// unchanged.
+unsafe impl Send for KaracWakeup {}
 
 /// Register a raw fd with the process-global event loop.
 ///
@@ -367,8 +428,8 @@ pub extern "C" fn karac_runtime_event_loop_register_fd(
         _ => return 0,
     };
     let mut source = mio::unix::SourceFd(&raw_fd);
-    let mut guard = lock_global_event_loop();
-    match guard.register(&mut source, dir, None, parked) {
+    let ev = global_event_loop();
+    match ev.register(&mut source, dir, None, parked) {
         Ok(token) => token.0 as u64,
         Err(_) => 0,
     }
@@ -384,8 +445,8 @@ pub extern "C" fn karac_runtime_event_loop_register_fd(
 #[no_mangle]
 pub extern "C" fn karac_runtime_event_loop_deregister_fd(raw_fd: i32, token: u64) -> i32 {
     let mut source = mio::unix::SourceFd(&raw_fd);
-    let mut guard = lock_global_event_loop();
-    match guard.deregister(&mut source, RegistrationToken(token as usize)) {
+    let ev = global_event_loop();
+    match ev.deregister(&mut source, RegistrationToken(token as usize)) {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -423,8 +484,20 @@ pub unsafe extern "C" fn karac_runtime_event_loop_poll(
         n if n > 0 => Some(Duration::from_nanos(n as u64)),
         _ => Some(Duration::ZERO),
     };
-    let mut guard = lock_global_event_loop();
-    let wakeups = match guard.run_once(max_wait) {
+    // If the background poller thread is running it owns polling — direct
+    // FFI poll callers get back an empty result so they fall through to
+    // `karac_runtime_event_loop_take_wakeups` instead of contending for
+    // the inner poll Mutex (which the background thread holds for the
+    // duration of its blocking call).
+    if BACKGROUND_POLLER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
+    {
+        return 0;
+    }
+    let ev = global_event_loop();
+    let wakeups = match ev.run_once(max_wait) {
         Ok(w) => w,
         Err(_) => return 0,
     };
@@ -540,6 +613,211 @@ pub struct KaracParkedTask {
 // runtime inspection.
 unsafe impl Send for KaracParkedTask {}
 
+// ── Background event-loop poller + wakeup queue (Phase 6 line 17 slice 3) ──
+//
+// An opt-in background thread that owns event-loop polling. Once started,
+// the thread loops on `EventLoop::run_once(None)` indefinitely (blocking
+// in mio's poll inside the inner `poll` Mutex), depositing wakeups into
+// an internal `VecDeque<KaracWakeup>` for consumption by a scheduler
+// thread via `karac_runtime_event_loop_take_wakeups`.
+//
+// **No deadlock with registration.** The `EventLoop` refactor that
+// landed alongside this section splits the inner state into two
+// independent Mutexes — `poll` (held by the background thread for the
+// duration of each blocking poll) and `fds` (held only briefly by
+// register / deregister). Concurrent `karac_runtime_event_loop_register_fd`
+// calls from any thread acquire only the `fds` Mutex, so the long-blocking
+// poll does not stall registration.
+//
+// **Direct FFI poll coexistence.** While the background poller is running,
+// direct `karac_runtime_event_loop_poll` callers short-circuit to return
+// 0 immediately — the background poller has authoritative ownership of
+// the polling channel and direct callers should drain via `take_wakeups`
+// instead. Documented in `karac_runtime_event_loop_poll`'s body.
+//
+// **Shutdown protocol.** `karac_runtime_event_loop_shutdown_background_thread`
+// sets the shutdown flag, fires the cross-thread `wake()` to unblock the
+// current poll call, signals the queue's `Condvar` to release any
+// waiting `take_wakeups` callers, joins the thread, and clears the
+// global slot. Idempotent — calling on a non-running thread returns -1
+// without side effects, so a re-start after shutdown is supported within
+// the same process.
+
+/// Internal poller state. Held inside `Arc` so the spawned thread can
+/// share it with the global slot.
+struct EventLoopPoller {
+    event_loop: Arc<EventLoop>,
+    queue: Mutex<VecDeque<KaracWakeup>>,
+    notify: Condvar,
+    shutdown: AtomicBool,
+    /// `JoinHandle` for the spawned thread. Wrapped in `Mutex<Option<_>>`
+    /// so the shutdown path can `take()` it independently of the rest
+    /// of the poller state.
+    handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+/// Global slot for the background poller. `None` until the first
+/// `karac_runtime_event_loop_start_background_thread` call; cleared
+/// back to `None` on shutdown so the thread can be re-started later
+/// within the same process. `Mutex<Option<Arc<_>>>` rather than
+/// `OnceLock` for exactly this restart capability.
+static BACKGROUND_POLLER: Mutex<Option<Arc<EventLoopPoller>>> = Mutex::new(None);
+
+fn lock_background_poller_slot() -> std::sync::MutexGuard<'static, Option<Arc<EventLoopPoller>>> {
+    BACKGROUND_POLLER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn poller_thread_main(poller: Arc<EventLoopPoller>) {
+    while !poller.shutdown.load(Ordering::Acquire) {
+        let wakeups = match poller.event_loop.run_once(None) {
+            Ok(w) => w,
+            Err(_) => {
+                // Treat transient poll errors as a yield — re-check
+                // shutdown and continue.
+                continue;
+            }
+        };
+        if wakeups.is_empty() {
+            continue;
+        }
+        let mut q = poller.queue.lock().unwrap_or_else(|p| p.into_inner());
+        for w in wakeups {
+            q.push_back(KaracWakeup {
+                token: w.token.0 as u64,
+                parked: w.parked,
+                direction: w.direction as u8,
+            });
+        }
+        drop(q);
+        poller.notify.notify_all();
+    }
+}
+
+/// Start the background event-loop poller thread.
+///
+/// Idempotent: a second call while the thread is already running
+/// returns 0 without re-spawning. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn karac_runtime_event_loop_start_background_thread() -> i32 {
+    let mut slot = lock_background_poller_slot();
+    if slot.is_some() {
+        return 0;
+    }
+    let event_loop = Arc::clone(global_event_loop());
+    let poller = Arc::new(EventLoopPoller {
+        event_loop,
+        queue: Mutex::new(VecDeque::new()),
+        notify: Condvar::new(),
+        shutdown: AtomicBool::new(false),
+        handle: Mutex::new(None),
+    });
+    let poller_for_thread = Arc::clone(&poller);
+    let join = thread::Builder::new()
+        .name("karac-event-loop".to_string())
+        .spawn(move || poller_thread_main(poller_for_thread))
+        .expect("karac_runtime: failed to spawn event-loop poller thread");
+    *poller.handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(join);
+    *slot = Some(poller);
+    0
+}
+
+/// Drain up to `max` wakeups from the background poller's queue into
+/// the caller's buffer.
+///
+/// `timeout_nanos`:
+/// - `-1`: block indefinitely until at least one wakeup arrives.
+/// - `0`: non-blocking — return immediately, even if the queue is empty.
+/// - `n > 0`: block up to `n` nanoseconds.
+/// - Any other negative value: treated as 0 (non-blocking).
+///
+/// Returns the number of wakeups written. 0 means "queue was empty at
+/// timeout" (or the background thread is not running).
+///
+/// # Safety
+///
+/// `out` must point to a writable buffer of at least `max ×
+/// sizeof(KaracWakeup)` bytes. `max = 0` with `out = null` is permitted
+/// (no writes).
+#[no_mangle]
+pub unsafe extern "C" fn karac_runtime_event_loop_take_wakeups(
+    out: *mut KaracWakeup,
+    max: usize,
+    timeout_nanos: i64,
+) -> usize {
+    let poller = {
+        let slot = lock_background_poller_slot();
+        match slot.as_ref() {
+            Some(p) => Arc::clone(p),
+            None => return 0,
+        }
+    };
+    let mut q = poller.queue.lock().unwrap_or_else(|p| p.into_inner());
+    if q.is_empty() {
+        match timeout_nanos {
+            -1 => {
+                q = poller.notify.wait(q).unwrap_or_else(|p| p.into_inner());
+            }
+            n if n > 0 => {
+                let (g, _) = poller
+                    .notify
+                    .wait_timeout(q, Duration::from_nanos(n as u64))
+                    .unwrap_or_else(|p| p.into_inner());
+                q = g;
+            }
+            _ => {
+                // Non-blocking — return empty.
+            }
+        }
+    }
+    let mut n_out = 0;
+    while n_out < max {
+        match q.pop_front() {
+            Some(w) => {
+                // SAFETY: caller's contract — `out` is writable for
+                // `max` entries; we write at offset `n_out < max`.
+                unsafe {
+                    out.add(n_out).write(w);
+                }
+                n_out += 1;
+            }
+            None => break,
+        }
+    }
+    n_out
+}
+
+/// Signal the background poller thread to stop, unblock its `poll`
+/// call via the cross-thread waker, join the thread, and clear the
+/// global slot.
+///
+/// Returns 0 on success, -1 if no background thread is running.
+/// A second shutdown after a successful shutdown returns -1 (the slot
+/// is empty).
+#[no_mangle]
+pub extern "C" fn karac_runtime_event_loop_shutdown_background_thread() -> i32 {
+    let poller = {
+        let mut slot = lock_background_poller_slot();
+        match slot.take() {
+            Some(p) => p,
+            None => return -1,
+        }
+    };
+    poller.shutdown.store(true, Ordering::Release);
+    let _ = karac_runtime_event_loop_wake();
+    poller.notify.notify_all();
+    let join = poller
+        .handle
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(h) = join {
+        let _ = h.join();
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,7 +846,7 @@ mod tests {
 
     #[test]
     fn cross_thread_wake_unblocks_poll() {
-        let mut ev = EventLoop::new().unwrap();
+        let ev = EventLoop::new().unwrap();
         let handle = ev.handle();
 
         let woke = thread::spawn(move || {
@@ -599,7 +877,7 @@ mod tests {
         let mut listener = TcpListener::bind(bind_addr).unwrap();
         let local = listener.local_addr().unwrap();
 
-        let mut ev = EventLoop::new().unwrap();
+        let ev = EventLoop::new().unwrap();
 
         // Use a stack-allocated u64 as the "parked task" stand-in. The
         // loop never derefs it; we just check round-trip identity.
@@ -633,7 +911,7 @@ mod tests {
 
     #[test]
     fn poll_timeout_returns_empty_wakeups() {
-        let mut ev = EventLoop::new().unwrap();
+        let ev = EventLoop::new().unwrap();
         let wakeups = ev.run_once(Some(Duration::from_millis(10))).unwrap();
         assert!(wakeups.is_empty(), "no fds registered → no wakeups");
     }
@@ -644,7 +922,7 @@ mod tests {
         // tokens differ. Also checks `next_token` increments correctly.
         let mut l1 = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let mut l2 = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let mut ev = EventLoop::new().unwrap();
+        let ev = EventLoop::new().unwrap();
         let t1 = ev
             .register(&mut l1, IoDirection::Read, None, std::ptr::null_mut())
             .unwrap();
@@ -918,5 +1196,134 @@ mod tests {
         assert_eq!(state.tag, 1, "state machine ended in state 1");
 
         connector.join().unwrap();
+    }
+
+    // ── Background poller thread (Phase 6 line 17 slice 3) ─────────────
+
+    /// Test-only guard that shuts down the background poller on drop.
+    /// Holds the FFI test lock so background-poller tests serialize
+    /// against the other FFI tests. The drop order matters: shutdown
+    /// runs first (while the FFI lock is still held), then the FFI lock
+    /// releases.
+    struct BackgroundPollerTestGuard {
+        _ffi: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for BackgroundPollerTestGuard {
+        fn drop(&mut self) {
+            let _ = karac_runtime_event_loop_shutdown_background_thread();
+        }
+    }
+
+    fn start_background_poller_for_test() -> BackgroundPollerTestGuard {
+        let _ffi = ffi_test_guard();
+        // Ensure clean start: a prior test that aborted abnormally could
+        // have left the thread running.
+        let _ = karac_runtime_event_loop_shutdown_background_thread();
+        let rc = karac_runtime_event_loop_start_background_thread();
+        assert_eq!(rc, 0, "start_background_thread should report success");
+        BackgroundPollerTestGuard { _ffi }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_thread_drains_wakeups_via_take() {
+        let _guard = start_background_poller_for_test();
+        use std::os::fd::AsRawFd;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let local = listener.local_addr().unwrap();
+        let raw_fd = listener.as_raw_fd();
+
+        let marker: u64 = 0xBEEF_0F0F_BEEF_0F0F;
+        let parked = std::ptr::addr_of!(marker) as *mut c_void;
+        let token = karac_runtime_event_loop_register_fd(raw_fd, 0, parked);
+        assert_ne!(token, 0, "register should return a non-zero token");
+
+        let connector = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let _stream = std::net::TcpStream::connect(local).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let mut buf: [KaracWakeup; 4] = unsafe { std::mem::zeroed() };
+        let n = unsafe {
+            karac_runtime_event_loop_take_wakeups(buf.as_mut_ptr(), buf.len(), 2_000_000_000)
+        };
+        assert!(
+            n >= 1,
+            "expected at least one wakeup via background thread, got {n}"
+        );
+        let w = &buf[0];
+        assert_eq!(w.token, token);
+        assert_eq!(w.parked, parked);
+        assert_eq!(w.direction, IoDirection::Read as u8);
+
+        connector.join().unwrap();
+        let dereg = karac_runtime_event_loop_deregister_fd(raw_fd, token);
+        assert_eq!(dereg, 0);
+    }
+
+    #[test]
+    fn background_thread_take_nonblocking_returns_zero_on_empty_queue() {
+        let _guard = start_background_poller_for_test();
+        let mut buf: [KaracWakeup; 4] = unsafe { std::mem::zeroed() };
+        let n = unsafe { karac_runtime_event_loop_take_wakeups(buf.as_mut_ptr(), buf.len(), 0) };
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn background_thread_take_with_timeout_unblocks_on_empty() {
+        let _guard = start_background_poller_for_test();
+        let mut buf: [KaracWakeup; 4] = unsafe { std::mem::zeroed() };
+        let start = Instant::now();
+        let n = unsafe {
+            karac_runtime_event_loop_take_wakeups(buf.as_mut_ptr(), buf.len(), 100_000_000)
+        };
+        let elapsed = start.elapsed();
+        assert_eq!(n, 0);
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "should wait ~100ms before timing out, only waited {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "should not wait much longer than 100ms, waited {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn background_thread_start_is_idempotent() {
+        let _guard = start_background_poller_for_test();
+        let rc = karac_runtime_event_loop_start_background_thread();
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn background_thread_shutdown_returns_minus_one_when_not_running() {
+        let _guard = ffi_test_guard();
+        let _ = karac_runtime_event_loop_shutdown_background_thread();
+        let rc = karac_runtime_event_loop_shutdown_background_thread();
+        assert_eq!(rc, -1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_ffi_poll_short_circuits_when_background_is_running() {
+        let _guard = start_background_poller_for_test();
+        // With the background poller owning polling, direct FFI poll
+        // returns 0 immediately so callers don't contend for the
+        // inner poll Mutex.
+        let mut buf: [KaracWakeup; 4] = unsafe { std::mem::zeroed() };
+        let start = Instant::now();
+        let n =
+            unsafe { karac_runtime_event_loop_poll(2_000_000_000, buf.as_mut_ptr(), buf.len()) };
+        let elapsed = start.elapsed();
+        assert_eq!(n, 0);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "direct poll should return immediately, took {elapsed:?}"
+        );
     }
 }
