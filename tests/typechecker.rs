@@ -1754,6 +1754,309 @@ fn lint_attrs_slice4b_polish_empty_overrides_keeps_default_cascade() {
     assert_eq!(unreachable.lint_name.as_deref(), Some("unreachable_arm"));
 }
 
+// ── Slice 5 — #[expect] fulfilment tracking ─────────────────────
+
+#[test]
+fn lint_attrs_slice5_expect_fulfilled_silent() {
+    // Positive — `#[expect(unreachable_arm)]` on a fn whose match
+    // has an unreachable arm: the warning is silent (slice 4b
+    // follow-up), the expectation is fulfilled (slice 5 — no
+    // unfulfilled warning).
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         #[expect(unreachable_arm)]\n\
+         fn name(c: Color) -> i64 {\n\
+             match c {\n\
+                 Red   => 1,\n\
+                 Red   => 2,\n\
+                 Green => 3,\n\
+                 Blue  => 4,\n\
+             }\n\
+         }",
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .all(|w| w.kind != TypeErrorKind::UnreachableArm),
+        "expect should silence the unreachable_arm warning; got: {:?}",
+        result.warnings,
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .all(|w| w.kind != TypeErrorKind::UnfulfilledLintExpectation),
+        "fulfilled expect should NOT emit unfulfilled_lint_expectation; got: {:?}",
+        result.warnings,
+    );
+}
+
+#[test]
+fn lint_attrs_slice5_expect_unfulfilled_emits_warning() {
+    // Headline — `#[expect(unreachable_arm)]` on a fn whose match
+    // has NO unreachable arm: the expectation is unfulfilled and the
+    // end-of-typecheck sweep emits `unfulfilled_lint_expectation`.
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         #[expect(unreachable_arm)]\n\
+         fn name(c: Color) -> i64 {\n\
+             match c {\n\
+                 Red   => 1,\n\
+                 Green => 2,\n\
+                 Blue  => 3,\n\
+             }\n\
+         }",
+    );
+    let unfulfilled = result
+        .warnings
+        .iter()
+        .find(|w| w.kind == TypeErrorKind::UnfulfilledLintExpectation)
+        .expect("expected unfulfilled_lint_expectation warning for the un-fired expect");
+    assert!(
+        unfulfilled.message.contains("unreachable_arm"),
+        "diagnostic should name the lint that didn't fire; got: {}",
+        unfulfilled.message,
+    );
+    assert_eq!(
+        unfulfilled.lint_name.as_deref(),
+        Some("unfulfilled_lint_expectation"),
+        "warning must carry the canonical lint name so #[allow(...)] can suppress",
+    );
+}
+
+#[test]
+fn lint_attrs_slice5_unfulfilled_suppressible_via_allow() {
+    // The sweep emission routes through `type_lint_warning`, so the
+    // standard cascade lets `#[allow(unfulfilled_lint_expectation)]`
+    // on the same item silence the warning. Pins that the same-item
+    // overrides are pushed as the innermost cascade frame at emission
+    // time (matching the `emit_unknown_lint_warnings` shape).
+    let result = typecheck_ok(
+        "#[allow(unfulfilled_lint_expectation)]\n\
+         #[expect(unreachable_arm)]\n\
+         fn f() -> i64 { 0 }",
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .all(|w| w.kind != TypeErrorKind::UnfulfilledLintExpectation),
+        "#[allow(unfulfilled_lint_expectation)] should silence the sweep; got: {:?}",
+        result.warnings,
+    );
+}
+
+#[test]
+fn lint_attrs_slice5_expect_on_unfulfilled_rejected() {
+    // The circular-guard pre-pass — `#[expect(unfulfilled_lint_expectation)]`
+    // is rejected with `error[E_EXPECT_ON_UNFULFILLED]`. Cannot be
+    // suppressed by any inner attribute (hard error via
+    // `type_error`, not routed through the cascade).
+    let parsed = parse(
+        "#[expect(unfulfilled_lint_expectation)]\n\
+         fn f() -> i64 { 0 }",
+    );
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
+    let resolved = resolve(&parsed.program);
+    assert!(
+        resolved.errors.is_empty(),
+        "resolve errors: {:?}",
+        resolved.errors
+    );
+    let result = typecheck(&parsed.program, &resolved);
+    let rejected = result
+        .errors
+        .iter()
+        .find(|e| e.kind == TypeErrorKind::ExpectOnUnfulfilled)
+        .expect("expected ExpectOnUnfulfilled error for the circular form");
+    assert!(
+        rejected.message.contains("E_EXPECT_ON_UNFULFILLED"),
+        "diagnostic should carry the symbolic error code; got: {}",
+        rejected.message,
+    );
+}
+
+#[test]
+fn lint_attrs_slice5_multiple_expects_track_independently() {
+    // Two `#[expect]` overrides on one item: only the un-fulfilled
+    // one emits. Pins that the (offset, lint_name) keying tracks
+    // overrides independently — the fulfilled `unreachable_arm`
+    // expectation doesn't cover-up the unfulfilled `deprecated` one.
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         #[expect(unreachable_arm, deprecated)]\n\
+         fn name(c: Color) -> i64 {\n\
+             match c {\n\
+                 Red   => 1,\n\
+                 Red   => 2,\n\
+                 Green => 3,\n\
+                 Blue  => 4,\n\
+             }\n\
+         }",
+    );
+    // The `unreachable_arm` expectation IS fulfilled (the match has
+    // a duplicate Red arm); the `deprecated` expectation is NOT
+    // (nothing in the body references a deprecated symbol).
+    let unfulfilled: Vec<_> = result
+        .warnings
+        .iter()
+        .filter(|w| w.kind == TypeErrorKind::UnfulfilledLintExpectation)
+        .collect();
+    assert_eq!(
+        unfulfilled.len(),
+        1,
+        "exactly one unfulfilled expectation expected; got {} — warnings: {:?}",
+        unfulfilled.len(),
+        result.warnings,
+    );
+    assert!(
+        unfulfilled[0].message.contains("deprecated"),
+        "the unfulfilled expectation should be for `deprecated`; got: {}",
+        unfulfilled[0].message,
+    );
+}
+
+#[test]
+fn lint_attrs_slice5_expect_at_impl_block_fulfilled_by_method_body() {
+    // Cascade — `#[expect]` on an impl block; the lint fires inside
+    // a method body. Slice 4b core's `check_impl_block` pushes the
+    // impl's overrides as a frame, and `check_function` pushes the
+    // method's; the cascade resolves Expect at the impl-block frame
+    // when the method's frame has no matching override. Fulfilment
+    // is recorded against the impl block's `#[expect]` and no
+    // unfulfilled warning surfaces.
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         pub struct S { x: i64 }\n\
+         #[expect(unreachable_arm)]\n\
+         impl S {\n\
+             fn classify(ref self, c: Color) -> i64 {\n\
+                 match c {\n\
+                     Red   => 1,\n\
+                     Red   => 2,\n\
+                     Green => 3,\n\
+                     Blue  => 4,\n\
+                 }\n\
+             }\n\
+         }",
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .all(|w| w.kind != TypeErrorKind::UnfulfilledLintExpectation),
+        "impl-block #[expect] should be fulfilled by lint firing in a method body; \
+         got: {:?}",
+        result.warnings,
+    );
+}
+
+#[test]
+fn lint_attrs_slice5_expect_at_impl_block_unfulfilled_emits() {
+    // Mirror of the previous — same shape but the method body
+    // doesn't fire the lint. The sweep walks impl-block lint_overrides
+    // (via `item_own_lint_overrides`) and emits unfulfilled.
+    let result = typecheck_ok(
+        "pub struct S { x: i64 }\n\
+         #[expect(unreachable_arm)]\n\
+         impl S {\n\
+             fn f(ref self) -> i64 { self.x }\n\
+         }",
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.kind == TypeErrorKind::UnfulfilledLintExpectation),
+        "impl-block #[expect] with no firing in any method should emit unfulfilled; \
+         got: {:?}",
+        result.warnings,
+    );
+}
+
+#[test]
+fn lint_attrs_slice5_inner_allow_does_not_fulfill_outer_expect() {
+    // Cascade semantics — outer `#[expect]` + inner `#[allow]` on
+    // the same lint: the inner Allow shadows the outer Expect at
+    // emission, so the cascade returns Allow (not Expect) and the
+    // outer expect's fulfilment bit stays unset. The end-of-typecheck
+    // sweep flags the outer expect as unfulfilled.
+    //
+    // This pins Rust's documented behavior: an `#[expect]` is
+    // fulfilled only when the cascade actually resolves to Expect
+    // for some firing — a closer Allow that suppresses entirely
+    // does not count as fulfilment.
+    let result = typecheck_ok(
+        "enum Color { Red, Green, Blue }\n\
+         pub struct S { x: i64 }\n\
+         #[expect(unreachable_arm)]\n\
+         impl S {\n\
+             #[allow(unreachable_arm)]\n\
+             fn classify(ref self, c: Color) -> i64 {\n\
+                 match c {\n\
+                     Red   => 1,\n\
+                     Red   => 2,\n\
+                     Green => 3,\n\
+                     Blue  => 4,\n\
+                 }\n\
+             }\n\
+         }",
+    );
+    let unfulfilled: Vec<_> = result
+        .warnings
+        .iter()
+        .filter(|w| w.kind == TypeErrorKind::UnfulfilledLintExpectation)
+        .collect();
+    assert_eq!(
+        unfulfilled.len(),
+        1,
+        "outer #[expect] should be flagged unfulfilled when inner #[allow] shadows; \
+         got warnings: {:?}",
+        result.warnings,
+    );
+}
+
+#[test]
+fn lint_attrs_slice5_unfulfilled_promotes_under_deny() {
+    // The sweep emission routes through `type_lint_warning`, so
+    // `#[deny(unfulfilled_lint_expectation)]` promotes the warning
+    // to an error. Pins that the slice-5 emission participates in
+    // the normal cascade machinery for level resolution, not just
+    // for suppression.
+    let parsed = parse(
+        "#[deny(unfulfilled_lint_expectation)]\n\
+         #[expect(unreachable_arm)]\n\
+         fn f() -> i64 { 0 }",
+    );
+    assert!(
+        parsed.errors.is_empty(),
+        "parse errors: {:?}",
+        parsed.errors
+    );
+    let resolved = resolve(&parsed.program);
+    assert!(
+        resolved.errors.is_empty(),
+        "resolve errors: {:?}",
+        resolved.errors
+    );
+    let result = typecheck(&parsed.program, &resolved);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.kind == TypeErrorKind::UnfulfilledLintExpectation),
+        "#[deny(unfulfilled_lint_expectation)] should promote the sweep warning \
+         to an error; got errors: {:?}, warnings: {:?}",
+        result.errors,
+        result.warnings,
+    );
+}
+
 // ── Maranget witness construction (exhaustiveness slice 4) ──────
 
 #[test]

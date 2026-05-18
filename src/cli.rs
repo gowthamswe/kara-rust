@@ -858,6 +858,12 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 // is rejected; never appears as a warning (the
                 // diagnostic is a hard error by construction).
                 crate::typechecker::TypeErrorKind::ForbiddenLintAllow => "E0247",
+                // Lint-level slice 5 — `#[expect(unfulfilled_lint_expectation)]`
+                // rejection (would be circular).
+                crate::typechecker::TypeErrorKind::ExpectOnUnfulfilled => "E0248",
+                // Lint-level slice 5 — appears on the errors path only
+                // when promoted via `#[deny(unfulfilled_lint_expectation)]`.
+                crate::typechecker::TypeErrorKind::UnfulfilledLintExpectation => "E0249",
             };
             diags.add(DiagEntry {
                 id: &format!("d{id_counter}"),
@@ -881,6 +887,7 @@ fn collect_diagnostics(pipeline: &Pipeline) -> DiagnosticJson {
                 crate::typechecker::TypeErrorKind::UnknownLint => "W0244",
                 crate::typechecker::TypeErrorKind::Deprecated => "W0245",
                 crate::typechecker::TypeErrorKind::MissingNonExhaustive => "W0246",
+                crate::typechecker::TypeErrorKind::UnfulfilledLintExpectation => "W0249",
                 // Other kinds aren't expected to appear as warnings today.
                 _ => "W0299",
             };

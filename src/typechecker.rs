@@ -456,6 +456,25 @@ pub enum TypeErrorKind {
     /// itself be suppressed. See design.md § Lint Level Attributes
     /// for the `-F` semantics; `E_FORBIDDEN_LINT_ALLOW`.
     ForbiddenLintAllow,
+    /// Lint-level slice 5 — `#[expect(unfulfilled_lint_expectation)]`
+    /// is rejected at typecheck pre-pass time as a hard error. The
+    /// cycle would be inert (the `expect` would silence its own
+    /// unfulfilled warning, which is itself the firing event that
+    /// fulfils the expect), so the spec makes it an error: *"Reject
+    /// `#[expect(unfulfilled_lint_expectation)]` with
+    /// `error[E_EXPECT_ON_UNFULFILLED]` (would be circular)."*
+    /// Emitted via `type_error` so it cannot itself be suppressed.
+    /// `E_EXPECT_ON_UNFULFILLED`.
+    ExpectOnUnfulfilled,
+    /// Lint-level slice 5 — emitted at end of typecheck for every
+    /// source `#[expect(NAME)]` whose named lint did not fire
+    /// anywhere in the attributed scope. Routes through
+    /// `type_lint_warning` with the `unfulfilled_lint_expectation`
+    /// lint name (registered `Warn`-by-default in
+    /// `crate::lints::STARTER_LINTS`), so `#[allow(unfulfilled_lint_expectation)]`
+    /// suppresses uniformly. `W0249` (warning path);
+    /// `#[deny(unfulfilled_lint_expectation)]` promotes to `E0249`.
+    UnfulfilledLintExpectation,
 }
 
 impl std::fmt::Display for TypeError {
@@ -835,6 +854,18 @@ pub struct TypeChecker<'a> {
     /// emits a hard error at every inner `#[allow(NAME)]` whose name
     /// the CLI marked `-F`.
     pub(super) cli_lint_overrides: crate::lints::CliLintOverrides,
+    /// Fulfilment bookkeeping for `#[expect(NAME)]` overrides
+    /// (slice 5). Each entry is keyed by `(span.offset, lint_name)`
+    /// of the originating `LintLevelOverride`. An entry is inserted
+    /// from [`Self::type_lint_warning`] whenever the cascade returns
+    /// `Expect` for the named lint — the innermost matching override
+    /// is the one whose expectation got fulfilled. At end of
+    /// [`Self::check`], [`Self::emit_unfulfilled_lint_expectations`]
+    /// walks every item's `lint_overrides` and emits
+    /// `unfulfilled_lint_expectation` for any `Expect` override whose
+    /// key is absent. Byte-offset alone is unique-enough as a key —
+    /// each lint-name token in the source has a distinct offset.
+    pub(super) fulfilled_expectations: HashSet<(usize, String)>,
 }
 
 /// Why a closure is `OnceFunction`-typed: which captured outer binding the
@@ -888,6 +919,7 @@ impl<'a> TypeChecker<'a> {
             current_fn_stdlib_origin: false,
             lint_override_stack: Vec::new(),
             cli_lint_overrides: crate::lints::CliLintOverrides::default(),
+            fulfilled_expectations: HashSet::new(),
         }
     }
 
@@ -935,6 +967,13 @@ impl<'a> TypeChecker<'a> {
         // still surfaces (the inner attribute is invalid; the lint
         // should fire). See `emit_forbidden_lint_allow_errors`.
         self.emit_forbidden_lint_allow_errors();
+        // Lint-level slice 5 — `#[expect(unfulfilled_lint_expectation)]`
+        // is rejected at typecheck time (would be circular — the
+        // expect would silence its own unfulfilled warning, which is
+        // its own fulfilling event). Pre-pass mirrors the forbid
+        // shape: walks every item's `lint_overrides` and emits the
+        // hard error before any other slice-5 machinery runs.
+        self.emit_expect_on_unfulfilled_errors();
         // `#[non_exhaustive]` slice 6 — stdlib hygiene lint. Runs as a
         // pre-pass for the same reason: cascade-aware emission needs
         // each enum's own `lint_overrides` pushed as the innermost
@@ -942,6 +981,14 @@ impl<'a> TypeChecker<'a> {
         self.emit_missing_non_exhaustive_warnings();
         self.check_items();
         self.finalize_pattern_binding_inner_types();
+        // Lint-level slice 5 — end-of-typecheck sweep. Walks every
+        // item's `lint_overrides` and emits `unfulfilled_lint_expectation`
+        // for any `Expect` override that wasn't fulfilled during
+        // `check_items`. Runs AFTER `check_items` because the
+        // fulfilment bookkeeping needs every emission site to have
+        // executed; runs BEFORE the TypeCheckResult is returned so
+        // the new warnings flow through the normal channel.
+        self.emit_unfulfilled_lint_expectations();
         let trait_impls: std::collections::HashSet<(String, String)> = self
             .env
             .impls
@@ -1100,6 +1147,128 @@ impl<'a> TypeChecker<'a> {
                  rejected — forbid mode disallows any source-level suppression of the lint",
             );
             self.type_error(message, span, TypeErrorKind::ForbiddenLintAllow);
+        }
+    }
+
+    /// Lint-level slice 5 — reject `#[expect(unfulfilled_lint_expectation)]`
+    /// at typecheck pre-pass time with `error[E_EXPECT_ON_UNFULFILLED]`.
+    /// The cycle would be inert: an `#[expect(unfulfilled_lint_expectation)]`
+    /// scope would silence its own unfulfilled warning, which is
+    /// itself the firing event that fulfils the expect, so the
+    /// expectation is fulfilled silently — the user gets no signal
+    /// either way. Spec rejects the form outright.
+    ///
+    /// Walks the same item-level surface as
+    /// `emit_forbidden_lint_allow_errors` (top-level items via
+    /// `item_own_lint_overrides` plus impl-block methods
+    /// explicitly). Emitted via `type_error` (not the cascade) so
+    /// the rejection cannot itself be suppressed.
+    fn emit_expect_on_unfulfilled_errors(&mut self) {
+        // Collect (span, lint_name) pairs first, then drain;
+        // `type_error` borrows `&mut self` so we can't hold a
+        // borrow of `self.program.items` across the call.
+        let mut emissions: Vec<Span> = Vec::new();
+        for item in &self.program.items {
+            if let Some(overs) = item_own_lint_overrides(item) {
+                collect_expect_on_unfulfilled(overs, &mut emissions);
+            }
+            if let Item::ImplBlock(imp) = item {
+                for impl_item in &imp.items {
+                    if let ImplItem::Method(f) = impl_item {
+                        collect_expect_on_unfulfilled(&f.lint_overrides, &mut emissions);
+                    }
+                }
+            }
+        }
+        for span in emissions {
+            let message = String::from(
+                "error[E_EXPECT_ON_UNFULFILLED]: `#[expect(unfulfilled_lint_expectation)]` \
+                 is rejected — the form would be circular (an unfulfilled `#[expect]` \
+                 fires this very lint, which the outer `#[expect]` would silence, \
+                 fulfilling itself, so the user gets no signal either way)",
+            );
+            self.type_error(message, span, TypeErrorKind::ExpectOnUnfulfilled);
+        }
+    }
+
+    /// Lint-level slice 5 — end-of-typecheck sweep. Walks every
+    /// item's `lint_overrides` (and impl-block methods' overrides)
+    /// and emits `unfulfilled_lint_expectation` for every `Expect`
+    /// override whose `(span.offset, lint_name)` key is absent from
+    /// `fulfilled_expectations`. Fulfilment is populated by
+    /// [`Self::type_lint_warning`]'s `Expect` arm as a side effect
+    /// of normal lint emission; an `Expect` override whose key is
+    /// still absent at end-of-typecheck means the named lint never
+    /// fired in the attributed scope.
+    ///
+    /// The emission routes through `type_lint_warning` so the
+    /// `unfulfilled_lint_expectation` lint participates in the
+    /// normal cascade — `#[allow(unfulfilled_lint_expectation)]`
+    /// suppresses, `#[deny(...)]` promotes. The originating item's
+    /// own `lint_overrides` are pushed as the innermost cascade
+    /// frame before emission so a same-item `#[allow]` suppresses.
+    /// Same shape as `emit_unknown_lint_warnings`.
+    ///
+    /// **Note.** `#[expect(unfulfilled_lint_expectation)]` is
+    /// already rejected by the slice-5 pre-pass
+    /// `emit_expect_on_unfulfilled_errors`, so no risk of recursion
+    /// at this site.
+    fn emit_unfulfilled_lint_expectations(&mut self) {
+        // Collect (outer impl-block frame, inner item frame, span, lint_name)
+        // pairs so the per-emission cascade walks the same shape as
+        // `emit_unknown_lint_warnings`.
+        let mut emissions: Vec<(
+            Vec<crate::lints::LintLevelOverride>,
+            Vec<crate::lints::LintLevelOverride>,
+            Span,
+            String,
+        )> = Vec::new();
+        for item in &self.program.items {
+            if let Some(overs) = item_own_lint_overrides(item) {
+                collect_unfulfilled_expects(
+                    overs,
+                    &self.fulfilled_expectations,
+                    Vec::new(),
+                    overs.to_vec(),
+                    &mut emissions,
+                );
+            }
+            if let Item::ImplBlock(imp) = item {
+                for impl_item in &imp.items {
+                    if let ImplItem::Method(f) = impl_item {
+                        collect_unfulfilled_expects(
+                            &f.lint_overrides,
+                            &self.fulfilled_expectations,
+                            imp.lint_overrides.clone(),
+                            f.lint_overrides.clone(),
+                            &mut emissions,
+                        );
+                    }
+                }
+            }
+        }
+        for (outer, inner, span, lint_name) in emissions {
+            let pushed_outer = !outer.is_empty();
+            if pushed_outer {
+                self.lint_override_stack.push(outer);
+            }
+            self.lint_override_stack.push(inner);
+            let message = format!(
+                "warning[unfulfilled_lint_expectation]: the lint `{lint_name}` did not fire \
+                 anywhere in the scope of this `#[expect({lint_name})]` — either the lint \
+                 has been fixed (remove the attribute) or the attribute was attached to the \
+                 wrong scope",
+            );
+            self.type_lint_warning(
+                message,
+                span,
+                TypeErrorKind::UnfulfilledLintExpectation,
+                "unfulfilled_lint_expectation",
+            );
+            self.lint_override_stack.pop();
+            if pushed_outer {
+                self.lint_override_stack.pop();
+            }
         }
     }
 
@@ -1327,13 +1496,24 @@ impl<'a> TypeChecker<'a> {
                 self.warnings.push(entry);
             }
             LintLevel::Expect => {
-                // `#[expect(NAME)]` on a scope whose lint fires is
-                // silent per design.md § Lint Level Attributes (the
-                // user told the compiler they expect the lint to
-                // fire, so its firing is acknowledged not surfaced).
-                // Slice 5 will additionally track fulfilment and
-                // emit `unfulfilled_lint_expectation` when the lint
-                // did NOT fire in the attributed scope.
+                // Slice 5 — record the fulfilled expectation. The
+                // cascade returned `Expect`, so the innermost
+                // matching override is necessarily an `Expect` one;
+                // mark it fulfilled so the end-of-typecheck sweep in
+                // `emit_unfulfilled_lint_expectations` doesn't flag
+                // it. Outer matching overrides (if any) are
+                // shadowed by the innermost match and stay
+                // unfulfilled — the user gets a signal that they're
+                // redundant. Per design.md § Lint Level Attributes:
+                // *"`#[expect(NAME)]` on a fn that triggers the lint
+                // is silent"* — the firing is acknowledged not
+                // surfaced.
+                let key = self
+                    .find_innermost_matching_override(lint_name)
+                    .map(|ov| (ov.span.offset, lint_name.to_string()));
+                if let Some(key) = key {
+                    self.fulfilled_expectations.insert(key);
+                }
             }
             LintLevel::Deny => {
                 self.errors.push(entry);
@@ -1364,6 +1544,26 @@ impl<'a> TypeChecker<'a> {
         self.cli_lint_overrides
             .level_for(lint_name, registry_default)
             .unwrap_or(registry_default)
+    }
+
+    /// Walk the `lint_override_stack` innermost-first looking for an
+    /// override matching `lint_name` (any level). Slice 5 uses this
+    /// from the `Expect` arm of `type_lint_warning` to locate the
+    /// specific source `#[expect(...)]` whose expectation just got
+    /// fulfilled — keyed by `(span.offset, lint_name)` for the
+    /// end-of-typecheck unfulfilled sweep.
+    pub(super) fn find_innermost_matching_override(
+        &self,
+        lint_name: &str,
+    ) -> Option<&crate::lints::LintLevelOverride> {
+        for frame in self.lint_override_stack.iter().rev() {
+            for ov in frame.iter().rev() {
+                if ov.lint == lint_name {
+                    return Some(ov);
+                }
+            }
+        }
+        None
     }
 
     /// `#[deprecated]` slice 4 — at a reference site, check whether
@@ -1887,6 +2087,61 @@ fn collect_forbidden_allows(
     for ov in overrides {
         if ov.level == crate::lints::LintLevel::Allow && cli.is_forbidden(&ov.lint) {
             out.push((ov.span.clone(), ov.lint.clone()));
+        }
+    }
+}
+
+/// Extract every `#[expect(unfulfilled_lint_expectation)]` span
+/// from an `lint_overrides` slice (slice 5 circular-guard pre-pass).
+/// The form would be inert: the unfulfilled warning the expect
+/// silences would itself fulfil the expect, so no signal ever
+/// surfaces — the spec rejects the form outright with
+/// `E_EXPECT_ON_UNFULFILLED`.
+fn collect_expect_on_unfulfilled(
+    overrides: &[crate::lints::LintLevelOverride],
+    out: &mut Vec<Span>,
+) {
+    for ov in overrides {
+        if ov.level == crate::lints::LintLevel::Expect && ov.lint == "unfulfilled_lint_expectation"
+        {
+            out.push(ov.span.clone());
+        }
+    }
+}
+
+/// Collect every `Expect` override whose `(span.offset, lint_name)`
+/// key is *not* in `fulfilled` — these are the unfulfilled
+/// expectations that the slice-5 end-of-typecheck sweep emits.
+/// Captures the outer (impl-block) and inner (item) cascade frames
+/// alongside each emission so the caller can push them in the right
+/// order, matching the cascade-walker shape that
+/// `emit_unknown_lint_warnings` already uses for self-suppression.
+fn collect_unfulfilled_expects(
+    overrides: &[crate::lints::LintLevelOverride],
+    fulfilled: &std::collections::HashSet<(usize, String)>,
+    outer_frame: Vec<crate::lints::LintLevelOverride>,
+    inner_frame: Vec<crate::lints::LintLevelOverride>,
+    out: &mut Vec<(
+        Vec<crate::lints::LintLevelOverride>,
+        Vec<crate::lints::LintLevelOverride>,
+        Span,
+        String,
+    )>,
+) {
+    for ov in overrides {
+        if ov.level == crate::lints::LintLevel::Expect
+            && !fulfilled.contains(&(ov.span.offset, ov.lint.clone()))
+            // Skip the rejected-at-pre-pass `unfulfilled_lint_expectation`
+            // name — the pre-pass already emitted E_EXPECT_ON_UNFULFILLED
+            // for it; we don't also want to flag it as unfulfilled.
+            && ov.lint != "unfulfilled_lint_expectation"
+        {
+            out.push((
+                outer_frame.clone(),
+                inner_frame.clone(),
+                ov.span.clone(),
+                ov.lint.clone(),
+            ));
         }
     }
 }
